@@ -180,7 +180,7 @@ def test_runtime_gateway_accepts_repository_scoped_installation_token() -> None:
                 "nameWithOwner,viewerPermission,defaultBranchRef",
             ): _success(
                 '{"nameWithOwner":"octo-org/optimizer",'
-                '"viewerPermission":"READ",'
+                '"viewerPermission":null,'
                 '"defaultBranchRef":{"name":"main"}}'
             ),
             user_command: _exit(
@@ -248,6 +248,33 @@ def test_gateway_requires_admin_permission() -> None:
         GhGitHubGateway(runner).verify_access(Path("repository"))
 
     assert error.value.permission == "WRITE"
+
+
+def test_gateway_requires_explicit_admin_permission_for_user_onboarding() -> None:
+    runner = FakeCommandRunner(
+        {
+            ("git", "remote", "get-url", "origin"): _success(
+                "https://github.com/octo-org/optimizer.git\n"
+            ),
+            (
+                "gh",
+                "repo",
+                "view",
+                "octo-org/optimizer",
+                "--json",
+                "nameWithOwner,viewerPermission,defaultBranchRef",
+            ): _success(
+                '{"nameWithOwner":"octo-org/optimizer",'
+                '"viewerPermission":null,'
+                '"defaultBranchRef":{"name":"main"}}'
+            ),
+        }
+    )
+
+    with pytest.raises(GitHubPermissionError) as error:
+        GhGitHubGateway(runner).verify_access(Path("repository"))
+
+    assert error.value.permission == "UNKNOWN"
 
 
 def test_gateway_rejects_repository_metadata_that_does_not_match_origin() -> None:

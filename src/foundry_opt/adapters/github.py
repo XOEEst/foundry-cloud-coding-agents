@@ -55,7 +55,7 @@ class GitHubResponseError(GitHubGatewayError):
 class GitHubRepositoryMetadata:
     repository: str
     default_branch: str
-    viewer_permission: str
+    viewer_permission: str | None
 
 
 class GhGitHubGateway(GitHubGateway):
@@ -72,8 +72,10 @@ class GhGitHubGateway(GitHubGateway):
         metadata = self.repository_metadata(repository_root)
 
         permission = metadata.viewer_permission
-        if self._require_admin and permission.casefold() != "admin":
-            raise GitHubPermissionError(permission)
+        if self._require_admin and (
+            permission is None or permission.casefold() != "admin"
+        ):
+            raise GitHubPermissionError(permission or "UNKNOWN")
 
         login = self._authenticated_login(repository_root)
         detail = f"Default branch: {metadata.default_branch}"
@@ -153,7 +155,10 @@ class GhGitHubGateway(GitHubGateway):
 
         if not all(
             isinstance(value, str) and value
-            for value in (repository, permission, default_branch)
+            for value in (repository, default_branch)
+        ) or not (
+            permission is None
+            or isinstance(permission, str) and permission
         ):
             raise GitHubResponseError()
         if repository.casefold() != origin_repository.casefold():
