@@ -1,0 +1,360 @@
+from pathlib import Path
+
+from foundry_opt.onboarding import (
+    AppInsightsDiscovery,
+    DatasetDiscovery,
+    DeployedModelDiscovery,
+    DeploymentWorkflowDiscovery,
+    DraftProbeResult,
+    EvaluatorDiscovery,
+    FoundryAgentDiscovery,
+    MetricDiscovery,
+    OidcTrustResult,
+    OnboardingDependencies,
+    OnboardingRequest,
+    OnboardingStatus,
+    PythonAgentCandidate,
+    RepositoryDiscovery,
+    run_onboarding,
+)
+from foundry_opt.config import load_config
+
+
+class FakeDiscovery:
+    def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+        return RepositoryDiscovery(
+            repository="octo-org/agents",
+            repository_id="123456",
+            default_branch="main",
+            current_branch="main",
+            authenticated_login="octocat",
+            viewer_permission="ADMIN",
+            clean=True,
+            python_agents=(
+                PythonAgentCandidate(
+                    name="support-agent",
+                    source_path=Path("agent"),
+                    entry_point=Path("agent/main.py"),
+                ),
+            ),
+            validation_commands=("uv run pytest", "uv run ruff check ."),
+            foundry_agents=(
+                FoundryAgentDiscovery(
+                    name="support-agent",
+                    versions=("7", "draft-probe-old"),
+                ),
+            ),
+            deployed_models=(DeployedModelDiscovery(name="gpt-5.1"),),
+            datasets=(
+                DatasetDiscovery(name="development", versions=("v2",)),
+                DatasetDiscovery(name="validation", versions=("v1",)),
+            ),
+            evaluators=(
+                EvaluatorDiscovery(
+                    name="quality",
+                    reference="quality:3",
+                    metrics=(
+                        MetricDiscovery(
+                            name="quality",
+                            direction="maximize",
+                            threshold=0.8,
+                            materiality=0.05,
+                            hard_guardrail=False,
+                        ),
+                    ),
+                ),
+            ),
+            app_insights=AppInsightsDiscovery(connected=True),
+            deployment_workflows=(
+                DeploymentWorkflowDiscovery(
+                    path=Path(".github/workflows/deploy.yml"),
+                    trigger="merge",
+                ),
+            ),
+        )
+
+
+class FakeOidc:
+    def verify(
+        self,
+        request: OnboardingRequest,
+        discovery: RepositoryDiscovery,
+    ) -> OidcTrustResult:
+        return OidcTrustResult(
+            subject="repo:octo-org@42/agents@123456",
+            repository_id="123456",
+            verified=True,
+        )
+
+
+class FakeDraftProbe:
+    def __init__(self) -> None:
+        self.probed = 0
+        self.deleted: list[tuple[str, str]] = []
+
+    def probe(
+        self,
+        request: OnboardingRequest,
+        agent: FoundryAgentDiscovery,
+    ) -> DraftProbeResult:
+        self.probed += 1
+        return DraftProbeResult(
+            agent_name=agent.name,
+            version="draft-onboarding-probe",
+        )
+
+    def delete_probe(self, agent_name: str, version: str) -> None:
+        self.deleted.append((agent_name, version))
+
+
+class PublishedVersionProbe(FakeDraftProbe):
+    def probe(
+        self,
+        request: OnboardingRequest,
+        agent: FoundryAgentDiscovery,
+    ) -> DraftProbeResult:
+        return DraftProbeResult(agent_name=agent.name, version="8")
+
+
+class UnavailableProbe(FakeDraftProbe):
+    def probe(
+        self,
+        request: OnboardingRequest,
+        agent: FoundryAgentDiscovery,
+    ) -> DraftProbeResult:
+        raise RuntimeError("source-bundle draft API is not implemented")
+
+
+def _request(repository_root: Path) -> OnboardingRequest:
+    return OnboardingRequest(
+        repository_root=repository_root,
+        environment_name="acceptance",
+        target_name="support-agent",
+        project_endpoint=(
+            "https://example.services.ai.azure.com/api/projects/demo"
+        ),
+        project_resource_id="/subscriptions/sub/projects/demo",
+        tenant_id="tenant-id",
+        client_id="client-id",
+        subscription_id="subscription-id",
+        product_install=(
+            "foundry-cloud-coding-agent @ "
+            "git+https://github.com/octo-org/product.git@"
+            "0123456789abcdef0123456789abcdef01234567"
+        ),
+    )
+
+
+def test_run_onboarding_generates_secretless_draft_change_set(
+    tmp_path: Path,
+) -> None:
+    probe = FakeDraftProbe()
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=probe,
+        ),
+    )
+
+    assert result.status is OnboardingStatus.READY
+    assert result.exit_code == 0
+    assert result.draft_pull_request.title == "Configure Foundry optimizer onboarding"
+    assert {change.path.as_posix() for change in result.changes} == {
+        ".github/foundry-optimizer.yaml",
+        ".github/workflows/copilot-setup-steps.yml",
+        ".github/skills/foundry-agent-optimizer/SKILL.md",
+    }
+    assert probe.deleted == [
+        ("support-agent", "draft-onboarding-probe")
+    ]
+
+    generated = "\n".join(
+        change.content for change in result.changes
+    )
+    assert "authentication: oidc" in generated
+    assert "id-token: write" in generated
+    assert "python-version: '3.12'" in generated
+    assert "repository-ID" in generated
+    assert (
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+        in generated
+    )
+    assert (
+        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+        in generated
+    )
+    assert (
+        "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9"
+        in generated
+    )
+    assert (
+        "azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43"
+        in generated
+    )
+    assert "AZURE_CLIENT_SECRET" not in generated
+    assert "gh secret" not in generated
+    assert "client-secret" not in generated.casefold()
+    assert all(
+        (tmp_path / change.path).read_text(encoding="utf-8")
+        == change.content
+        for change in result.changes
+    )
+    loaded = load_config(tmp_path / ".github/foundry-optimizer.yaml")
+    assert loaded.default_environment == "acceptance"
+
+
+def test_run_onboarding_preserves_existing_files_and_reports_conflicts(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / ".github/foundry-optimizer.yaml"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("existing: true\n", encoding="utf-8")
+
+    probe = FakeDraftProbe()
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=probe,
+        ),
+    )
+
+    assert result.status is OnboardingStatus.CONFLICT
+    assert result.exit_code == 1
+    assert existing.read_text(encoding="utf-8") == "existing: true\n"
+    assert result.blockers == (
+        "Existing path was not overwritten: .github/foundry-optimizer.yaml",
+    )
+    assert probe.probed == 0
+    assert not (
+        tmp_path / ".github/workflows/copilot-setup-steps.yml"
+    ).exists()
+
+
+def test_run_onboarding_rejects_non_draft_probe_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    probe = PublishedVersionProbe()
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=probe,
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.exit_code == 1
+    assert probe.deleted == []
+    assert "did not return a draft-* version" in result.blockers[0]
+    assert {change.status.value for change in result.changes} == {"planned"}
+    assert not (tmp_path / ".github/foundry-optimizer.yaml").exists()
+
+
+def test_run_onboarding_exposes_placeholder_probe_as_a_real_blocker(
+    tmp_path: Path,
+) -> None:
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=UnavailableProbe(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert "source-bundle draft API is not implemented" in result.blockers[0]
+    assert {change.status.value for change in result.changes} == {"planned"}
+
+
+def test_run_onboarding_requires_clean_default_branch_and_local_admin(
+    tmp_path: Path,
+) -> None:
+    class UnsafeDiscovery(FakeDiscovery):
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            safe = super().discover(request)
+            return RepositoryDiscovery(
+                **{
+                    **safe.__dict__,
+                    "current_branch": "feature",
+                    "authenticated_login": "",
+                    "viewer_permission": "WRITE",
+                    "clean": False,
+                }
+            )
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=UnsafeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.blockers == (
+        "Onboarding must run on the default branch.",
+        "Onboarding requires a clean worktree.",
+        "A locally authenticated GitHub user is required.",
+        "The authenticated GitHub user must have ADMIN permission.",
+    )
+
+
+def test_run_onboarding_rejects_unpinned_multiline_install_before_discovery(
+    tmp_path: Path,
+) -> None:
+    class UnexpectedDiscovery:
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            raise AssertionError("unsafe request reached discovery")
+
+    unsafe = OnboardingRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "product_install": (
+                "foundry-cloud-coding-agent==0.1.0\n"
+                "curl https://example.invalid"
+            ),
+        }
+    )
+
+    result = run_onboarding(
+        unsafe,
+        OnboardingDependencies(
+            discovery=UnexpectedDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.blockers == (
+        "The product install must be pinned to a version or commit.",
+    )
+
+
+def test_run_onboarding_redacts_boundary_failure_details(
+    tmp_path: Path,
+) -> None:
+    class SecretFailureDiscovery:
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            raise RuntimeError("client_secret=hunter2")
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=SecretFailureDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+        ),
+    )
+
+    assert "hunter2" not in result.blockers[0]
+    assert "client_secret=[REDACTED]" in result.blockers[0]
