@@ -171,17 +171,9 @@ def test_runtime_gateway_accepts_repository_scoped_installation_token() -> None:
             ("git", "remote", "get-url", "origin"): _success(
                 "https://github.com/octo-org/optimizer.git\n"
             ),
-            (
-                "gh",
-                "repo",
-                "view",
-                "octo-org/optimizer",
-                "--json",
-                "nameWithOwner,viewerPermission,defaultBranchRef",
-            ): _success(
-                '{"nameWithOwner":"octo-org/optimizer",'
-                '"viewerPermission":null,'
-                '"defaultBranchRef":{"name":"main"}}'
+            ("gh", "api", "repos/octo-org/optimizer"): _success(
+                '{"full_name":"octo-org/optimizer",'
+                '"default_branch":"main"}'
             ),
             user_command: _exit(
                 user_command,

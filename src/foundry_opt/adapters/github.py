@@ -94,11 +94,20 @@ class GhGitHubGateway(GitHubGateway):
         repository_root: Path,
     ) -> GitHubRepositoryMetadata:
         origin_repository = self._origin_repository(repository_root)
-        metadata = self._repository_metadata(repository_root, origin_repository)
+        if self._require_admin:
+            metadata = self._user_repository_metadata(
+                repository_root,
+                origin_repository,
+            )
+        else:
+            metadata = self._runtime_repository_metadata(
+                repository_root,
+                origin_repository,
+            )
         return GitHubRepositoryMetadata(
             repository=metadata["nameWithOwner"],
-            default_branch=metadata["defaultBranchRef"]["name"],
-            viewer_permission=metadata["viewerPermission"],
+            default_branch=metadata["defaultBranch"],
+            viewer_permission=metadata.get("viewerPermission"),
         )
 
     def _authenticated_login(self, repository_root: Path) -> str | None:
@@ -125,7 +134,7 @@ class GhGitHubGateway(GitHubGateway):
             raise GitHubRepositoryError()
         return repository
 
-    def _repository_metadata(
+    def _user_repository_metadata(
         self,
         repository_root: Path,
         origin_repository: str,
@@ -166,7 +175,46 @@ class GhGitHubGateway(GitHubGateway):
                 origin_repository,
                 repository,
             )
-        return metadata
+        return {
+            "nameWithOwner": repository,
+            "defaultBranch": default_branch,
+            "viewerPermission": permission,
+        }
+
+    def _runtime_repository_metadata(
+        self,
+        repository_root: Path,
+        origin_repository: str,
+    ) -> dict[str, Any]:
+        try:
+            raw_metadata = self._command_runner.run(
+                ["gh", "api", f"repos/{origin_repository}"],
+                cwd=repository_root,
+            ).stdout
+        except CommandError as error:
+            raise GitHubRepositoryError() from error
+
+        try:
+            metadata = json.loads(raw_metadata)
+            repository = metadata["full_name"]
+            default_branch = metadata["default_branch"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise GitHubResponseError() from error
+
+        if not all(
+            isinstance(value, str) and value
+            for value in (repository, default_branch)
+        ):
+            raise GitHubResponseError()
+        if repository.casefold() != origin_repository.casefold():
+            raise GitHubRepositoryMismatchError(
+                origin_repository,
+                repository,
+            )
+        return {
+            "nameWithOwner": repository,
+            "defaultBranch": default_branch,
+        }
 
 
 def github_repository_from_remote_url(remote_url: str) -> str | None:
