@@ -99,3 +99,32 @@ customer-agent = "customer_agent.main:app"
     assert report.passed
     assert len(report.results) == 4
     assert not list(repository.rglob("__pycache__"))
+
+
+def test_fallback_validation_executes_configured_flat_entry_point(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "flat-agent"
+    repository.mkdir()
+    (repository / "main.py").write_text(
+        """
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.parse_args()
+""".strip(),
+        encoding="utf-8",
+    )
+
+    report = run_validation(
+        ValidationRequest(
+            repository,
+            entry_point=("python", "main.py"),
+        ),
+        SubprocessCommandRunner(),
+    )
+
+    assert report.discovered is False
+    assert report.passed
+    assert len(report.results) == 3
+    assert not list(repository.rglob("__pycache__"))

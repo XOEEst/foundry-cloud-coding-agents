@@ -87,15 +87,31 @@ def test_build_source_bundle_applies_declared_and_mandatory_exclusions(
 
     assert artifact.included_files == ("src/main.py",)
     reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
-    assert reasons[".git/config"] == "mandatory: version-control metadata"
-    assert reasons[".azure/state"] == "mandatory: Azure local state"
-    assert reasons[".venv/module.py"] == "mandatory: virtual environment"
-    assert reasons["__pycache__/main.pyc"] == "mandatory: cache"
-    assert reasons["dist/agent.whl"] == "mandatory: build artifact"
-    assert reasons[".foundry-opt/evidence.json"] == (
-        "mandatory: optimizer evidence"
-    )
+    assert reasons[".git/"] == "mandatory: version-control metadata"
+    assert reasons[".azure/"] == "mandatory: Azure local state"
+    assert reasons[".venv/"] == "mandatory: virtual environment"
+    assert reasons["__pycache__/"] == "mandatory: cache"
+    assert reasons["dist/"] == "mandatory: build artifact"
+    assert reasons[".foundry-opt/"] == "mandatory: optimizer evidence"
     assert reasons["tests/test_main.py"] == "declared exclude: tests/**"
+
+
+def test_build_source_bundle_excludes_root_git_file(tmp_path: Path) -> None:
+    repository = tmp_path / "worktree"
+    repository.mkdir()
+    (repository / ".git").write_text(
+        "gitdir: C:/outside/repository/.git/worktrees/demo\n",
+        encoding="utf-8",
+    )
+    (repository / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    artifact = build_source_bundle(
+        BundleRequest(repository, tmp_path / "bundle.zip")
+    )
+
+    assert artifact.included_files == ("main.py",)
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons[".git"] == "mandatory: version-control metadata"
 
 
 @pytest.mark.parametrize(
@@ -139,6 +155,30 @@ def test_build_source_bundle_rejects_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(UnsafeSourcePathError):
         build_source_bundle(BundleRequest(repository, tmp_path / "bundle.zip"))
+
+
+def test_build_source_bundle_prunes_excluded_symlink_directories(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    outside = tmp_path / "outside-venv"
+    outside.mkdir()
+    (outside / "secret.py").write_text("outside", encoding="utf-8")
+    link = repository / ".venv"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    (repository / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    artifact = build_source_bundle(
+        BundleRequest(repository, tmp_path / "bundle.zip")
+    )
+
+    assert artifact.included_files == ("main.py",)
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons[".venv/"] == "mandatory: virtual environment"
 
 
 def test_build_source_bundle_requires_output_outside_repository_root_parent(

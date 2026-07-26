@@ -86,17 +86,16 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
 
     included: list[tuple[str, Path]] = []
     excluded: list[ExcludedFile] = []
-    for archive_path, source_path in _source_files(root):
-        resolved = _contained_file(source_path, root)
-        if resolved in generated_paths:
-            excluded.append(ExcludedFile(archive_path, "generated bundle output"))
-            continue
-
+    for archive_path, source_path in _source_files(root, excluded):
         mandatory_reason = _mandatory_exclusion(archive_path)
         if mandatory_reason is not None:
             excluded.append(
                 ExcludedFile(archive_path, f"mandatory: {mandatory_reason}")
             )
+            continue
+        resolved = _contained_file(source_path, root)
+        if resolved in generated_paths:
+            excluded.append(ExcludedFile(archive_path, "generated bundle output"))
             continue
         if _secret_shaped(archive_path):
             raise SecretSourceFileError(archive_path)
@@ -159,17 +158,30 @@ def _resolve_output(path: Path, root: Path) -> Path:
     return expanded.resolve()
 
 
-def _source_files(root: Path):
+def _source_files(root: Path, excluded: list[ExcludedFile]):
     for current, directory_names, file_names in os.walk(
         root,
         topdown=True,
         followlinks=False,
     ):
         current_path = Path(current)
-        for name in tuple(directory_names):
+        retained_directories: list[str] = []
+        for name in sorted(directory_names):
+            relative = (current_path / name).relative_to(root).as_posix()
+            mandatory_reason = _mandatory_directory_exclusion(name)
+            if mandatory_reason is not None:
+                excluded.append(
+                    ExcludedFile(
+                        f"{relative}/",
+                        f"mandatory: {mandatory_reason}",
+                    )
+                )
+                continue
             candidate = current_path / name
             if candidate.is_symlink():
                 raise UnsafeSourcePathError(candidate)
+            retained_directories.append(name)
+        directory_names[:] = retained_directories
         for name in sorted(file_names):
             candidate = current_path / name
             relative = candidate.relative_to(root)
@@ -190,16 +202,26 @@ def _contained_file(path: Path, root: Path) -> Path:
 
 def _mandatory_exclusion(archive_path: str) -> str | None:
     path = PurePosixPath(archive_path)
+    if path.name.casefold() == ".git":
+        return "version-control metadata"
     for part in path.parts[:-1]:
-        reason = _MANDATORY_DIRECTORIES.get(part.casefold())
+        reason = _mandatory_directory_exclusion(part)
         if reason is not None:
             return reason
-        if part.casefold().endswith(".egg-info"):
-            return "build artifact"
     name = path.name.casefold()
     if name in {".coverage", "coverage.xml"}:
         return "build artifact"
     if any(name.endswith(suffix) for suffix in _MANDATORY_FILE_SUFFIXES):
+        return "build artifact"
+    return None
+
+
+def _mandatory_directory_exclusion(name: str) -> str | None:
+    normalized = name.casefold()
+    reason = _MANDATORY_DIRECTORIES.get(normalized)
+    if reason is not None:
+        return reason
+    if normalized.endswith(".egg-info"):
         return "build artifact"
     return None
 

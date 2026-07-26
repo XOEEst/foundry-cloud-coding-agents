@@ -8,6 +8,7 @@ from foundry_opt.packaging.models import (
     UnsafeSourcePathError,
 )
 from foundry_opt.packaging.validation import (
+    ValidationCommand,
     ValidationReport,
     ValidationRequest,
     ValidationResult,
@@ -22,6 +23,7 @@ __all__ = [
     "SecretSourceFileError",
     "UnsafeSourcePathError",
     "ValidationReport",
+    "ValidationCommand",
     "ValidationRequest",
     "ValidationResult",
     "build_source_bundle",

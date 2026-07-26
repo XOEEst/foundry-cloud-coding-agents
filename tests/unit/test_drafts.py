@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,7 +103,43 @@ def _request(
 def _baseline() -> FakeResponse:
     return FakeResponse(
         200,
-        {"version": "7", "draft": False, "status": "active"},
+        {
+            "version": "7",
+            "draft": False,
+            "status": "active",
+            "description": "published baseline",
+            "metadata": {
+                "owner": "platform",
+                "telemetry-mode": "full",
+            },
+            "blueprint_reference": {
+                "type": "ManagedAgentIdentityBlueprint",
+                "blueprint_id": "baseline-blueprint",
+            },
+            "definition": {
+                "kind": "hosted",
+                "cpu": "2",
+                "memory": "4Gi",
+                "protocol_versions": [
+                    {"protocol": "invocations", "version": "1.0.0"}
+                ],
+                "environment_variables": {
+                    "AZURE_AI_MODEL_DEPLOYMENT_NAME": "baseline-model",
+                    "TELEMETRY_MODE": "full",
+                },
+                "code_configuration": {
+                    "runtime": "python_3_14",
+                    "entry_point": ["python", "old.py"],
+                    "dependency_resolution": "bundled",
+                    "content_hash": "old-content-hash",
+                },
+                "responsible_ai": {"policy_name": "baseline-rai"},
+                "telemetry": {
+                    "application_insights_connection": "baseline-telemetry"
+                },
+                "future_operational_field": {"preserve": True},
+            },
+        },
     )
 
 
@@ -162,6 +199,30 @@ def test_create_draft_uses_preview_rest_contract_and_preserves_binary_zip(
     metadata = json.loads(metadata_part[1])
     assert metadata["draft"] is True
     assert metadata["metadata"]["foundry-opt-base-version"] == "7"
+    assert metadata["metadata"]["owner"] == "platform"
+    assert metadata["metadata"]["telemetry-mode"] == "full"
+    assert metadata["description"] == "published baseline"
+    assert metadata["blueprint_reference"]["blueprint_id"] == "baseline-blueprint"
+    definition = metadata["definition"]
+    assert definition["cpu"] == "2"
+    assert definition["memory"] == "4Gi"
+    assert definition["protocol_versions"] == [
+        {"protocol": "invocations", "version": "1.0.0"}
+    ]
+    assert definition["environment_variables"] == {
+        "AZURE_AI_MODEL_DEPLOYMENT_NAME": "baseline-model",
+        "TELEMETRY_MODE": "full",
+    }
+    assert definition["responsible_ai"] == {"policy_name": "baseline-rai"}
+    assert definition["telemetry"] == {
+        "application_insights_connection": "baseline-telemetry"
+    }
+    assert definition["future_operational_field"] == {"preserve": True}
+    assert definition["code_configuration"] == {
+        "runtime": request.runtime,
+        "entry_point": list(request.entry_point),
+        "dependency_resolution": request.dependency_resolution,
+    }
     assert "container_configuration" not in json.dumps(metadata)
     uploaded_zip = _multipart_part(create_call, "code")[1]
     assert uploaded_zip == request.bundle.path.read_bytes()
@@ -314,6 +375,45 @@ def test_delete_probe_refuses_candidate_drafts(tmp_path: Path) -> None:
     client = FakeProjectClient([_baseline(), _draft(request.bundle.sha256)])
     gateway, _ = _gateway(client)
     record = gateway.create_draft(request)
+
+    with pytest.raises(ValueError):
+        gateway.delete_probe(record)
+
+
+def test_delete_probe_rejects_caller_forged_probe_record(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeProjectClient([_baseline(), _draft(request.bundle.sha256)])
+    gateway, _ = _gateway(client)
+    candidate = gateway.create_draft(request)
+    forged = replace(candidate, probe=True)
+
+    with pytest.raises(ValueError):
+        gateway.delete_probe(forged)
+
+
+def test_delete_probe_requires_creating_gateway_identity(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path, probe=True)
+    client = FakeProjectClient([_baseline(), _draft(request.bundle.sha256)])
+    creating_gateway, _ = _gateway(client)
+    record = creating_gateway.create_draft(request)
+    other_gateway, _ = _gateway(FakeProjectClient([]))
+
+    with pytest.raises(ValueError):
+        other_gateway.delete_probe(record)
+
+
+def test_delete_probe_rejects_replayed_record(tmp_path: Path) -> None:
+    request = _request(tmp_path, probe=True)
+    client = FakeProjectClient(
+        [_baseline(), _draft(request.bundle.sha256), FakeResponse(204)]
+    )
+    gateway, _ = _gateway(client)
+    record = gateway.create_draft(request)
+    gateway.delete_probe(record)
 
     with pytest.raises(ValueError):
         gateway.delete_probe(record)

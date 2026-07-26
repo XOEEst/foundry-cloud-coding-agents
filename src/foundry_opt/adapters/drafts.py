@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import suppress
+from copy import deepcopy
 import hashlib
+import hmac
 from io import BytesIO
 import json
 from pathlib import Path
 import re
+import secrets
 from typing import Any, Protocol
 from urllib.parse import quote
 import zipfile
@@ -83,6 +86,7 @@ class DraftGateway:
     ) -> None:
         self._credential_provider = credential_provider
         self._client_factory = client_factory
+        self._probe_records: dict[int, tuple[DraftRecord, str, bytes]] = {}
 
     def create_draft(self, request: DraftRequest) -> DraftRecord:
         _verify_local_bundle(
@@ -105,7 +109,7 @@ class DraftGateway:
             )
             _verify_published_baseline(baseline, request.base_version)
 
-            metadata = _draft_metadata(request)
+            metadata = _draft_metadata(request, baseline)
             create_request = HttpRequest(
                 "POST",
                 _versions_url(request.agent_name),
@@ -141,18 +145,34 @@ class DraftGateway:
                 client,
                 create_request,
             )
-            return _parse_draft_response(
+            record = _parse_draft_response(
                 response,
                 response_headers,
                 request,
             )
+            if request.probe:
+                token = secrets.token_urlsafe(32)
+                self._probe_records[id(record)] = (
+                    record,
+                    token,
+                    _probe_signature(record, token),
+                )
+            return record
         finally:
             _close_quietly(client)
             _close_quietly(credential)
 
     def delete_probe(self, record: DraftRecord) -> None:
+        registered = self._probe_records.get(id(record))
+        if registered is None:
+            raise ValueError("only a confirmed onboarding probe may be deleted")
+        registered_record, token, expected_signature = registered
         if (
-            not record.probe
+            registered_record is not record
+            or not hmac.compare_digest(
+                _probe_signature(record, token),
+                expected_signature,
+            )
             or not record.project_endpoint
             or not _DRAFT_VERSION.fullmatch(record.version_id)
         ):
@@ -171,37 +191,70 @@ class DraftGateway:
                 ),
             )
             _require_success(response)
+            self._probe_records.pop(id(record), None)
         finally:
             _close_quietly(client)
             _close_quietly(credential)
 
 
-def _draft_metadata(request: DraftRequest) -> dict[str, Any]:
-    metadata = dict(request.metadata)
-    metadata["foundry-opt-base-version"] = str(request.base_version)
-    metadata["foundry-opt-source-sha256"] = request.bundle.sha256
-    return {
-        "definition": {
-            "kind": "hosted",
-            "protocol_versions": [
-                {
-                    "protocol": request.protocol,
-                    "version": request.protocol_version,
-                }
-            ],
-            "cpu": request.cpu,
-            "memory": request.memory,
-            "code_configuration": {
-                "runtime": request.runtime,
-                "entry_point": list(request.entry_point),
-                "dependency_resolution": request.dependency_resolution,
-            },
-            "environment_variables": dict(request.environment_variables),
-        },
-        "description": request.description,
+def _draft_metadata(
+    request: DraftRequest,
+    baseline: dict[str, Any],
+) -> dict[str, Any]:
+    baseline_definition = baseline.get("definition")
+    if (
+        not isinstance(baseline_definition, dict)
+        or baseline_definition.get("kind") != "hosted"
+    ):
+        raise DraftResponseError()
+    definition = deepcopy(baseline_definition)
+    definition.pop("container_configuration", None)
+    configuration = definition.get("code_configuration")
+    if configuration is None:
+        configuration = {}
+    if not isinstance(configuration, dict):
+        raise DraftResponseError()
+    configuration = deepcopy(configuration)
+    configuration.pop("content_hash", None)
+    configuration.update(
+        {
+            "runtime": request.runtime,
+            "entry_point": list(request.entry_point),
+            "dependency_resolution": request.dependency_resolution,
+        }
+    )
+    definition["code_configuration"] = configuration
+
+    baseline_metadata = baseline.get("metadata")
+    if baseline_metadata is None:
+        baseline_metadata = {}
+    if not isinstance(baseline_metadata, dict):
+        raise DraftResponseError()
+    metadata = deepcopy(baseline_metadata)
+    metadata.update(dict(request.metadata))
+    for key, value in (
+        ("foundry-opt-base-version", str(request.base_version)),
+        ("foundry-opt-source-sha256", request.bundle.sha256),
+    ):
+        if key in metadata or len(metadata) < 16:
+            metadata[key] = value
+    if len(metadata) > 16:
+        raise DraftResponseError()
+
+    payload: dict[str, Any] = {
+        "definition": definition,
+        "description": (
+            request.description
+            if request.description is not None
+            else deepcopy(baseline.get("description"))
+        ),
         "metadata": metadata,
         "draft": True,
     }
+    blueprint_reference = baseline.get("blueprint_reference")
+    if blueprint_reference is not None:
+        payload["blueprint_reference"] = deepcopy(blueprint_reference)
+    return payload
 
 
 def _verify_published_baseline(
@@ -340,6 +393,19 @@ def _verify_local_bundle(
     digest = hashlib.sha256(content).hexdigest()
     if digest.casefold() != expected_sha256.casefold():
         raise DraftHashMismatchError()
+
+
+def _probe_signature(record: DraftRecord, token: str) -> bytes:
+    identity = "\0".join(
+        (
+            record.project_endpoint,
+            record.agent_name,
+            record.version_id,
+            str(record.base_version),
+            record.sha256,
+        )
+    ).encode("utf-8")
+    return hmac.digest(token.encode("utf-8"), identity, "sha256")
 
 
 def _versions_url(agent_name: str) -> str:

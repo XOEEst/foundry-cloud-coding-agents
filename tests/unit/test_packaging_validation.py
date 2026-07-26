@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from foundry_opt.packaging import (
+    ValidationCommand,
     ValidationRequest,
     run_validation,
 )
@@ -180,3 +183,172 @@ def test_run_validation_runs_all_checks_and_redacts_failures(
     assert report.results[0].passed is False
     assert report.results[0].stdout == "token=[REDACTED]"
     assert report.results[1].passed is True
+
+
+def test_run_validation_redacts_underscore_env_names_and_known_secrets(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    command = ("python", "-c", "print('known-runtime-secret')")
+
+    class SecretRunner(RecordingRunner):
+        def run(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            cwd: Path | None = None,
+        ) -> CommandResult:
+            self.calls.append((tuple(arguments), cwd))
+            return CommandResult(
+                1,
+                (
+                    "AZURE_CLIENT_SECRET=alpha "
+                    "MY_RUNTIME_TOKEN=bravo DB_PASSWORD=charlie "
+                    "known-runtime-secret"
+                ),
+                "SERVICE_CONNECTION_STRING=AccountKey=delta",
+            )
+
+    request = ValidationRequest(
+        repository,
+        commands=(command,),
+        secrets=("known-runtime-secret",),
+    )
+    report = run_validation(request, SecretRunner())
+
+    persisted = " ".join(
+        (
+            *report.results[0].command,
+            report.results[0].stdout,
+            report.results[0].stderr,
+        )
+    )
+    assert "alpha" not in persisted
+    assert "bravo" not in persisted
+    assert "charlie" not in persisted
+    assert "delta" not in persisted
+    assert "known-runtime-secret" not in persisted
+    assert "known-runtime-secret" not in repr(request)
+    assert persisted.count("[REDACTED]") >= 5
+
+
+def test_run_validation_uses_configured_entry_point_and_flat_module(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / "main.py").write_text(
+        "def main():\n    return None\n",
+        encoding="utf-8",
+    )
+    runner = RecordingRunner()
+
+    report = run_validation(
+        ValidationRequest(
+            repository,
+            entry_point=("python", "main.py"),
+        ),
+        runner,
+    )
+
+    rendered = [" ".join(command) for command, _ in runner.calls]
+    assert report.discovered is False
+    assert any("import main" in command for command in rendered)
+    assert any(
+        "main.py" in command and "subprocess.run" in command
+        for command in rendered
+    )
+
+
+def test_run_validation_preserves_workflow_working_directories(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    workflow = repository / ".github" / "workflows"
+    workflow.mkdir(parents=True)
+    (repository / "services" / "default").mkdir(parents=True)
+    (repository / "services" / "job").mkdir()
+    (repository / "services" / "step").mkdir()
+    (workflow / "ci.yml").write_text(
+        """
+defaults:
+  run:
+    working-directory: services/default
+jobs:
+  validate:
+    defaults:
+      run:
+        working-directory: services/job
+    steps:
+      - run: uv run pytest -q
+      - run: uv run ruff check .
+        working-directory: services/step
+  other:
+    steps:
+      - run: uv run mypy .
+""".strip(),
+        encoding="utf-8",
+    )
+    runner = RecordingRunner()
+
+    run_validation(ValidationRequest(repository), runner)
+
+    assert runner.calls == [
+        (
+            ("uv", "run", "pytest", "-q"),
+            (repository / "services" / "job").resolve(),
+        ),
+        (
+            ("uv", "run", "ruff", "check", "."),
+            (repository / "services" / "step").resolve(),
+        ),
+        (
+            ("uv", "run", "mypy", "."),
+            (repository / "services" / "default").resolve(),
+        ),
+    ]
+
+
+def test_run_validation_rejects_workflow_working_directory_escape(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    workflow = repository / ".github" / "workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "ci.yml").write_text(
+        """
+jobs:
+  validate:
+    steps:
+      - run: uv run pytest
+        working-directory: ../outside
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        run_validation(ValidationRequest(repository), RecordingRunner())
+
+
+def test_run_validation_accepts_explicit_validation_command_directory(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    service = repository / "service"
+    service.mkdir(parents=True)
+    runner = RecordingRunner()
+
+    run_validation(
+        ValidationRequest(
+            repository,
+            commands=(
+                ValidationCommand(("python", "-m", "pytest"), Path("service")),
+            ),
+        ),
+        runner,
+    )
+
+    assert runner.calls == [
+        (("python", "-m", "pytest"), service.resolve())
+    ]
