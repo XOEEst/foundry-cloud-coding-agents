@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import zipfile
+
+import pytest
+
+from foundry_opt.packaging import (
+    BundleRequest,
+    SecretSourceFileError,
+    UnsafeSourcePathError,
+    build_source_bundle,
+)
+
+
+def test_build_source_bundle_is_binary_safe_and_deterministic(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / "main.py").write_text("print('hello')\n", encoding="utf-8")
+    binary = b"\x00\xff\x10PNG\r\n\x1a\n"
+    (repository / "asset.bin").write_bytes(binary)
+    nested = repository / "skills"
+    nested.mkdir()
+    (nested / "skill.txt").write_text("skill", encoding="utf-8")
+
+    first = build_source_bundle(
+        BundleRequest(repository, tmp_path / "first.zip")
+    )
+    os.utime(repository / "main.py", (2_000_000_000, 2_000_000_000))
+    second = build_source_bundle(
+        BundleRequest(repository, tmp_path / "second.zip")
+    )
+
+    assert first.sha256 == second.sha256
+    assert first.path.read_bytes() == second.path.read_bytes()
+    assert first.included_files == ("asset.bin", "main.py", "skills/skill.txt")
+    assert first.byte_size == first.path.stat().st_size
+    with zipfile.ZipFile(first.path) as archive:
+        assert archive.namelist() == list(first.included_files)
+        assert archive.read("asset.bin") == binary
+        assert {item.date_time for item in archive.infolist()} == {
+            (1980, 1, 1, 0, 0, 0)
+        }
+        assert all("\\" not in item.filename for item in archive.infolist())
+
+    manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["sha256"] == first.sha256
+    assert manifest["included_files"] == list(first.included_files)
+    assert "credential" not in json.dumps(manifest).casefold()
+
+
+def test_build_source_bundle_applies_declared_and_mandatory_exclusions(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    (repository / ".git").mkdir(parents=True)
+    (repository / ".git" / "config").write_text("ignored", encoding="utf-8")
+    (repository / ".azure").mkdir()
+    (repository / ".azure" / "state").write_text("ignored", encoding="utf-8")
+    (repository / ".venv").mkdir()
+    (repository / ".venv" / "module.py").write_text("ignored", encoding="utf-8")
+    (repository / "__pycache__").mkdir()
+    (repository / "__pycache__" / "main.pyc").write_bytes(b"ignored")
+    (repository / "dist").mkdir()
+    (repository / "dist" / "agent.whl").write_bytes(b"ignored")
+    (repository / ".foundry-opt").mkdir()
+    (repository / ".foundry-opt" / "evidence.json").write_text(
+        "ignored", encoding="utf-8"
+    )
+    (repository / "src").mkdir()
+    (repository / "src" / "main.py").write_text("included", encoding="utf-8")
+    (repository / "tests").mkdir()
+    (repository / "tests" / "test_main.py").write_text(
+        "excluded", encoding="utf-8"
+    )
+
+    artifact = build_source_bundle(
+        BundleRequest(
+            repository_root=repository,
+            output_path=tmp_path / "bundle.zip",
+            include=("src/**", "tests/**"),
+            exclude=("tests/**",),
+        )
+    )
+
+    assert artifact.included_files == ("src/main.py",)
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons[".git/config"] == "mandatory: version-control metadata"
+    assert reasons[".azure/state"] == "mandatory: Azure local state"
+    assert reasons[".venv/module.py"] == "mandatory: virtual environment"
+    assert reasons["__pycache__/main.pyc"] == "mandatory: cache"
+    assert reasons["dist/agent.whl"] == "mandatory: build artifact"
+    assert reasons[".foundry-opt/evidence.json"] == (
+        "mandatory: optimizer evidence"
+    )
+    assert reasons["tests/test_main.py"] == "declared exclude: tests/**"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".env",
+        ".env.local",
+        ".npmrc",
+        "credentials.json",
+        "client-secret.txt",
+        "id_rsa",
+        "secrets.yaml",
+    ],
+)
+def test_build_source_bundle_rejects_secret_shaped_files(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / relative_path).write_text("must-not-leak", encoding="utf-8")
+
+    with pytest.raises(SecretSourceFileError) as raised:
+        build_source_bundle(BundleRequest(repository, tmp_path / "bundle.zip"))
+
+    assert relative_path in str(raised.value)
+    assert "must-not-leak" not in str(raised.value)
+    assert not (tmp_path / "bundle.zip").exists()
+
+
+def test_build_source_bundle_rejects_symlinks(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("outside", encoding="utf-8")
+    link = repository / "linked.py"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(UnsafeSourcePathError):
+        build_source_bundle(BundleRequest(repository, tmp_path / "bundle.zip"))
+
+
+def test_build_source_bundle_requires_output_outside_repository_root_parent(
+    tmp_path: Path,
+) -> None:
+    repository_file = tmp_path / "not-a-directory"
+    repository_file.write_text("x", encoding="utf-8")
+
+    with pytest.raises(UnsafeSourcePathError):
+        build_source_bundle(
+            BundleRequest(repository_file, tmp_path / "bundle.zip")
+        )
+
+
+def test_build_source_bundle_excludes_previous_generated_output(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    output = repository / "agent.zip"
+
+    first = build_source_bundle(BundleRequest(repository, output))
+    second = build_source_bundle(BundleRequest(repository, output))
+
+    assert first.sha256 == second.sha256
+    reasons = {entry.path: entry.reason for entry in second.excluded_files}
+    assert reasons["agent.zip"] == "generated bundle output"
+    assert reasons["agent.zip.manifest.json"] == "generated bundle output"
