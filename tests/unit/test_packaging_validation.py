@@ -410,3 +410,81 @@ def test_run_validation_appends_configured_entry_checks_to_discovered_commands(
     assert len(rendered) == 3
     assert "importlib" in rendered[1]
     assert "main.py" in rendered[2]
+
+
+def test_run_validation_python_module_entry_uses_src_layout_path(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    package = repository / "src" / "demo_agent"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    runner = RecordingRunner()
+
+    run_validation(
+        ValidationRequest(
+            repository,
+            commands=(("python", "-m", "pytest"),),
+            entry_point=("python", "-m", "demo_agent"),
+        ),
+        runner,
+    )
+
+    import_check = " ".join(runner.calls[1][0])
+    startup_check = " ".join(runner.calls[2][0])
+    assert "PYTHONPATH" in import_check
+    assert repr(str((repository / "src").resolve()))[1:-1] in import_check
+    assert "PYTHONPATH" in startup_check
+    assert repr(str((repository / "src").resolve()))[1:-1] in startup_check
+
+
+def test_run_validation_fully_redacts_quoted_json_and_whitespace_credentials(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+
+    class QuotedSecretRunner(RecordingRunner):
+        def run(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            cwd: Path | None = None,
+        ) -> CommandResult:
+            return CommandResult(
+                1,
+                (
+                    'AZURE_CLIENT_SECRET = "alpha beta" '
+                    "'MY_RUNTIME_TOKEN': 'bravo charlie' "
+                    '{"DB_PASSWORD": "delta echo", '
+                    '"api_key": "foxtrot golf"}'
+                ),
+                (
+                    'SERVICE_CONNECTION_STRING = '
+                    '"AccountKey=hotel india;Endpoint=https://storage/"'
+                ),
+            )
+
+    report = run_validation(
+        ValidationRequest(
+            repository,
+            commands=(("python", "-c", "pass"),),
+        ),
+        QuotedSecretRunner(),
+    )
+
+    persisted = f"{report.results[0].stdout} {report.results[0].stderr}"
+    for fragment in (
+        "alpha",
+        "beta",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+    ):
+        assert fragment not in persisted
+    assert persisted.count("[REDACTED]") >= 5

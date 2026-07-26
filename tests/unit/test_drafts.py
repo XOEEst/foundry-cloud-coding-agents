@@ -270,6 +270,52 @@ def test_create_draft_rejects_draft_baseline(tmp_path: Path) -> None:
         gateway.create_draft(request)
 
 
+def test_create_draft_reserves_provenance_metadata_at_capacity(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    baseline = _baseline()
+    baseline._payload["metadata"] = {
+        f"inherited-{index:02d}": f"value-{index:02d}"
+        for index in range(16)
+    }
+    client = FakeProjectClient([baseline, _draft(request.bundle.sha256)])
+    gateway, _ = _gateway(client)
+
+    gateway.create_draft(request)
+
+    metadata = json.loads(_multipart_part(client.requests[1], "metadata")[1])
+    inherited = metadata["metadata"]
+    assert len(inherited) == 16
+    assert inherited["foundry-opt-base-version"] == "7"
+    assert inherited["foundry-opt-source-sha256"] == request.bundle.sha256
+    assert tuple(inherited)[:2] == (
+        "foundry-opt-base-version",
+        "foundry-opt-source-sha256",
+    )
+    assert "inherited-00" in inherited
+    assert "inherited-13" in inherited
+    assert "inherited-14" not in inherited
+    assert "inherited-15" not in inherited
+
+
+def test_create_draft_fails_when_caller_metadata_exceeds_reserved_capacity(
+    tmp_path: Path,
+) -> None:
+    values = _request(tmp_path).__dict__
+
+    with pytest.raises(ValueError, match="reserved.*provenance"):
+        DraftRequest(
+            **{
+                **values,
+                "metadata": {
+                    f"caller-{index:02d}": f"value-{index:02d}"
+                    for index in range(15)
+                },
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("status", "expected"),
     [

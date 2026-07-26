@@ -87,7 +87,15 @@ class DraftRequest:
                 )
         metadata = dict(self.metadata)
         if len(metadata) > 14:
-            raise ValueError("metadata permits at most 14 caller entries")
+            raise ValueError(
+                "metadata permits at most 14 caller entries; two entries "
+                "are reserved for foundry-opt provenance"
+            )
+        if {
+            "foundry-opt-base-version",
+            "foundry-opt-source-sha256",
+        } & metadata.keys():
+            raise ValueError("foundry-opt provenance metadata is reserved")
         if any(not isinstance(key, str) or not isinstance(value, str)
                for key, value in metadata.items()):
             raise ValueError("metadata keys and values must be strings")

@@ -230,16 +230,26 @@ def _draft_metadata(
         baseline_metadata = {}
     if not isinstance(baseline_metadata, dict):
         raise DraftResponseError()
-    metadata = deepcopy(baseline_metadata)
-    metadata.update(dict(request.metadata))
-    for key, value in (
-        ("foundry-opt-base-version", str(request.base_version)),
-        ("foundry-opt-source-sha256", request.bundle.sha256),
-    ):
-        if key in metadata or len(metadata) < 16:
-            metadata[key] = value
-    if len(metadata) > 16:
+    provenance = {
+        "foundry-opt-base-version": str(request.base_version),
+        "foundry-opt-source-sha256": request.bundle.sha256,
+    }
+    caller_metadata = dict(request.metadata)
+    if any(key in caller_metadata for key in provenance):
         raise DraftResponseError()
+    if len(caller_metadata) > 14:
+        raise DraftResponseError()
+    inherited_metadata = {
+        key: value
+        for key, value in sorted(deepcopy(baseline_metadata).items())
+        if key not in provenance and key not in caller_metadata
+    }
+    inherited_slots = 16 - len(provenance) - len(caller_metadata)
+    metadata = {
+        **provenance,
+        **caller_metadata,
+        **dict(list(inherited_metadata.items())[:inherited_slots]),
+    }
 
     payload: dict[str, Any] = {
         "definition": definition,

@@ -128,3 +128,35 @@ parser.parse_args()
     assert report.passed
     assert len(report.results) == 3
     assert not list(repository.rglob("__pycache__"))
+
+
+def test_configured_module_entry_executes_for_src_layout(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "module-agent"
+    package = repository / "src" / "module_agent"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        """
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.parse_args()
+""".strip(),
+        encoding="utf-8",
+    )
+
+    report = run_validation(
+        ValidationRequest(
+            repository,
+            commands=(("python", "-c", "pass"),),
+            entry_point=("python", "-m", "module_agent"),
+        ),
+        SubprocessCommandRunner(),
+    )
+
+    assert report.discovered
+    assert report.passed
+    assert len(report.results) == 3
+    assert not list(repository.rglob("__pycache__"))

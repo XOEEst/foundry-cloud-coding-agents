@@ -436,20 +436,28 @@ def _entry_point_checks(
                 resolved = (root / source).resolve()
             if not resolved.is_relative_to(root) or not resolved.is_file():
                 raise ValueError("entry_point source escapes repository")
+    python_path = (root / "src").resolve() if (root / "src").is_dir() else None
+    environment = (
+        "{**os.environ,'PYTHONDONTWRITEBYTECODE':'1',"
+        f"'PYTHONPATH':{str(python_path)!r}+os.pathsep+"
+        "os.environ.get('PYTHONPATH','')}"
+        if python_path is not None
+        else "{**os.environ,'PYTHONDONTWRITEBYTECODE':'1'}"
+    )
     import_inner = _entry_point_import(arguments, root)
     import_check = (
         "import os,subprocess;"
         f"subprocess.run([{executable!r},'-c',{import_inner!r}],"
         "check=True,timeout=10,"
         "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
-        "env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})"
+        f"env={environment})"
     )
     startup_check = (
         "import os,subprocess;"
         f"subprocess.run({arguments!r}+['--help'],"
         "check=True,timeout=10,"
         "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
-        "env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})"
+        f"env={environment})"
     )
     return (
         ValidationCommand((executable, "-c", import_check), root),
@@ -546,17 +554,23 @@ def _logical_lines(value: str) -> tuple[str, ...]:
 
 
 def _redact_output(value: str, secrets: tuple[str, ...] = ()) -> str:
-    redacted = redact(value, secrets) or ""
-    redacted = re.sub(
-        r"(?i)(\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|"
-        r"API_KEY|PRIVATE_KEY|CONNECTION_STRING)[A-Z0-9_]*"
-        r"\b\s*[:=]\s*)(?!\[REDACTED\])[^\s,;]+",
-        r"\1[REDACTED]",
-        redacted,
+    redacted = value
+    key = (
+        r"(?:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY|"
+        r"PRIVATE_KEY|CONNECTION_STRING)[A-Z0-9_]*|api[-_]?key|token|"
+        r"secret|password|credential)"
     )
-    return re.sub(
-        r"(?i)(\b(?:token|secret|password|credential|api[-_]?key)"
-        r"\b\s*[:=]\s*)(?!\[REDACTED\])[^\s,;]+",
-        r"\1[REDACTED]",
-        redacted,
+    double_quoted_assignment = re.compile(
+        rf'(?i)(["\']?{key}["\']?\s*[:=]\s*)"(?!\[REDACTED\])[^"]*"'
     )
+    redacted = double_quoted_assignment.sub(r'\1"[REDACTED]"', redacted)
+    single_quoted_assignment = re.compile(
+        rf"(?i)([\"']?{key}[\"']?\s*[:=]\s*)'(?!\[REDACTED\])[^']*'"
+    )
+    redacted = single_quoted_assignment.sub(r"\1'[REDACTED]'", redacted)
+    unquoted_assignment = re.compile(
+        rf"(?i)([\"']?{key}[\"']?\s*[:=]\s*)"
+        rf"(?![\"']|\[REDACTED\])[^\s,;}}]+"
+    )
+    redacted = unquoted_assignment.sub(r"\1[REDACTED]", redacted)
+    return redact(redacted, secrets) or ""
