@@ -1,17 +1,22 @@
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from foundry_opt.adapters.discovery import (
     AzureSdkFoundryInventory,
     FoundryInventory,
     LocalOnboardingDiscovery,
 )
+from foundry_opt.adapters.foundry import FoundryEndpointError
 from foundry_opt.onboarding import (
     AppInsightsDiscovery,
     DatasetDiscovery,
     DeployedModelDiscovery,
     EvaluatorDiscovery,
     FoundryAgentDiscovery,
+    MetricDiscovery,
     OnboardingRequest,
 )
 from foundry_opt.preflight.interfaces import CommandResult
@@ -193,8 +198,151 @@ def test_sdk_inventory_uses_supported_read_only_collections(
         DatasetDiscovery("development", ("1", "2")),
     )
     assert inventory.evaluators == (
-        EvaluatorDiscovery("quality", "quality:3"),
+        EvaluatorDiscovery(
+            "quality",
+            "quality:3",
+            needs_input=(
+                "Foundry did not expose optimizer metric policy semantics."
+            ),
+        ),
     )
     assert inventory.app_insights == AppInsightsDiscovery(connected=True)
     assert client.closed is True
     assert credential.closed is True
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://evil.example/api/projects/demo",
+        "https://example.services.ai.azure.com.evil/api/projects/demo",
+        "http://example.services.ai.azure.com/api/projects/demo",
+        "https://example.services.ai.azure.com/api/projects/demo?token=leak",
+    ],
+)
+def test_sdk_inventory_rejects_unofficial_endpoint_before_credentials(
+    tmp_path: Path,
+    endpoint: str,
+) -> None:
+    credential_created = False
+    client_created = False
+
+    def credential_factory(tenant: str):
+        nonlocal credential_created
+        credential_created = True
+        raise AssertionError("credential creation must not be reached")
+
+    def client_factory(project_endpoint: str, credential):
+        nonlocal client_created
+        client_created = True
+        raise AssertionError("client creation must not be reached")
+
+    request = replace(_request(tmp_path), project_endpoint=endpoint)
+
+    with pytest.raises(FoundryEndpointError):
+        AzureSdkFoundryInventory(
+            credential_factory=credential_factory,
+            client_factory=client_factory,
+        ).discover(request)
+
+    assert credential_created is False
+    assert client_created is False
+
+
+def test_sdk_inventory_discovers_explicit_evaluator_metric_semantics(
+    tmp_path: Path,
+) -> None:
+    class Credential:
+        def close(self) -> None:
+            return None
+
+    class Client:
+        agents = type("Agents", (), {
+            "list": lambda self: [],
+        })()
+        deployments = type("Deployments", (), {
+            "list": lambda self: [],
+        })()
+        datasets = type("Datasets", (), {"list": lambda self: []})()
+        beta = type("Beta", (), {
+            "evaluators": type("Evaluators", (), {
+                "list": lambda self, **kwargs: [{
+                    "name": "quality",
+                    "version": "3",
+                    "tags": {
+                        "foundry-opt.metrics": (
+                            '[{"name":"quality","direction":"maximize",'
+                            '"threshold":0.8,"materiality":0.05,'
+                            '"hard_guardrail":false}]'
+                        )
+                    },
+                }],
+            })(),
+        })()
+        connections = type("Connections", (), {
+            "list": lambda self: [],
+        })()
+
+        def close(self) -> None:
+            return None
+
+    inventory = AzureSdkFoundryInventory(
+        credential_factory=lambda tenant: Credential(),
+        client_factory=lambda endpoint, credential: Client(),
+    ).discover(_request(tmp_path))
+
+    assert inventory.evaluators == (
+        EvaluatorDiscovery(
+            "quality",
+            "quality:3",
+            metrics=(
+                MetricDiscovery(
+                    name="quality",
+                    direction="maximize",
+                    threshold=0.8,
+                    materiality=0.05,
+                    hard_guardrail=False,
+                ),
+            ),
+        ),
+    )
+
+
+def test_sdk_inventory_does_not_coerce_invalid_evaluator_semantics(
+    tmp_path: Path,
+) -> None:
+    class Credential:
+        def close(self) -> None:
+            return None
+
+    class Client:
+        agents = type("Agents", (), {"list": lambda self: []})()
+        deployments = type("Deployments", (), {"list": lambda self: []})()
+        datasets = type("Datasets", (), {"list": lambda self: []})()
+        beta = type("Beta", (), {
+            "evaluators": type("Evaluators", (), {
+                "list": lambda self, **kwargs: [{
+                    "name": "quality",
+                    "version": "3",
+                    "tags": {
+                        "foundry-opt.metrics": (
+                            '[{"name":"quality","direction":"maximize",'
+                            '"threshold":0.8,"materiality":0.05,'
+                            '"hard_guardrail":"false"}]'
+                        )
+                    },
+                }],
+            })(),
+        })()
+        connections = type("Connections", (), {"list": lambda self: []})()
+
+        def close(self) -> None:
+            return None
+
+    inventory = AzureSdkFoundryInventory(
+        credential_factory=lambda tenant: Credential(),
+        client_factory=lambda endpoint, credential: Client(),
+    ).discover(_request(tmp_path))
+
+    assert inventory.evaluators[0].metrics == ()
+    assert "invalid" in (inventory.evaluators[0].needs_input or "")

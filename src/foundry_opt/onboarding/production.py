@@ -10,6 +10,7 @@ from foundry_opt.onboarding.models import (
     OnboardingRequest,
 )
 from foundry_opt.onboarding.runner import OnboardingDependencies
+from foundry_opt.onboarding.repository import GhOnboardingPublisher
 
 
 class DraftProbeUnavailable(RuntimeError):
@@ -40,4 +41,5 @@ def build_production_onboarding_dependencies() -> OnboardingDependencies:
         ),
         oidc=CommandOidcVerifier(commands),
         draft_probe=UnavailableSourceBundleDraftProbe(),
+        publisher=GhOnboardingPublisher(commands),
     )

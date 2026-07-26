@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 
 from foundry_opt.onboarding.generation import (
     generate_change_contents,
@@ -11,6 +10,8 @@ from foundry_opt.onboarding.generation import (
 from foundry_opt.onboarding.interfaces import (
     DiscoveryGateway,
     DraftProbe,
+    ChangeSetWriter,
+    OnboardingPublisher,
     OidcVerifier,
 )
 from foundry_opt.onboarding.models import (
@@ -22,6 +23,13 @@ from foundry_opt.onboarding.models import (
     OnboardingStatus,
 )
 from foundry_opt.preflight.redaction import redact
+from foundry_opt.onboarding.repository import (
+    ChangeSetConflictError,
+    ChangeSetError,
+    OnboardingPublishError,
+    SafeChangeSetWriter,
+    UnavailableOnboardingPublisher,
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +37,12 @@ class OnboardingDependencies:
     discovery: DiscoveryGateway
     oidc: OidcVerifier
     draft_probe: DraftProbe
+    publisher: OnboardingPublisher = field(
+        default_factory=UnavailableOnboardingPublisher
+    )
+    change_writer: ChangeSetWriter = field(
+        default_factory=SafeChangeSetWriter
+    )
 
 
 def run_onboarding(
@@ -60,7 +74,7 @@ def run_onboarding(
         )
 
     guard_blockers = _repository_guard_blockers(discovery)
-    input_blockers = validate_generation_inputs(discovery)
+    input_blockers = validate_generation_inputs(request, discovery)
     if guard_blockers or input_blockers:
         return OnboardingResult(
             status=OnboardingStatus.BLOCKED,
@@ -99,55 +113,51 @@ def run_onboarding(
             discovery=discovery,
             oidc=oidc,
         )
-    planned_changes = tuple(
-        OnboardingChange(
-            path=path,
-            content=content,
-            status=ChangeStatus.PLANNED,
+    try:
+        planned_changes = dependencies.change_writer.prevalidate(
+            request.repository_root,
+            contents,
         )
-        for path, content in contents.items()
-    )
-    conflicts = tuple(
-        change.path
-        for change in planned_changes
-        if (request.repository_root / change.path).exists()
-    )
-    if conflicts:
-        conflict_set = set(conflicts)
+    except ChangeSetConflictError as error:
+        conflict_set = set(error.paths)
         return OnboardingResult(
             status=OnboardingStatus.CONFLICT,
             changes=tuple(
                 OnboardingChange(
-                    path=change.path,
-                    content=change.content,
+                    path=path,
+                    content=content,
                     status=(
                         ChangeStatus.CONFLICT
-                        if change.path in conflict_set
+                        if path in conflict_set
                         else ChangeStatus.PLANNED
                     ),
                     detail=(
                         "Existing path was preserved."
-                        if change.path in conflict_set
+                        if path in conflict_set
                         else None
                     ),
                 )
-                for change in planned_changes
+                for path, content in contents.items()
             ),
             draft_pull_request=draft_pr,
             discovery=discovery,
             oidc=oidc,
             blockers=tuple(
                 f"Existing path was not overwritten: {path.as_posix()}"
-                for path in conflicts
+                for path in error.paths
             ),
         )
+    except ChangeSetError as error:
+        return _blocked(
+            draft_pr,
+            f"Generated change set is unsafe: {_safe_error(error)}",
+            discovery=discovery,
+            oidc=oidc,
+        )
     foundry_agent = next(
-        (
-            agent
-            for agent in discovery.foundry_agents
-            if agent.name == request.target_name
-        ),
-        discovery.foundry_agents[0],
+        agent
+        for agent in discovery.foundry_agents
+        if agent.name == request.target_name
     )
     try:
         probe = dependencies.draft_probe.probe(request, foundry_agent)
@@ -188,34 +198,49 @@ def run_onboarding(
             changes=planned_changes,
         )
 
-    changes = tuple(
-        _write_new_file(request.repository_root, path, content)
-        for path, content in contents.items()
-    )
-    status = (
-        OnboardingStatus.CONFLICT
-        if any(change.status is ChangeStatus.CONFLICT for change in changes)
-        else OnboardingStatus.READY
-    )
-    blockers = tuple(
-        f"Existing path was not overwritten: {change.path.as_posix()}"
-        for change in changes
-        if change.status is ChangeStatus.CONFLICT
-    )
+    try:
+        changes = dependencies.change_writer.write(
+            request.repository_root,
+            contents,
+        )
+    except ChangeSetError as error:
+        return _blocked(
+            draft_pr,
+            _safe_error(error),
+            discovery=discovery,
+            oidc=oidc,
+            draft_probe=probe,
+            changes=planned_changes,
+        )
+    try:
+        publication = dependencies.publisher.publish(
+            request,
+            discovery,
+            changes,
+            draft_pr,
+        )
+    except (OnboardingPublishError, RuntimeError) as error:
+        return _blocked(
+            draft_pr,
+            f"Draft pull request publication failed: {_safe_error(error)}",
+            discovery=discovery,
+            oidc=oidc,
+            draft_probe=probe,
+            changes=changes,
+        )
     return OnboardingResult(
-        status=status,
+        status=OnboardingStatus.READY,
         changes=changes,
         draft_pull_request=draft_pr,
         discovery=discovery,
         oidc=oidc,
         draft_probe=probe,
-        blockers=blockers,
+        published_pull_request=publication,
         guidance=(
             "Create non-secret GitHub Actions variables AZURE_TENANT_ID, "
             "AZURE_CLIENT_ID, and AZURE_SUBSCRIPTION_ID.",
             "Azure OIDC does not require GitHub Agents or Actions secrets.",
-            "Commit these files on a branch and open the described pull request "
-            "as a draft; init does not push or open it.",
+            f"Draft onboarding pull request created: {publication.url}",
         ),
     )
 
@@ -231,30 +256,6 @@ def _repository_guard_blockers(discovery) -> tuple[str, ...]:
     if discovery.viewer_permission.casefold() != "admin":
         blockers.append("The authenticated GitHub user must have ADMIN permission.")
     return tuple(blockers)
-
-
-def _write_new_file(
-    repository_root: Path,
-    path: Path,
-    content: str,
-) -> OnboardingChange:
-    destination = repository_root / path
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with destination.open("x", encoding="utf-8", newline="\n") as stream:
-            stream.write(content)
-    except FileExistsError:
-        return OnboardingChange(
-            path=path,
-            content=content,
-            status=ChangeStatus.CONFLICT,
-            detail="Existing file was preserved.",
-        )
-    return OnboardingChange(
-        path=path,
-        content=content,
-        status=ChangeStatus.CREATED,
-    )
 
 
 def _blocked(

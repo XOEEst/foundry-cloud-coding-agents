@@ -13,6 +13,7 @@ from azure.ai.projects import AIProjectClient
 from azure.identity import AzureCliCredential
 import yaml
 
+from foundry_opt.adapters.foundry import _validate_project_endpoint
 from foundry_opt.adapters.github import github_repository_from_remote_url
 from foundry_opt.onboarding.models import (
     AppInsightsDiscovery,
@@ -21,6 +22,7 @@ from foundry_opt.onboarding.models import (
     DeploymentWorkflowDiscovery,
     EvaluatorDiscovery,
     FoundryAgentDiscovery,
+    MetricDiscovery,
     OnboardingRequest,
     PythonAgentCandidate,
     RepositoryDiscovery,
@@ -144,6 +146,7 @@ class AzureSdkFoundryInventory:
         self._client_factory = client_factory
 
     def discover(self, request: OnboardingRequest) -> FoundryInventory:
+        _validate_project_endpoint(request.project_endpoint)
         credential = self._credential_factory(request.tenant_id)
         client = None
         try:
@@ -200,22 +203,8 @@ class AzureSdkFoundryInventory:
                 client.datasets.list(),
                 DatasetDiscovery,
             )
-            evaluators = tuple(
-                EvaluatorDiscovery(
-                    name=name,
-                    reference=f"{name}:{version}",
-                )
-                for name, version in sorted(
-                    {
-                        (
-                            str(_attribute(item, "name")),
-                            str(_attribute(item, "version", "id")),
-                        )
-                        for item in client.beta.evaluators.list(type="all")
-                        if _attribute(item, "name") is not None
-                        and _attribute(item, "version", "id") is not None
-                    }
-                )
+            evaluators = _discover_evaluators(
+                client.beta.evaluators.list(type="all")
             )
             app_insights = _discover_app_insights(client.connections.list())
             return FoundryInventory(
@@ -410,6 +399,78 @@ def _discover_app_insights(
             )
         return AppInsightsDiscovery(connected=True)
     return AppInsightsDiscovery(connected=False)
+
+
+def _discover_evaluators(
+    items: Iterable[Any],
+) -> tuple[EvaluatorDiscovery, ...]:
+    discovered: dict[tuple[str, str], EvaluatorDiscovery] = {}
+    for item in items:
+        name = _attribute(item, "name")
+        version = _attribute(item, "version", "id")
+        if name is None or version is None:
+            continue
+        name = str(name)
+        version = str(version)
+        metrics, needs_input = _metric_semantics(item)
+        discovered[(name, version)] = EvaluatorDiscovery(
+            name=name,
+            reference=f"{name}:{version}",
+            metrics=metrics,
+            needs_input=needs_input,
+        )
+    return tuple(discovered[key] for key in sorted(discovered))
+
+
+def _metric_semantics(
+    evaluator: Any,
+) -> tuple[tuple[MetricDiscovery, ...], str | None]:
+    tags = _attribute(evaluator, "tags")
+    raw = (
+        tags.get("foundry-opt.metrics")
+        if isinstance(tags, dict)
+        else None
+    )
+    if raw is None:
+        return (
+            (),
+            "Foundry did not expose optimizer metric policy semantics.",
+        )
+    try:
+        values = json.loads(raw)
+        if not isinstance(values, list) or not values:
+            raise ValueError
+        if any(
+            not isinstance(value, dict)
+            or not isinstance(value.get("name"), str)
+            or not value["name"]
+            or value.get("direction") not in {"maximize", "minimize"}
+            or not isinstance(value.get("threshold"), (int, float))
+            or isinstance(value.get("threshold"), bool)
+            or not isinstance(value.get("materiality"), (int, float))
+            or isinstance(value.get("materiality"), bool)
+            or value["materiality"] <= 0
+            or type(value.get("hard_guardrail")) is not bool
+            for value in values
+        ):
+            raise ValueError
+        metrics = tuple(
+            MetricDiscovery(
+                name=value["name"],
+                direction=value["direction"],
+                threshold=float(value["threshold"]),
+                materiality=float(value["materiality"]),
+                hard_guardrail=value["hard_guardrail"],
+            )
+            for value in values
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return (
+            (),
+            "The foundry-opt.metrics evaluator tag is invalid; provide "
+            "explicit direction, threshold, materiality, and guardrail input.",
+        )
+    return metrics, None
 
 
 def _attribute(value: Any, *names: str) -> Any | None:

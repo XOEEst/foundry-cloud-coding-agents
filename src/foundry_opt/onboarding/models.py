@@ -55,6 +55,7 @@ class EvaluatorDiscovery:
     name: str
     reference: str
     metrics: tuple[MetricDiscovery, ...] = ()
+    needs_input: str | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,13 @@ class DraftPullRequest:
 
 
 @dataclass(frozen=True)
+class DraftPullRequestPublication:
+    url: str
+    branch: str
+    commit_sha: str
+
+
+@dataclass(frozen=True)
 class OnboardingResult:
     status: OnboardingStatus
     changes: tuple[OnboardingChange, ...]
@@ -137,6 +145,7 @@ class OnboardingResult:
     discovery: RepositoryDiscovery | None = None
     oidc: OidcTrustResult | None = None
     draft_probe: DraftProbeResult | None = None
+    published_pull_request: DraftPullRequestPublication | None = None
     blockers: tuple[str, ...] = ()
     guidance: tuple[str, ...] = field(default_factory=tuple)
 

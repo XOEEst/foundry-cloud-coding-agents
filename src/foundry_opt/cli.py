@@ -76,6 +76,8 @@ def _render_onboarding(result: OnboardingResult) -> str:
         lines.append(f"Next: {guidance}")
     lines.append(f"Draft PR: {result.draft_pull_request.title}")
     lines.append(result.draft_pull_request.body)
+    if result.published_pull_request is not None:
+        lines.append(f"Draft PR URL: {result.published_pull_request.url}")
     return "\n".join(lines)
 
 

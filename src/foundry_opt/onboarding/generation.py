@@ -160,12 +160,18 @@ jobs:
     steps:
       - name: Checkout repository
         uses: {CHECKOUT_ACTION} # v7.0.1
+      - name: Export non-secret Azure OIDC identifiers
+        shell: bash
+        run: |
+          echo "AZURE_TENANT_ID=${{{{ vars.AZURE_TENANT_ID }}}}" >> "$GITHUB_ENV"
+          echo "AZURE_CLIENT_ID=${{{{ vars.AZURE_CLIENT_ID }}}}" >> "$GITHUB_ENV"
+          echo "AZURE_SUBSCRIPTION_ID=${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}" >> "$GITHUB_ENV"
       - name: Sign in to Azure with repository-ID OIDC
         uses: {AZURE_LOGIN_ACTION} # v3.0.0
         with:
-          client-id: ${{{{ vars.AZURE_CLIENT_ID }}}}
-          tenant-id: ${{{{ vars.AZURE_TENANT_ID }}}}
-          subscription-id: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+          client-id: ${{{{ env.AZURE_CLIENT_ID }}}}
+          tenant-id: ${{{{ env.AZURE_TENANT_ID }}}}
+          subscription-id: ${{{{ env.AZURE_SUBSCRIPTION_ID }}}}
       - name: Set up Python
         uses: {SETUP_PYTHON_ACTION} # v7.0.0
         with:
@@ -202,6 +208,7 @@ description: Safely prepare and run Foundry agent optimization campaigns.
 
 
 def validate_generation_inputs(
+    request: OnboardingRequest,
     discovery: RepositoryDiscovery,
 ) -> tuple[str, ...]:
     blockers: list[str] = []
@@ -225,12 +232,35 @@ def validate_generation_inputs(
         )
     if not discovery.evaluators:
         blockers.append("No evaluator was discovered.")
-    elif not any(evaluator.metrics for evaluator in discovery.evaluators):
-        blockers.append(
-            "Evaluator metric policies require explicit discovered semantics."
+    else:
+        blockers.extend(
+            f"Evaluator {evaluator.reference} needs input: "
+            f"{evaluator.needs_input or 'metric policy semantics are missing.'}"
+            for evaluator in discovery.evaluators
+            if not evaluator.metrics
         )
     if not discovery.deployment_workflows:
         blockers.append("No deployment workflow was discovered.")
+    local_matches = tuple(
+        agent
+        for agent in discovery.python_agents
+        if agent.name == request.target_name
+    )
+    foundry_matches = tuple(
+        agent
+        for agent in discovery.foundry_agents
+        if agent.name == request.target_name
+    )
+    if len(local_matches) != 1:
+        blockers.append(
+            f"Target {request.target_name!r} must exactly match one local "
+            f"Python agent; found {len(local_matches)}."
+        )
+    if len(foundry_matches) != 1:
+        blockers.append(
+            f"Target {request.target_name!r} must exactly match one Foundry "
+            f"agent; found {len(foundry_matches)}."
+        )
     return tuple(blockers)
 
 
@@ -278,20 +308,24 @@ def _select_local_agent(
     target_name: str,
     discovery: RepositoryDiscovery,
 ) -> PythonAgentCandidate:
-    return next(
-        (agent for agent in discovery.python_agents if agent.name == target_name),
-        discovery.python_agents[0],
+    matches = tuple(
+        agent for agent in discovery.python_agents if agent.name == target_name
     )
+    if len(matches) != 1:
+        raise ValueError("target must exactly match one local Python agent")
+    return matches[0]
 
 
 def _select_foundry_agent(
     target_name: str,
     discovery: RepositoryDiscovery,
 ) -> FoundryAgentDiscovery:
-    return next(
-        (agent for agent in discovery.foundry_agents if agent.name == target_name),
-        discovery.foundry_agents[0],
+    matches = tuple(
+        agent for agent in discovery.foundry_agents if agent.name == target_name
     )
+    if len(matches) != 1:
+        raise ValueError("target must exactly match one Foundry agent")
+    return matches[0]
 
 
 def _select_evaluator(discovery: RepositoryDiscovery) -> EvaluatorDiscovery:

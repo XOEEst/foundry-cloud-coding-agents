@@ -9,6 +9,7 @@ from foundry_opt.onboarding import (
     DeployedModelDiscovery,
     DeploymentWorkflowDiscovery,
     DraftProbeResult,
+    DraftPullRequestPublication,
     EvaluatorDiscovery,
     FoundryAgentDiscovery,
     MetricDiscovery,
@@ -90,6 +91,15 @@ class Probe:
         return None
 
 
+class Publisher:
+    def publish(self, request, discovery, changes, draft_pull_request):
+        return DraftPullRequestPublication(
+            url="https://github.com/octo-org/agents/pull/42",
+            branch="foundry-opt/onboarding-support-agent",
+            commit_sha="abc123",
+        )
+
+
 def _arguments() -> list[str]:
     return [
         "init",
@@ -119,7 +129,12 @@ def test_init_cli_returns_zero_and_describes_draft_pr(
     monkeypatch.setattr(
         cli,
         "build_onboarding_dependencies",
-        lambda: OnboardingDependencies(Discovery(), Oidc(), Probe()),
+        lambda: OnboardingDependencies(
+            Discovery(),
+            Oidc(),
+            Probe(),
+            publisher=Publisher(),
+        ),
     )
 
     monkeypatch.chdir(tmp_path)
@@ -128,8 +143,8 @@ def test_init_cli_returns_zero_and_describes_draft_pr(
     assert result.exit_code == 0
     assert "Onboarding ready" in result.stdout
     assert "Draft PR: Configure Foundry optimizer onboarding" in result.stdout
+    assert "https://github.com/octo-org/agents/pull/42" in result.stdout
     assert ".github/foundry-optimizer.yaml" in result.stdout
-    assert "does not push or open it" in result.stdout
 
 
 def test_init_cli_returns_one_when_draft_probe_is_unavailable(

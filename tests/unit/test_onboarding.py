@@ -1,11 +1,14 @@
 from pathlib import Path
 
+import pytest
+
 from foundry_opt.onboarding import (
     AppInsightsDiscovery,
     DatasetDiscovery,
     DeployedModelDiscovery,
     DeploymentWorkflowDiscovery,
     DraftProbeResult,
+    DraftPullRequestPublication,
     EvaluatorDiscovery,
     FoundryAgentDiscovery,
     MetricDiscovery,
@@ -125,6 +128,20 @@ class UnavailableProbe(FakeDraftProbe):
         raise RuntimeError("source-bundle draft API is not implemented")
 
 
+class FakePublisher:
+    def publish(self, request, discovery, changes, draft_pull_request):
+        return DraftPullRequestPublication(
+            url="https://github.com/octo-org/agents/pull/42",
+            branch="foundry-opt/onboarding-support-agent",
+            commit_sha="abc123",
+        )
+
+
+class FailingPublisher:
+    def publish(self, request, discovery, changes, draft_pull_request):
+        raise RuntimeError("push rejected")
+
+
 def _request(repository_root: Path) -> OnboardingRequest:
     return OnboardingRequest(
         repository_root=repository_root,
@@ -156,11 +173,17 @@ def test_run_onboarding_generates_secretless_draft_change_set(
             discovery=FakeDiscovery(),
             oidc=FakeOidc(),
             draft_probe=probe,
+            publisher=FakePublisher(),
         ),
     )
 
     assert result.status is OnboardingStatus.READY
     assert result.exit_code == 0
+    assert result.published_pull_request == DraftPullRequestPublication(
+        url="https://github.com/octo-org/agents/pull/42",
+        branch="foundry-opt/onboarding-support-agent",
+        commit_sha="abc123",
+    )
     assert result.draft_pull_request.title == "Configure Foundry optimizer onboarding"
     assert {change.path.as_posix() for change in result.changes} == {
         ".github/foundry-optimizer.yaml",
@@ -177,6 +200,18 @@ def test_run_onboarding_generates_secretless_draft_change_set(
     assert "authentication: oidc" in generated
     assert "id-token: write" in generated
     assert "python-version: '3.12'" in generated
+    assert "AZURE_TENANT_ID=${{ vars.AZURE_TENANT_ID }}" in generated
+    assert "AZURE_CLIENT_ID=${{ vars.AZURE_CLIENT_ID }}" in generated
+    assert (
+        "AZURE_SUBSCRIPTION_ID=${{ vars.AZURE_SUBSCRIPTION_ID }}"
+        in generated
+    )
+    assert generated.count('>> "$GITHUB_ENV"') == 3
+    assert "client-id: ${{ env.AZURE_CLIENT_ID }}" in generated
+    assert "tenant-id: ${{ env.AZURE_TENANT_ID }}" in generated
+    assert (
+        "subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}" in generated
+    )
     assert "repository-ID" in generated
     assert (
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -358,3 +393,149 @@ def test_run_onboarding_redacts_boundary_failure_details(
 
     assert "hunter2" not in result.blockers[0]
     assert "client_secret=[REDACTED]" in result.blockers[0]
+
+
+def test_run_onboarding_returns_typed_evaluator_needs_input(
+    tmp_path: Path,
+) -> None:
+    class NeedsInputDiscovery(FakeDiscovery):
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            discovered = super().discover(request)
+            return RepositoryDiscovery(
+                **{
+                    **discovered.__dict__,
+                    "evaluators": (
+                        EvaluatorDiscovery(
+                            name="quality",
+                            reference="quality:3",
+                            needs_input=(
+                                "Foundry did not expose optimizer metric "
+                                "policy semantics."
+                            ),
+                        ),
+                    ),
+                }
+            )
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=NeedsInputDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.blockers == (
+        "Evaluator quality:3 needs input: Foundry did not expose optimizer "
+        "metric policy semantics.",
+    )
+
+
+def test_run_onboarding_blocks_unknown_target_without_fallback(
+    tmp_path: Path,
+) -> None:
+    probe = FakeDraftProbe()
+    request = OnboardingRequest(
+        **{**_request(tmp_path).__dict__, "target_name": "missing-agent"}
+    )
+
+    result = run_onboarding(
+        request,
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=probe,
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.blockers == (
+        "Target 'missing-agent' must exactly match one local Python agent; "
+        "found 0.",
+        "Target 'missing-agent' must exactly match one Foundry agent; found 0.",
+    )
+    assert probe.probed == 0
+
+
+def test_run_onboarding_blocks_ambiguous_target_without_fallback(
+    tmp_path: Path,
+) -> None:
+    class AmbiguousDiscovery(FakeDiscovery):
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            discovered = super().discover(request)
+            duplicate = discovered.python_agents[0]
+            return RepositoryDiscovery(
+                **{
+                    **discovered.__dict__,
+                    "python_agents": (duplicate, duplicate),
+                }
+            )
+
+    probe = FakeDraftProbe()
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=AmbiguousDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=probe,
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.blockers == (
+        "Target 'support-agent' must exactly match one local Python agent; "
+        "found 2.",
+    )
+    assert probe.probed == 0
+
+
+def test_run_onboarding_blocks_when_draft_pr_publication_fails(
+    tmp_path: Path,
+) -> None:
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+            publisher=FailingPublisher(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.published_pull_request is None
+    assert result.blockers == (
+        "Draft pull request publication failed: push rejected",
+    )
+
+
+def test_run_onboarding_prevalidates_symlinked_parents_before_probe(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (tmp_path / ".github").symlink_to(
+            outside,
+            target_is_directory=True,
+        )
+    except OSError as error:
+        pytest.skip(f"directory symlinks unavailable: {error}")
+    probe = FakeDraftProbe()
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=probe,
+            publisher=FakePublisher(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert "symlinked parent" in result.blockers[0]
+    assert probe.probed == 0
+    assert not (outside / "foundry-optimizer.yaml").exists()
