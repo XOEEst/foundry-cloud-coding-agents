@@ -4,6 +4,7 @@ import pytest
 
 from foundry_opt.onboarding import (
     AppInsightsDiscovery,
+    ChangeStatus,
     DatasetDiscovery,
     DeployedModelDiscovery,
     DeploymentWorkflowDiscovery,
@@ -13,6 +14,7 @@ from foundry_opt.onboarding import (
     FoundryAgentDiscovery,
     MetricDiscovery,
     OidcTrustResult,
+    OnboardingChange,
     OnboardingDependencies,
     OnboardingRequest,
     OnboardingStatus,
@@ -21,6 +23,7 @@ from foundry_opt.onboarding import (
     run_onboarding,
 )
 from foundry_opt.config import load_config
+from foundry_opt.onboarding.repository import ChangeSetConflictError
 
 
 class FakeDiscovery:
@@ -539,3 +542,38 @@ def test_run_onboarding_prevalidates_symlinked_parents_before_probe(
     assert "symlinked parent" in result.blockers[0]
     assert probe.probed == 0
     assert not (outside / "foundry-optimizer.yaml").exists()
+
+
+def test_run_onboarding_reports_destination_race_as_conflict(
+    tmp_path: Path,
+) -> None:
+    raced_path = Path(".github/foundry-optimizer.yaml")
+
+    class RacingWriter:
+        def prevalidate(self, repository_root, contents):
+            return tuple(
+                OnboardingChange(path, content, ChangeStatus.PLANNED)
+                for path, content in contents.items()
+            )
+
+        def write(self, repository_root, contents):
+            raise ChangeSetConflictError((raced_path,))
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+            publisher=FakePublisher(),
+            change_writer=RacingWriter(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.CONFLICT
+    assert result.blockers == (
+        "Existing path was not overwritten: .github/foundry-optimizer.yaml",
+    )
+    assert next(
+        change for change in result.changes if change.path == raced_path
+    ).status is ChangeStatus.CONFLICT

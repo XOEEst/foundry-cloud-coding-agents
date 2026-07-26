@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
+from uuid import uuid4
 
 from foundry_opt.adapters.commands import CommandError
 from foundry_opt.onboarding.models import (
@@ -52,18 +54,19 @@ class UnavailableOnboardingPublisher:
         )
 
 
-WriteFile = Callable[[Path, str], None]
-
-
-def _write_exclusive(path: Path, content: str) -> None:
-    with path.open("x", encoding="utf-8", newline="\n") as stream:
-        stream.write(content)
+@dataclass
+class _StagedFile:
+    path: Path
+    destination: Path
+    temporary_path: Path
+    temporary_name: str
+    descriptor: int
+    parent_descriptor: int | None
+    identity: tuple[int, int]
+    installed: bool = False
 
 
 class SafeChangeSetWriter:
-    def __init__(self, *, write_file: WriteFile = _write_exclusive) -> None:
-        self._write_file = write_file
-
     def prevalidate(
         self,
         repository_root: Path,
@@ -82,7 +85,7 @@ class SafeChangeSetWriter:
                     f"Generated path resolves more than once: {path.as_posix()}"
                 )
             resolved_destinations.add(destination)
-            if destination.is_symlink():
+            if _is_link_like(destination):
                 raise UnsafeChangePathError(
                     f"Generated path is a symlink: {path.as_posix()}"
                 )
@@ -106,9 +109,10 @@ class SafeChangeSetWriter:
     ) -> tuple[OnboardingChange, ...]:
         self.prevalidate(repository_root, contents)
         root = repository_root.resolve(strict=True)
-        attempted_files: list[Path] = []
         created_directories: list[Path] = []
+        staged_files: list[_StagedFile] = []
         changes: list[OnboardingChange] = []
+        conflict: Path | None = None
         try:
             for path, content in contents.items():
                 destination = self._safe_destination(root, path)
@@ -117,30 +121,39 @@ class SafeChangeSetWriter:
                     destination.parent,
                     created_directories,
                 )
-                self._safe_destination(root, path)
-                attempted_files.append(destination)
-                self._write_file(destination, content)
+                staged = self._stage_file(
+                    root,
+                    path,
+                    destination,
+                    content,
+                )
+                staged_files.append(staged)
+            for staged in staged_files:
+                try:
+                    self._install(staged, root)
+                except FileExistsError:
+                    conflict = staged.path
+                    raise
                 changes.append(
                     OnboardingChange(
-                        path=path,
-                        content=content,
+                        path=staged.path,
+                        content=contents[staged.path],
                         status=ChangeStatus.CREATED,
                     )
                 )
         except Exception as error:
-            for created_file in reversed(attempted_files):
-                try:
-                    created_file.unlink()
-                except OSError:
-                    pass
+            self._rollback(staged_files)
             for directory in reversed(created_directories):
                 try:
                     directory.rmdir()
                 except OSError:
                     pass
+            if conflict is not None:
+                raise ChangeSetConflictError((conflict,)) from error
             raise ChangeSetWriteError(
                 f"Generated change-set write failed: {error}"
             ) from error
+        self._finish(staged_files)
         return tuple(changes)
 
     def _safe_destination(self, root: Path, path: Path) -> Path:
@@ -151,7 +164,7 @@ class SafeChangeSetWriter:
         current = root
         for part in path.parent.parts:
             current = current / part
-            if current.is_symlink():
+            if _is_link_like(current):
                 raise UnsafeChangePathError(
                     f"Generated path has a symlinked parent: {path.as_posix()}"
                 )
@@ -181,7 +194,7 @@ class SafeChangeSetWriter:
         current = root
         for part in relative.parts:
             current = current / part
-            if current.is_symlink():
+            if _is_link_like(current):
                 raise UnsafeChangePathError(
                     f"Generated path has a symlinked parent: {relative}"
                 )
@@ -193,6 +206,198 @@ class SafeChangeSetWriter:
                 continue
             current.mkdir()
             created.append(current)
+
+    def _stage_file(
+        self,
+        root: Path,
+        path: Path,
+        destination: Path,
+        content: str,
+    ) -> _StagedFile:
+        self._safe_destination(root, path)
+        parent_descriptor = self._open_parent_descriptor(
+            root,
+            destination.parent,
+        )
+        temporary_name = f".foundry-opt-{uuid4().hex}.tmp"
+        temporary_path = destination.parent / temporary_name
+        descriptor: int | None = None
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_BINARY", 0)
+            if parent_descriptor is None:
+                descriptor = os.open(temporary_path, flags, 0o600)
+            else:
+                descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            self._write_all(descriptor, content.encode("utf-8"))
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o644)
+            os.fsync(descriptor)
+            stat = os.fstat(descriptor)
+            return _StagedFile(
+                path=path,
+                destination=destination,
+                temporary_path=temporary_path,
+                temporary_name=temporary_name,
+                descriptor=descriptor,
+                parent_descriptor=parent_descriptor,
+                identity=(stat.st_dev, stat.st_ino),
+            )
+        except Exception:
+            if descriptor is not None:
+                os.close(descriptor)
+            self._unlink_temporary(
+                temporary_path,
+                temporary_name,
+                parent_descriptor,
+            )
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
+            raise
+
+    def _install(self, staged: _StagedFile, root: Path) -> None:
+        self._safe_destination(root, staged.path)
+        if staged.parent_descriptor is None:
+            os.link(
+                staged.temporary_path,
+                staged.destination,
+                follow_symlinks=False,
+            )
+        else:
+            os.link(
+                staged.temporary_name,
+                staged.destination.name,
+                src_dir_fd=staged.parent_descriptor,
+                dst_dir_fd=staged.parent_descriptor,
+                follow_symlinks=False,
+            )
+        staged.installed = True
+
+    def _rollback(self, staged_files: list[_StagedFile]) -> None:
+        for staged in reversed(staged_files):
+            if staged.installed and self._destination_is_staged(staged):
+                self._unlink_destination(staged)
+        self._finish(staged_files)
+
+    def _finish(self, staged_files: list[_StagedFile]) -> None:
+        for staged in reversed(staged_files):
+            try:
+                os.close(staged.descriptor)
+            except OSError:
+                pass
+            self._unlink_temporary(
+                staged.temporary_path,
+                staged.temporary_name,
+                staged.parent_descriptor,
+            )
+            if staged.parent_descriptor is not None:
+                try:
+                    os.close(staged.parent_descriptor)
+                except OSError:
+                    pass
+
+    def _destination_is_staged(self, staged: _StagedFile) -> bool:
+        try:
+            if staged.parent_descriptor is None:
+                stat = os.stat(
+                    staged.destination,
+                    follow_symlinks=False,
+                )
+            else:
+                stat = os.stat(
+                    staged.destination.name,
+                    dir_fd=staged.parent_descriptor,
+                    follow_symlinks=False,
+                )
+        except OSError:
+            return False
+        return (stat.st_dev, stat.st_ino) == staged.identity
+
+    def _unlink_destination(self, staged: _StagedFile) -> None:
+        try:
+            if staged.parent_descriptor is None:
+                staged.destination.unlink()
+            else:
+                os.unlink(
+                    staged.destination.name,
+                    dir_fd=staged.parent_descriptor,
+                )
+        except OSError:
+            pass
+
+    def _unlink_temporary(
+        self,
+        temporary_path: Path,
+        temporary_name: str,
+        parent_descriptor: int | None,
+    ) -> None:
+        try:
+            if parent_descriptor is None:
+                temporary_path.unlink()
+            else:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+        except OSError:
+            pass
+
+    def _open_parent_descriptor(
+        self,
+        root: Path,
+        parent: Path,
+    ) -> int | None:
+        required = (os.open, os.link, os.stat, os.unlink)
+        if not all(operation in os.supports_dir_fd for operation in required):
+            self._verify_resolved_parent(root, parent)
+            return None
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(root, flags)
+        try:
+            for part in parent.relative_to(root).parts:
+                next_descriptor = os.open(
+                    part,
+                    flags,
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = next_descriptor
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _verify_resolved_parent(self, root: Path, parent: Path) -> None:
+        current = root
+        for part in parent.relative_to(root).parts:
+            current = current / part
+            if _is_link_like(current):
+                raise UnsafeChangePathError(
+                    f"Generated path has a symlinked parent: {parent}"
+                )
+        resolved = parent.resolve(strict=True)
+        try:
+            contained = os.path.commonpath((str(root), str(resolved))) == str(root)
+        except ValueError:
+            contained = False
+        if not contained:
+            raise UnsafeChangePathError(
+                f"Generated path parent escapes the repository: {parent}"
+            )
+
+    def _write_all(self, descriptor: int, content: bytes) -> None:
+        remaining = memoryview(content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("temporary file write made no progress")
+            remaining = remaining[written:]
 
 
 class GhOnboardingPublisher:
@@ -278,3 +483,10 @@ def _branch_slug(value: str) -> str:
             "Target name cannot produce a safe onboarding branch name."
         )
     return slug
+
+
+def _is_link_like(path: Path) -> bool:
+    is_junction = getattr(path, "is_junction", None)
+    return path.is_symlink() or bool(
+        callable(is_junction) and is_junction()
+    )

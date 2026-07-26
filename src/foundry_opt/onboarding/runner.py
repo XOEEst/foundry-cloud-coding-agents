@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from foundry_opt.onboarding.generation import (
     generate_change_contents,
@@ -119,33 +120,12 @@ def run_onboarding(
             contents,
         )
     except ChangeSetConflictError as error:
-        conflict_set = set(error.paths)
-        return OnboardingResult(
-            status=OnboardingStatus.CONFLICT,
-            changes=tuple(
-                OnboardingChange(
-                    path=path,
-                    content=content,
-                    status=(
-                        ChangeStatus.CONFLICT
-                        if path in conflict_set
-                        else ChangeStatus.PLANNED
-                    ),
-                    detail=(
-                        "Existing path was preserved."
-                        if path in conflict_set
-                        else None
-                    ),
-                )
-                for path, content in contents.items()
-            ),
-            draft_pull_request=draft_pr,
+        return _conflict_result(
+            draft_pr,
+            contents,
+            error,
             discovery=discovery,
             oidc=oidc,
-            blockers=tuple(
-                f"Existing path was not overwritten: {path.as_posix()}"
-                for path in error.paths
-            ),
         )
     except ChangeSetError as error:
         return _blocked(
@@ -202,6 +182,15 @@ def run_onboarding(
         changes = dependencies.change_writer.write(
             request.repository_root,
             contents,
+        )
+    except ChangeSetConflictError as error:
+        return _conflict_result(
+            draft_pr,
+            contents,
+            error,
+            discovery=discovery,
+            oidc=oidc,
+            draft_probe=probe,
         )
     except ChangeSetError as error:
         return _blocked(
@@ -269,6 +258,41 @@ def _blocked(
         changes=changes,
         draft_pull_request=draft_pr,
         blockers=(blocker,),
+        **values,
+    )
+
+
+def _conflict_result(
+    draft_pr: DraftPullRequest,
+    contents: dict[Path, str],
+    error: ChangeSetConflictError,
+    **values,
+) -> OnboardingResult:
+    conflict_set = set(error.paths)
+    return OnboardingResult(
+        status=OnboardingStatus.CONFLICT,
+        changes=tuple(
+            OnboardingChange(
+                path=path,
+                content=content,
+                status=(
+                    ChangeStatus.CONFLICT
+                    if path in conflict_set
+                    else ChangeStatus.PLANNED
+                ),
+                detail=(
+                    "Existing path was preserved."
+                    if path in conflict_set
+                    else None
+                ),
+            )
+            for path, content in contents.items()
+        ),
+        draft_pull_request=draft_pr,
+        blockers=tuple(
+            f"Existing path was not overwritten: {path.as_posix()}"
+            for path in error.paths
+        ),
         **values,
     )
 

@@ -1,8 +1,10 @@
 from collections.abc import Sequence
+import os
 from pathlib import Path
 
 import pytest
 
+import foundry_opt.onboarding.repository as repository_module
 from foundry_opt.onboarding import (
     ChangeStatus,
     DraftPullRequest,
@@ -11,6 +13,7 @@ from foundry_opt.onboarding import (
     RepositoryDiscovery,
 )
 from foundry_opt.onboarding.repository import (
+    ChangeSetConflictError,
     ChangeSetWriteError,
     GhOnboardingPublisher,
     SafeChangeSetWriter,
@@ -54,19 +57,24 @@ def test_safe_writer_rejects_paths_outside_resolved_repository(
 
 def test_safe_writer_rolls_back_files_when_any_write_fails(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     writes = 0
+    original_write = os.write
 
-    def write_file(path: Path, content: str) -> None:
+    def partial_write(fd: int, content: bytes) -> int:
         nonlocal writes
         writes += 1
         if writes == 2:
-            path.write_text("partial", encoding="utf-8")
+            assert not (
+                tmp_path / ".github/foundry-optimizer.yaml"
+            ).exists()
+            original_write(fd, content[:2])
             raise OSError("disk full")
-        with path.open("x", encoding="utf-8", newline="\n") as stream:
-            stream.write(content)
+        return original_write(fd, content)
 
-    writer = SafeChangeSetWriter(write_file=write_file)
+    monkeypatch.setattr(repository_module.os, "write", partial_write)
+    writer = SafeChangeSetWriter()
     contents = {
         Path(".github/foundry-optimizer.yaml"): "schema_version: '1'\n",
         Path(".github/workflows/copilot-setup-steps.yml"): "name: Setup\n",
@@ -77,6 +85,71 @@ def test_safe_writer_rolls_back_files_when_any_write_fails(
 
     assert not (tmp_path / ".github/foundry-optimizer.yaml").exists()
     assert not (tmp_path / ".github/workflows/copilot-setup-steps.yml").exists()
+    assert list(tmp_path.rglob(".foundry-opt-*.tmp")) == []
+
+
+def test_safe_writer_preserves_destination_won_by_another_process(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_link = os.link
+    link_attempts = 0
+    winner = tmp_path / ".github/workflows/copilot-setup-steps.yml"
+
+    def racing_link(source, destination, *args, **kwargs):
+        nonlocal link_attempts
+        link_attempts += 1
+        if link_attempts == 2:
+            winner.write_text("other process\n", encoding="utf-8")
+            raise FileExistsError(str(winner))
+        return original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(repository_module.os, "link", racing_link)
+    contents = {
+        Path(".github/foundry-optimizer.yaml"): "schema_version: '1'\n",
+        Path(".github/workflows/copilot-setup-steps.yml"): "name: Setup\n",
+    }
+
+    with pytest.raises(ChangeSetConflictError):
+        SafeChangeSetWriter().write(tmp_path, contents)
+
+    assert not (tmp_path / ".github/foundry-optimizer.yaml").exists()
+    assert winner.read_text(encoding="utf-8") == "other process\n"
+    assert list(tmp_path.rglob(".foundry-opt-*.tmp")) == []
+
+
+def test_safe_writer_installs_only_fully_written_temporary_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    original_link = os.link
+    observed: list[bytes] = []
+
+    def observing_link(source, destination, *args, **kwargs):
+        source_dir = kwargs.get("src_dir_fd")
+        if source_dir is None:
+            observed.append(Path(source).read_bytes())
+        else:
+            descriptor = os.open(source, os.O_RDONLY, dir_fd=source_dir)
+            try:
+                observed.append(os.read(descriptor, 4096))
+            finally:
+                os.close(descriptor)
+        return original_link(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(repository_module.os, "link", observing_link)
+    content = "schema_version: '1'\n"
+
+    SafeChangeSetWriter().write(
+        tmp_path,
+        {Path(".github/foundry-optimizer.yaml"): content},
+    )
+
+    assert observed == [content.encode("utf-8")]
+    assert (
+        tmp_path / ".github/foundry-optimizer.yaml"
+    ).read_text(encoding="utf-8") == content
+    assert list(tmp_path.rglob(".foundry-opt-*.tmp")) == []
 
 
 class FakeCommands:
