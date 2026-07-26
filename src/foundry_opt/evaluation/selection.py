@@ -4,6 +4,7 @@ from foundry_opt.evaluation.models import (
     CandidateDecision,
     EvaluationPolicy,
     EvaluationResult,
+    EvaluationStatus,
     MetricPolicy,
     Outcome,
     ParetoResult,
@@ -18,6 +19,21 @@ def select_eligible_candidates(
     metric_policies: EvaluationPolicy | Sequence[MetricPolicy],
 ) -> ParetoResult:
     policy = _coerce_policy(metric_policies)
+    baseline_failure = _baseline_failure(baseline, policy)
+    if baseline_failure is not None:
+        decisions = tuple(
+            CandidateDecision(
+                subject_id=candidate.run.subject_id,
+                eligible=False,
+                reason=baseline_failure,
+            )
+            for candidate in candidates
+        )
+        return ParetoResult(
+            decisions=decisions,
+            frontier_ids=(),
+            eligible_ids=(),
+        )
     initial_rejections: dict[str, str] = {}
     contenders: list[EvaluationResult] = []
 
@@ -115,6 +131,25 @@ def select_eligible_candidates(
         frontier_ids=frontier_ids,
         eligible_ids=frontier_ids,
     )
+
+
+def _baseline_failure(
+    baseline: EvaluationResult,
+    policy: EvaluationPolicy,
+) -> str | None:
+    if (
+        not baseline.complete
+        or baseline.run.status is not EvaluationStatus.COMPLETED
+    ):
+        return "Baseline evaluation is incomplete or failed."
+    undefined = _undefined_metrics(baseline, policy)
+    if undefined:
+        return (
+            "Baseline required metric is undefined: "
+            + ", ".join(undefined)
+            + "."
+        )
+    return None
 
 
 def _undefined_metrics(

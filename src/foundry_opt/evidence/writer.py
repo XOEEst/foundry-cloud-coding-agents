@@ -1,6 +1,6 @@
 import hashlib
 import json
-from pathlib import Path
+from math import isfinite
 from urllib.parse import urlsplit, urlunsplit
 
 from foundry_opt.evaluation import (
@@ -134,7 +134,11 @@ def _result_document(
             for attempt in result.all_runs
         ],
         "split": run.split.value,
-        "portal_url": _safe_portal_url(run.portal_url),
+        "portal_url": _safe_portal_url(
+            run.portal_url,
+            evaluation_id=run.evaluation_id,
+            run_id=run.run_id,
+        ),
         "complete": result.complete,
         "repeat_count": max(result.attempts - 1, 0),
         "duration_ms": result.duration_ms,
@@ -202,7 +206,7 @@ def _score_document(
 ) -> dict[str, object]:
     raw_score = (
         score.raw_score
-        if isinstance(score.raw_score, (bool, int, float))
+        if _is_finite_number(score.raw_score)
         else None
     )
     return {
@@ -268,16 +272,47 @@ def _decision_code(eligible: bool, reason: str) -> str:
     return "ineligible"
 
 
-def _safe_portal_url(value: str | None) -> str | None:
+def _safe_portal_url(
+    value: str | None,
+    *,
+    evaluation_id: str,
+    run_id: str,
+) -> str | None:
     if value is None:
         return None
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    hostname = parsed.hostname.casefold() if parsed.hostname else None
     if (
         parsed.scheme.casefold() != "https"
-        or not parsed.hostname
+        or hostname not in {"portal.azure.com", "ai.azure.com"}
+        or port is not None
         or parsed.username is not None
         or parsed.password is not None
     ):
+        return None
+    path_parts = tuple(part for part in parsed.path.split("/") if part)
+    if parsed.path != "/" + "/".join(path_parts):
+        return None
+    valid_paths = {
+        ("runs", run_id),
+        ("evaluations", evaluation_id, "runs", run_id),
+    }
+    valid_project_path = (
+        len(path_parts) == 6
+        and path_parts[0] == "projects"
+        and _safe_identifier(path_parts[1])
+        and path_parts[2:] == (
+            "evaluations",
+            evaluation_id,
+            "runs",
+            run_id,
+        )
+    )
+    if path_parts not in valid_paths and not valid_project_path:
         return None
     return urlunsplit(
         (
@@ -288,6 +323,25 @@ def _safe_portal_url(value: str | None) -> str | None:
             "",
         )
     )
+
+
+def _safe_identifier(value: str) -> bool:
+    return (
+        1 <= len(value) <= 128
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in "._:-")
+            for character in value
+        )
+    )
+
+
+def _is_finite_number(value: object) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and isfinite(value)
 
 
 def _unique(values: object) -> tuple[str, ...]:

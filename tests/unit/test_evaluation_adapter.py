@@ -353,6 +353,29 @@ def test_output_adapter_rejects_non_finite_normalized_scores() -> None:
         )
 
 
+@pytest.mark.parametrize("raw_score", [float("nan"), float("inf"), float("-inf")])
+def test_output_adapter_rejects_non_finite_raw_scores(
+    raw_score: float,
+) -> None:
+    with pytest.raises(EvaluationSchemaError):
+        BatchEvaluationOutput.from_payload(
+            {
+                "kind": "batch",
+                "case_id": "case-1",
+                "case_hash": "sha256:case-1",
+                "response_id": "response-1",
+                "scores": [
+                    {
+                        "metric": "quality",
+                        "raw_score": raw_score,
+                        "normalized_score": 0.8,
+                    }
+                ],
+                "usage": {},
+            }
+        )
+
+
 def test_iter_output_items_rejects_repeated_continuation_token() -> None:
     transport = FakeEvaluationTransport()
     transport.page_responses = {
@@ -488,6 +511,30 @@ def test_iter_output_items_rejects_missing_item_kind() -> None:
         None: {
             "items": [
                 {
+                    "case_id": "case-1",
+                    "case_hash": "sha256:case-1",
+                    "response_id": "response-1",
+                    "scores": [],
+                    "usage": {},
+                }
+            ],
+            "continuation_token": None,
+        }
+    }
+    gateway = EvaluationGateway(transport)
+    _create_batch_run(gateway)
+
+    with pytest.raises(EvaluationSchemaError):
+        tuple(gateway.iter_output_items("run-1"))
+
+
+def test_iter_output_items_rejects_null_item_kind() -> None:
+    transport = FakeEvaluationTransport()
+    transport.page_responses = {
+        None: {
+            "items": [
+                {
+                    "kind": None,
                     "case_id": "case-1",
                     "case_hash": "sha256:case-1",
                     "response_id": "response-1",

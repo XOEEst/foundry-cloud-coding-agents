@@ -119,7 +119,9 @@ class BatchEvaluationOutput:
         payload: Mapping[str, object],
     ) -> "BatchEvaluationOutput":
         try:
-            if str(payload["kind"]) != "batch":
+            if not isinstance(payload["kind"], str):
+                raise TypeError("Evaluation kind must be a string.")
+            if payload["kind"] != "batch":
                 raise ValueError("Expected a batch result.")
             return cls(
                 case_id=str(payload["case_id"]),
@@ -164,7 +166,9 @@ class MultiTurnSimulationOutput:
         payload: Mapping[str, object],
     ) -> "MultiTurnSimulationOutput":
         try:
-            if str(payload.get("kind")) != "multi_turn_simulation":
+            if not isinstance(payload["kind"], str):
+                raise TypeError("Evaluation kind must be a string.")
+            if payload["kind"] != "multi_turn_simulation":
                 raise ValueError("Expected a multi-turn simulation result.")
             return cls(
                 case_id=str(payload["case_id"]),
@@ -515,6 +519,11 @@ def _parse_item(
         raise EvaluationSchemaError(
             "Evaluation output item omitted its evaluation mode."
         )
+    supplied_kind = payload["kind"]
+    if not isinstance(supplied_kind, str) or supplied_kind != context.kind:
+        raise EvaluationSchemaError(
+            "Evaluation output item mode conflicts with pinned request context."
+        )
     validated = _validate_and_fill_context(
         payload,
         kind=context.kind,
@@ -622,6 +631,8 @@ def _optional_float(value: object) -> float | None:
 
 
 def _scalar_score(value: object) -> bool | int | float | str | None:
+    if isinstance(value, float) and not isfinite(value):
+        raise ValueError("Raw evaluation scores must be finite.")
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     raise TypeError("Raw evaluation scores must be scalar values.")
