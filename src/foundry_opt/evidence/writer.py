@@ -12,8 +12,13 @@ from foundry_opt.evaluation import (
 from foundry_opt.evidence.models import EvidenceManifest, EvidenceRequest
 
 
+class SensitiveEvidenceError(ValueError):
+    pass
+
+
 def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
     document = _build_document(request)
+    _reject_sensitive_strings(document, request.sensitive_values)
     serialized = (
         json.dumps(
             document,
@@ -44,6 +49,8 @@ def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
 
 
 def _build_document(request: EvidenceRequest) -> dict[str, object]:
+    for telemetry_item in request.telemetry:
+        telemetry_item.validate()
     document: dict[str, object] = {
         "schema_version": 1,
         "campaign_id": request.campaign_id,
@@ -342,6 +349,32 @@ def _is_finite_number(value: object) -> bool:
     if isinstance(value, int):
         return True
     return isinstance(value, float) and isfinite(value)
+
+
+def _reject_sensitive_strings(
+    value: object,
+    sensitive_values: tuple[str, ...],
+) -> None:
+    secrets = tuple(secret for secret in sensitive_values if secret)
+    if not secrets:
+        return
+    for text in _iter_strings(value):
+        if any(secret in text for secret in secrets):
+            raise SensitiveEvidenceError(
+                "Evidence contains a configured sensitive value."
+            )
+
+
+def _iter_strings(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_strings(key)
+            yield from _iter_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_strings(item)
 
 
 def _unique(values: object) -> tuple[str, ...]:

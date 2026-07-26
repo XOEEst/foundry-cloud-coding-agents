@@ -178,3 +178,32 @@ def test_ignored_undefined_metric_does_not_make_completed_run_incomplete() -> No
     assert result.metrics["optional_style"].outcome is Outcome.UNDEFINED
     assert result.complete is True
     assert result.needs_repeat is False
+
+
+def test_normalization_rejects_duplicate_scores_for_one_metric() -> None:
+    item = EvaluationItem(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=("response-1",),
+        scores=(
+            EvaluationScore("quality", 4, 0.8, "first"),
+            EvaluationScore("quality", 1, 0.2, "duplicate"),
+            EvaluationScore("latency", 1.4, 1.4, "fast"),
+        ),
+        usage=Usage(),
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        normalize_evaluation(_run(), (item,), _policy())
+
+
+def test_evaluation_policy_rejects_duplicate_metric_names() -> None:
+    metric = MetricPolicy(
+        name="quality",
+        direction=MetricDirection.MAXIMIZE,
+        threshold=0.75,
+        materiality=0.05,
+    )
+
+    with pytest.raises(ValueError):
+        EvaluationPolicy(metrics=(metric, metric))

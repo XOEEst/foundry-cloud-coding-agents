@@ -548,7 +548,7 @@ def _parse_item(
 
 
 def _parse_scores(value: object) -> tuple[EvaluationScore, ...]:
-    return tuple(
+    scores = tuple(
         EvaluationScore(
             metric=str(score["metric"]),
             raw_score=_scalar_score(score.get("raw_score")),
@@ -558,6 +558,10 @@ def _parse_scores(value: object) -> tuple[EvaluationScore, ...]:
         for raw_score in _list(value)
         for score in (_mapping(raw_score),)
     )
+    names = tuple(score.metric for score in scores)
+    if len(names) != len(set(names)):
+        raise ValueError("Evaluation output contains duplicate metric scores.")
+    return scores
 
 
 def _parse_usage(value: object) -> Usage:

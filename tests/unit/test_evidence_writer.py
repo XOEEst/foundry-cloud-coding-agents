@@ -17,6 +17,8 @@ from foundry_opt.evaluation import (
 )
 from foundry_opt.evidence import (
     EvidenceRequest,
+    SensitiveEvidenceError,
+    TelemetryEvidence,
     write_redacted_evidence,
 )
 
@@ -261,3 +263,109 @@ def test_evidence_writer_never_persists_provider_controlled_text(
         "provider_error"
     )
     assert document["candidates"][0]["error_count"] == 2
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["campaign", "source_hash", "run_id", "telemetry_response_id"],
+)
+def test_evidence_writer_rejects_sensitive_values_in_every_string_field(
+    tmp_path: Path,
+    location: str,
+) -> None:
+    sensitive = "DO-NOT-COMMIT"
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    campaign_id = "campaign-1"
+    source_hash = "sha256:source"
+    telemetry_response_id = "response-1"
+    if location == "campaign":
+        campaign_id = f"campaign-{sensitive}"
+    elif location == "source_hash":
+        source_hash = f"sha256:{sensitive}"
+    elif location == "run_id":
+        baseline = replace(
+            baseline,
+            run=replace(baseline.run, run_id=f"run-{sensitive}"),
+        )
+    else:
+        telemetry_response_id = f"response-{sensitive}"
+    output = tmp_path / "evidence.json"
+
+    with pytest.raises(SensitiveEvidenceError):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=output,
+                campaign_id=campaign_id,
+                baseline=baseline,
+                candidates=(),
+                pareto=select_eligible_candidates(baseline, (), POLICY),
+                source_hash=source_hash,
+                telemetry=(
+                    TelemetryEvidence(
+                        response_id=telemetry_response_id,
+                        request_count=1,
+                        dependency_count=0,
+                        exception_count=0,
+                        duration_ms=10,
+                        success_rate=1.0,
+                    ),
+                ),
+                sensitive_values=(sensitive,),
+            )
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("duration_ms", float("nan")),
+        ("duration_ms", float("inf")),
+        ("success_rate", float("-inf")),
+    ],
+)
+def test_telemetry_evidence_rejects_non_finite_floats(
+    field: str,
+    value: float,
+) -> None:
+    values: dict[str, object] = {
+        "response_id": "response-1",
+        "request_count": 1,
+        "dependency_count": 0,
+        "exception_count": 0,
+        "duration_ms": 10.0,
+        "success_rate": 1.0,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        TelemetryEvidence(**values)
+
+
+def test_evidence_writer_revalidates_telemetry_model_boundary(
+    tmp_path: Path,
+) -> None:
+    telemetry = TelemetryEvidence(
+        response_id="response-1",
+        request_count=1,
+        dependency_count=0,
+        exception_count=0,
+        duration_ms=10,
+        success_rate=1.0,
+    )
+    object.__setattr__(telemetry, "duration_ms", float("nan"))
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+
+    with pytest.raises(ValueError):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=tmp_path / "evidence.json",
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(),
+                pareto=select_eligible_candidates(baseline, (), POLICY),
+                source_hash="sha256:source",
+                telemetry=(telemetry,),
+            )
+        )

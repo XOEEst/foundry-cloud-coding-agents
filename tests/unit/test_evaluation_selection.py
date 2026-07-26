@@ -147,6 +147,21 @@ def test_incomplete_candidate_is_not_eligible_after_its_single_repeat() -> None:
     assert "incomplete" in result.decision_for("candidate").reason
 
 
+def test_non_completed_candidate_run_is_not_eligible() -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    candidate = replace(
+        candidate,
+        run=replace(candidate.run, status=EvaluationStatus.FAILED),
+        complete=True,
+    )
+
+    result = select_eligible_candidates(baseline, (candidate,), POLICY)
+
+    assert result.eligible_ids == ()
+    assert "completed" in result.decision_for("candidate").reason
+
+
 def test_explicit_ignore_behavior_excludes_undefined_metric_from_selection() -> None:
     policy = EvaluationPolicy(
         metrics=(

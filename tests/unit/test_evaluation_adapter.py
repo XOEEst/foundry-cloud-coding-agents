@@ -333,6 +333,31 @@ def test_output_adapter_rejects_raw_structures_as_scores() -> None:
         )
 
 
+def test_output_adapter_rejects_duplicate_metric_scores() -> None:
+    with pytest.raises(EvaluationSchemaError):
+        BatchEvaluationOutput.from_payload(
+            {
+                "kind": "batch",
+                "case_id": "case-1",
+                "case_hash": "sha256:case-1",
+                "response_id": "response-1",
+                "scores": [
+                    {
+                        "metric": "quality",
+                        "raw_score": 4,
+                        "normalized_score": 0.8,
+                    },
+                    {
+                        "metric": "quality",
+                        "raw_score": 1,
+                        "normalized_score": 0.2,
+                    },
+                ],
+                "usage": {},
+            }
+        )
+
+
 def test_output_adapter_rejects_non_finite_normalized_scores() -> None:
     with pytest.raises(EvaluationSchemaError):
         BatchEvaluationOutput.from_payload(

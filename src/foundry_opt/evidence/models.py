@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from pathlib import Path
 
 from foundry_opt.evaluation import EvaluationResult, ParetoResult
@@ -13,6 +14,15 @@ class TelemetryEvidence:
     exception_count: int
     duration_ms: float
     success_rate: float | None
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        if not isfinite(self.duration_ms):
+            raise ValueError("Telemetry evidence duration must be finite.")
+        if self.success_rate is not None and not isfinite(self.success_rate):
+            raise ValueError("Telemetry evidence success rate must be finite.")
 
 
 @dataclass(frozen=True)

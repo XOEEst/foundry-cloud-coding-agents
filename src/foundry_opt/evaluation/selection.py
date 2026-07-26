@@ -38,6 +38,11 @@ def select_eligible_candidates(
     contenders: list[EvaluationResult] = []
 
     for candidate in candidates:
+        if candidate.run.status is not EvaluationStatus.COMPLETED:
+            initial_rejections[candidate.run.subject_id] = (
+                "Candidate run did not reach completed status."
+            )
+            continue
         if not candidate.complete:
             initial_rejections[candidate.run.subject_id] = (
                 "Candidate evaluation remained incomplete after its repeat."

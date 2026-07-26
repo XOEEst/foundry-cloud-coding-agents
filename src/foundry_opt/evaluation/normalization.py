@@ -86,6 +86,20 @@ def _normalize_case(
     item: EvaluationItem,
     policy: EvaluationPolicy,
 ) -> NormalizedCase:
+    score_names = tuple(score.metric for score in item.scores)
+    duplicates = tuple(
+        sorted(
+            name
+            for name in set(score_names)
+            if score_names.count(name) > 1
+        )
+    )
+    if duplicates:
+        raise ValueError(
+            "Evaluation item contains duplicate metric scores: "
+            + ", ".join(duplicates)
+            + "."
+        )
     supplied_scores = {score.metric: score for score in item.scores}
     normalized_scores = []
     for metric_policy in policy.metrics:
