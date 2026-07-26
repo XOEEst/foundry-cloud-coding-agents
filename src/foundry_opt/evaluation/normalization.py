@@ -1,4 +1,5 @@
 from collections.abc import Iterable, Sequence
+from math import isfinite
 from statistics import median
 
 from foundry_opt.evaluation.models import (
@@ -116,6 +117,8 @@ def _normalize_case(
             )
             continue
         value = score.normalized_score
+        if value is not None and not isfinite(value):
+            raise ValueError("Normalized evaluation scores must be finite.")
         outcome = (
             Outcome.UNDEFINED
             if value is None

@@ -369,3 +369,84 @@ def test_evidence_writer_revalidates_telemetry_model_boundary(
                 telemetry=(telemetry,),
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("run_id", {"nested": "payload"}),
+        ("evaluation_id", ["evaluation-baseline"]),
+        ("subject_id", "subject with spaces"),
+    ],
+)
+def test_evidence_writer_rejects_unsafe_result_identifiers(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    baseline = replace(
+        baseline,
+        run=replace(baseline.run, **{field: value}),
+    )
+
+    with pytest.raises(ValueError, match="identifier"):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=tmp_path / "evidence.json",
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(),
+                pareto=select_eligible_candidates(baseline, (), POLICY),
+                source_hash="sha256:source",
+            )
+        )
+
+
+def test_evidence_writer_rejects_unsafe_case_and_trace_identifiers(
+    tmp_path: Path,
+) -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    item = EvaluationItem(
+        case_id="case with spaces",
+        case_hash="sha256:case-1",
+        response_ids=("response/unsafe",),
+        scores=(
+            EvaluationScore("quality", 4, 0.8, "correct"),
+            EvaluationScore("latency", 1.4, 1.4, "fast"),
+        ),
+        usage=Usage(),
+        trajectory=TrajectoryMetadata(
+            trajectory_id="trajectory/unsafe",
+            turn_count=1,
+            tool_calls=(
+                ToolCallMetadata(
+                    call_id="call/unsafe",
+                    name="search",
+                    status="completed",
+                ),
+            ),
+        ),
+    )
+    candidate = normalize_evaluation(
+        candidate.run,
+        (item,),
+        EvaluationPolicy(metrics=POLICY.metrics),
+    )
+
+    with pytest.raises(ValueError, match="identifier"):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=tmp_path / "evidence.json",
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(candidate,),
+                pareto=select_eligible_candidates(
+                    baseline,
+                    (candidate,),
+                    POLICY,
+                ),
+                source_hash="sha256:source",
+            )
+        )

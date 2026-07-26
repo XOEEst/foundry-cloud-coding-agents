@@ -102,6 +102,12 @@ class EvaluationScore:
     normalized_score: float | None
     reason: str | None = None
 
+    def __post_init__(self) -> None:
+        _validate_optional_finite(
+            self.normalized_score,
+            "Normalized evaluation score",
+        )
+
 
 @dataclass(frozen=True)
 class EvaluationItem:
@@ -187,6 +193,12 @@ class NormalizedCaseMetric:
     reason: str | None
     outcome: Outcome
 
+    def __post_init__(self) -> None:
+        _validate_optional_finite(
+            self.normalized_score,
+            "Normalized case score",
+        )
+
 
 @dataclass(frozen=True)
 class NormalizedCase:
@@ -209,6 +221,15 @@ class MetricAggregate:
     spread: float | None
     outcome: Outcome
     sample_count: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("median", self.median),
+            ("minimum", self.minimum),
+            ("maximum", self.maximum),
+            ("spread", self.spread),
+        ):
+            _validate_optional_finite(value, f"Metric aggregate {name}")
 
 
 @dataclass(frozen=True)
@@ -304,6 +325,14 @@ class EvaluationFunnelRequest:
     candidates: tuple[EvaluationSubject, ...]
     policy: EvaluationPolicy
 
+    def __post_init__(self) -> None:
+        subject_ids = (
+            self.baseline.subject_id,
+            *(candidate.subject_id for candidate in self.candidates),
+        )
+        if len(subject_ids) != len(set(subject_ids)):
+            raise ValueError("Evaluation funnel subject IDs must be unique.")
+
 
 @dataclass(frozen=True)
 class FunnelStageResult:
@@ -315,3 +344,12 @@ class FunnelStageResult:
 class FunnelResult:
     development: FunnelStageResult
     validation: FunnelStageResult
+
+
+def _validate_optional_finite(value: float | None, label: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a finite number.")
+    if not isfinite(value):
+        raise ValueError(f"{label} must be finite.")

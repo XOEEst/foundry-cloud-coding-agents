@@ -207,3 +207,26 @@ def test_evaluation_policy_rejects_duplicate_metric_names() -> None:
 
     with pytest.raises(ValueError):
         EvaluationPolicy(metrics=(metric, metric))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_evaluation_score_rejects_non_finite_normalized_score(
+    value: float,
+) -> None:
+    with pytest.raises(ValueError):
+        EvaluationScore("quality", 4, value, "invalid")
+
+
+def test_normalization_revalidates_mutated_non_finite_score() -> None:
+    score = EvaluationScore("quality", 4, 0.8, "valid")
+    object.__setattr__(score, "normalized_score", float("nan"))
+    item = EvaluationItem(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=("response-1",),
+        scores=(score, EvaluationScore("latency", 1.4, 1.4, "fast")),
+        usage=Usage(),
+    )
+
+    with pytest.raises(ValueError):
+        normalize_evaluation(_run(), (item,), _policy())

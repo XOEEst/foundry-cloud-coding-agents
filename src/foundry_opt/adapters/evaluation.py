@@ -124,9 +124,12 @@ class BatchEvaluationOutput:
             if payload["kind"] != "batch":
                 raise ValueError("Expected a batch result.")
             return cls(
-                case_id=str(payload["case_id"]),
-                case_hash=str(payload["case_hash"]),
-                response_id=str(payload["response_id"]),
+                case_id=_identifier(payload["case_id"], "case_id"),
+                case_hash=_identifier(payload["case_hash"], "case_hash"),
+                response_id=_identifier(
+                    payload["response_id"],
+                    "response_id",
+                ),
                 scores=_parse_scores(payload["scores"]),
                 usage=_parse_usage(payload.get("usage", {})),
                 error=_optional_string(payload.get("error")),
@@ -171,10 +174,11 @@ class MultiTurnSimulationOutput:
             if payload["kind"] != "multi_turn_simulation":
                 raise ValueError("Expected a multi-turn simulation result.")
             return cls(
-                case_id=str(payload["case_id"]),
-                case_hash=str(payload["case_hash"]),
+                case_id=_identifier(payload["case_id"], "case_id"),
+                case_hash=_identifier(payload["case_hash"], "case_hash"),
                 response_ids=tuple(
-                    str(value) for value in _list(payload["response_ids"])
+                    _identifier(value, "response_id")
+                    for value in _list(payload["response_ids"])
                 ),
                 scores=_parse_scores(payload["scores"]),
                 usage=_parse_usage(payload.get("usage", {})),
@@ -443,9 +447,9 @@ def _serialize_run_request(
 def _parse_definition(payload: Mapping[str, object]) -> EvaluationDefinition:
     try:
         return EvaluationDefinition(
-            definition_id=str(payload["id"]),
-            version=str(payload["version"]),
-            fingerprint=str(payload["fingerprint"]),
+            definition_id=_identifier(payload["id"], "definition_id"),
+            version=_identifier(payload["version"], "definition_version"),
+            fingerprint=_identifier(payload["fingerprint"], "fingerprint"),
             portal_url=_optional_string(payload.get("portal_url")),
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -460,24 +464,40 @@ def _parse_run(payload: Mapping[str, object]) -> EvaluationRun:
         dataset = _mapping(payload["dataset"])
         evaluator = _mapping(payload["evaluator"])
         return EvaluationRun(
-            run_id=str(payload["run_id"]),
-            evaluation_id=str(payload["evaluation_id"]),
-            subject_id=str(payload.get("subject_id", "candidate")),
-            split=DatasetSplit(str(payload.get("split", "development"))),
+            run_id=_identifier(payload["run_id"], "run_id"),
+            evaluation_id=_identifier(
+                payload["evaluation_id"],
+                "evaluation_id",
+            ),
+            subject_id=_identifier(
+                payload.get("subject_id", "candidate"),
+                "subject_id",
+            ),
+            split=DatasetSplit(
+                _required_string(
+                    payload.get("split", "development"),
+                    "split",
+                )
+            ),
             agent=AgentVersionRef(
-                str(agent["agent_id"]),
-                str(agent["draft_id"]),
-                str(agent["version"]),
+                _identifier(agent["agent_id"], "agent_id"),
+                _identifier(agent["draft_id"], "draft_id"),
+                _identifier(agent["version"], "agent_version"),
             ),
             dataset=DatasetVersionRef(
-                str(dataset["dataset_id"]),
-                str(dataset["version"]),
+                _identifier(dataset["dataset_id"], "dataset_id"),
+                _identifier(dataset["version"], "dataset_version"),
             ),
             evaluator=EvaluatorDefinitionRef(
-                str(evaluator["definition_id"]),
-                str(evaluator["version"]),
+                _identifier(
+                    evaluator["definition_id"],
+                    "evaluator_definition_id",
+                ),
+                _identifier(evaluator["version"], "evaluator_version"),
             ),
-            status=EvaluationStatus(str(payload["status"])),
+            status=EvaluationStatus(
+                _required_string(payload["status"], "status")
+            ),
             portal_url=_optional_string(payload.get("portal_url")),
             started_at=_parse_datetime(payload.get("started_at")),
             completed_at=_parse_datetime(payload.get("completed_at")),
@@ -502,7 +522,8 @@ def _parse_page(
                 _parse_item(_mapping(item), context) for item in raw_items
             ),
             continuation_token=_optional_string(
-                payload.get("continuation_token")
+                payload.get("continuation_token"),
+                "continuation_token",
             ),
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -535,7 +556,7 @@ def _parse_item(
         run_id=context.run_id,
         evaluation_id=context.evaluation_id,
     )
-    kind = str(validated["kind"])
+    kind = _required_string(validated["kind"], "kind")
     if kind == "batch":
         return BatchEvaluationOutput.from_payload(
             validated
@@ -550,7 +571,7 @@ def _parse_item(
 def _parse_scores(value: object) -> tuple[EvaluationScore, ...]:
     scores = tuple(
         EvaluationScore(
-            metric=str(score["metric"]),
+            metric=_identifier(score["metric"], "metric"),
             raw_score=_scalar_score(score.get("raw_score")),
             normalized_score=_optional_float(score.get("normalized_score")),
             reason=_optional_string(score.get("reason")),
@@ -576,13 +597,16 @@ def _parse_usage(value: object) -> Usage:
 def _parse_trajectory(payload: Mapping[str, object]) -> TrajectoryMetadata:
     raw_tool_calls = _list(payload.get("tool_calls", []))
     return TrajectoryMetadata(
-        trajectory_id=str(payload["trajectory_id"]),
+        trajectory_id=_identifier(
+            payload["trajectory_id"],
+            "trajectory_id",
+        ),
         turn_count=int(payload["turn_count"]),
         tool_calls=tuple(
             ToolCallMetadata(
-                call_id=str(tool_call["call_id"]),
-                name=str(tool_call["name"]),
-                status=str(tool_call["status"]),
+                call_id=_identifier(tool_call["call_id"], "tool_call_id"),
+                name=_required_string(tool_call["name"], "tool_name"),
+                status=_required_string(tool_call["status"], "tool_status"),
                 duration_ms=(
                     int(tool_call["duration_ms"])
                     if tool_call.get("duration_ms") is not None
@@ -600,7 +624,7 @@ def _parse_datetime(value: object) -> datetime | None:
         return None
     if isinstance(value, datetime):
         return value
-    text = str(value)
+    text = _required_string(value, "datetime")
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     parsed = datetime.fromisoformat(text)
@@ -621,8 +645,11 @@ def _list(value: object) -> list[Any]:
     return value
 
 
-def _optional_string(value: object) -> str | None:
-    return None if value is None else str(value)
+def _optional_string(
+    value: object,
+    field: str = "text",
+) -> str | None:
+    return None if value is None else _required_string(value, field)
 
 
 def _optional_float(value: object) -> float | None:
@@ -640,6 +667,26 @@ def _scalar_score(value: object) -> bool | int | float | str | None:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     raise TypeError("Raw evaluation scores must be scalar values.")
+
+
+def _required_string(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string.")
+    return value
+
+
+def _identifier(value: object, field: str) -> str:
+    text = _required_string(value, field)
+    if (
+        not 1 <= len(text) <= 256
+        or not all(
+            character.isascii()
+            and (character.isalnum() or character in "._:-")
+            for character in text
+        )
+    ):
+        raise ValueError(f"{field} is not a safe bounded identifier.")
+    return text
 
 
 def _validate_and_fill_context(

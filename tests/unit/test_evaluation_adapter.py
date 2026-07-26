@@ -358,6 +358,70 @@ def test_output_adapter_rejects_duplicate_metric_scores() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("case_id", {"nested": "payload"}),
+        ("case_hash", ["sha256:case-1"]),
+        ("response_id", {"id": "response-1"}),
+    ],
+)
+def test_batch_output_rejects_structured_identifiers(
+    field: str,
+    value: object,
+) -> None:
+    payload: dict[str, object] = {
+        "kind": "batch",
+        "case_id": "case-1",
+        "case_hash": "sha256:case-1",
+        "response_id": "response-1",
+        "scores": [],
+        "usage": {},
+    }
+    payload[field] = value
+
+    with pytest.raises(EvaluationSchemaError):
+        BatchEvaluationOutput.from_payload(payload)
+
+
+def test_simulation_output_rejects_structured_trajectory_identifiers() -> None:
+    with pytest.raises(EvaluationSchemaError):
+        MultiTurnSimulationOutput.from_payload(
+            {
+                "kind": "multi_turn_simulation",
+                "case_id": "case-1",
+                "case_hash": "sha256:case-1",
+                "response_ids": ["response-1"],
+                "scores": [],
+                "usage": {},
+                "trajectory": {
+                    "trajectory_id": {"nested": "payload"},
+                    "turn_count": 1,
+                    "tool_calls": [
+                        {
+                            "call_id": ["call-1"],
+                            "name": "search",
+                            "status": "completed",
+                        }
+                    ],
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("field", ["run_id", "evaluation_id"])
+def test_create_run_rejects_structured_run_identifiers(field: str) -> None:
+    transport = FakeEvaluationTransport()
+
+    def create_run(payload: Mapping[str, object]) -> Mapping[str, object]:
+        return _run_payload("queued", **{field: {"nested": "payload"}})
+
+    transport.create_run = create_run  # type: ignore[method-assign]
+
+    with pytest.raises(EvaluationSchemaError):
+        EvaluationGateway(transport).create_run(_batch_request())
+
+
 def test_output_adapter_rejects_non_finite_normalized_scores() -> None:
     with pytest.raises(EvaluationSchemaError):
         BatchEvaluationOutput.from_payload(

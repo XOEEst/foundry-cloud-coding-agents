@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import pytest
+
 from foundry_opt.evaluation import (
     DatasetSplit,
     EvaluationFunnelRequest,
@@ -202,3 +204,32 @@ def test_repeat_combination_ignores_configured_undefined_metric() -> None:
     assert combined.attempts == 2
     assert combined.complete is True
     assert result.validation.pareto.eligible_ids == ("candidate",)
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        (EvaluationSubject("baseline"),),
+        (EvaluationSubject("candidate"), EvaluationSubject("candidate")),
+    ],
+)
+def test_funnel_request_rejects_duplicate_subject_ids(
+    candidates: tuple[EvaluationSubject, ...],
+) -> None:
+    policy = EvaluationPolicy(
+        metrics=(
+            MetricPolicy(
+                "quality",
+                MetricDirection.MAXIMIZE,
+                threshold=0.6,
+                materiality=0.05,
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="subject"):
+        EvaluationFunnelRequest(
+            baseline=EvaluationSubject("baseline"),
+            candidates=candidates,
+            policy=policy,
+        )

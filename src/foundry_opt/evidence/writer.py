@@ -17,6 +17,7 @@ class SensitiveEvidenceError(ValueError):
 
 
 def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
+    _validate_evidence_identifiers(request)
     document = _build_document(request)
     _reject_sensitive_strings(document, request.sensitive_values)
     serialized = (
@@ -334,7 +335,7 @@ def _safe_portal_url(
 
 def _safe_identifier(value: str) -> bool:
     return (
-        1 <= len(value) <= 128
+        1 <= len(value) <= 256
         and all(
             character.isascii()
             and (character.isalnum() or character in "._:-")
@@ -349,6 +350,73 @@ def _is_finite_number(value: object) -> bool:
     if isinstance(value, int):
         return True
     return isinstance(value, float) and isfinite(value)
+
+
+def _validate_evidence_identifiers(request: EvidenceRequest) -> None:
+    _require_identifier(request.campaign_id, "campaign_id")
+    _require_identifier(request.source_hash, "source_hash")
+    for subject_id, patch_hash in (request.patch_hashes or {}).items():
+        _require_identifier(subject_id, "patch subject_id")
+        _require_identifier(patch_hash, "patch_hash")
+    for subject_id in (
+        *request.pareto.frontier_ids,
+        *request.pareto.eligible_ids,
+    ):
+        _require_identifier(subject_id, "pareto subject_id")
+    for decision in request.pareto.decisions:
+        _require_identifier(decision.subject_id, "decision subject_id")
+    for result in (request.baseline, *request.candidates):
+        _validate_result_identifiers(result)
+    for telemetry_item in request.telemetry:
+        _require_identifier(
+            telemetry_item.response_id,
+            "telemetry response_id",
+        )
+
+
+def _validate_result_identifiers(result: EvaluationResult) -> None:
+    run = result.run
+    for value, field in (
+        (run.subject_id, "subject_id"),
+        (run.run_id, "run_id"),
+        (run.evaluation_id, "evaluation_id"),
+        (run.agent.agent_id, "agent_id"),
+        (run.agent.draft_id, "draft_id"),
+        (run.agent.version, "agent_version"),
+        (run.dataset.dataset_id, "dataset_id"),
+        (run.dataset.version, "dataset_version"),
+        (run.evaluator.definition_id, "evaluator_definition_id"),
+        (run.evaluator.version, "evaluator_version"),
+    ):
+        _require_identifier(value, field)
+    for attempt in result.all_runs:
+        _require_identifier(attempt.run_id, "attempt run_id")
+        _require_identifier(
+            attempt.evaluation_id,
+            "attempt evaluation_id",
+        )
+    for metric_name in result.metrics:
+        _require_identifier(metric_name, "metric")
+    for case in result.cases:
+        _require_identifier(case.case_id, "case_id")
+        _require_identifier(case.case_hash, "case_hash")
+        for response_id in case.response_ids:
+            _require_identifier(response_id, "response_id")
+        for score in case.scores:
+            _require_identifier(score.metric, "case metric")
+        if case.trajectory is not None:
+            _require_identifier(
+                case.trajectory.trajectory_id,
+                "trajectory_id",
+            )
+            for tool_call in case.trajectory.tool_calls:
+                _require_identifier(tool_call.call_id, "tool_call_id")
+
+
+def _require_identifier(value: object, field: str) -> str:
+    if not isinstance(value, str) or not _safe_identifier(value):
+        raise ValueError(f"{field} must be a safe bounded identifier.")
+    return value
 
 
 def _reject_sensitive_strings(
