@@ -172,3 +172,45 @@ def test_explicit_ignore_behavior_excludes_undefined_metric_from_selection() -> 
     result = select_eligible_candidates(baseline, (candidate,), policy)
 
     assert result.eligible_ids == ("candidate",)
+
+
+def test_ignore_undefined_does_not_ignore_explicit_guardrail_failure() -> None:
+    policy = EvaluationPolicy(
+        metrics=(
+            POLICY.metrics[0],
+            replace(
+                POLICY.metrics[1],
+                undefined_behavior=UndefinedBehavior.IGNORE,
+            ),
+        )
+    )
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.90, latency=2.1)
+
+    result = select_eligible_candidates(baseline, (candidate,), policy)
+
+    assert result.eligible_ids == ()
+    assert "hard guardrail" in result.decision_for("candidate").reason
+
+
+def test_baseline_dominated_candidate_is_not_eligible() -> None:
+    baseline = _result("baseline", quality=0.80, latency=1.4)
+    candidate = _result("candidate", quality=0.70, latency=1.6)
+
+    result = select_eligible_candidates(baseline, (candidate,), POLICY)
+
+    assert result.eligible_ids == ()
+    assert "baseline" in result.decision_for("candidate").reason
+
+
+def test_zero_materiality_still_requires_strict_positive_improvement() -> None:
+    policy = EvaluationPolicy(
+        metrics=tuple(replace(metric, materiality=0) for metric in POLICY.metrics)
+    )
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    unchanged = _result("unchanged", quality=0.70, latency=1.5)
+
+    result = select_eligible_candidates(baseline, (unchanged,), policy)
+
+    assert result.eligible_ids == ()
+    assert "material improvement" in result.decision_for("unchanged").reason

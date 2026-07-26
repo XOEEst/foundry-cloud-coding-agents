@@ -41,6 +41,18 @@ class EvaluationPaginationError(EvaluationAdapterError):
 
 
 @dataclass(frozen=True)
+class _RunContext:
+    run_id: str
+    evaluation_id: str
+    kind: str
+    subject_id: str
+    split: DatasetSplit
+    agent: AgentVersionRef
+    dataset: DatasetVersionRef
+    evaluator: EvaluatorDefinitionRef
+
+
+@dataclass(frozen=True)
 class EvaluationDefinitionRequest:
     name: str
     evaluator_type: str
@@ -107,7 +119,7 @@ class BatchEvaluationOutput:
         payload: Mapping[str, object],
     ) -> "BatchEvaluationOutput":
         try:
-            if str(payload.get("kind", "batch")) != "batch":
+            if str(payload["kind"]) != "batch":
                 raise ValueError("Expected a batch result.")
             return cls(
                 case_id=str(payload["case_id"]),
@@ -246,6 +258,7 @@ class EvaluationGateway:
         self._page_size = page_size
         self._max_pages = max_pages
         self._sleep = sleep
+        self._contexts: dict[str, _RunContext] = {}
 
     def create_or_reuse_definition(
         self,
@@ -279,21 +292,53 @@ class EvaluationGateway:
         self,
         request: BatchEvaluationRequest | MultiTurnSimulationRequest,
     ) -> EvaluationRun:
-        payload = _serialize_run_request(request)
-        response = dict(self._transport.create_run(payload))
-        response.setdefault("subject_id", request.subject_id)
-        response.setdefault("split", request.split.value)
-        response.setdefault("agent", payload["agent"])
-        response.setdefault("dataset", payload["dataset"])
-        response.setdefault("evaluator", payload["evaluator"])
-        return _parse_run(response)
+        request_payload = _serialize_run_request(request)
+        response = _validate_and_fill_context(
+            self._transport.create_run(request_payload),
+            kind=str(request_payload["kind"]),
+            subject_id=request.subject_id,
+            split=request.split,
+            agent=request.agent,
+            dataset=request.dataset,
+            evaluator=request.evaluator,
+        )
+        run = _parse_run(response)
+        context = _RunContext(
+            run_id=run.run_id,
+            evaluation_id=run.evaluation_id,
+            kind=str(request_payload["kind"]),
+            subject_id=request.subject_id,
+            split=request.split,
+            agent=request.agent,
+            dataset=request.dataset,
+            evaluator=request.evaluator,
+        )
+        existing = self._contexts.get(run.run_id)
+        if existing is not None and existing != context:
+            raise EvaluationSchemaError(
+                "Evaluation run ID was reused with conflicting pinned context."
+            )
+        self._contexts[run.run_id] = context
+        return run
 
     def get_run(self, run_id: str) -> EvaluationRun:
+        context = self._context_for(run_id)
         delay = self._poll_policy.initial_delay_seconds
         last_status: EvaluationStatus | None = None
         for attempt in range(1, self._poll_policy.max_attempts + 1):
             try:
-                run = _parse_run(self._transport.get_run(run_id))
+                response = _validate_and_fill_context(
+                    self._transport.get_run(run_id),
+                    kind=context.kind,
+                    subject_id=context.subject_id,
+                    split=context.split,
+                    agent=context.agent,
+                    dataset=context.dataset,
+                    evaluator=context.evaluator,
+                    run_id=context.run_id,
+                    evaluation_id=context.evaluation_id,
+                )
+                run = _parse_run(response)
             except RetryableEvaluationError:
                 run = None
             if run is not None:
@@ -317,15 +362,26 @@ class EvaluationGateway:
         )
 
     def iter_output_items(self, run_id: str) -> Iterator[EvaluationItem]:
+        context = self._context_for(run_id)
         continuation_token: str | None = None
         seen_tokens: set[str] = set()
         for _ in range(self._max_pages):
-            raw_page = self._transport.list_output_items(
-                run_id,
-                continuation_token=continuation_token,
-                page_size=self._page_size,
+            raw_page = _validate_and_fill_context(
+                self._transport.list_output_items(
+                    run_id,
+                    continuation_token=continuation_token,
+                    page_size=self._page_size,
+                ),
+                kind=context.kind,
+                subject_id=context.subject_id,
+                split=context.split,
+                agent=context.agent,
+                dataset=context.dataset,
+                evaluator=context.evaluator,
+                run_id=context.run_id,
+                evaluation_id=context.evaluation_id,
             )
-            page = _parse_page(raw_page)
+            page = _parse_page(raw_page, context)
             yield from page.items
             continuation_token = page.continuation_token
             if continuation_token is None:
@@ -338,6 +394,14 @@ class EvaluationGateway:
         raise EvaluationPaginationError(
             "Evaluation output exceeded the configured page bound."
         )
+
+    def _context_for(self, run_id: str) -> _RunContext:
+        try:
+            return self._contexts[run_id]
+        except KeyError:
+            raise EvaluationSchemaError(
+                "Evaluation run has no retained pinned request context."
+            ) from None
 
 
 def _serialize_run_request(
@@ -421,13 +485,18 @@ def _parse_run(payload: Mapping[str, object]) -> EvaluationRun:
         ) from error
 
 
-def _parse_page(payload: Mapping[str, object]) -> EvaluationOutputPage:
+def _parse_page(
+    payload: Mapping[str, object],
+    context: _RunContext,
+) -> EvaluationOutputPage:
     try:
         raw_items = payload["items"]
         if not isinstance(raw_items, list):
             raise TypeError("items must be a list")
         return EvaluationOutputPage(
-            items=tuple(_parse_item(_mapping(item)) for item in raw_items),
+            items=tuple(
+                _parse_item(_mapping(item), context) for item in raw_items
+            ),
             continuation_token=_optional_string(
                 payload.get("continuation_token")
             ),
@@ -438,13 +507,33 @@ def _parse_page(payload: Mapping[str, object]) -> EvaluationOutputPage:
         ) from error
 
 
-def _parse_item(payload: Mapping[str, object]) -> EvaluationItem:
-    kind = str(payload.get("kind", "batch"))
+def _parse_item(
+    payload: Mapping[str, object],
+    context: _RunContext,
+) -> EvaluationItem:
+    if "kind" not in payload:
+        raise EvaluationSchemaError(
+            "Evaluation output item omitted its evaluation mode."
+        )
+    validated = _validate_and_fill_context(
+        payload,
+        kind=context.kind,
+        subject_id=context.subject_id,
+        split=context.split,
+        agent=context.agent,
+        dataset=context.dataset,
+        evaluator=context.evaluator,
+        run_id=context.run_id,
+        evaluation_id=context.evaluation_id,
+    )
+    kind = str(validated["kind"])
     if kind == "batch":
-        return BatchEvaluationOutput.from_payload(payload).to_evaluation_item()
+        return BatchEvaluationOutput.from_payload(
+            validated
+        ).to_evaluation_item()
     if kind == "multi_turn_simulation":
         return MultiTurnSimulationOutput.from_payload(
-            payload
+            validated
         ).to_evaluation_item()
     raise EvaluationSchemaError(f"Unsupported evaluation item kind: {kind}.")
 
@@ -536,3 +625,87 @@ def _scalar_score(value: object) -> bool | int | float | str | None:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     raise TypeError("Raw evaluation scores must be scalar values.")
+
+
+def _validate_and_fill_context(
+    payload: Mapping[str, object],
+    *,
+    kind: str,
+    subject_id: str,
+    split: DatasetSplit,
+    agent: AgentVersionRef,
+    dataset: DatasetVersionRef,
+    evaluator: EvaluatorDefinitionRef,
+    run_id: str | None = None,
+    evaluation_id: str | None = None,
+) -> dict[str, object]:
+    validated = dict(payload)
+    expected_scalars = {
+        "kind": kind,
+        "subject_id": subject_id,
+        "split": split.value,
+    }
+    if run_id is not None:
+        expected_scalars["run_id"] = run_id
+    if evaluation_id is not None:
+        expected_scalars["evaluation_id"] = evaluation_id
+    supplied_mode = validated.get("mode")
+    if supplied_mode is not None and str(supplied_mode) != kind:
+        raise EvaluationSchemaError(
+            "Provider evaluation mode conflicts with pinned request context."
+        )
+    for field, expected in expected_scalars.items():
+        supplied = validated.get(field)
+        if supplied is not None and str(supplied) != expected:
+            raise EvaluationSchemaError(
+                f"Provider {field} conflicts with pinned request context."
+            )
+        validated[field] = expected
+    validated["agent"] = _validated_reference(
+        validated.get("agent"),
+        {
+            "agent_id": agent.agent_id,
+            "draft_id": agent.draft_id,
+            "version": agent.version,
+        },
+        "agent",
+    )
+    validated["dataset"] = _validated_reference(
+        validated.get("dataset"),
+        {
+            "dataset_id": dataset.dataset_id,
+            "version": dataset.version,
+        },
+        "dataset",
+    )
+    validated["evaluator"] = _validated_reference(
+        validated.get("evaluator"),
+        {
+            "definition_id": evaluator.definition_id,
+            "version": evaluator.version,
+        },
+        "evaluator",
+    )
+    return validated
+
+
+def _validated_reference(
+    supplied: object,
+    expected: dict[str, str],
+    field: str,
+) -> dict[str, object]:
+    if supplied is None:
+        return dict(expected)
+    supplied_mapping = _mapping(supplied)
+    validated = dict(supplied_mapping)
+    for name, expected_value in expected.items():
+        supplied_value = supplied_mapping.get(name)
+        if (
+            supplied_value is not None
+            and str(supplied_value) != expected_value
+        ):
+            raise EvaluationSchemaError(
+                f"Provider {field}.{name} conflicts with pinned request context."
+            )
+        validated[name] = expected_value
+    return validated

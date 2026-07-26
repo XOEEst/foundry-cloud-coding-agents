@@ -37,10 +37,19 @@ def select_eligible_candidates(
             metric.name
             for metric in policy.metrics
             if metric.hard_guardrail
-            and metric.undefined_behavior is not UndefinedBehavior.IGNORE
             and (
-                metric.name not in candidate.metrics
-                or candidate.metrics[metric.name].outcome is not Outcome.PASS
+                (
+                    metric.name in candidate.metrics
+                    and candidate.metrics[metric.name].outcome is Outcome.FAIL
+                )
+                or (
+                    metric.undefined_behavior is UndefinedBehavior.FAIL
+                    and (
+                        metric.name not in candidate.metrics
+                        or candidate.metrics[metric.name].outcome
+                        is Outcome.UNDEFINED
+                    )
+                )
             )
         )
         if failed_guardrails:
@@ -48,6 +57,11 @@ def select_eligible_candidates(
                 "Candidate failed a hard guardrail: "
                 + ", ".join(failed_guardrails)
                 + "."
+            )
+            continue
+        if _dominates(baseline, candidate, policy):
+            initial_rejections[candidate.run.subject_id] = (
+                "Candidate is dominated by the baseline."
             )
             continue
         if not _materially_improves(baseline, candidate, policy):
@@ -134,13 +148,11 @@ def _materially_improves(
             or candidate_value.median is None
         ):
             continue
-        if (
-            metric.improvement(
-                baseline_value.median,
-                candidate_value.median,
-            )
-            >= metric.materiality
-        ):
+        improvement = metric.improvement(
+            baseline_value.median,
+            candidate_value.median,
+        )
+        if improvement > 0 and improvement >= metric.materiality:
             return True
     return False
 

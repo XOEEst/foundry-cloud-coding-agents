@@ -68,8 +68,11 @@ class FakeEvaluationTransport:
         return self.page_responses[continuation_token]
 
 
-def _run_payload(status: str) -> dict[str, object]:
-    return {
+def _run_payload(
+    status: str,
+    **overrides: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "run_id": "run-1",
         "evaluation_id": "evaluation-1",
         "status": status,
@@ -87,6 +90,8 @@ def _run_payload(status: str) -> dict[str, object]:
         ),
         "error": "one case failed" if status == "partial" else None,
     }
+    payload.update(overrides)
+    return payload
 
 
 def _batch_request() -> BatchEvaluationRequest:
@@ -96,6 +101,10 @@ def _batch_request() -> BatchEvaluationRequest:
         dataset=DatasetVersionRef("dataset-1", "12"),
         evaluator=EvaluatorDefinitionRef("eval-def-1", "7"),
     )
+
+
+def _create_batch_run(gateway: EvaluationGateway) -> None:
+    gateway.create_run(_batch_request())
 
 
 def test_create_or_reuse_definition_reuses_exact_fingerprint() -> None:
@@ -180,6 +189,7 @@ def test_get_run_polls_to_terminal_state_with_bounded_backoff() -> None:
         poll_policy=PollPolicy(max_attempts=4, initial_delay_seconds=1, multiplier=2),
         sleep=delays.append,
     )
+    _create_batch_run(gateway)
 
     result = gateway.get_run("run-1")
 
@@ -197,12 +207,13 @@ def test_get_run_stops_after_bounded_attempts() -> None:
         poll_policy=PollPolicy(max_attempts=3, initial_delay_seconds=0),
         sleep=lambda _: None,
     )
+    _create_batch_run(gateway)
 
     with pytest.raises(EvaluationPollingTimeoutError):
         gateway.get_run("run-1")
 
 
-def test_iter_output_items_paginates_batch_and_simulation_contracts() -> None:
+def test_iter_output_items_paginates_expected_batch_contract() -> None:
     transport = FakeEvaluationTransport()
     transport.page_responses = {
         None: {
@@ -229,14 +240,14 @@ def test_iter_output_items_paginates_batch_and_simulation_contracts() -> None:
         "page-2": {
             "items": [
                 {
-                    "kind": "multi_turn_simulation",
+                    "kind": "batch",
                     "case_id": "case-2",
                     "case_hash": "sha256:case-2",
-                    "response_ids": ["response-2", "response-3"],
+                    "response_id": "response-2",
                     "scores": [
                         {
                             "metric": "quality",
-                            "raw_score": "pass",
+                            "raw_score": 5,
                             "normalized_score": 1.0,
                             "reason": "completed",
                         }
@@ -246,18 +257,6 @@ def test_iter_output_items_paginates_batch_and_simulation_contracts() -> None:
                         "output_tokens": 8,
                         "cached_tokens": 3,
                     },
-                    "trajectory": {
-                        "trajectory_id": "trajectory-2",
-                        "turn_count": 3,
-                        "tool_calls": [
-                            {
-                                "call_id": "call-1",
-                                "name": "search",
-                                "status": "completed",
-                                "duration_ms": 25,
-                            }
-                        ],
-                    },
                     "duration_ms": 300,
                 }
             ],
@@ -265,6 +264,7 @@ def test_iter_output_items_paginates_batch_and_simulation_contracts() -> None:
         },
     }
     gateway = EvaluationGateway(transport, page_size=1)
+    _create_batch_run(gateway)
 
     items = tuple(gateway.iter_output_items("run-1"))
 
@@ -273,9 +273,7 @@ def test_iter_output_items_paginates_batch_and_simulation_contracts() -> None:
         ("run-1", "page-2", 1),
     ]
     assert items[0].response_ids == ("response-1",)
-    assert items[1].response_ids == ("response-2", "response-3")
-    assert items[1].trajectory is not None
-    assert items[1].trajectory.tool_calls[0].name == "search"
+    assert items[1].response_ids == ("response-2",)
     assert isinstance(
         EvaluationOutputPage(items=items, continuation_token=None),
         EvaluationOutputPage,
@@ -362,6 +360,220 @@ def test_iter_output_items_rejects_repeated_continuation_token() -> None:
         "same": {"items": [], "continuation_token": "same"},
     }
     gateway = EvaluationGateway(transport)
+    _create_batch_run(gateway)
 
     with pytest.raises(EvaluationPaginationError):
         tuple(gateway.iter_output_items("run-1"))
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_value"),
+    [
+        ("kind", "multi_turn_simulation"),
+        ("subject_id", "other-candidate"),
+        ("split", "validation"),
+        ("agent", {"agent_id": "agent-2", "draft_id": "draft-9", "version": "3"}),
+        ("agent", {"agent_id": "agent-1", "draft_id": "draft-8", "version": "3"}),
+        ("agent", {"agent_id": "agent-1", "draft_id": "draft-9", "version": "4"}),
+        ("dataset", {"dataset_id": "dataset-2", "version": "12"}),
+        ("dataset", {"dataset_id": "dataset-1", "version": "13"}),
+        ("evaluator", {"definition_id": "eval-def-2", "version": "7"}),
+        ("evaluator", {"definition_id": "eval-def-1", "version": "8"}),
+    ],
+)
+def test_create_run_rejects_provider_context_conflicts(
+    field: str,
+    conflicting_value: object,
+) -> None:
+    transport = FakeEvaluationTransport()
+
+    def create_run(payload: Mapping[str, object]) -> Mapping[str, object]:
+        return _run_payload("queued", **{field: conflicting_value})
+
+    transport.create_run = create_run  # type: ignore[method-assign]
+    gateway = EvaluationGateway(transport)
+
+    with pytest.raises(EvaluationSchemaError):
+        gateway.create_run(_batch_request())
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_value"),
+    [
+        ("run_id", "run-other"),
+        ("evaluation_id", "evaluation-other"),
+        ("kind", "multi_turn_simulation"),
+        ("subject_id", "other-candidate"),
+        ("split", "validation"),
+        ("agent", {"agent_id": "agent-1", "draft_id": "draft-9", "version": "4"}),
+        ("dataset", {"dataset_id": "dataset-1", "version": "13"}),
+        ("evaluator", {"definition_id": "eval-def-1", "version": "8"}),
+    ],
+)
+def test_get_run_rejects_poll_context_conflicts(
+    field: str,
+    conflicting_value: object,
+) -> None:
+    transport = FakeEvaluationTransport()
+    gateway = EvaluationGateway(transport)
+    _create_batch_run(gateway)
+    transport.run_responses = [
+        _run_payload("completed", **{field: conflicting_value})
+    ]
+
+    with pytest.raises(EvaluationSchemaError):
+        gateway.get_run("run-1")
+
+
+def test_provider_omissions_are_filled_from_trusted_request_context() -> None:
+    transport = FakeEvaluationTransport()
+
+    def create_run(payload: Mapping[str, object]) -> Mapping[str, object]:
+        return {
+            "run_id": "run-1",
+            "evaluation_id": "evaluation-1",
+            "status": "queued",
+        }
+
+    transport.create_run = create_run  # type: ignore[method-assign]
+    gateway = EvaluationGateway(transport)
+
+    run = gateway.create_run(_batch_request())
+
+    assert run.agent == AgentVersionRef("agent-1", "draft-9", "3")
+    assert run.dataset == DatasetVersionRef("dataset-1", "12")
+    assert run.evaluator == EvaluatorDefinitionRef("eval-def-1", "7")
+
+
+def test_poll_omissions_are_filled_from_retained_request_context() -> None:
+    transport = FakeEvaluationTransport()
+    gateway = EvaluationGateway(transport)
+    _create_batch_run(gateway)
+    transport.run_responses = [
+        {
+            "run_id": "run-1",
+            "evaluation_id": "evaluation-1",
+            "status": "completed",
+        }
+    ]
+
+    run = gateway.get_run("run-1")
+
+    assert run.agent == AgentVersionRef("agent-1", "draft-9", "3")
+    assert run.dataset == DatasetVersionRef("dataset-1", "12")
+    assert run.evaluator == EvaluatorDefinitionRef("eval-def-1", "7")
+
+
+def test_create_run_rejects_reused_run_id_with_conflicting_request_context() -> None:
+    transport = FakeEvaluationTransport()
+    gateway = EvaluationGateway(transport)
+    _create_batch_run(gateway)
+
+    with pytest.raises(EvaluationSchemaError):
+        gateway.create_run(
+            MultiTurnSimulationRequest(
+                display_name="candidate simulation",
+                agent=AgentVersionRef("agent-1", "draft-9", "3"),
+                dataset=DatasetVersionRef("dataset-1", "12"),
+                evaluator=EvaluatorDefinitionRef("eval-def-1", "7"),
+                max_turns=2,
+                personas=("developer",),
+            )
+        )
+
+
+def test_iter_output_items_rejects_missing_item_kind() -> None:
+    transport = FakeEvaluationTransport()
+    transport.page_responses = {
+        None: {
+            "items": [
+                {
+                    "case_id": "case-1",
+                    "case_hash": "sha256:case-1",
+                    "response_id": "response-1",
+                    "scores": [],
+                    "usage": {},
+                }
+            ],
+            "continuation_token": None,
+        }
+    }
+    gateway = EvaluationGateway(transport)
+    _create_batch_run(gateway)
+
+    with pytest.raises(EvaluationSchemaError):
+        tuple(gateway.iter_output_items("run-1"))
+
+
+def test_iter_output_items_rejects_mixed_evaluation_modes() -> None:
+    transport = FakeEvaluationTransport()
+    transport.page_responses = {
+        None: {
+            "items": [
+                {
+                    "kind": "multi_turn_simulation",
+                    "case_id": "case-1",
+                    "case_hash": "sha256:case-1",
+                    "response_ids": ["response-1"],
+                    "scores": [],
+                    "usage": {},
+                    "trajectory": {
+                        "trajectory_id": "trajectory-1",
+                        "turn_count": 1,
+                        "tool_calls": [],
+                    },
+                }
+            ],
+            "continuation_token": None,
+        }
+    }
+    gateway = EvaluationGateway(transport)
+    _create_batch_run(gateway)
+
+    with pytest.raises(EvaluationSchemaError):
+        tuple(gateway.iter_output_items("run-1"))
+
+
+@pytest.mark.parametrize(
+    ("field", "conflicting_value"),
+    [
+        ("run_id", "run-other"),
+        ("evaluation_id", "evaluation-other"),
+        ("kind", "multi_turn_simulation"),
+        ("subject_id", "other-candidate"),
+        ("split", "validation"),
+        ("agent", {"agent_id": "agent-1", "draft_id": "draft-9", "version": "4"}),
+        ("dataset", {"dataset_id": "dataset-1", "version": "13"}),
+        ("evaluator", {"definition_id": "eval-def-1", "version": "8"}),
+    ],
+)
+def test_output_page_rejects_conflicting_run_context(
+    field: str,
+    conflicting_value: object,
+) -> None:
+    transport = FakeEvaluationTransport()
+    transport.page_responses = {
+        None: {
+            field: conflicting_value,
+            "items": [],
+            "continuation_token": None,
+        }
+    }
+    gateway = EvaluationGateway(transport)
+    _create_batch_run(gateway)
+
+    with pytest.raises(EvaluationSchemaError):
+        tuple(gateway.iter_output_items("run-1"))
+
+
+def test_batch_output_parser_rejects_missing_item_kind() -> None:
+    with pytest.raises(EvaluationSchemaError):
+        BatchEvaluationOutput.from_payload(
+            {
+                "case_id": "case-1",
+                "case_hash": "sha256:case-1",
+                "response_id": "response-1",
+                "scores": [],
+                "usage": {},
+            }
+        )

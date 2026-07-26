@@ -7,9 +7,9 @@ from foundry_opt.evaluation import (
     EvaluationResult,
     NormalizedCase,
     NormalizedCaseMetric,
+    Outcome,
 )
 from foundry_opt.evidence.models import EvidenceManifest, EvidenceRequest
-from foundry_opt.preflight.redaction import redact
 
 
 def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
@@ -44,15 +44,14 @@ def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
 
 
 def _build_document(request: EvidenceRequest) -> dict[str, object]:
-    sensitive_values = request.sensitive_values
     document: dict[str, object] = {
         "schema_version": 1,
-        "campaign_id": _safe_text(request.campaign_id, sensitive_values),
+        "campaign_id": request.campaign_id,
         "source_hash": request.source_hash,
-        "baseline": _result_document(request.baseline, sensitive_values),
+        "baseline": _result_document(request.baseline),
         "candidates": [
             {
-                **_result_document(candidate, sensitive_values),
+                **_result_document(candidate),
                 "patch_hash": (request.patch_hashes or {}).get(
                     candidate.run.subject_id
                 ),
@@ -66,7 +65,10 @@ def _build_document(request: EvidenceRequest) -> dict[str, object]:
                 {
                     "subject_id": decision.subject_id,
                     "eligible": decision.eligible,
-                    "reason": _safe_text(decision.reason, sensitive_values),
+                    "reason_code": _decision_code(
+                        decision.eligible,
+                        decision.reason,
+                    ),
                 }
                 for decision in request.pareto.decisions
             ],
@@ -91,7 +93,6 @@ def _build_document(request: EvidenceRequest) -> dict[str, object]:
 
 def _result_document(
     result: EvaluationResult,
-    sensitive_values: tuple[str, ...],
 ) -> dict[str, object]:
     run = result.run
     return {
@@ -126,7 +127,9 @@ def _result_document(
                     if attempt.completed_at is not None
                     else None
                 ),
-                "error": _safe_text(attempt.error, sensitive_values),
+                "error_code": (
+                    "provider_error" if attempt.error is not None else None
+                ),
             }
             for attempt in result.all_runs
         ],
@@ -140,9 +143,7 @@ def _result_document(
             "output_tokens": result.usage.output_tokens,
             "cached_tokens": result.usage.cached_tokens,
         },
-        "errors": [
-            _safe_text(error, sensitive_values) for error in result.errors
-        ],
+        "error_count": len(result.errors),
         "metrics": {
             name: {
                 "median": aggregate.median,
@@ -155,14 +156,13 @@ def _result_document(
             for name, aggregate in sorted(result.metrics.items())
         },
         "cases": [
-            _case_document(case, sensitive_values) for case in result.cases
+            _case_document(case) for case in result.cases
         ],
     }
 
 
 def _case_document(
     case: NormalizedCase,
-    sensitive_values: tuple[str, ...],
 ) -> dict[str, object]:
     trajectory: dict[str, object] | None = None
     if case.trajectory is not None:
@@ -172,8 +172,7 @@ def _case_document(
             "tool_calls": [
                 {
                     "call_id": tool_call.call_id,
-                    "name": _safe_text(tool_call.name, sensitive_values),
-                    "status": _safe_text(tool_call.status, sensitive_values),
+                    "status_code": _tool_status_code(tool_call.status),
                     "duration_ms": tool_call.duration_ms,
                 }
                 for tool_call in case.trajectory.tool_calls
@@ -184,10 +183,10 @@ def _case_document(
         "case_hash": case.case_hash,
         "response_ids": list(case.response_ids),
         "duration_ms": case.duration_ms,
-        "reason": _case_reason(case, sensitive_values),
-        "error": _safe_text(case.error, sensitive_values),
+        "reason_code": _case_reason_code(case),
+        "error_code": "case_error" if case.error is not None else None,
         "scores": [
-            _score_document(score, sensitive_values) for score in case.scores
+            _score_document(score) for score in case.scores
         ],
         "usage": {
             "input_tokens": case.usage.input_tokens,
@@ -200,42 +199,73 @@ def _case_document(
 
 def _score_document(
     score: NormalizedCaseMetric,
-    sensitive_values: tuple[str, ...],
 ) -> dict[str, object]:
-    raw_score = score.raw_score
-    if isinstance(raw_score, str):
-        raw_score = _safe_text(raw_score, sensitive_values)
+    raw_score = (
+        score.raw_score
+        if isinstance(score.raw_score, (bool, int, float))
+        else None
+    )
     return {
         "metric": score.metric,
         "raw_score": raw_score,
+        "raw_score_code": _raw_score_code(score.raw_score),
         "normalized_score": score.normalized_score,
         "outcome": score.outcome.value,
-        "reason": _safe_text(score.reason, sensitive_values),
+        "reason_code": _outcome_reason_code(score.outcome),
     }
 
 
-def _case_reason(
-    case: NormalizedCase,
-    sensitive_values: tuple[str, ...],
-) -> str | None:
-    reasons = tuple(
-        score.reason for score in case.scores if score.reason is not None
-    )
-    if not reasons:
-        return None
-    return _safe_text(" | ".join(dict.fromkeys(reasons)), sensitive_values)
+def _case_reason_code(case: NormalizedCase) -> str:
+    outcomes = {score.outcome for score in case.scores}
+    if Outcome.FAIL in outcomes:
+        return "evaluator_fail"
+    if Outcome.UNDEFINED in outcomes:
+        return "evaluator_undefined"
+    return "evaluator_pass"
 
 
-def _safe_text(
-    value: str | None,
-    sensitive_values: tuple[str, ...],
-) -> str | None:
-    if value is None:
+def _outcome_reason_code(outcome: Outcome) -> str:
+    return f"evaluator_{outcome.value}"
+
+
+def _raw_score_code(value: object) -> str | None:
+    if not isinstance(value, str):
         return None
-    redacted = redact(value, sensitive_values)
-    if redacted is None:
-        return None
-    return redacted[:512]
+    normalized = value.strip().casefold()
+    return normalized if normalized in {"pass", "fail", "undefined"} else None
+
+
+def _tool_status_code(value: str) -> str:
+    normalized = value.strip().casefold()
+    if normalized in {
+        "queued",
+        "running",
+        "completed",
+        "succeeded",
+        "failed",
+        "cancelled",
+    }:
+        return normalized
+    return "unknown"
+
+
+def _decision_code(eligible: bool, reason: str) -> str:
+    if eligible:
+        return "eligible"
+    normalized = reason.casefold()
+    if "hard guardrail" in normalized:
+        return "hard_guardrail_failed"
+    if "undefined" in normalized:
+        return "required_metric_undefined"
+    if "incomplete" in normalized:
+        return "evaluation_incomplete"
+    if "dominated by the baseline" in normalized:
+        return "baseline_dominated"
+    if "dominated" in normalized:
+        return "candidate_dominated"
+    if "material improvement" in normalized:
+        return "no_material_improvement"
+    return "ineligible"
 
 
 def _safe_portal_url(value: str | None) -> str | None:

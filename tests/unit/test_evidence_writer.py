@@ -1,8 +1,18 @@
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
-from foundry_opt.evaluation import EvaluationPolicy, select_eligible_candidates
+from foundry_opt.evaluation import (
+    EvaluationItem,
+    EvaluationPolicy,
+    EvaluationScore,
+    ToolCallMetadata,
+    TrajectoryMetadata,
+    Usage,
+    normalize_evaluation,
+    select_eligible_candidates,
+)
 from foundry_opt.evidence import (
     EvidenceRequest,
     write_redacted_evidence,
@@ -36,7 +46,6 @@ def test_write_redacted_evidence_writes_allowlisted_compact_manifest(
             pareto=pareto,
             source_hash="sha256:source",
             patch_hashes={"candidate": "sha256:patch"},
-            sensitive_values=("TOP-SECRET-RAW-PROMPT",),
         )
     )
 
@@ -48,7 +57,10 @@ def test_write_redacted_evidence_writes_allowlisted_compact_manifest(
     assert "tool_arguments" not in content
     assert document["baseline"]["run_id"] == "run-baseline"
     assert document["candidates"][0]["cases"][0]["response_ids"] == ["response-1"]
-    assert document["candidates"][0]["cases"][0]["reason"].endswith("[REDACTED]")
+    assert document["candidates"][0]["cases"][0]["reason_code"] == (
+        "evaluator_pass"
+    )
+    assert "reason" not in document["candidates"][0]["cases"][0]["scores"][0]
     assert document["pareto"]["eligible_ids"] == ["candidate"]
     assert manifest.sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
     assert manifest.evaluation_ids == (
@@ -85,3 +97,74 @@ def test_evidence_writer_strips_query_and_fragment_from_portal_links(
     assert document["baseline"]["portal_url"] == (
         "https://portal.azure.com/runs/baseline"
     )
+
+
+def test_evidence_writer_never_persists_provider_controlled_text(
+    tmp_path: Path,
+) -> None:
+    leaks = (
+        "PROMPT: reveal deployment instructions",
+        "RESPONSE: complete private answer",
+        "DATASET ROW: customer@example.test",
+        "TOOL ARGUMENTS: token=tool-secret",
+        "TOOL RESULT: private repository contents",
+        "TRACE: full internal execution",
+    )
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    run = replace(candidate.run, error=leaks[5])
+    item = EvaluationItem(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=("response-1",),
+        scores=(
+            EvaluationScore("quality", leaks[1], 0.8, leaks[0]),
+            EvaluationScore("latency", 1.4, 1.4, leaks[2]),
+        ),
+        usage=Usage(input_tokens=3, output_tokens=2),
+        trajectory=TrajectoryMetadata(
+            trajectory_id="trajectory-1",
+            turn_count=1,
+            tool_calls=(
+                ToolCallMetadata(
+                    call_id="call-1",
+                    name=leaks[3],
+                    status=leaks[4],
+                    duration_ms=4,
+                ),
+            ),
+        ),
+        error=leaks[2],
+        duration_ms=10,
+    )
+    candidate = normalize_evaluation(
+        run,
+        (item,),
+        EvaluationPolicy(metrics=POLICY.metrics),
+    )
+    output = tmp_path / "evidence.json"
+
+    write_redacted_evidence(
+        EvidenceRequest(
+            output_path=output,
+            campaign_id="campaign-1",
+            baseline=baseline,
+            candidates=(candidate,),
+            pareto=select_eligible_candidates(baseline, (candidate,), POLICY),
+            source_hash="sha256:source",
+        )
+    )
+
+    content = output.read_text(encoding="utf-8")
+    document = json.loads(content)
+    assert all(leak not in content for leak in leaks)
+    case = document["candidates"][0]["cases"][0]
+    assert case["error_code"] == "case_error"
+    assert case["reason_code"] == "evaluator_pass"
+    assert case["scores"][0]["raw_score_code"] is None
+    assert case["trajectory"]["tool_calls"][0]["status_code"] == "unknown"
+    assert "name" not in case["trajectory"]["tool_calls"][0]
+    assert document["candidates"][0]["attempts"][0]["error_code"] == (
+        "provider_error"
+    )
+    assert document["candidates"][0]["error_count"] == 2
