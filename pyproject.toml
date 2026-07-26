@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "foundry-cloud-coding-agent"
+version = "0.1.0"
+description = "Optimize Microsoft Foundry coding agents with reviewable evidence."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "azure-ai-projects>=2.0.0",
+    "azure-identity>=1.23.0",
+    "pydantic>=2.11.0",
+    "pyyaml>=6.0.2",
+    "typer>=0.16.0",
+]
+
+[project.scripts]
+foundry-opt = "foundry_opt.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/foundry_opt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--basetemp=.pytest-tmp"
+markers = [
+    "acceptance: requires the dedicated private GitHub repository and disposable Foundry project",
+]
+
+[tool.uv]
+package = true
