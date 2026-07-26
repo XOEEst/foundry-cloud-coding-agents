@@ -122,7 +122,6 @@ def test_gateway_verifies_authenticated_admin_access_with_read_only_commands() -
     repository_root = Path("repository")
     runner = FakeCommandRunner(
         {
-            ("gh", "auth", "status"): _success(),
             ("gh", "api", "user", "--jq", ".login"): _success("octocat\n"),
             ("git", "remote", "get-url", "origin"): _success(
                 "git@github.com:octo-org/optimizer.git\n"
@@ -149,8 +148,6 @@ def test_gateway_verifies_authenticated_admin_access_with_read_only_commands() -
         detail="Authenticated as octocat; default branch: main",
     )
     assert runner.invocations == [
-        (("gh", "auth", "status"), repository_root),
-        (("gh", "api", "user", "--jq", ".login"), repository_root),
         (("git", "remote", "get-url", "origin"), repository_root),
         (
             (
@@ -163,22 +160,45 @@ def test_gateway_verifies_authenticated_admin_access_with_read_only_commands() -
             ),
             repository_root,
         ),
+        (("gh", "api", "user", "--jq", ".login"), repository_root),
     ]
 
 
-def test_gateway_maps_authentication_failure_without_exposing_diagnostics() -> None:
-    command = ("gh", "auth", "status")
+def test_runtime_gateway_accepts_repository_scoped_installation_token() -> None:
+    user_command = ("gh", "api", "user", "--jq", ".login")
     runner = FakeCommandRunner(
         {
-            command: _exit(command, "token secret-token was rejected"),
+            ("git", "remote", "get-url", "origin"): _success(
+                "https://github.com/octo-org/optimizer.git\n"
+            ),
+            (
+                "gh",
+                "repo",
+                "view",
+                "octo-org/optimizer",
+                "--json",
+                "nameWithOwner,viewerPermission,defaultBranchRef",
+            ): _success(
+                '{"nameWithOwner":"octo-org/optimizer",'
+                '"viewerPermission":"READ",'
+                '"defaultBranchRef":{"name":"main"}}'
+            ),
+            user_command: _exit(
+                user_command,
+                "Resource not accessible by integration",
+            ),
         }
     )
 
-    with pytest.raises(GitHubAuthenticationError) as error:
-        GhGitHubGateway(runner).verify_access(Path("repository"))
+    result = GhGitHubGateway(
+        runner,
+        require_admin=False,
+    ).verify_access(Path("repository"))
 
-    assert str(error.value) == "GitHub CLI authentication failed"
-    assert "secret-token" not in str(error.value)
+    assert result == GatewayResult(
+        summary="GitHub access verified for octo-org/optimizer",
+        detail="Default branch: main",
+    )
 
 
 def test_gateway_maps_unreachable_repository() -> None:
@@ -192,8 +212,6 @@ def test_gateway_maps_unreachable_repository() -> None:
     )
     runner = FakeCommandRunner(
         {
-            ("gh", "auth", "status"): _success(),
-            ("gh", "api", "user", "--jq", ".login"): _success("octocat\n"),
             ("git", "remote", "get-url", "origin"): _success(
                 "https://github.com/octo-org/optimizer.git\n"
             ),
@@ -208,8 +226,6 @@ def test_gateway_maps_unreachable_repository() -> None:
 def test_gateway_requires_admin_permission() -> None:
     runner = FakeCommandRunner(
         {
-            ("gh", "auth", "status"): _success(),
-            ("gh", "api", "user", "--jq", ".login"): _success("octocat\n"),
             ("git", "remote", "get-url", "origin"): _success(
                 "https://github.com/octo-org/optimizer.git\n"
             ),
@@ -237,8 +253,6 @@ def test_gateway_requires_admin_permission() -> None:
 def test_gateway_rejects_repository_metadata_that_does_not_match_origin() -> None:
     runner = FakeCommandRunner(
         {
-            ("gh", "auth", "status"): _success(),
-            ("gh", "api", "user", "--jq", ".login"): _success("octocat\n"),
             ("git", "remote", "get-url", "origin"): _success(
                 "https://github.com/octo-org/optimizer.git\n"
             ),
@@ -293,8 +307,6 @@ def test_gateway_matches_repository_metadata_case_insensitively() -> None:
 def test_gateway_rejects_malformed_repository_metadata() -> None:
     runner = FakeCommandRunner(
         {
-            ("gh", "auth", "status"): _success(),
-            ("gh", "api", "user", "--jq", ".login"): _success("octocat\n"),
             ("git", "remote", "get-url", "origin"): _success(
                 "https://github.com/octo-org/optimizer.git\n"
             ),

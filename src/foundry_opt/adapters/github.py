@@ -59,24 +59,32 @@ class GitHubRepositoryMetadata:
 
 
 class GhGitHubGateway(GitHubGateway):
-    def __init__(self, command_runner: CommandRunner) -> None:
+    def __init__(
+        self,
+        command_runner: CommandRunner,
+        *,
+        require_admin: bool = True,
+    ) -> None:
         self._command_runner = command_runner
+        self._require_admin = require_admin
 
     def verify_access(self, repository_root: Path) -> GatewayResult:
-        self._verify_authentication(repository_root)
-        login = self._authenticated_login(repository_root)
         metadata = self.repository_metadata(repository_root)
 
         permission = metadata.viewer_permission
-        if permission.casefold() != "admin":
+        if self._require_admin and permission.casefold() != "admin":
             raise GitHubPermissionError(permission)
 
-        return GatewayResult(
-            summary=f"GitHub access verified for {metadata.repository}",
-            detail=(
+        login = self._authenticated_login(repository_root)
+        detail = f"Default branch: {metadata.default_branch}"
+        if login is not None:
+            detail = (
                 f"Authenticated as {login}; default branch: "
                 f"{metadata.default_branch}"
-            ),
+            )
+        return GatewayResult(
+            summary=f"GitHub access verified for {metadata.repository}",
+            detail=detail,
         )
 
     def repository_metadata(
@@ -91,26 +99,15 @@ class GhGitHubGateway(GitHubGateway):
             viewer_permission=metadata["viewerPermission"],
         )
 
-    def _verify_authentication(self, repository_root: Path) -> None:
-        try:
-            self._command_runner.run(
-                ["gh", "auth", "status"],
-                cwd=repository_root,
-            )
-        except CommandError as error:
-            raise GitHubAuthenticationError() from error
-
-    def _authenticated_login(self, repository_root: Path) -> str:
+    def _authenticated_login(self, repository_root: Path) -> str | None:
         try:
             login = self._command_runner.run(
                 ["gh", "api", "user", "--jq", ".login"],
                 cwd=repository_root,
             ).stdout.strip()
-        except CommandError as error:
-            raise GitHubAuthenticationError() from error
-        if not login:
-            raise GitHubAuthenticationError()
-        return login
+        except CommandError:
+            return None
+        return login or None
 
     def _origin_repository(self, repository_root: Path) -> str:
         try:

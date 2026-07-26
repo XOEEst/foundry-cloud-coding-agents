@@ -220,7 +220,10 @@ def build_production_preflight_runner(
 ) -> PreflightRunner:
     command_runner = command_runner or SubprocessCommandRunner()
     environment = environment or OsEnvironmentReader()
-    github_gateway = github_gateway or GhGitHubGateway(command_runner)
+    github_gateway = github_gateway or GhGitHubGateway(
+        command_runner,
+        require_admin=False,
+    )
     selection_check = TargetSelectionCheck(config, request)
     if selection_check.run(request).status is CheckStatus.FAIL:
         return PreflightRunner((selection_check,))
