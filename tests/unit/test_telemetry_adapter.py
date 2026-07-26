@@ -6,22 +6,14 @@ from foundry_opt.adapters.telemetry import (
     ApplicationInsightsTelemetry,
     TelemetryBoundsError,
     TelemetryQueryRequest,
+    TelemetrySchemaError,
 )
 
 
 class FakeKqlTransport:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object], int]] = []
-
-    def query(
-        self,
-        query: str,
-        parameters: dict[str, object],
-        *,
-        timeout_seconds: int,
-    ) -> list[dict[str, object]]:
-        self.calls.append((query, parameters, timeout_seconds))
-        return [
+        self.rows: list[dict[str, object]] = [
             {
                 "response_id": "response-1",
                 "request_count": 2,
@@ -32,6 +24,16 @@ class FakeKqlTransport:
                 "raw_trace": "must remain transient",
             }
         ]
+
+    def query(
+        self,
+        query: str,
+        parameters: dict[str, object],
+        *,
+        timeout_seconds: int,
+    ) -> list[dict[str, object]]:
+        self.calls.append((query, parameters, timeout_seconds))
+        return self.rows
 
 
 def _request(**overrides: object) -> TelemetryQueryRequest:
@@ -82,3 +84,25 @@ def test_telemetry_query_rejects_requests_outside_fixed_bounds(
 ) -> None:
     with pytest.raises(TelemetryBoundsError):
         _request(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("duration_ms", float("nan")),
+        ("duration_ms", float("inf")),
+        ("duration_ms", float("-inf")),
+        ("success_rate", float("nan")),
+        ("success_rate", float("inf")),
+        ("success_rate", float("-inf")),
+    ],
+)
+def test_telemetry_parser_rejects_non_finite_float_aggregates(
+    field: str,
+    value: float,
+) -> None:
+    transport = FakeKqlTransport()
+    transport.rows[0][field] = value
+
+    with pytest.raises(TelemetrySchemaError):
+        ApplicationInsightsTelemetry(transport).enrich(_request())

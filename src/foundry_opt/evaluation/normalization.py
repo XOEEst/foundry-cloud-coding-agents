@@ -12,6 +12,7 @@ from foundry_opt.evaluation.models import (
     NormalizedCase,
     NormalizedCaseMetric,
     Outcome,
+    UndefinedBehavior,
     Usage,
 )
 
@@ -44,8 +45,9 @@ def normalize_evaluation(
         and bool(normalized_cases)
         and not errors
         and all(
-            aggregate.outcome is not Outcome.UNDEFINED
-            for aggregate in aggregates.values()
+            metric.undefined_behavior is UndefinedBehavior.IGNORE
+            or aggregates[metric.name].outcome is not Outcome.UNDEFINED
+            for metric in resolved_policy.metrics
         )
     )
     needs_repeat = (

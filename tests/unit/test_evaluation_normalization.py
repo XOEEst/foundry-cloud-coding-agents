@@ -16,6 +16,7 @@ from foundry_opt.evaluation import (
     MetricPolicy,
     Outcome,
     TrajectoryMetadata,
+    UndefinedBehavior,
     Usage,
     normalize_evaluation,
 )
@@ -143,3 +144,37 @@ def test_metric_policy_rejects_negative_materiality() -> None:
             threshold=0.75,
             materiality=-0.01,
         )
+
+
+def test_ignored_undefined_metric_does_not_make_completed_run_incomplete() -> None:
+    policy = EvaluationPolicy(
+        metrics=(
+            MetricPolicy(
+                name="quality",
+                direction=MetricDirection.MAXIMIZE,
+                threshold=0.75,
+                materiality=0.05,
+            ),
+            MetricPolicy(
+                name="optional_style",
+                direction=MetricDirection.MAXIMIZE,
+                threshold=0.5,
+                materiality=0.05,
+                undefined_behavior=UndefinedBehavior.IGNORE,
+            ),
+        )
+    )
+    item = EvaluationItem(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=("response-1",),
+        scores=(EvaluationScore("quality", 4, 0.8, "correct"),),
+        usage=Usage(),
+        duration_ms=10,
+    )
+
+    result = normalize_evaluation(_run(), (item,), policy)
+
+    assert result.metrics["optional_style"].outcome is Outcome.UNDEFINED
+    assert result.complete is True
+    assert result.needs_repeat is False

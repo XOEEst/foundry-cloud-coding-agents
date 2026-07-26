@@ -12,6 +12,7 @@ from foundry_opt.evaluation.models import (
     FunnelStageResult,
     MetricAggregate,
     Outcome,
+    UndefinedBehavior,
     Usage,
 )
 from foundry_opt.evaluation.selection import select_eligible_candidates
@@ -160,8 +161,9 @@ def _combine_attempts(
         errors=first.errors + second.errors,
         complete=second.complete
         and all(
-            aggregate.outcome is not Outcome.UNDEFINED
-            for aggregate in aggregates.values()
+            metric.undefined_behavior is UndefinedBehavior.IGNORE
+            or aggregates[metric.name].outcome is not Outcome.UNDEFINED
+            for metric in policy.metrics
         ),
         needs_repeat=False,
         attempts=2,

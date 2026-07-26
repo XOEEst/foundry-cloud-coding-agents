@@ -1,6 +1,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from math import isfinite
 from typing import Protocol
 
 
@@ -129,12 +130,19 @@ def _parse_aggregate(row: Mapping[str, object]) -> TelemetryAggregate:
             request_count=int(row["request_count"]),
             dependency_count=int(row["dependency_count"]),
             exception_count=int(row["exception_count"]),
-            duration_ms=float(row["duration_ms"]),
+            duration_ms=_finite_float(row["duration_ms"]),
             success_rate=(
-                None if success_rate is None else float(success_rate)
+                None if success_rate is None else _finite_float(success_rate)
             ),
         )
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, OverflowError, TypeError, ValueError) as error:
         raise TelemetrySchemaError(
             "Telemetry response did not match the aggregate schema."
         ) from error
+
+
+def _finite_float(value: object) -> float:
+    parsed = float(value)
+    if not isfinite(parsed):
+        raise ValueError("Telemetry aggregate floats must be finite.")
+    return parsed

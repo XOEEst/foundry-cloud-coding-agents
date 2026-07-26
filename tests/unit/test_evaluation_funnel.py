@@ -7,7 +7,10 @@ from foundry_opt.evaluation import (
     EvaluationSubject,
     FunnelResult,
     MetricDirection,
+    MetricAggregate,
     MetricPolicy,
+    Outcome,
+    UndefinedBehavior,
     run_evaluation_funnel,
 )
 
@@ -128,4 +131,74 @@ def test_funnel_can_recover_when_partial_first_attempt_repeats_cleanly() -> None
     recovered = result.development.results["candidate"]
     assert recovered.complete is True
     assert recovered.attempts == 2
+    assert result.validation.pareto.eligible_ids == ("candidate",)
+
+
+def test_repeat_combination_ignores_configured_undefined_metric() -> None:
+    policy = EvaluationPolicy(
+        metrics=(
+            MetricPolicy(
+                "quality",
+                MetricDirection.MAXIMIZE,
+                threshold=0.6,
+                materiality=0.05,
+            ),
+            MetricPolicy(
+                "latency",
+                MetricDirection.MINIMIZE,
+                threshold=2.0,
+                materiality=0.2,
+                hard_guardrail=True,
+            ),
+            MetricPolicy(
+                "optional_style",
+                MetricDirection.MAXIMIZE,
+                threshold=0.5,
+                materiality=0.05,
+                undefined_behavior=UndefinedBehavior.IGNORE,
+            ),
+        )
+    )
+    request = EvaluationFunnelRequest(
+        baseline=EvaluationSubject("baseline"),
+        candidates=(EvaluationSubject("candidate"),),
+        policy=policy,
+    )
+
+    def evaluate(
+        subject: EvaluationSubject,
+        split: DatasetSplit,
+        attempt: int,
+    ):
+        quality = 0.70 if subject.subject_id == "baseline" else 0.80
+        result = _result(subject.subject_id, quality, 1.4)
+        result = replace(
+            result,
+            run=replace(result.run, split=split),
+            metrics={
+                **result.metrics,
+                "optional_style": MetricAggregate(
+                    "optional_style",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Outcome.UNDEFINED,
+                    0,
+                ),
+            },
+        )
+        if (
+            subject.subject_id == "candidate"
+            and split is DatasetSplit.DEVELOPMENT
+            and attempt == 1
+        ):
+            return replace(result, needs_repeat=True)
+        return result
+
+    result = run_evaluation_funnel(request, evaluate)
+
+    combined = result.development.results["candidate"]
+    assert combined.attempts == 2
+    assert combined.complete is True
     assert result.validation.pareto.eligible_ids == ("candidate",)
