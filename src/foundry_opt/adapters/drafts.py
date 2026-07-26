@@ -89,7 +89,7 @@ class DraftGateway:
         self._probe_records: dict[int, tuple[DraftRecord, str, bytes]] = {}
 
     def create_draft(self, request: DraftRequest) -> DraftRecord:
-        _verify_local_bundle(
+        bundle_bytes = _verify_local_bundle(
             request.bundle.path,
             request.bundle.sha256,
             request.bundle.byte_size,
@@ -135,7 +135,7 @@ class DraftGateway:
                         "code",
                         (
                             request.bundle.path.name,
-                            request.bundle.path.read_bytes(),
+                            bundle_bytes,
                             "application/zip",
                         ),
                     ),
@@ -381,7 +381,7 @@ def _verify_local_bundle(
     path: Path,
     expected_sha256: str,
     expected_size: int,
-) -> None:
+) -> bytes:
     try:
         content = path.read_bytes()
     except OSError as error:
@@ -393,6 +393,7 @@ def _verify_local_bundle(
     digest = hashlib.sha256(content).hexdigest()
     if digest.casefold() != expected_sha256.casefold():
         raise DraftHashMismatchError()
+    return content
 
 
 def _probe_signature(record: DraftRecord, token: str) -> bytes:

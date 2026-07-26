@@ -68,6 +68,22 @@ class FakeProjectClient:
         self.closed = True
 
 
+class MutatingProjectClient(FakeProjectClient):
+    def __init__(
+        self,
+        responses: list[FakeResponse],
+        mutate_after_baseline: Any,
+    ) -> None:
+        super().__init__(responses)
+        self.mutate_after_baseline = mutate_after_baseline
+
+    def send_request(self, request: Any, **kwargs: Any) -> FakeResponse:
+        response = super().send_request(request, **kwargs)
+        if len(self.requests) == 1:
+            self.mutate_after_baseline()
+        return response
+
+
 def _bundle(tmp_path: Path, binary: bytes = b"print('ok')\n"):
     repository = tmp_path / "repo"
     repository.mkdir()
@@ -306,6 +322,29 @@ def test_create_draft_rejects_locally_tampered_zip_before_api_call(
         gateway.create_draft(request)
 
     assert client.requests == []
+
+
+def test_create_draft_uploads_exact_pre_baseline_verified_snapshot(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    verified_bytes = request.bundle.path.read_bytes()
+    replacement = BytesIO()
+    with zipfile.ZipFile(replacement, "w") as archive:
+        archive.writestr("main.py", b"raced replacement")
+
+    client = MutatingProjectClient(
+        [_baseline(), _draft(request.bundle.sha256)],
+        lambda: request.bundle.path.write_bytes(replacement.getvalue()),
+    )
+    gateway, _ = _gateway(client)
+
+    gateway.create_draft(request)
+
+    create_call = client.requests[1]
+    uploaded = _multipart_part(create_call, "code")[1]
+    assert uploaded == verified_bytes
+    assert uploaded != request.bundle.path.read_bytes()
 
 
 def test_create_draft_requires_positive_published_base_version(

@@ -84,7 +84,7 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
     manifest_path = output.with_name(f"{output.name}.manifest.json")
     generated_paths = {output, manifest_path, output.with_suffix(f"{output.suffix}.partial")}
 
-    included: list[tuple[str, Path]] = []
+    included: list[tuple[str, bytes]] = []
     excluded: list[ExcludedFile] = []
     for archive_path, source_path in _source_files(root, excluded):
         mandatory_reason = _mandatory_exclusion(archive_path)
@@ -93,7 +93,7 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
                 ExcludedFile(archive_path, f"mandatory: {mandatory_reason}")
             )
             continue
-        resolved = _contained_file(source_path, root)
+        resolved, content = _snapshot_contained_file(source_path, root)
         if resolved in generated_paths:
             excluded.append(ExcludedFile(archive_path, "generated bundle output"))
             continue
@@ -112,7 +112,7 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
         if _first_match(archive_path, request.include) is None:
             excluded.append(ExcludedFile(archive_path, "not included"))
             continue
-        included.append((archive_path, resolved))
+        included.append((archive_path, content))
 
     included.sort(key=lambda item: item[0])
     excluded.sort(key=lambda item: item.path)
@@ -125,7 +125,7 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
             compression=zipfile.ZIP_DEFLATED,
             compresslevel=9,
         ) as archive:
-            for archive_path, source_path in included:
+            for archive_path, content in included:
                 info = zipfile.ZipInfo(archive_path, _FIXED_TIMESTAMP)
                 info.create_system = 3
                 info.compress_type = zipfile.ZIP_DEFLATED
@@ -133,7 +133,7 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
                     stat.S_IFREG | stat.S_IRUSR | stat.S_IWUSR
                     | stat.S_IRGRP | stat.S_IROTH
                 ) << 16
-                archive.writestr(info, source_path.read_bytes(), compresslevel=9)
+                archive.writestr(info, content, compresslevel=9)
         partial.replace(output)
     finally:
         partial.unlink(missing_ok=True)
@@ -188,16 +188,49 @@ def _source_files(root: Path, excluded: list[ExcludedFile]):
             yield relative.as_posix(), candidate
 
 
-def _contained_file(path: Path, root: Path) -> Path:
-    if path.is_symlink():
-        raise UnsafeSourcePathError(path)
+def _snapshot_contained_file(path: Path, root: Path) -> tuple[Path, bytes]:
     try:
+        before = os.stat(path, follow_symlinks=False)
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise UnsafeSourcePathError(path) from error
-    if not resolved.is_relative_to(root) or not resolved.is_file():
+    if not stat.S_ISREG(before.st_mode) or not resolved.is_relative_to(root):
         raise UnsafeSourcePathError(path)
-    return resolved
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise UnsafeSourcePathError(path) from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _file_identity(before) != _file_identity(opened)
+            or _file_state(before) != _file_state(opened)
+        ):
+            raise UnsafeSourcePathError(path)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _file_state(opened) != _file_state(after):
+            raise UnsafeSourcePathError(path)
+        return resolved, b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _file_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def _file_state(value: os.stat_result) -> tuple[int, int]:
+    return value.st_size, value.st_mtime_ns
 
 
 def _mandatory_exclusion(archive_path: str) -> str | None:

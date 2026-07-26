@@ -74,7 +74,15 @@ def run_validation(
         commands = _discover_commands(root)
         discovered = bool(commands)
         if not commands:
-            commands = _fallback_commands(root, request.entry_point)
+            commands = _fallback_commands(
+                root,
+                include_inferred_entry_checks=not request.entry_point,
+            )
+    if request.entry_point:
+        commands = (
+            *commands,
+            *_entry_point_checks(root, sys.executable, request.entry_point),
+        )
 
     results: list[ValidationResult] = []
     for validation_command in commands:
@@ -304,7 +312,8 @@ def _command_kind(command: tuple[str, ...]) -> str | None:
 
 def _fallback_commands(
     root: Path,
-    entry_point: tuple[str, ...],
+    *,
+    include_inferred_entry_checks: bool,
 ) -> tuple[ValidationCommand, ...]:
     executable = sys.executable
     commands: list[ValidationCommand] = []
@@ -318,7 +327,7 @@ def _fallback_commands(
     commands.append(ValidationCommand((executable, "-c", syntax_check), root))
 
     pyproject = _read_toml(root / "pyproject.toml")
-    imports = _import_names(root)
+    imports = _import_names(root) if include_inferred_entry_checks else ()
     for import_name in imports:
         prefix = "import sys;sys.path.insert(0,'src');" if (
             root / "src"
@@ -352,17 +361,13 @@ def _fallback_commands(
         )
         commands.append(ValidationCommand((executable, "-c", package_check), root))
 
-    if entry_point:
-        commands.append(_entry_point_smoke(root, executable, entry_point))
-        return tuple(commands)
-
     scripts = (
         pyproject.get("project", {}).get("scripts", {})
         if isinstance(pyproject, dict)
         else {}
     )
     startup_added = False
-    if isinstance(scripts, dict):
+    if include_inferred_entry_checks and isinstance(scripts, dict):
         for name, target in sorted(scripts.items()):
             if not isinstance(target, str) or ":" not in target:
                 continue
@@ -388,7 +393,7 @@ def _fallback_commands(
             )
             commands.append(ValidationCommand((executable, "-c", smoke), root))
             startup_added = True
-    if not startup_added and imports:
+    if include_inferred_entry_checks and not startup_added and imports:
         module = imports[0]
         path_setup = (
             "import sys;sys.dont_write_bytecode=True;"
@@ -411,11 +416,11 @@ def _fallback_commands(
     return tuple(commands)
 
 
-def _entry_point_smoke(
+def _entry_point_checks(
     root: Path,
     executable: str,
     entry_point: tuple[str, ...],
-) -> ValidationCommand:
+) -> tuple[ValidationCommand, ValidationCommand]:
     arguments = list(entry_point)
     if not arguments or any(not argument for argument in arguments):
         raise ValueError("entry_point must not be empty")
@@ -431,14 +436,55 @@ def _entry_point_smoke(
                 resolved = (root / source).resolve()
             if not resolved.is_relative_to(root) or not resolved.is_file():
                 raise ValueError("entry_point source escapes repository")
-    smoke = (
+    import_inner = _entry_point_import(arguments, root)
+    import_check = (
+        "import os,subprocess;"
+        f"subprocess.run([{executable!r},'-c',{import_inner!r}],"
+        "check=True,timeout=10,"
+        "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+        "env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})"
+    )
+    startup_check = (
         "import os,subprocess;"
         f"subprocess.run({arguments!r}+['--help'],"
         "check=True,timeout=10,"
         "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
         "env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'})"
     )
-    return ValidationCommand((executable, "-c", smoke), root)
+    return (
+        ValidationCommand((executable, "-c", import_check), root),
+        ValidationCommand((executable, "-c", startup_check), root),
+    )
+
+
+def _entry_point_import(arguments: list[str], root: Path) -> str:
+    for argument in arguments[1:]:
+        if argument.casefold().endswith(".py"):
+            source = Path(argument)
+            resolved = source.resolve() if source.is_absolute() else (
+                root / source
+            ).resolve()
+            return (
+                "import importlib.util,pathlib;"
+                f"path=pathlib.Path({str(resolved)!r});"
+                "spec=importlib.util.spec_from_file_location("
+                "'_foundry_opt_entrypoint',path);"
+                "assert spec is not None and spec.loader is not None;"
+                "module=importlib.util.module_from_spec(spec);"
+                "spec.loader.exec_module(module)"
+            )
+    if "-m" in arguments:
+        index = arguments.index("-m")
+        if index + 1 < len(arguments):
+            return (
+                "import importlib;"
+                f"importlib.import_module({arguments[index + 1]!r})"
+            )
+    return (
+        "import pathlib,shutil;"
+        f"command={arguments[0]!r};"
+        "assert pathlib.Path(command).exists() or shutil.which(command)"
+    )
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

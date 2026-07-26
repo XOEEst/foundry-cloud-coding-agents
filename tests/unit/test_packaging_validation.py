@@ -254,7 +254,7 @@ def test_run_validation_uses_configured_entry_point_and_flat_module(
 
     rendered = [" ".join(command) for command, _ in runner.calls]
     assert report.discovered is False
-    assert any("import main" in command for command in rendered)
+    assert any("importlib" in command and "main.py" in command for command in rendered)
     assert any(
         "main.py" in command and "subprocess.run" in command
         for command in rendered
@@ -352,3 +352,61 @@ def test_run_validation_accepts_explicit_validation_command_directory(
     assert runner.calls == [
         (("python", "-m", "pytest"), service.resolve())
     ]
+
+
+def test_run_validation_appends_configured_entry_checks_to_explicit_commands(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / "main.py").write_text(
+        "def main():\n    return None\n",
+        encoding="utf-8",
+    )
+    runner = RecordingRunner()
+
+    run_validation(
+        ValidationRequest(
+            repository,
+            commands=(("python", "-m", "pytest"),),
+            entry_point=("python", "main.py"),
+        ),
+        runner,
+    )
+
+    rendered = [" ".join(command) for command, _ in runner.calls]
+    assert rendered[0] == "python -m pytest"
+    assert len(rendered) == 3
+    assert "importlib" in rendered[1]
+    assert "main.py" in rendered[2]
+
+
+def test_run_validation_appends_configured_entry_checks_to_discovered_commands(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    workflow = repository / ".github" / "workflows"
+    workflow.mkdir(parents=True)
+    (repository / "main.py").write_text(
+        "def main():\n    return None\n",
+        encoding="utf-8",
+    )
+    (workflow / "ci.yml").write_text(
+        "jobs:\n  test:\n    steps:\n      - run: uv run pytest\n",
+        encoding="utf-8",
+    )
+    runner = RecordingRunner()
+
+    run_validation(
+        ValidationRequest(
+            repository,
+            entry_point=("python", "main.py"),
+        ),
+        runner,
+    )
+
+    rendered = [" ".join(command) for command, _ in runner.calls]
+    assert rendered[0] == "uv run pytest"
+    assert len(rendered) == 3
+    assert "importlib" in rendered[1]
+    assert "main.py" in rendered[2]

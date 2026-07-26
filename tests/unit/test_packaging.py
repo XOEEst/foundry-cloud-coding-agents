@@ -157,6 +157,37 @@ def test_build_source_bundle_rejects_symlinks(tmp_path: Path) -> None:
         build_source_bundle(BundleRequest(repository, tmp_path / "bundle.zip"))
 
 
+def test_build_source_bundle_uses_validated_file_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    source = repository / "main.py"
+    source.write_bytes(b"validated-source")
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(b"raced-outside-source")
+    original_read_bytes = Path.read_bytes
+
+    def replace_before_reopen(path: Path) -> bytes:
+        if path == source:
+            path.unlink()
+            try:
+                path.symlink_to(outside)
+            except OSError:
+                path.write_bytes(outside.read_bytes())
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", replace_before_reopen)
+
+    artifact = build_source_bundle(
+        BundleRequest(repository, tmp_path / "bundle.zip")
+    )
+
+    with zipfile.ZipFile(artifact.path) as archive:
+        assert archive.read("main.py") == b"validated-source"
+
+
 def test_build_source_bundle_prunes_excluded_symlink_directories(
     tmp_path: Path,
 ) -> None:
