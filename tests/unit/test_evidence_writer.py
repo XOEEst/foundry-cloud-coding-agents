@@ -7,6 +7,7 @@ import pytest
 
 from foundry_opt.evaluation import (
     CandidateDecision,
+    DatasetSplit,
     EvaluationItem,
     EvaluationPolicy,
     EvaluationScore,
@@ -613,3 +614,46 @@ def test_evidence_writer_rejects_symlink_destination(tmp_path: Path) -> None:
         )
 
     assert target.read_text(encoding="utf-8") == "external-content"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda run: replace(run, subject_id="foreign-subject"),
+        lambda run: replace(
+            run,
+            agent=replace(run.agent, draft_id="foreign-draft"),
+        ),
+        lambda run: replace(
+            run,
+            dataset=replace(run.dataset, version="foreign-version"),
+        ),
+        lambda run: replace(
+            run,
+            evaluator=replace(run.evaluator, version="foreign-version"),
+        ),
+        lambda run: replace(run, split=DatasetSplit.DEVELOPMENT),
+    ],
+)
+def test_evidence_writer_rejects_foreign_attempt_run_lineage(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    baseline = replace(
+        baseline,
+        attempt_runs=(mutate(baseline.run),),
+    )
+
+    with pytest.raises(ValueError, match="lineage"):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=tmp_path / "evidence.json",
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(),
+                pareto=select_eligible_candidates(baseline, (), POLICY),
+                metric_policies=POLICY,
+                source_hash="sha256:source",
+            )
+        )

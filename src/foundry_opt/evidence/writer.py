@@ -456,6 +456,16 @@ def _validate_result_identifiers(result: EvaluationResult) -> None:
     ):
         _require_identifier(value, field)
     for attempt in result.all_runs:
+        if (
+            attempt.subject_id != run.subject_id
+            or attempt.agent != run.agent
+            or attempt.dataset != run.dataset
+            or attempt.evaluator != run.evaluator
+            or attempt.split is not run.split
+        ):
+            raise ValueError(
+                "Evidence attempt run lineage differs from its parent result."
+            )
         _require_identifier(attempt.run_id, "attempt run_id")
         _require_identifier(
             attempt.evaluation_id,

@@ -316,7 +316,7 @@ class ParetoResult:
 @dataclass(frozen=True)
 class EvaluationSubject:
     subject_id: str
-    agent: AgentVersionRef | None = None
+    agent: AgentVersionRef
 
 
 @dataclass(frozen=True)

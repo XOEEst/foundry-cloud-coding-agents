@@ -3,6 +3,7 @@ from dataclasses import replace
 import pytest
 
 from foundry_opt.evaluation import (
+    AgentVersionRef,
     DatasetSplit,
     EvaluationFunnelRequest,
     EvaluationPolicy,
@@ -18,6 +19,13 @@ from foundry_opt.evaluation import (
 )
 
 from test_evaluation_selection import _result
+
+
+def _subject(subject_id: str) -> EvaluationSubject:
+    return EvaluationSubject(
+        subject_id,
+        AgentVersionRef("agent-1", f"draft-{subject_id}", "1"),
+    )
 
 
 def test_funnel_repeats_noisy_results_once_and_validates_only_development_winners() -> None:
@@ -40,10 +48,10 @@ def test_funnel_repeats_noisy_results_once_and_validates_only_development_winner
         noisy_spread=0.2,
     )
     request = EvaluationFunnelRequest(
-        baseline=EvaluationSubject("baseline"),
+        baseline=_subject("baseline"),
         candidates=(
-            EvaluationSubject("winner"),
-            EvaluationSubject("rejected"),
+            _subject("winner"),
+            _subject("rejected"),
         ),
         policy=policy,
     )
@@ -107,8 +115,8 @@ def test_funnel_can_recover_when_partial_first_attempt_repeats_cleanly() -> None
         )
     )
     request = EvaluationFunnelRequest(
-        baseline=EvaluationSubject("baseline"),
-        candidates=(EvaluationSubject("candidate"),),
+        baseline=_subject("baseline"),
+        candidates=(_subject("candidate"),),
         policy=policy,
     )
 
@@ -163,8 +171,8 @@ def test_repeat_combination_ignores_configured_undefined_metric() -> None:
         )
     )
     request = EvaluationFunnelRequest(
-        baseline=EvaluationSubject("baseline"),
-        candidates=(EvaluationSubject("candidate"),),
+        baseline=_subject("baseline"),
+        candidates=(_subject("candidate"),),
         policy=policy,
     )
 
@@ -210,8 +218,8 @@ def test_repeat_combination_ignores_configured_undefined_metric() -> None:
 @pytest.mark.parametrize(
     "candidates",
     [
-        (EvaluationSubject("baseline"),),
-        (EvaluationSubject("candidate"), EvaluationSubject("candidate")),
+        (_subject("baseline"),),
+        (_subject("candidate"), _subject("candidate")),
     ],
 )
 def test_funnel_request_rejects_duplicate_subject_ids(
@@ -230,7 +238,7 @@ def test_funnel_request_rejects_duplicate_subject_ids(
 
     with pytest.raises(ValueError, match="subject"):
         EvaluationFunnelRequest(
-            baseline=EvaluationSubject("baseline"),
+            baseline=_subject("baseline"),
             candidates=candidates,
             policy=policy,
         )
@@ -248,8 +256,8 @@ def test_partial_attempt_metrics_do_not_influence_retry_eligibility() -> None:
         )
     )
     request = EvaluationFunnelRequest(
-        baseline=EvaluationSubject("baseline"),
-        candidates=(EvaluationSubject("candidate"),),
+        baseline=_subject("baseline"),
+        candidates=(_subject("candidate"),),
         policy=policy,
     )
     calls: list[tuple[str, DatasetSplit, int]] = []
@@ -305,3 +313,61 @@ def test_partial_attempt_metrics_do_not_influence_retry_eligibility() -> None:
     assert combined.complete is True
     assert result.development.pareto.eligible_ids == ()
     assert ("candidate", DatasetSplit.VALIDATION, 1) not in calls
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda result: replace(
+            result,
+            run=replace(result.run, subject_id="stale-subject"),
+        ),
+        lambda result: replace(
+            result,
+            run=replace(
+                result.run,
+                agent=AgentVersionRef("agent-1", "stale-draft", "1"),
+            ),
+        ),
+        lambda result: replace(
+            result,
+            run=replace(result.run, split=DatasetSplit.VALIDATION),
+        ),
+    ],
+)
+def test_funnel_rejects_attempts_outside_requested_subject_lineage(
+    mutate,
+) -> None:
+    expected_agent = AgentVersionRef("agent-1", "draft-baseline", "1")
+    request = EvaluationFunnelRequest(
+        baseline=EvaluationSubject("baseline", expected_agent),
+        candidates=(),
+        policy=EvaluationPolicy(
+            metrics=(
+                MetricPolicy(
+                    "quality",
+                    MetricDirection.MAXIMIZE,
+                    threshold=0.6,
+                    materiality=0.05,
+                ),
+                MetricPolicy(
+                    "latency",
+                    MetricDirection.MINIMIZE,
+                    threshold=2.0,
+                    materiality=0.2,
+                ),
+            )
+        ),
+    )
+
+    def evaluate(
+        subject: EvaluationSubject,
+        split: DatasetSplit,
+        attempt: int,
+    ):
+        result = _result(subject.subject_id, quality=0.70, latency=1.5)
+        result = replace(result, run=replace(result.run, split=split))
+        return mutate(result)
+
+    with pytest.raises(ValueError, match="lineage"):
+        run_evaluation_funnel(request, evaluate)
