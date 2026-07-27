@@ -190,7 +190,14 @@ def _gateway(
 
 
 def _multipart_part(request: Any, name: str) -> tuple[Any, ...]:
-    return dict(request._files)[name]
+    content_type = request.headers["Content-Type"]
+    boundary = content_type.split("boundary=", 1)[1].encode()
+    for part in request.content.split(b"--" + boundary):
+        if f'name="{name}"'.encode() not in part:
+            continue
+        _, content = part.split(b"\r\n\r\n", 1)
+        return (None, content.removesuffix(b"\r\n"))
+    raise AssertionError(f"multipart part {name!r} was not found")
 
 
 def test_create_draft_uses_preview_rest_contract_and_preserves_binary_zip(

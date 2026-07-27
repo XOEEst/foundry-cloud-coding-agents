@@ -118,36 +118,26 @@ class DraftGateway:
             _verify_published_baseline(baseline, request.base_version)
 
             metadata = _draft_metadata(request, baseline)
+            metadata_json = json.dumps(
+                metadata,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            multipart_body, content_type = _multipart_body(
+                metadata_json,
+                bundle_bytes,
+                request.bundle.path.name,
+            )
             create_request = HttpRequest(
                 "POST",
                 _versions_url(request.project_endpoint, request.agent_name),
                 headers={
                     "Accept": "application/json",
+                    "Content-Type": content_type,
                     "Foundry-Features": _PREVIEW_HEADER,
                     "x-ms-code-zip-sha256": request.bundle.sha256,
                 },
-                files=(
-                    (
-                        "metadata",
-                        (
-                            "metadata.json",
-                            json.dumps(
-                                metadata,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ).encode("utf-8"),
-                            "application/json",
-                        ),
-                    ),
-                    (
-                        "code",
-                        (
-                            request.bundle.path.name,
-                            bundle_bytes,
-                            "application/zip",
-                        ),
-                    ),
-                ),
+                content=multipart_body,
             )
             response, response_headers = _send_json_with_headers(
                 client,
@@ -332,6 +322,32 @@ def _nested_hash(payload: dict[str, Any]) -> str | None:
         return None
     value = configuration.get("content_hash")
     return value if isinstance(value, str) else None
+
+
+def _multipart_body(
+    metadata_json: bytes,
+    bundle_bytes: bytes,
+    filename: str,
+) -> tuple[bytes, str]:
+    boundary = f"----FoundryOptBoundary{secrets.token_hex(16)}"
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
+    parts = (
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="metadata"\r\n',
+        b"Content-Type: application/json\r\n\r\n",
+        metadata_json,
+        b"\r\n",
+        f"--{boundary}\r\n".encode(),
+        (
+            'Content-Disposition: form-data; name="code"; '
+            f'filename="{safe_filename}"\r\n'
+        ).encode(),
+        b"Content-Type: application/zip\r\n\r\n",
+        bundle_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode(),
+    )
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 def _header(headers: Any, name: str) -> str | None:
