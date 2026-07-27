@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+import os
 from pathlib import Path
 import subprocess
 
@@ -40,20 +41,26 @@ class SubprocessCommandRunner:
         arguments: Sequence[str],
         *,
         cwd: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+        input_text: str | None = None,
     ) -> CommandResult:
         command = list(arguments)
         if not command:
             raise ValueError("arguments must contain an executable")
 
+        options = {
+            "cwd": cwd,
+            "shell": False,
+            "capture_output": True,
+            "text": True,
+            "check": False,
+        }
+        if environment is not None:
+            options["env"] = {**os.environ, **environment}
+        if input_text is not None:
+            options["input"] = input_text
         try:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                shell=False,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            completed = subprocess.run(command, **options)
         except FileNotFoundError as error:
             raise CommandNotFoundError(command) from error
 
