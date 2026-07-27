@@ -47,6 +47,7 @@ _API_VERSION = "v1"
 _MAX_ZIP_BYTES = 250 * 1024 * 1024
 _PROVENANCE_KEYS = (
     "foundry-opt-base-version",
+    "foundry-opt-baseline-source-sha256",
     "foundry-opt-source-sha256",
     "foundry-opt-patch-sha256",
     "foundry-opt-tree-hash",
@@ -134,7 +135,7 @@ class DeploymentGateway:
                     headers={"Accept": "application/json"},
                 ),
             )
-            _verify_published_baseline(baseline, request.base_version)
+            _verify_published_baseline(baseline, request)
             metadata = _deployment_metadata(request, baseline)
             metadata_json = json.dumps(
                 metadata,
@@ -304,6 +305,9 @@ def _deployment_metadata(
 def _provenance_metadata(request: DeploymentRequest) -> dict[str, str]:
     return {
         "foundry-opt-base-version": str(request.base_version),
+        "foundry-opt-baseline-source-sha256": (
+            request.expected_baseline_source_sha256
+        ),
         "foundry-opt-source-sha256": request.bundle.sha256,
         "foundry-opt-patch-sha256": request.patch_sha256,
         "foundry-opt-tree-hash": request.tree_hash,
@@ -313,11 +317,14 @@ def _provenance_metadata(request: DeploymentRequest) -> dict[str, str]:
 
 def _verify_published_baseline(
     payload: dict[str, Any],
-    expected_version: int,
+    request: DeploymentRequest,
 ) -> None:
     if (
-        str(payload.get("version", "")) != str(expected_version)
+        str(payload.get("version", "")) != str(request.base_version)
         or payload.get("draft") is not False
+        or str(payload.get("status", "")).casefold() != "active"
+        or _nested_hash(payload)
+        != request.expected_baseline_source_sha256
     ):
         raise DeploymentResponseError()
 
@@ -407,6 +414,9 @@ def _parse_published_readback(
             agent_name=agent_name,
             version=version,
             base_version=int(metadata["foundry-opt-base-version"]),
+            baseline_source_sha256=metadata[
+                "foundry-opt-baseline-source-sha256"
+            ],
             sha256=source_sha256,
             patch_sha256=metadata["foundry-opt-patch-sha256"],
             tree_hash=metadata["foundry-opt-tree-hash"],
@@ -432,6 +442,8 @@ def _verify_readback_matches_request(
 ) -> None:
     if (
         record.base_version != request.base_version
+        or record.baseline_source_sha256
+        != request.expected_baseline_source_sha256
         or record.sha256 != request.bundle.sha256
         or record.patch_sha256 != request.patch_sha256
         or record.tree_hash != request.tree_hash

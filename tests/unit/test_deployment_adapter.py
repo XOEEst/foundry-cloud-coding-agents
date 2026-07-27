@@ -30,6 +30,7 @@ PROJECT_ENDPOINT = "https://example.services.ai.azure.com/api/projects/demo"
 SHA = "a" * 64
 TREE = "b" * 40
 EVIDENCE = "c" * 64
+BASELINE_SHA = "d" * 64
 
 
 class FakeCredentialProvider:
@@ -95,6 +96,7 @@ def _request(tmp_path: Path) -> DeploymentRequest:
         project_endpoint=PROJECT_ENDPOINT,
         agent_name="demo-agent",
         base_version=7,
+        expected_baseline_source_sha256=BASELINE_SHA,
         bundle=_bundle(tmp_path),
         runtime="python_3_13",
         entry_point=("python", "main.py"),
@@ -105,12 +107,18 @@ def _request(tmp_path: Path) -> DeploymentRequest:
     )
 
 
-def _baseline(version: int = 7) -> FakeResponse:
+def _baseline(
+    version: int = 7,
+    *,
+    status: str = "active",
+    source_sha256: str = BASELINE_SHA,
+) -> FakeResponse:
     return FakeResponse(
         200,
         {
             "version": str(version),
             "draft": False,
+            "status": status,
             "description": "published baseline",
             "metadata": {"owner": "platform"},
             "blueprint_reference": {"blueprint_id": "pinned-blueprint"},
@@ -126,7 +134,7 @@ def _baseline(version: int = 7) -> FakeResponse:
                     "runtime": "python_3_12",
                     "entry_point": ["python", "old.py"],
                     "dependency_resolution": "bundled",
-                    "content_hash": "old",
+                    "content_hash": source_sha256,
                 },
                 "container_configuration": {
                     "image": "registry.azurecr.io/forbidden:latest"
@@ -173,6 +181,9 @@ def _readback(
 ) -> FakeResponse:
     provenance = {
         "foundry-opt-base-version": str(request.base_version),
+        "foundry-opt-baseline-source-sha256": (
+            request.expected_baseline_source_sha256
+        ),
         "foundry-opt-source-sha256": request.bundle.sha256,
         "foundry-opt-patch-sha256": request.patch_sha256,
         "foundry-opt-tree-hash": request.tree_hash,
@@ -268,6 +279,7 @@ def test_publish_uses_source_zip_contract_and_inherits_pinned_base(
 
     assert gateway.deployment_client_id == DEPLOYMENT_OIDC_CLIENT_ID
     assert record.version == 8
+    assert record.baseline_source_sha256 == BASELINE_SHA
     assert record.sha256 == request.bundle.sha256
     assert record.patch_sha256 == SHA
     assert record.tree_hash == TREE
@@ -310,6 +322,9 @@ def test_publish_uses_source_zip_contract_and_inherits_pinned_base(
     }
     assert metadata["metadata"]["owner"] == "platform"
     assert metadata["metadata"]["foundry-opt-base-version"] == "7"
+    assert metadata["metadata"][
+        "foundry-opt-baseline-source-sha256"
+    ] == BASELINE_SHA
     assert metadata["metadata"]["foundry-opt-patch-sha256"] == SHA
     definition = metadata["definition"]
     assert definition["cpu"] == "2"
@@ -372,6 +387,28 @@ def test_publish_rejects_service_hash_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(DeploymentHashMismatchError):
         gateway.publish(request)
+
+
+@pytest.mark.parametrize(
+    "baseline",
+    [
+        lambda: _baseline(status="creating"),
+        lambda: _baseline(status="failed"),
+        lambda: _baseline(source_sha256="0" * 64),
+    ],
+)
+def test_publish_rejects_inactive_or_wrong_source_pinned_baseline(
+    tmp_path: Path,
+    baseline: Any,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeClient([baseline()])
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DeploymentResponseError):
+        gateway.publish(request)
+
+    assert len(client.requests) == 1
 
 
 def test_publish_rejects_tampered_bundle_before_authentication(
@@ -507,6 +544,10 @@ def test_publish_rejects_wrong_active_principal_before_credentials_or_http(
         lambda request: replace(request, description="new description"),
         lambda request: replace(request, metadata={"release": "candidate"}),
         lambda request: replace(request, base_version=6),
+        lambda request: replace(
+            request,
+            expected_baseline_source_sha256="e" * 64,
+        ),
     ],
 )
 def test_idempotency_key_covers_complete_canonical_publication(
@@ -524,7 +565,12 @@ def test_idempotency_key_covers_complete_canonical_publication(
     )
     changed_client = FakeClient(
         [
-            _baseline(changed.base_version),
+            _baseline(
+                changed.base_version,
+                source_sha256=(
+                    changed.expected_baseline_source_sha256
+                ),
+            ),
             _published(changed.bundle.sha256),
             _readback(changed),
         ]
@@ -597,6 +643,7 @@ def test_publish_rejects_terminal_failure_readback(
             request,
             metadata={
                 "foundry-opt-base-version": "7",
+                "foundry-opt-baseline-source-sha256": BASELINE_SHA,
                 "foundry-opt-source-sha256": "0" * 64,
                 "foundry-opt-patch-sha256": SHA,
                 "foundry-opt-tree-hash": TREE,
@@ -607,6 +654,7 @@ def test_publish_rejects_terminal_failure_readback(
             request,
             metadata={
                 "foundry-opt-base-version": "07",
+                "foundry-opt-baseline-source-sha256": BASELINE_SHA,
                 "foundry-opt-source-sha256": request.bundle.sha256,
                 "foundry-opt-patch-sha256": request.patch_sha256,
                 "foundry-opt-tree-hash": request.tree_hash,
@@ -704,6 +752,7 @@ def test_publish_verifies_all_caller_and_inherited_metadata(
 
     assert record.metadata == {
         "foundry-opt-base-version": "7",
+        "foundry-opt-baseline-source-sha256": BASELINE_SHA,
         "foundry-opt-source-sha256": request.bundle.sha256,
         "foundry-opt-patch-sha256": request.patch_sha256,
         "foundry-opt-tree-hash": request.tree_hash,
@@ -723,6 +772,7 @@ def test_deployment_request_rejects_noncanonical_endpoint_before_auth(
             project_endpoint="https://evil.example/api/projects/demo",
             agent_name="demo-agent",
             base_version=7,
+            expected_baseline_source_sha256=BASELINE_SHA,
             bundle=bundle,
             runtime="python_3_13",
             entry_point=("python", "main.py"),

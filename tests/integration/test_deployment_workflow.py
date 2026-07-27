@@ -19,6 +19,11 @@ from foundry_opt.deployment import (
     WorkflowRunStatus,
     verify_deployed_selection,
 )
+from foundry_opt.evaluation import (
+    EvaluationPolicy,
+    MetricDirection,
+    MetricPolicy,
+)
 from foundry_opt.packaging import BundleRequest, build_source_bundle
 
 
@@ -43,6 +48,10 @@ def _evidence_result(
     subject_id: str,
     *,
     patch_sha256: str | None = None,
+    quality: float,
+    safety: float = 1.0,
+    complete: bool = True,
+    status: str = "completed",
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "subject_id": subject_id,
@@ -55,10 +64,25 @@ def _evidence_result(
         "evaluator": {"definition_id": "evaluator-1", "version": "1"},
         "evaluation_id": f"evaluation-{subject_id}",
         "run_id": f"run-{subject_id}",
-        "attempts": [],
+        "attempts": [
+            {
+                "evaluation_id": f"evaluation-{subject_id}",
+                "run_id": f"run-{subject_id}",
+                "status": status,
+                "started_at": "2026-07-27T00:00:00Z",
+                "completed_at": (
+                    "2026-07-27T00:01:00Z"
+                    if status == "completed"
+                    else None
+                ),
+                "error_code": (
+                    None if status == "completed" else "provider_error"
+                ),
+            }
+        ],
         "split": "validation",
         "portal_url": None,
-        "complete": True,
+        "complete": complete,
         "repeat_count": 0,
         "duration_ms": 1,
         "usage": {
@@ -67,8 +91,62 @@ def _evidence_result(
             "cached_tokens": 0,
         },
         "error_count": 0,
-        "metrics": {},
-        "cases": [],
+        "metrics": {
+            "quality": {
+                "median": quality,
+                "minimum": quality,
+                "maximum": quality,
+                "spread": 0.0,
+                "outcome": "pass",
+                "sample_count": 1,
+            },
+            "safety": {
+                "median": safety,
+                "minimum": safety,
+                "maximum": safety,
+                "spread": 0.0,
+                "outcome": "pass" if safety >= 0.9 else "fail",
+                "sample_count": 1,
+            },
+        },
+        "cases": [
+            {
+                "case_id": "case-1",
+                "case_hash": "case-hash-1",
+                "response_ids": [f"response-{subject_id}"],
+                "duration_ms": 1,
+                "reason_code": "evaluator_pass",
+                "error_code": None,
+                "scores": [
+                    {
+                        "metric": "quality",
+                        "raw_score": quality,
+                        "raw_score_code": None,
+                        "normalized_score": quality,
+                        "outcome": "pass",
+                        "reason_code": "evaluator_pass",
+                    },
+                    {
+                        "metric": "safety",
+                        "raw_score": safety,
+                        "raw_score_code": None,
+                        "normalized_score": safety,
+                        "outcome": "pass" if safety >= 0.9 else "fail",
+                        "reason_code": (
+                            "evaluator_pass"
+                            if safety >= 0.9
+                            else "evaluator_fail"
+                        ),
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cached_tokens": 0,
+                },
+                "trajectory": None,
+            }
+        ],
     }
     if patch_sha256 is not None:
         result["patch_hash"] = patch_sha256
@@ -124,11 +202,15 @@ def _request(tmp_path: Path) -> DeploymentVerificationRequest:
                 "schema_version": 1,
                 "campaign_id": "campaign-1",
                 "source_hash": baseline_bundle.sha256,
-                "baseline": _evidence_result("baseline-1"),
+                "baseline": _evidence_result(
+                    "baseline-1",
+                    quality=0.5,
+                ),
                 "candidates": [
                     _evidence_result(
                         "candidate-1",
                         patch_sha256=patch_sha,
+                        quality=0.8,
                     ),
                 ],
                 "pareto": {
@@ -166,6 +248,7 @@ def _request(tmp_path: Path) -> DeploymentVerificationRequest:
         agent_name="demo-agent",
         version=8,
         base_version=7,
+        baseline_source_sha256=baseline_bundle.sha256,
         sha256=bundle.sha256,
         patch_sha256=patch_sha,
         tree_hash=selected_tree,
@@ -177,6 +260,7 @@ def _request(tmp_path: Path) -> DeploymentVerificationRequest:
         dependency_resolution="remote_build",
         metadata={
             "foundry-opt-base-version": "7",
+            "foundry-opt-baseline-source-sha256": baseline_bundle.sha256,
             "foundry-opt-source-sha256": bundle.sha256,
             "foundry-opt-patch-sha256": patch_sha,
             "foundry-opt-tree-hash": selected_tree,
@@ -189,6 +273,7 @@ def _request(tmp_path: Path) -> DeploymentVerificationRequest:
         patch_path=Path("artifacts/candidate.patch"),
         expected_patch_sha256=patch_sha,
         expected_base_commit=base_commit,
+        expected_baseline_source_sha256=baseline_bundle.sha256,
         expected_tree_hash=selected_tree,
         deployed_tree_hash=selected_tree,
         evidence_path=Path("evidence/result.json"),
@@ -207,6 +292,23 @@ def _request(tmp_path: Path) -> DeploymentVerificationRequest:
         expected_runtime="python_3_13",
         expected_entry_point=("python", "main.py"),
         expected_dependency_resolution="remote_build",
+        expected_metric_policy=EvaluationPolicy(
+            metrics=(
+                MetricPolicy(
+                    name="quality",
+                    direction=MetricDirection.MAXIMIZE,
+                    threshold=0.4,
+                    materiality=0.1,
+                ),
+                MetricPolicy(
+                    name="safety",
+                    direction=MetricDirection.MAXIMIZE,
+                    threshold=0.9,
+                    materiality=0.0,
+                    hard_guardrail=True,
+                ),
+            )
+        ),
         expected_commit=selected_commit,
         expected_run_url=RUN_URL,
         expected_portal_url=PORTAL_URL,
@@ -389,6 +491,23 @@ def test_verify_deployed_selection_rejects_pinned_base_mismatch(
     assert "service_provenance_record" in verification.failed_checks
 
 
+def test_verify_rejects_baseline_source_provenance_mismatch(
+    tmp_path: Path,
+) -> None:
+    request = replace(
+        _request(tmp_path),
+        expected_baseline_source_sha256="0" * 64,
+    )
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is False
+    assert {
+        "reproduced_baseline_bundle",
+        "service_provenance_record",
+    }.issubset(verification.failed_checks)
+
+
 def test_verify_rejects_nonterminal_published_record(
     tmp_path: Path,
 ) -> None:
@@ -569,6 +688,74 @@ def test_verify_rebuilds_baseline_bundle_from_exact_patch_base(
     ],
 )
 def test_verify_enforces_exact_evidence_selection_consistency(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    request = _request(tmp_path)
+    evidence = request.repository_root / request.evidence_path
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    mutation(document)
+    evidence.write_text(
+        json.dumps(document, sort_keys=True),
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    request = replace(
+        request,
+        expected_evidence_sha256=digest,
+        record=replace(
+            request.record,
+            evidence_sha256=digest,
+            metadata={
+                **request.record.metadata,
+                "foundry-opt-evidence-sha256": digest,
+            },
+        ),
+    )
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is False
+    assert "evidence_lineage" in verification.failed_checks
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda document: document["baseline"].update({"complete": False}),
+        lambda document: document["candidates"][0].update(
+            {"complete": False}
+        ),
+        lambda document: document["baseline"]["attempts"][0].update(
+            {
+                "status": "failed",
+                "completed_at": None,
+                "error_code": "provider_error",
+            }
+        ),
+        lambda document: document["candidates"][0]["attempts"][0].update(
+            {
+                "status": "failed",
+                "completed_at": None,
+                "error_code": "provider_error",
+            }
+        ),
+        lambda document: document["candidates"][0]["metrics"][
+            "safety"
+        ].update(
+            {
+                "median": 0.1,
+                "minimum": 0.1,
+                "maximum": 0.1,
+                "outcome": "fail",
+            }
+        ),
+        lambda document: document["candidates"][0]["metrics"][
+            "quality"
+        ].update({"outcome": "fail"}),
+    ],
+)
+def test_verify_recomputes_evidence_eligibility_from_results_and_policy(
     tmp_path: Path,
     mutation,
 ) -> None:

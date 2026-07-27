@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+from statistics import median
 import subprocess
 import uuid
 
@@ -15,6 +16,24 @@ from foundry_opt.deployment.models import (
     DeploymentVerificationStatus,
     WorkflowRunStatus,
 )
+from foundry_opt.evaluation import (
+    AgentVersionRef,
+    DatasetSplit,
+    DatasetVersionRef,
+    EvaluationPolicy,
+    EvaluationResult,
+    EvaluationRun,
+    EvaluationStatus,
+    EvaluatorDefinitionRef,
+    MetricAggregate,
+    NormalizedCase,
+    NormalizedCaseMetric,
+    Outcome,
+    UndefinedBehavior,
+    Usage,
+    select_eligible_candidates,
+)
+from foundry_opt.evidence.writer import _decision_code
 from foundry_opt.github_workflow.errors import CampaignPublicationError
 from foundry_opt.github_workflow.publication import (
     _verify_redacted_evidence,
@@ -134,6 +153,7 @@ def verify_deployed_selection(
             "baseline_bundle_sha256",
             baseline_bundle_sha256
             == request.expected_baseline_bundle_sha256
+            == request.expected_baseline_source_sha256
             == request.baseline_bundle.sha256
             and (
                 baseline_bundle_content is not None
@@ -148,7 +168,8 @@ def verify_deployed_selection(
             and reproduction.baseline_bundle_bytes
             == baseline_bundle_content
             and reproduction.baseline_bundle_sha256
-            == request.expected_baseline_bundle_sha256,
+            == request.expected_baseline_bundle_sha256
+            == request.expected_baseline_source_sha256,
         ),
         DeploymentCheck(
             "published_terminal_status",
@@ -162,6 +183,8 @@ def verify_deployed_selection(
             and request.record.agent_name == request.expected_agent_name
             and request.record.base_version
             == request.expected_base_version
+            and request.record.baseline_source_sha256
+            == request.expected_baseline_source_sha256
             and request.record.version == request.expected_version
             and request.record.sha256 == request.expected_bundle_sha256
             and request.record.patch_sha256
@@ -351,7 +374,7 @@ def _evidence_matches(
     return (
         document.get("campaign_id") == request.expected_campaign_id
         and document.get("source_hash")
-        == request.expected_baseline_bundle_sha256
+        == request.expected_baseline_source_sha256
         and isinstance(baseline, dict)
         and baseline.get("subject_id")
         == request.expected_baseline_subject_id
@@ -360,7 +383,285 @@ def _evidence_matches(
         and request.candidate_id in eligible_set
         and decision_by_id.get(request.candidate_id) is True
         and len(matching) == 1
+        and _selection_matches_evidence(
+            baseline,
+            candidates,
+            pareto,
+            request,
+        )
     )
+
+
+def _selection_matches_evidence(
+    baseline: object,
+    candidates: list[object],
+    pareto: dict[str, object],
+    request: DeploymentVerificationRequest,
+) -> bool:
+    try:
+        baseline_result = _serialized_result(
+            baseline,
+            request.expected_metric_policy,
+        )
+        candidate_results = tuple(
+            _serialized_result(candidate, request.expected_metric_policy)
+            for candidate in candidates
+        )
+        recomputed = select_eligible_candidates(
+            baseline_result,
+            candidate_results,
+            request.expected_metric_policy,
+        )
+        decisions = [
+            {
+                "subject_id": decision.subject_id,
+                "eligible": decision.eligible,
+                "reason_code": _decision_code(
+                    decision.eligible,
+                    decision.reason,
+                ),
+            }
+            for decision in recomputed.decisions
+        ]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        pareto.get("frontier_ids") == list(recomputed.frontier_ids)
+        and pareto.get("eligible_ids") == list(recomputed.eligible_ids)
+        and pareto.get("decisions") == decisions
+        and request.candidate_id in recomputed.eligible_ids
+    )
+
+
+def _serialized_result(
+    value: object,
+    policy: EvaluationPolicy,
+) -> EvaluationResult:
+    if not isinstance(value, dict):
+        raise ValueError
+    attempts = value["attempts"]
+    if not isinstance(attempts, list) or not attempts:
+        raise ValueError
+    matching_attempts = [
+        attempt
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        and attempt.get("evaluation_id") == value["evaluation_id"]
+        and attempt.get("run_id") == value["run_id"]
+    ]
+    if len(matching_attempts) != 1:
+        raise ValueError
+    if value["repeat_count"] != len(attempts) - 1:
+        raise ValueError
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            raise ValueError
+        attempt_status = EvaluationStatus(attempt["status"])
+        if (
+            attempt_status is EvaluationStatus.COMPLETED
+            and (
+                attempt.get("completed_at") is None
+                or attempt.get("error_code") is not None
+            )
+        ):
+            raise ValueError
+    primary_attempt = matching_attempts[0]
+    status = EvaluationStatus(primary_attempt["status"])
+    if (
+        status is EvaluationStatus.COMPLETED
+        and (
+            primary_attempt.get("completed_at") is None
+            or primary_attempt.get("error_code") is not None
+        )
+    ):
+        raise ValueError
+    if value["error_count"] != 0:
+        raise ValueError
+    agent = value["agent"]
+    dataset = value["dataset"]
+    evaluator = value["evaluator"]
+    metrics = {
+        name: MetricAggregate(
+            metric=name,
+            median=aggregate["median"],
+            minimum=aggregate["minimum"],
+            maximum=aggregate["maximum"],
+            spread=aggregate["spread"],
+            outcome=Outcome(aggregate["outcome"]),
+            sample_count=aggregate["sample_count"],
+        )
+        for name, aggregate in value["metrics"].items()
+    }
+    if set(metrics) != {metric.name for metric in policy.metrics}:
+        raise ValueError
+    cases = tuple(
+        _serialized_case(case, policy) for case in value["cases"]
+    )
+    _verify_serialized_aggregates(cases, metrics, policy)
+    return EvaluationResult(
+        run=EvaluationRun(
+            run_id=value["run_id"],
+            evaluation_id=value["evaluation_id"],
+            subject_id=value["subject_id"],
+            split=DatasetSplit(value["split"]),
+            agent=AgentVersionRef(
+                agent_id=agent["agent_id"],
+                draft_id=agent["draft_id"],
+                version=agent["version"],
+            ),
+            dataset=DatasetVersionRef(
+                dataset_id=dataset["dataset_id"],
+                version=dataset["version"],
+            ),
+            evaluator=EvaluatorDefinitionRef(
+                definition_id=evaluator["definition_id"],
+                version=evaluator["version"],
+            ),
+            status=status,
+            portal_url=value["portal_url"],
+            started_at=None,
+            completed_at=None,
+            error=(
+                None
+                if primary_attempt.get("error_code") is None
+                else "provider_error"
+            ),
+        ),
+        cases=cases,
+        metrics=metrics,
+        usage=Usage(
+            input_tokens=value["usage"]["input_tokens"],
+            output_tokens=value["usage"]["output_tokens"],
+            cached_tokens=value["usage"]["cached_tokens"],
+        ),
+        duration_ms=value["duration_ms"],
+        errors=(),
+        complete=value["complete"],
+        needs_repeat=False,
+        attempts=value["repeat_count"] + 1,
+    )
+
+
+def _serialized_case(
+    value: object,
+    policy: EvaluationPolicy,
+) -> NormalizedCase:
+    if not isinstance(value, dict) or value["error_code"] is not None:
+        raise ValueError
+    serialized_scores = value["scores"]
+    if not isinstance(serialized_scores, list):
+        raise ValueError
+    scores_by_name = {
+        score["metric"]: score
+        for score in serialized_scores
+        if isinstance(score, dict)
+    }
+    if (
+        len(scores_by_name) != len(serialized_scores)
+        or set(scores_by_name)
+        != {metric.name for metric in policy.metrics}
+    ):
+        raise ValueError
+    scores: list[NormalizedCaseMetric] = []
+    for metric in policy.metrics:
+        score = scores_by_name[metric.name]
+        normalized = score["normalized_score"]
+        expected_outcome = (
+            Outcome.UNDEFINED
+            if normalized is None
+            else Outcome.PASS
+            if metric.passes(normalized)
+            else Outcome.FAIL
+        )
+        if Outcome(score["outcome"]) is not expected_outcome:
+            raise ValueError
+        if score["reason_code"] != f"evaluator_{expected_outcome.value}":
+            raise ValueError
+        scores.append(
+            NormalizedCaseMetric(
+                metric=metric.name,
+                raw_score=score["raw_score"],
+                normalized_score=normalized,
+                reason=None,
+                outcome=expected_outcome,
+            )
+        )
+    outcomes = {score.outcome for score in scores}
+    expected_reason = (
+        "evaluator_fail"
+        if Outcome.FAIL in outcomes
+        else "evaluator_undefined"
+        if Outcome.UNDEFINED in outcomes
+        else "evaluator_pass"
+    )
+    if value["reason_code"] != expected_reason:
+        raise ValueError
+    return NormalizedCase(
+        case_id=value["case_id"],
+        case_hash=value["case_hash"],
+        response_ids=tuple(value["response_ids"]),
+        scores=tuple(scores),
+        usage=Usage(
+            input_tokens=value["usage"]["input_tokens"],
+            output_tokens=value["usage"]["output_tokens"],
+            cached_tokens=value["usage"]["cached_tokens"],
+        ),
+        trajectory=None,
+        error=None,
+        duration_ms=value["duration_ms"],
+    )
+
+
+def _verify_serialized_aggregates(
+    cases: tuple[NormalizedCase, ...],
+    metrics: dict[str, MetricAggregate],
+    policy: EvaluationPolicy,
+) -> None:
+    for metric in policy.metrics:
+        aggregate = metrics[metric.name]
+        scores = tuple(
+            score
+            for case in cases
+            for score in case.scores
+            if score.metric == metric.name
+        )
+        values = tuple(
+            score.normalized_score
+            for score in scores
+            if score.normalized_score is not None
+        )
+        undefined = any(
+            score.outcome is Outcome.UNDEFINED for score in scores
+        )
+        if not values:
+            if (
+                aggregate.sample_count != 0
+                or aggregate.median is not None
+                or aggregate.minimum is not None
+                or aggregate.maximum is not None
+                or aggregate.spread is not None
+                or aggregate.outcome is not Outcome.UNDEFINED
+            ):
+                raise ValueError
+            continue
+        expected_median = float(median(values))
+        expected_outcome = (
+            Outcome.UNDEFINED
+            if undefined
+            and metric.undefined_behavior is UndefinedBehavior.FAIL
+            else Outcome.PASS
+            if metric.passes(expected_median)
+            else Outcome.FAIL
+        )
+        if (
+            aggregate.sample_count != len(values)
+            or aggregate.minimum != min(values)
+            or aggregate.maximum != max(values)
+            or aggregate.spread != round(max(values) - min(values), 12)
+            or aggregate.median != expected_median
+            or aggregate.outcome is not expected_outcome
+        ):
+            raise ValueError
 
 
 def _record_metadata_matches(
@@ -368,6 +669,9 @@ def _record_metadata_matches(
 ) -> bool:
     expected = {
         "foundry-opt-base-version": str(request.expected_base_version),
+        "foundry-opt-baseline-source-sha256": (
+            request.expected_baseline_source_sha256
+        ),
         "foundry-opt-source-sha256": request.expected_bundle_sha256,
         "foundry-opt-patch-sha256": request.expected_patch_sha256,
         "foundry-opt-tree-hash": request.expected_tree_hash,

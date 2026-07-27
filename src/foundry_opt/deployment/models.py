@@ -9,6 +9,7 @@ from typing import Mapping
 from urllib.parse import urlsplit
 
 from foundry_opt.drafts.models import project_endpoint_components
+from foundry_opt.evaluation import EvaluationPolicy
 from foundry_opt.packaging import BundleArtifact
 
 
@@ -87,6 +88,7 @@ class DeploymentRequest:
     project_endpoint: str
     agent_name: str
     base_version: int
+    expected_baseline_source_sha256: str
     bundle: BundleArtifact
     runtime: str
     entry_point: tuple[str, ...]
@@ -107,6 +109,10 @@ class DeploymentRequest:
             or self.base_version < 1
         ):
             raise ValueError("base_version must be a positive published version")
+        _sha256(
+            self.expected_baseline_source_sha256,
+            "expected_baseline_source_sha256",
+        )
         if not isinstance(self.bundle, BundleArtifact):
             raise ValueError("bundle must be a BundleArtifact")
         if not self.runtime:
@@ -119,9 +125,9 @@ class DeploymentRequest:
         _tree_hash(self.tree_hash, "tree_hash")
         _sha256(self.evidence_sha256, "evidence_sha256")
         metadata = dict(self.metadata)
-        if len(metadata) > 11:
+        if len(metadata) > 10:
             raise ValueError(
-                "metadata permits at most 11 caller entries; five entries "
+                "metadata permits at most 10 caller entries; six entries "
                 "are reserved for deployment provenance"
             )
         for key, value in metadata.items():
@@ -134,6 +140,7 @@ class DeploymentRequest:
                 raise ValueError("metadata must not contain credentials")
         if {
             "foundry-opt-base-version",
+            "foundry-opt-baseline-source-sha256",
             "foundry-opt-source-sha256",
             "foundry-opt-patch-sha256",
             "foundry-opt-tree-hash",
@@ -151,6 +158,7 @@ class DeploymentRecord:
     agent_name: str
     version: int
     base_version: int
+    baseline_source_sha256: str
     sha256: str
     patch_sha256: str
     tree_hash: str
@@ -174,6 +182,10 @@ class DeploymentRecord:
             or self.version <= self.base_version
         ):
             raise ValueError("deployment versions must be positive integers")
+        _sha256(
+            self.baseline_source_sha256,
+            "baseline_source_sha256",
+        )
         _sha256(self.sha256, "sha256")
         _sha256(self.patch_sha256, "patch_sha256")
         _tree_hash(self.tree_hash, "tree_hash")
@@ -308,6 +320,7 @@ class DeploymentVerificationRequest:
     patch_path: Path
     expected_patch_sha256: str
     expected_base_commit: str
+    expected_baseline_source_sha256: str
     expected_tree_hash: str
     deployed_tree_hash: str
     evidence_path: Path
@@ -325,6 +338,7 @@ class DeploymentVerificationRequest:
     expected_runtime: str
     expected_entry_point: tuple[str, ...]
     expected_dependency_resolution: str
+    expected_metric_policy: EvaluationPolicy
     expected_commit: str
     expected_run_url: str
     expected_portal_url: str
@@ -352,6 +366,10 @@ class DeploymentVerificationRequest:
         _sha256(self.expected_patch_sha256, "expected_patch_sha256")
         if not _COMMIT.fullmatch(self.expected_base_commit):
             raise ValueError("expected_base_commit is invalid")
+        _sha256(
+            self.expected_baseline_source_sha256,
+            "expected_baseline_source_sha256",
+        )
         _tree_hash(self.expected_tree_hash, "expected_tree_hash")
         _tree_hash(self.deployed_tree_hash, "deployed_tree_hash")
         _sha256(
@@ -396,6 +414,10 @@ class DeploymentVerificationRequest:
             "bundled",
         }:
             raise ValueError("expected_dependency_resolution is invalid")
+        if not isinstance(self.expected_metric_policy, EvaluationPolicy):
+            raise ValueError(
+                "expected_metric_policy must be an EvaluationPolicy"
+            )
         if not _COMMIT.fullmatch(self.expected_commit):
             raise ValueError("expected_commit is invalid")
         _safe_url(
