@@ -1,3 +1,5 @@
+import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -286,12 +288,21 @@ def _batch_run_request() -> dict[str, object]:
 
 
 def _list_single_item(
-    result: Mapping[str, object],
+    result: Mapping[str, object] | list[Mapping[str, object]],
     *,
     normalization: Mapping[str, object] | None = None,
     include_normalization: bool = True,
     default_completed_status: bool = True,
 ) -> Mapping[str, object]:
+    raw_results = result if isinstance(result, list) else [result]
+    provider_results = [
+        (
+            {"status": "completed", **dict(raw_result)}
+            if default_completed_status
+            else dict(raw_result)
+        )
+        for raw_result in raw_results
+    ]
     transport, client = _transport()
     _create_definition(
         transport,
@@ -319,13 +330,7 @@ def _list_single_item(
                         "case_hash": "sha256:case-1",
                         "response_id": "resp-1",
                     },
-                    "results": [
-                        (
-                            {"status": "completed", **dict(result)}
-                            if default_completed_status
-                            else dict(result)
-                        )
-                    ],
+                    "results": provider_results,
                     "sample": {
                         "usage": {
                             "prompt_tokens": 10,
@@ -506,10 +511,9 @@ def test_batch_run_pins_exact_draft_dataset_evaluator_and_context() -> None:
                 "development/versions/12"
             ),
         },
-        "input_messages": {
-            "type": "item_reference",
-            "item_reference": "item.query",
-        },
+        "input_messages": _definition_payload()["configuration"]["batch"][
+            "input_messages"
+        ],
         "target": {
             "type": "azure_ai_agent",
             "name": "agent-name",
@@ -573,6 +577,56 @@ def test_batch_binding_accepts_supported_item_reference_shape() -> None:
         "type": "item_reference",
         "item_reference": "item.conversation_input",
     }
+
+
+def test_batch_binding_preserves_complete_responses_message_template() -> None:
+    transport, client = _transport()
+    payload = _definition_payload()
+    template = {
+        "type": "template",
+        "template": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": {
+                    "type": "input_text",
+                    "text": "Follow {{item.policy}}.",
+                },
+            },
+            {
+                "type": "message",
+                "role": "system",
+                "content": "Case {{item.case_id}}",
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": {
+                    "type": "input_text",
+                    "text": "{{item.query}}",
+                },
+            },
+        ],
+    }
+    payload["configuration"]["batch"]["input_messages"] = template
+
+    def create(**kwargs: object) -> object:
+        client.evals.create_calls.append(kwargs)
+        return _created_definition(kwargs)
+
+    client.evals.create = create  # type: ignore[method-assign]
+    transport.create_definition(payload)
+
+    def create_run(**kwargs: object) -> object:
+        client.evals.runs.create_calls.append(kwargs)
+        return _run_payload(kwargs["metadata"])
+
+    client.evals.runs.create = create_run  # type: ignore[method-assign]
+    transport.create_run(_batch_run_request())
+
+    assert client.evals.runs.create_calls[0]["data_source"][
+        "input_messages"
+    ] == template
 
 
 def test_batch_binding_preserves_hosted_invocation_freeform_shape() -> None:
@@ -648,7 +702,7 @@ def test_batch_binding_rejects_invalid_invocation_freeform_shape(
             "template": [
                 {
                     "type": "message",
-                    "role": "assistant",
+                    "role": "tool",
                     "content": {
                         "type": "input_text",
                         "text": "{{item.query}}",
@@ -855,6 +909,30 @@ def test_provider_normalized_score_is_not_replaced_by_raw_scale() -> None:
     assert score["normalized_score"] == 0.75
 
 
+def test_criterion_names_remain_distinct_when_metrics_match() -> None:
+    item = _list_single_item(
+        [
+            {
+                "name": "quality-primary",
+                "metric": "coherence",
+                "score": 0.8,
+                "normalized_score": 0.8,
+            },
+            {
+                "name": "quality-guardrail",
+                "metric": "coherence",
+                "score": 0.6,
+                "normalized_score": 0.6,
+            },
+        ]
+    )
+
+    assert [score["metric"] for score in item["scores"]] == [
+        "quality-primary",
+        "quality-guardrail",
+    ]
+
+
 def test_skipped_evaluator_result_does_not_produce_a_score() -> None:
     item = _list_single_item(
         {
@@ -1027,6 +1105,74 @@ def test_output_page_rejects_cross_run_item() -> None:
             continuation_token=None,
             page_size=25,
         )
+
+
+def test_query_only_output_derives_stable_case_identity() -> None:
+    transport, client = _transport()
+    _create_definition(transport, client)
+
+    def create(**kwargs: object) -> object:
+        client.evals.runs.create_calls.append(kwargs)
+        return _run_payload(kwargs["metadata"])
+
+    client.evals.runs.create = create  # type: ignore[method-assign]
+    transport.create_run(_batch_run_request())
+    datasource_item = {
+        "query": "How do I reverse a string?",
+        "response_id": "resp-query-only",
+    }
+    client.evals.runs.output_items.responses = [
+        FakePage(
+            [
+                {
+                    "id": "output-query-only",
+                    "run_id": "evalrun-1",
+                    "eval_id": "eval-definition",
+                    "datasource_item_id": 7,
+                    "status": "pass",
+                    "datasource_item": datasource_item,
+                    "results": [
+                        {
+                            "status": "completed",
+                            "name": "quality",
+                            "score": 0.8,
+                        }
+                    ],
+                    "sample": {
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 4,
+                            "cached_tokens": 0,
+                        },
+                        "error": None,
+                    },
+                }
+            ]
+        )
+    ]
+
+    page = transport.list_output_items(
+        "evalrun-1",
+        continuation_token=None,
+        page_size=10,
+    )
+
+    identity = {
+        "datasource_item": datasource_item,
+        "provider_output_item_id": "output-query-only",
+        "response_ids": ["resp-query-only"],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    item = page["items"][0]
+    assert item["case_id"] == "item:7"
+    assert item["case_hash"] == f"sha256:{digest}"
 
 
 def test_simulation_output_remains_separately_tagged_with_trajectory() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -486,15 +487,26 @@ class FoundryEvaluationTransport(EvaluationTransport):
             *evaluator_errors,
         )
         kind = _required_string(context.get("kind"), "evaluation kind")
+        response_ids = (
+            [_batch_response_id(datasource)]
+            if kind == "batch"
+            else _simulation_response_ids(datasource, item_id)
+        )
+        case_digest = _case_identity_digest(
+            datasource,
+            item_id=item_id,
+            response_ids=response_ids,
+        )
         common: dict[str, object] = {
             "kind": kind,
             "run_id": run_id,
             "evaluation_id": evaluation_id,
-            "case_id": _case_id(datasource),
-            "case_hash": _required_string(
-                datasource.get("case_hash"),
-                "output case_hash",
+            "case_id": _case_id(
+                datasource,
+                datasource_item_id=payload.get("datasource_item_id"),
+                digest=case_digest,
             ),
+            "case_hash": _case_hash(datasource, case_digest),
             "scores": scores,
             "usage": usage,
             "error": error,
@@ -502,9 +514,8 @@ class FoundryEvaluationTransport(EvaluationTransport):
             "duration_ms": 0,
         }
         if kind == "batch":
-            common["response_id"] = _batch_response_id(datasource)
+            common["response_id"] = response_ids[0]
             return common
-        response_ids = _simulation_response_ids(datasource, item_id)
         common["response_ids"] = response_ids
         common["trajectory"] = _trajectory(datasource, item_id)
         return common
@@ -610,43 +621,56 @@ def _batch_input_messages(value: object) -> dict[str, Any]:
         }
     if input_type != "template":
         raise EvaluationSchemaError(
-            "batch input_messages must use item_reference or a convertible "
-            "single-item template."
+            "batch input_messages must use item_reference, template, or a "
+            "freeform invocation object."
         )
+    return _responses_message_template(input_messages)
+
+
+def _responses_message_template(
+    input_messages: Mapping[str, object],
+) -> dict[str, Any]:
     template = _required_list(
         input_messages.get("template"),
         "batch input_messages template",
     )
-    if len(template) != 1:
+    if not template:
         raise EvaluationSchemaError(
-            "batch input_messages template must contain one user message."
+            "batch input_messages template cannot be empty."
         )
-    message = _required_mapping(
-        template[0],
-        "batch input_messages template message",
-    )
-    content = _required_mapping(
-        message.get("content"),
-        "batch input_messages template content",
-    )
-    if (
-        message.get("type") != "message"
-        or message.get("role") != "user"
-        or content.get("type") != "input_text"
-    ):
+    found_reference = False
+    for raw_message in template:
+        message = _required_mapping(
+            raw_message,
+            "batch input_messages template message",
+        )
+        message_type = message.get("type")
+        if message_type is not None and message_type != "message":
+            raise EvaluationSchemaError(
+                "batch input_messages template message type must be message."
+            )
+        role = message.get("role")
+        if role not in {"developer", "system", "user", "assistant"}:
+            raise EvaluationSchemaError(
+                "batch input_messages template contains an unsupported role."
+            )
+        if "content" not in message:
+            raise EvaluationSchemaError(
+                "batch input_messages template message requires content."
+            )
+        found_reference = (
+            _validate_invocation_json(message["content"]) or found_reference
+        )
+    if not found_reference:
         raise EvaluationSchemaError(
-            "batch input_messages template must be one user input_text message."
+            "batch input_messages template must contain an item reference."
         )
-    text = _required_string(
-        content.get("text"),
-        "batch input_messages template text",
-    )
-    if not text.startswith("{{item.") or not text.endswith("}}"):
+    cloned = _json_value(input_messages)
+    if not isinstance(cloned, dict):
         raise EvaluationSchemaError(
-            "batch input_messages template must contain one item reference."
+            "batch input_messages template must be a JSON object."
         )
-    reference = _item_reference(text[2:-2])
-    return {"type": "item_reference", "item_reference": reference}
+    return cloned
 
 
 def _invocation_input_messages(
@@ -956,8 +980,8 @@ def _scores(
     for raw_result in results:
         result = _provider_mapping(raw_result, "evaluator result")
         metric = _required_string(
-            result.get("metric", result.get("name")),
-            "evaluator metric",
+            result.get("name"),
+            "evaluation criterion name",
         )
         raw_status = result.get("status")
         if raw_status is None or raw_status == "":
@@ -1146,9 +1170,49 @@ def _usage(sample: Mapping[str, object]) -> dict[str, int]:
     }
 
 
-def _case_id(datasource: Mapping[str, object]) -> str:
+def _case_id(
+    datasource: Mapping[str, object],
+    *,
+    datasource_item_id: object,
+    digest: str,
+) -> str:
     value = datasource.get("case_id", datasource.get("id"))
-    return _required_string(value, "output case_id")
+    if value is not None:
+        return _required_string(value, "output case_id")
+    if (
+        isinstance(datasource_item_id, int)
+        and not isinstance(datasource_item_id, bool)
+        and datasource_item_id >= 0
+    ):
+        return f"item:{datasource_item_id}"
+    return f"case:{digest[:24]}"
+
+
+def _case_hash(datasource: Mapping[str, object], digest: str) -> str:
+    supplied = datasource.get("case_hash")
+    if supplied is not None:
+        return _required_string(supplied, "output case_hash")
+    return f"sha256:{digest}"
+
+
+def _case_identity_digest(
+    datasource: Mapping[str, object],
+    *,
+    item_id: str,
+    response_ids: list[str],
+) -> str:
+    identity = {
+        "datasource_item": _json_value(datasource),
+        "provider_output_item_id": item_id,
+        "response_ids": response_ids,
+    }
+    encoded = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _batch_response_id(datasource: Mapping[str, object]) -> str:
