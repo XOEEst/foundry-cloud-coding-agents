@@ -313,7 +313,7 @@ def _dependencies(
         generator=generator,
         validate=validate,
         build_bundle=lambda root, output: _bundle(output),
-        create_draft=lambda target, subject_id, bundle: DraftRecord(
+        create_draft=lambda target, subject_id, idempotency_key, bundle: DraftRecord(
             target,
             f"draft-{subject_id}",
             1,
@@ -368,6 +368,7 @@ def test_campaign_runs_exact_base_and_adapts_candidates_sequentially(
     def create_draft(
         target: str,
         subject_id: str,
+        idempotency_key: str,
         bundle: BundleArtifact,
     ) -> DraftRecord:
         return DraftRecord(
@@ -659,7 +660,7 @@ def test_retained_drafts_are_persisted_before_deadline_paths(
         clock=clock,
     )
 
-    def create_draft(target, subject_id, bundle):
+    def create_draft(target, subject_id, idempotency_key, bundle):
         record = DraftRecord(
             target,
             f"draft-{subject_id}",
@@ -712,6 +713,116 @@ def test_baseline_draft_is_persisted_before_evaluation_failure(
     assert state.status == "failed"
     assert state.baseline_draft is not None
     assert state.baseline_draft.version_id == "draft-baseline"
+
+
+def test_baseline_remote_create_has_durable_idempotency_intent(
+    tmp_path: Path,
+) -> None:
+    class FailReconciliationStore(MemoryCampaignStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.saves = 0
+
+        def save(self, repository_root: Path, state: CampaignState) -> None:
+            self.saves += 1
+            if self.saves == 3:
+                raise OSError("baseline reconciliation unavailable")
+            super().save(repository_root, state)
+
+    repository = FakeRepository(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        repository=repository,
+        generator=FakeGenerator(),
+        clock=FakeClock(),
+    )
+    state_store = FailReconciliationStore()
+    creates: list[tuple[str, str]] = []
+
+    def create_draft(target, subject_id, idempotency_key, bundle):
+        creates.append((subject_id, idempotency_key))
+        return DraftRecord(
+            target,
+            f"draft-{subject_id}",
+            1,
+            bundle.sha256,
+            "ready",
+        )
+
+    with pytest.raises(OSError, match="baseline reconciliation"):
+        run_campaign(
+            _request(tmp_path),
+            replace(
+                dependencies,
+                state=state_store,
+                create_draft=create_draft,
+            ),
+        )
+
+    state = state_store.load(tmp_path, "campaign-1")
+    assert state is not None
+    assert state.baseline_draft_intent is not None
+    assert state.baseline_draft_intent.status == "pending"
+    assert state.baseline_draft is None
+    assert creates == [
+        ("baseline", state.baseline_draft_intent.idempotency_key),
+    ]
+
+
+def test_candidate_remote_create_has_durable_idempotency_intent(
+    tmp_path: Path,
+) -> None:
+    class FailCandidateReconciliationStore(MemoryCampaignStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.saves = 0
+
+        def save(self, repository_root: Path, state: CampaignState) -> None:
+            self.saves += 1
+            if self.saves >= 7:
+                raise OSError("candidate reconciliation unavailable")
+            super().save(repository_root, state)
+
+    repository = FakeRepository(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        repository=repository,
+        generator=FakeGenerator(),
+        clock=FakeClock(),
+    )
+    state_store = FailCandidateReconciliationStore()
+    creates: list[tuple[str, str]] = []
+
+    def create_draft(target, subject_id, idempotency_key, bundle):
+        creates.append((subject_id, idempotency_key))
+        return DraftRecord(
+            target,
+            f"draft-{subject_id}",
+            1,
+            bundle.sha256,
+            "ready",
+        )
+
+    with pytest.raises(OSError, match="candidate reconciliation"):
+        run_campaign(
+            _request(tmp_path, candidates=1),
+            replace(
+                dependencies,
+                state=state_store,
+                create_draft=create_draft,
+            ),
+        )
+
+    state = state_store.load(tmp_path, "campaign-1")
+    assert state is not None
+    candidate = state.candidates[0]
+    assert candidate.draft_intent is not None
+    assert candidate.draft_intent.status == "pending"
+    assert candidate.draft is None
+    assert creates[-1] == (
+        "candidate-1",
+        candidate.draft_intent.idempotency_key,
+    )
 
 
 def test_deadline_stops_held_out_candidates_and_repeat_attempts(
@@ -769,6 +880,34 @@ def test_deadline_stops_held_out_candidates_and_repeat_attempts(
     )
     assert retry_report.candidates == ()
     assert ("candidate-1", DatasetSplit.DEVELOPMENT, 2) not in retry_calls
+
+
+def test_evaluation_completing_at_deadline_is_discarded(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = FakeRepository(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        repository=repository,
+        generator=FakeGenerator(),
+        clock=clock,
+    )
+    base_evaluate = dependencies.evaluate
+
+    def complete_at_deadline(subject, split, attempt):
+        result = base_evaluate(subject, split, attempt)
+        if subject.subject_id == "candidate-1":
+            clock.advance(minutes=50)
+        return result
+
+    report = run_campaign(
+        _request(tmp_path, candidates=1),
+        replace(dependencies, evaluate=complete_at_deadline),
+    )
+
+    assert report.candidates == ()
+    assert report.pareto_candidate_ids == ()
 
 
 def test_hard_guardrail_blocks_provisional_pareto_and_held_out_funnel(

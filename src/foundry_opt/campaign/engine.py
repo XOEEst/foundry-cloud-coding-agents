@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+import hashlib
 from pathlib import Path
 import sys
 
@@ -26,6 +27,7 @@ from foundry_opt.campaign.state import (
     CampaignState,
     CampaignStateStore,
     CandidateState,
+    DraftCreationIntent,
     DraftMetadata,
 )
 from foundry_opt.evaluation import (
@@ -156,15 +158,32 @@ def _run_campaign(
             baseline_worktree.path,
             baseline_worktree.path / ".foundry-opt-baseline.zip",
         )
+        baseline_intent = _draft_creation_intent(
+            request,
+            "baseline",
+            pinned.commit,
+            baseline_bundle.sha256,
+        )
+        state = replace(
+            state,
+            baseline_draft_intent=baseline_intent,
+            updated_at=dependencies.clock.now(),
+        )
+        dependencies.state.save(root, state)
         baseline_draft = dependencies.create_draft(
             request.target,
             "baseline",
+            baseline_intent.idempotency_key,
             baseline_bundle,
         )
         state = replace(
             state,
             baseline_draft_id=baseline_draft.version_id,
             baseline_draft=DraftMetadata.from_record(baseline_draft),
+            baseline_draft_intent=replace(
+                baseline_intent,
+                status="reconciled",
+            ),
             updated_at=dependencies.clock.now(),
         )
         dependencies.state.save(root, state)
@@ -514,10 +533,28 @@ def _run_campaign(
                 )
                 dependencies.state.save(root, state)
                 continue
+            draft_intent = _draft_creation_intent(
+                request,
+                candidate_id,
+                pinned.commit,
+                bundle.sha256,
+            )
+            state = replace(
+                _replace_candidate(
+                    state,
+                    candidate_id,
+                    lineage=lineage,
+                    draft_intent=draft_intent,
+                    timings=timings,
+                ),
+                updated_at=dependencies.clock.now(),
+            )
+            dependencies.state.save(root, state)
             draft_started = dependencies.clock.now()
             draft = dependencies.create_draft(
                 request.target,
                 candidate_id,
+                draft_intent.idempotency_key,
                 bundle,
             )
             timings["draft_seconds"] = _seconds(
@@ -529,6 +566,10 @@ def _run_campaign(
                     candidate_id,
                     lineage=lineage,
                     draft=DraftMetadata.from_record(draft),
+                    draft_intent=replace(
+                        draft_intent,
+                        status="reconciled",
+                    ),
                     timings=timings,
                 ),
                 updated_at=dependencies.clock.now(),
@@ -873,10 +914,14 @@ def _evaluate(
     if check_initial_deadline and deadline():
         raise _CampaignDeadlineExceeded()
     result = dependencies.evaluate(subject, split, 1)
+    if deadline():
+        raise _CampaignDeadlineExceeded()
     if result.needs_repeat:
         if deadline():
             raise _CampaignDeadlineExceeded()
         result = dependencies.evaluate(subject, split, 2)
+        if deadline():
+            raise _CampaignDeadlineExceeded()
     return result
 
 
@@ -931,6 +976,27 @@ def _repository_output(
     if not output.parent.resolve().is_relative_to(repository_root):
         raise ValueError(f"{label} path escapes repository")
     return output
+
+
+def _draft_creation_intent(
+    request: CampaignRequest,
+    subject_id: str,
+    base_commit: str,
+    bundle_sha256: str,
+) -> DraftCreationIntent:
+    payload = "\0".join(
+        (
+            request.campaign_id,
+            request.target,
+            subject_id,
+            base_commit,
+            bundle_sha256,
+        )
+    ).encode("utf-8")
+    return DraftCreationIntent(
+        subject_id=subject_id,
+        idempotency_key=hashlib.sha256(payload).hexdigest(),
+    )
 
 
 def _enforce_mutation(

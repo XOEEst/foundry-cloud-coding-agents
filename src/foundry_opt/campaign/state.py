@@ -16,6 +16,22 @@ from foundry_opt.drafts import DraftRecord
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class DraftCreationIntent:
+    subject_id: str
+    idempotency_key: str
+    status: str = "pending"
+
+    def __post_init__(self) -> None:
+        if not _IDENTIFIER.fullmatch(self.subject_id):
+            raise ValueError("draft intent subject_id is invalid")
+        if not _SHA256.fullmatch(self.idempotency_key):
+            raise ValueError("draft intent idempotency_key is invalid")
+        if self.status not in {"pending", "reconciled"}:
+            raise ValueError("draft intent status is invalid")
 
 
 @dataclass(frozen=True)
@@ -53,6 +69,7 @@ class CandidateState:
     error_code: str | None = None
     timings: Mapping[str, float] = field(default_factory=dict)
     draft: DraftMetadata | None = None
+    draft_intent: DraftCreationIntent | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
@@ -84,6 +101,7 @@ class CampaignState:
     pareto_candidate_ids: tuple[str, ...] = ()
     error_code: str | None = None
     baseline_draft: DraftMetadata | None = None
+    baseline_draft_intent: DraftCreationIntent | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -244,6 +262,9 @@ def _state_document(state: CampaignState) -> dict[str, object]:
     return {
         "baseline_draft_id": state.baseline_draft_id,
         "baseline_draft": _draft_document(state.baseline_draft),
+        "baseline_draft_intent": _intent_document(
+            state.baseline_draft_intent
+        ),
         "baseline_metrics": dict(state.baseline_metrics),
         "base_commit": state.base_commit,
         "campaign_id": state.campaign_id,
@@ -287,6 +308,7 @@ def _candidate_document(candidate: CandidateState) -> dict[str, object]:
         "candidate_id": candidate.candidate_id,
         "error_code": candidate.error_code,
         "draft": _draft_document(candidate.draft),
+        "draft_intent": _intent_document(candidate.draft_intent),
         "lineage": (
             {
                 "changed_paths": [
@@ -332,6 +354,9 @@ def _state_from_document(document: object) -> CampaignState:
         ),
         error_code=document.get("error_code"),
         baseline_draft=_draft_from_document(document.get("baseline_draft")),
+        baseline_draft_intent=_intent_from_document(
+            document.get("baseline_draft_intent")
+        ),
     )
 
 
@@ -371,6 +396,7 @@ def _candidate_from_document(document: object) -> CandidateState:
             metrics=dict(artifact_document["metrics"]),
         )
     draft = _draft_from_document(document.get("draft"))
+    draft_intent = _intent_from_document(document.get("draft_intent"))
     return CandidateState(
         candidate_id=str(document["candidate_id"]),
         slot=int(document["slot"]),
@@ -382,6 +408,7 @@ def _candidate_from_document(document: object) -> CandidateState:
         error_code=document.get("error_code"),
         timings=dict(document.get("timings", {})),
         draft=draft,
+        draft_intent=draft_intent,
     )
 
 
@@ -418,4 +445,30 @@ def _draft_from_document(document: object) -> DraftMetadata | None:
         ),
         probe=bool(document["probe"]),
         project_endpoint=str(document["project_endpoint"]),
+    )
+
+
+def _intent_document(
+    intent: DraftCreationIntent | None,
+) -> dict[str, str] | None:
+    if intent is None:
+        return None
+    return {
+        "idempotency_key": intent.idempotency_key,
+        "status": intent.status,
+        "subject_id": intent.subject_id,
+    }
+
+
+def _intent_from_document(
+    document: object,
+) -> DraftCreationIntent | None:
+    if document is None:
+        return None
+    if not isinstance(document, dict):
+        raise ValueError("draft intent document is invalid")
+    return DraftCreationIntent(
+        subject_id=str(document["subject_id"]),
+        idempotency_key=str(document["idempotency_key"]),
+        status=str(document["status"]),
     )

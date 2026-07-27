@@ -280,7 +280,7 @@ class CandidateGenerator(Protocol):
 
 ValidationRunner = Callable[[Path], ValidationReport]
 BundleBuilder = Callable[[Path, Path], BundleArtifact]
-DraftCreator = Callable[[str, str, BundleArtifact], DraftRecord]
+DraftCreator = Callable[[str, str, str, BundleArtifact], DraftRecord]
 EvaluationRunner = Callable[
     [EvaluationSubject, DatasetSplit, int],
     EvaluationResult,

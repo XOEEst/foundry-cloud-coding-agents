@@ -7,6 +7,7 @@ from foundry_opt.campaign.models import CandidateArtifact, PatchArtifact
 from foundry_opt.campaign.state import (
     CampaignState,
     CandidateState,
+    DraftCreationIntent,
     DraftMetadata,
     FileCampaignStateStore,
 )
@@ -43,6 +44,7 @@ def test_file_campaign_state_round_trips_safe_resumable_metadata(
         False,
         "https://resource.services.ai.azure.com/api/projects/project",
     )
+    intent = DraftCreationIntent("candidate-1", "e" * 64, "reconciled")
     state = CampaignState(
         "campaign-1",
         "agent",
@@ -71,12 +73,14 @@ def test_file_campaign_state_round_trips_safe_resumable_metadata(
                     "total_seconds": 30.0,
                 },
                 draft=draft,
+                draft_intent=intent,
             ),
         ),
         1,
         0,
         ("candidate-1",),
         baseline_draft=replace(draft, version_id="draft-baseline"),
+        baseline_draft_intent=replace(intent, subject_id="baseline"),
     )
     store = FileCampaignStateStore()
 
@@ -95,6 +99,7 @@ def test_file_campaign_state_round_trips_safe_resumable_metadata(
     assert "instructions.md" in text
     assert "generation_seconds" in text
     assert "draft-baseline" in text
+    assert '"idempotency_key": "eeee' in text
     assert "response" not in text
     assert "secret" not in text
 
