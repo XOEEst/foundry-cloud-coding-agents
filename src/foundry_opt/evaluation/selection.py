@@ -5,6 +5,7 @@ from foundry_opt.evaluation.models import (
     EvaluationPolicy,
     EvaluationResult,
     EvaluationStatus,
+    MetricAggregate,
     MetricPolicy,
     Outcome,
     ParetoResult,
@@ -47,6 +48,14 @@ def select_eligible_candidates(
             initial_rejections[candidate.run.subject_id] = (
                 "Candidate evaluation remained incomplete after its repeat."
             )
+            continue
+        comparison_failure = _comparison_failure(
+            baseline,
+            candidate,
+            policy,
+        )
+        if comparison_failure is not None:
+            initial_rejections[candidate.run.subject_id] = comparison_failure
             continue
         undefined = _undefined_metrics(candidate, policy)
         if undefined:
@@ -154,7 +163,72 @@ def _baseline_failure(
             + ", ".join(undefined)
             + "."
         )
+    if not _policy_compatible(baseline, policy):
+        return "Baseline metrics are incompatible with the metric policy."
     return None
+
+
+def _comparison_failure(
+    baseline: EvaluationResult,
+    candidate: EvaluationResult,
+    policy: EvaluationPolicy,
+) -> str | None:
+    if (
+        baseline.run.split is not candidate.run.split
+        or baseline.run.dataset != candidate.run.dataset
+        or baseline.run.evaluator != candidate.run.evaluator
+        or _case_lineage(baseline) != _case_lineage(candidate)
+    ):
+        return (
+            "Candidate evaluation lineage differs from the pinned baseline."
+        )
+    if (
+        not _policy_compatible(candidate, policy)
+        or set(candidate.metrics) != set(baseline.metrics)
+    ):
+        return "Candidate metrics are incompatible with the metric policy."
+    return None
+
+
+def _case_lineage(result: EvaluationResult) -> frozenset[tuple[str, str]]:
+    return frozenset(
+        (case.case_id, case.case_hash) for case in result.cases
+    )
+
+
+def _policy_compatible(
+    result: EvaluationResult,
+    policy: EvaluationPolicy,
+) -> bool:
+    policy_names = {metric.name for metric in policy.metrics}
+    return (
+        policy_names <= set(result.metrics)
+        and all(
+            aggregate.metric == name
+            for name, aggregate in result.metrics.items()
+        )
+        and all(
+            _aggregate_matches_policy(
+                result.metrics[metric.name],
+                metric,
+            )
+            for metric in policy.metrics
+        )
+    )
+
+
+def _aggregate_matches_policy(
+    aggregate: MetricAggregate,
+    policy: MetricPolicy,
+) -> bool:
+    if aggregate.median is None:
+        return aggregate.outcome is Outcome.UNDEFINED
+    expected = (
+        Outcome.PASS
+        if policy.passes(aggregate.median)
+        else Outcome.FAIL
+    )
+    return aggregate.outcome is expected
 
 
 def _undefined_metrics(

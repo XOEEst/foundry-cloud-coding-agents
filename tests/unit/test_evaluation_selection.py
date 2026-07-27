@@ -1,6 +1,8 @@
 from dataclasses import replace
 from datetime import UTC, datetime
 
+import pytest
+
 from foundry_opt.evaluation import (
     AgentVersionRef,
     DatasetSplit,
@@ -321,3 +323,129 @@ def test_differing_ignored_metric_sets_are_incomparable_without_cycle() -> None:
 
     assert pareto.frontier_ids == ("a", "b", "c")
     assert pareto.eligible_ids == ("a", "b", "c")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda candidate: replace(
+            candidate,
+            run=replace(candidate.run, split=DatasetSplit.DEVELOPMENT),
+        ),
+        lambda candidate: replace(
+            candidate,
+            run=replace(
+                candidate.run,
+                dataset=DatasetVersionRef("other-dataset", "1"),
+            ),
+        ),
+        lambda candidate: replace(
+            candidate,
+            run=replace(
+                candidate.run,
+                dataset=DatasetVersionRef("validation", "2"),
+            ),
+        ),
+        lambda candidate: replace(
+            candidate,
+            run=replace(
+                candidate.run,
+                evaluator=EvaluatorDefinitionRef("other-definition", "1"),
+            ),
+        ),
+        lambda candidate: replace(
+            candidate,
+            run=replace(
+                candidate.run,
+                evaluator=EvaluatorDefinitionRef("definition", "2"),
+            ),
+        ),
+        lambda candidate: candidate.with_case_reason(
+            case_id="other-case",
+            case_hash="sha256:other-case",
+            response_ids=("response-other",),
+            reason="score",
+            scores={"quality": (0.8, 0.8, "pass")},
+            duration_ms=1,
+        ),
+        lambda candidate: replace(
+            candidate,
+            cases=(
+                replace(
+                    candidate.cases[0],
+                    case_hash="sha256:different-case",
+                ),
+            ),
+        ),
+    ],
+)
+def test_candidate_requires_identical_evaluation_lineage(mutate) -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    baseline = baseline.with_case_reason(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=("response-baseline",),
+        reason="score",
+        scores={"quality": (0.7, 0.7, "pass")},
+        duration_ms=1,
+    )
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    candidate = candidate.with_case_reason(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=("response-candidate",),
+        reason="score",
+        scores={"quality": (0.8, 0.8, "pass")},
+        duration_ms=1,
+    )
+    candidate = mutate(candidate)
+
+    pareto = select_eligible_candidates(baseline, (candidate,), POLICY)
+
+    assert pareto.eligible_ids == ()
+    assert "lineage" in pareto.decision_for("candidate").reason.casefold()
+
+
+def test_candidate_requires_compatible_metric_policy() -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    candidate = replace(
+        candidate,
+        metrics={
+            **candidate.metrics,
+            "unconfigured": MetricAggregate(
+                "unconfigured",
+                1,
+                1,
+                1,
+                0,
+                Outcome.PASS,
+                1,
+            ),
+        },
+    )
+
+    pareto = select_eligible_candidates(baseline, (candidate,), POLICY)
+
+    assert pareto.eligible_ids == ()
+    assert "policy" in pareto.decision_for("candidate").reason.casefold()
+
+
+def test_candidate_metric_outcomes_must_match_supplied_policy() -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.90, latency=2.1)
+    candidate = replace(
+        candidate,
+        metrics={
+            **candidate.metrics,
+            "latency": replace(
+                candidate.metrics["latency"],
+                outcome=Outcome.PASS,
+            ),
+        },
+    )
+
+    pareto = select_eligible_candidates(baseline, (candidate,), POLICY)
+
+    assert pareto.eligible_ids == ()
+    assert "policy" in pareto.decision_for("candidate").reason.casefold()

@@ -11,6 +11,7 @@ from foundry_opt.evaluation import (
     NormalizedCase,
     NormalizedCaseMetric,
     Outcome,
+    select_eligible_candidates,
 )
 from foundry_opt.evidence.models import EvidenceManifest, EvidenceRequest
 
@@ -427,6 +428,15 @@ def _validate_pareto_binding(request: EvidenceRequest) -> None:
     ):
         raise ValueError(
             "Pareto evidence must exactly describe the serialized candidates."
+        )
+    recomputed = select_eligible_candidates(
+        request.baseline,
+        request.candidates,
+        request.metric_policies,
+    )
+    if request.pareto != recomputed:
+        raise ValueError(
+            "Pareto evidence does not match the recomputed selection."
         )
 
 

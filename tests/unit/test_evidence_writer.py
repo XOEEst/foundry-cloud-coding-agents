@@ -31,6 +31,14 @@ def test_write_redacted_evidence_writes_allowlisted_compact_manifest(
     tmp_path: Path,
 ) -> None:
     baseline = _result("baseline", quality=0.70, latency=1.5)
+    baseline = baseline.with_case_reason(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=("response-baseline",),
+        reason="baseline",
+        scores={"quality": (3, 0.7, "pass"), "latency": (1.5, 1.5, "pass")},
+        duration_ms=100,
+    )
     candidate = _result("candidate", quality=0.80, latency=1.4)
     candidate = candidate.with_case_reason(
         case_id="case-1",
@@ -50,6 +58,7 @@ def test_write_redacted_evidence_writes_allowlisted_compact_manifest(
             baseline=baseline,
             candidates=(candidate,),
             pareto=pareto,
+            metric_policies=POLICY,
             source_hash="sha256:source",
             patch_hashes={"candidate": "sha256:patch"},
         )
@@ -95,6 +104,7 @@ def test_evidence_writer_strips_query_and_fragment_from_portal_links(
                 (),
                 EvaluationPolicy(metrics=POLICY.metrics),
             ),
+            metric_policies=POLICY,
             source_hash="sha256:source",
         )
     )
@@ -125,6 +135,7 @@ def test_evidence_writer_rejects_untrusted_portal_host_and_path(
             baseline=baseline,
             candidates=(candidate,),
             pareto=select_eligible_candidates(baseline, (candidate,), POLICY),
+            metric_policies=POLICY,
             source_hash="sha256:source",
         )
     )
@@ -152,6 +163,7 @@ def test_evidence_writer_rejects_noncanonical_portal_path(
             baseline=baseline,
             candidates=(),
             pareto=select_eligible_candidates(baseline, (), POLICY),
+            metric_policies=POLICY,
             source_hash="sha256:source",
         )
     )
@@ -187,6 +199,7 @@ def test_evidence_writer_omits_non_finite_raw_float_scores(
             baseline=baseline,
             candidates=(candidate,),
             pareto=select_eligible_candidates(baseline, (candidate,), POLICY),
+            metric_policies=POLICY,
             source_hash="sha256:source",
         )
     )
@@ -248,6 +261,7 @@ def test_evidence_writer_never_persists_provider_controlled_text(
             baseline=baseline,
             candidates=(candidate,),
             pareto=select_eligible_candidates(baseline, (candidate,), POLICY),
+            metric_policies=POLICY,
             source_hash="sha256:source",
         )
     )
@@ -301,6 +315,7 @@ def test_evidence_writer_rejects_sensitive_values_in_every_string_field(
                 baseline=baseline,
                 candidates=(),
                 pareto=select_eligible_candidates(baseline, (), POLICY),
+                metric_policies=POLICY,
                 source_hash=source_hash,
                 telemetry=(
                     TelemetryEvidence(
@@ -367,6 +382,7 @@ def test_evidence_writer_revalidates_telemetry_model_boundary(
                 baseline=baseline,
                 candidates=(),
                 pareto=select_eligible_candidates(baseline, (), POLICY),
+                metric_policies=POLICY,
                 source_hash="sha256:source",
                 telemetry=(telemetry,),
             )
@@ -400,6 +416,7 @@ def test_evidence_writer_rejects_unsafe_result_identifiers(
                 baseline=baseline,
                 candidates=(),
                 pareto=select_eligible_candidates(baseline, (), POLICY),
+                metric_policies=POLICY,
                 source_hash="sha256:source",
             )
         )
@@ -449,6 +466,7 @@ def test_evidence_writer_rejects_unsafe_case_and_trace_identifiers(
                     (candidate,),
                     POLICY,
                 ),
+                metric_policies=POLICY,
                 source_hash="sha256:source",
             )
         )
@@ -494,6 +512,34 @@ def test_evidence_writer_requires_pareto_exactly_bound_to_candidates(
                 baseline=baseline,
                 candidates=(candidate,),
                 pareto=pareto_factory(valid),
+                metric_policies=POLICY,
+                source_hash="sha256:source",
+            )
+        )
+
+
+def test_evidence_writer_recomputes_and_rejects_fabricated_pareto(
+    tmp_path: Path,
+) -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    fabricated = ParetoResult(
+        decisions=(
+            CandidateDecision("candidate", False, "caller fabricated"),
+        ),
+        frontier_ids=(),
+        eligible_ids=(),
+    )
+
+    with pytest.raises(ValueError, match="recomputed"):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=tmp_path / "evidence.json",
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(candidate,),
+                pareto=fabricated,
+                metric_policies=POLICY,
                 source_hash="sha256:source",
             )
         )
@@ -514,6 +560,7 @@ def test_evidence_writer_rejects_duplicate_candidate_subject_ids(
                 baseline=baseline,
                 candidates=(candidate, candidate),
                 pareto=pareto,
+                metric_policies=POLICY,
                 source_hash="sha256:source",
             )
         )
@@ -534,6 +581,7 @@ def test_evidence_writer_does_not_overwrite_existing_destination(
                 baseline=baseline,
                 candidates=(),
                 pareto=select_eligible_candidates(baseline, (), POLICY),
+                metric_policies=POLICY,
                 source_hash="sha256:source",
             )
         )
@@ -559,6 +607,7 @@ def test_evidence_writer_rejects_symlink_destination(tmp_path: Path) -> None:
                 baseline=baseline,
                 candidates=(),
                 pareto=select_eligible_candidates(baseline, (), POLICY),
+                metric_policies=POLICY,
                 source_hash="sha256:source",
             )
         )

@@ -3,7 +3,11 @@ from datetime import datetime
 from math import isfinite
 from pathlib import Path
 
-from foundry_opt.evaluation import EvaluationResult, ParetoResult
+from foundry_opt.evaluation import (
+    EvaluationPolicy,
+    EvaluationResult,
+    ParetoResult,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,7 @@ class EvidenceRequest:
     baseline: EvaluationResult
     candidates: tuple[EvaluationResult, ...]
     pareto: ParetoResult
+    metric_policies: EvaluationPolicy
     source_hash: str
     patch_hashes: dict[str, str] | None = None
     telemetry: tuple[TelemetryEvidence, ...] = ()
