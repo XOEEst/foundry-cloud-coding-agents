@@ -7,6 +7,7 @@ from foundry_opt.evaluation.models import (
     EvaluationFunnelRequest,
     EvaluationPolicy,
     EvaluationResult,
+    EvaluationStatus,
     EvaluationSubject,
     FunnelResult,
     FunnelStageResult,
@@ -103,10 +104,16 @@ def _combine_attempts(
     policy: EvaluationPolicy,
 ) -> EvaluationResult:
     first, second = attempts
+    valid_attempts = tuple(
+        result
+        for result in attempts
+        if result.complete
+        and result.run.status is EvaluationStatus.COMPLETED
+    )
     aggregates: dict[str, MetricAggregate] = {}
     for metric_policy in policy.metrics:
         attempt_aggregates = tuple(
-            result.metrics[metric_policy.name] for result in attempts
+            result.metrics[metric_policy.name] for result in valid_attempts
         )
         medians = tuple(
             aggregate.median
@@ -154,12 +161,18 @@ def _combine_attempts(
         )
     return replace(
         second,
-        cases=first.cases + second.cases,
+        cases=tuple(
+            case
+            for result in valid_attempts
+            for case in result.cases
+        ),
         metrics=aggregates,
         usage=first.usage + second.usage,
         duration_ms=first.duration_ms + second.duration_ms,
         errors=first.errors + second.errors,
         complete=second.complete
+        and second.run.status is EvaluationStatus.COMPLETED
+        and bool(valid_attempts)
         and all(
             metric.undefined_behavior is UndefinedBehavior.IGNORE
             or aggregates[metric.name].outcome is not Outcome.UNDEFINED

@@ -6,6 +6,7 @@ from foundry_opt.evaluation import (
     DatasetSplit,
     EvaluationFunnelRequest,
     EvaluationPolicy,
+    EvaluationStatus,
     EvaluationSubject,
     FunnelResult,
     MetricDirection,
@@ -233,3 +234,74 @@ def test_funnel_request_rejects_duplicate_subject_ids(
             candidates=candidates,
             policy=policy,
         )
+
+
+def test_partial_attempt_metrics_do_not_influence_retry_eligibility() -> None:
+    policy = EvaluationPolicy(
+        metrics=(
+            MetricPolicy(
+                "quality",
+                MetricDirection.MAXIMIZE,
+                threshold=0.6,
+                materiality=0.01,
+            ),
+        )
+    )
+    request = EvaluationFunnelRequest(
+        baseline=EvaluationSubject("baseline"),
+        candidates=(EvaluationSubject("candidate"),),
+        policy=policy,
+    )
+    calls: list[tuple[str, DatasetSplit, int]] = []
+
+    def evaluate(
+        subject: EvaluationSubject,
+        split: DatasetSplit,
+        attempt: int,
+    ):
+        calls.append((subject.subject_id, split, attempt))
+        if subject.subject_id == "baseline":
+            quality = 0.70
+        elif split is DatasetSplit.DEVELOPMENT and attempt == 1:
+            quality = 1.0
+        else:
+            quality = 0.69
+        result = _result(subject.subject_id, quality, 1.4)
+        result = replace(result, run=replace(result.run, split=split))
+        case_id = (
+            "partial-case"
+            if subject.subject_id == "candidate"
+            and split is DatasetSplit.DEVELOPMENT
+            and attempt == 1
+            else "complete-case"
+        )
+        result = result.with_case_reason(
+            case_id=case_id,
+            case_hash=f"sha256:{case_id}",
+            response_ids=(f"response-{case_id}",),
+            reason="score",
+            scores={"quality": (quality, quality, "pass")},
+            duration_ms=1,
+        )
+        if (
+            subject.subject_id == "candidate"
+            and split is DatasetSplit.DEVELOPMENT
+            and attempt == 1
+        ):
+            return replace(
+                result,
+                run=replace(result.run, status=EvaluationStatus.PARTIAL),
+                complete=False,
+                needs_repeat=True,
+                errors=("partial attempt",),
+            )
+        return result
+
+    result = run_evaluation_funnel(request, evaluate)
+
+    combined = result.development.results["candidate"]
+    assert combined.metrics["quality"].median == 0.69
+    assert tuple(case.case_id for case in combined.cases) == ("complete-case",)
+    assert combined.complete is True
+    assert result.development.pareto.eligible_ids == ()
+    assert ("candidate", DatasetSplit.VALIDATION, 1) not in calls
