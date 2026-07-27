@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from io import BytesIO
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ from foundry_opt.adapters.deployment import (
     DeploymentConflictError,
     DeploymentGateway,
     DeploymentHashMismatchError,
+    DeploymentIdentityError,
     DeploymentResponseError,
 )
 from foundry_opt.deployment import DeploymentRequest
@@ -30,13 +32,22 @@ EVIDENCE = "c" * 64
 
 
 class FakeCredentialProvider:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        client_id: str = DEPLOYMENT_OIDC_CLIENT_ID,
+    ) -> None:
+        self.client_id = client_id
+        self.create_count = 0
         self.credential = SimpleNamespace(closed=False)
         self.credential.close = lambda: setattr(
             self.credential, "closed", True
         )
 
+    def active_client_id(self) -> str:
+        return self.client_id
+
     def create(self) -> object:
+        self.create_count += 1
         return self.credential
 
 
@@ -93,11 +104,11 @@ def _request(tmp_path: Path) -> DeploymentRequest:
     )
 
 
-def _baseline() -> FakeResponse:
+def _baseline(version: int = 7) -> FakeResponse:
     return FakeResponse(
         200,
         {
-            "version": "7",
+            "version": str(version),
             "draft": False,
             "description": "published baseline",
             "metadata": {"owner": "platform"},
@@ -369,6 +380,72 @@ def test_deployment_gateway_rejects_any_other_oidc_client() -> None:
             FakeCredentialProvider(),
             deployment_client_id="8179845f-cf82-46d6-bbb8-9adf13d082f9",
         )
+
+
+def test_publish_rejects_wrong_active_principal_before_credentials_or_http(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    credentials = FakeCredentialProvider(
+        "8179845f-cf82-46d6-bbb8-9adf13d082f9"
+    )
+    client = FakeClient([])
+    gateway = DeploymentGateway(
+        credentials,
+        client_factory=lambda endpoint, credential: client,
+    )
+
+    with pytest.raises(DeploymentIdentityError):
+        gateway.publish(request)
+
+    assert credentials.create_count == 0
+    assert client.requests == []
+
+
+@pytest.mark.parametrize(
+    "changed_request",
+    [
+        lambda request: replace(request, agent_name="other-agent"),
+        lambda request: replace(
+            request,
+            project_endpoint=(
+                "https://other.services.ai.azure.com/api/projects/demo"
+            ),
+        ),
+        lambda request: replace(request, runtime="python_3_14"),
+        lambda request: replace(
+            request,
+            entry_point=("python", "-m", "agent"),
+        ),
+        lambda request: replace(request, dependency_resolution="bundled"),
+        lambda request: replace(request, description="new description"),
+        lambda request: replace(request, metadata={"release": "candidate"}),
+        lambda request: replace(request, base_version=6),
+    ],
+)
+def test_idempotency_key_covers_complete_canonical_publication(
+    tmp_path: Path,
+    changed_request: Any,
+) -> None:
+    original = _request(tmp_path)
+    changed = changed_request(original)
+    original_client = FakeClient(
+        [_baseline(), _published(original.bundle.sha256)]
+    )
+    changed_client = FakeClient(
+        [
+            _baseline(changed.base_version),
+            _published(changed.bundle.sha256),
+        ]
+    )
+
+    _gateway(original_client)[0].publish(original)
+    _gateway(changed_client)[0].publish(changed)
+
+    assert (
+        original_client.requests[1].headers["Idempotency-Key"]
+        != changed_client.requests[1].headers["Idempotency-Key"]
+    )
 
 
 def test_deployment_request_rejects_noncanonical_endpoint_before_auth(

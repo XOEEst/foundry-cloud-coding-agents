@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from foundry_opt.deployment.models import (
 
 def detect_deployment_workflow(root: Path) -> DeploymentWorkflow:
     root = root.expanduser().resolve()
+    default_branch = _default_branch(root)
     candidates: list[DeploymentWorkflow] = []
     workflow_root = root / ".github" / "workflows"
     if workflow_root.is_dir():
@@ -22,7 +24,7 @@ def detect_deployment_workflow(root: Path) -> DeploymentWorkflow:
             (*workflow_root.glob("*.yml"), *workflow_root.glob("*.yaml"))
         )
         for path in paths:
-            candidate = _workflow_candidate(root, path)
+            candidate = _workflow_candidate(root, path, default_branch)
             if candidate is not None:
                 candidates.append(candidate)
     if candidates:
@@ -63,6 +65,7 @@ def detect_deployment_workflow(root: Path) -> DeploymentWorkflow:
 def _workflow_candidate(
     root: Path,
     path: Path,
+    default_branch: str | None,
 ) -> DeploymentWorkflow | None:
     try:
         content = path.read_text(encoding="utf-8")
@@ -72,7 +75,10 @@ def _workflow_candidate(
     if not isinstance(document, dict):
         return None
     lowered = f"{path.name}\n{content}".casefold()
-    if any(marker in lowered for marker in ("az acr", "docker build", ".azurecr.io")):
+    if any(
+        marker in lowered
+        for marker in ("az acr", "docker build", ".azurecr.io")
+    ):
         return None
     role = document.get("x-foundry-opt-role")
     deployment_marked = role == "deployment" or (
@@ -90,8 +96,8 @@ def _workflow_candidate(
     )
     if not deployment_marked:
         return None
-    triggers = _trigger_names(document)
-    if _is_merge_trigger(triggers, lowered):
+    triggers = _trigger_configuration(document)
+    if _is_default_branch_merge_trigger(triggers, default_branch):
         trigger = DeploymentTrigger.MERGE
     elif "workflow_dispatch" in triggers:
         trigger = DeploymentTrigger.MANUAL
@@ -106,31 +112,98 @@ def _workflow_candidate(
     )
 
 
-def _trigger_names(document: dict[str, Any]) -> set[str]:
+def _trigger_configuration(document: dict[str, Any]) -> dict[str, Any]:
     value = document.get("on", document.get(True))
     if isinstance(value, str):
-        return {value.casefold()}
+        return {value.casefold(): None}
     if isinstance(value, list):
         return {
-            item.casefold()
+            item.casefold(): None
             for item in value
             if isinstance(item, str)
         }
     if isinstance(value, dict):
         return {
-            str(key).casefold()
-            for key in value
+            str(key).casefold(): child
+            for key, child in value.items()
         }
-    return set()
+    return {}
 
 
-def _is_merge_trigger(triggers: set[str], content: str) -> bool:
+def _is_default_branch_merge_trigger(
+    triggers: dict[str, Any],
+    default_branch: str | None,
+) -> bool:
+    if default_branch is None:
+        return False
+    push = triggers.get("push", _MISSING)
+    if push is not _MISSING and _only_branch(push, default_branch):
+        return True
+    workflow_run = triggers.get("workflow_run", _MISSING)
     return (
-        "push" in triggers
-        or "workflow_run" in triggers
-        or (
-            "pull_request" in triggers
-            and "closed" in content
-            and "merged" in content
-        )
+        workflow_run is not _MISSING
+        and isinstance(workflow_run, dict)
+        and _completed(workflow_run.get("types"))
+        and _only_branch(workflow_run, default_branch)
     )
+
+
+def _only_branch(configuration: Any, default_branch: str) -> bool:
+    if not isinstance(configuration, dict):
+        return False
+    branches = configuration.get("branches")
+    if isinstance(branches, str):
+        branch_values = (branches,)
+    elif isinstance(branches, list):
+        branch_values = tuple(
+            value for value in branches if isinstance(value, str)
+        )
+    else:
+        return False
+    return branch_values == (default_branch,)
+
+
+def _completed(value: Any) -> bool:
+    if isinstance(value, str):
+        values = (value,)
+    elif isinstance(value, list):
+        values = tuple(item for item in value if isinstance(item, str))
+    else:
+        return False
+    return "completed" in {item.casefold() for item in values}
+
+
+def _default_branch(root: Path) -> str | None:
+    remote = _git_output(
+        root,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+    )
+    if remote and "/" in remote:
+        return remote.split("/", 1)[1]
+    branches = _git_output(
+        root,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads",
+    )
+    values = tuple(line for line in branches.splitlines() if line)
+    return values[0] if len(values) == 1 else None
+
+
+def _git_output(root: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ("git", *arguments),
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+_MISSING = object()

@@ -14,6 +14,14 @@ class DeploymentAuthorizationError(DeploymentError):
         )
 
 
+class DeploymentIdentityError(DeploymentError):
+    def __init__(self) -> None:
+        super().__init__(
+            "The active Azure principal is not the configured deployment "
+            "OIDC identity."
+        )
+
+
 class DeploymentApiError(DeploymentError):
     def __init__(self, status_code: int | None = None) -> None:
         self.status_code = status_code

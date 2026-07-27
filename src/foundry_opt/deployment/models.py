@@ -167,6 +167,7 @@ class DeploymentRecord:
             or isinstance(self.version, bool)
             or self.version < 1
             or self.base_version < 1
+            or self.version <= self.base_version
         ):
             raise ValueError("deployment versions must be positive integers")
         _sha256(self.sha256, "sha256")
@@ -289,12 +290,16 @@ class DeploymentVerificationRequest:
     candidate_id: str
     patch_path: Path
     expected_patch_sha256: str
+    expected_base_commit: str
     expected_tree_hash: str
     deployed_tree_hash: str
     evidence_path: Path
     expected_evidence_sha256: str
     bundle: BundleArtifact
     expected_bundle_sha256: str
+    expected_project_endpoint: str
+    expected_agent_name: str
+    expected_base_version: int
     expected_version: int
     expected_commit: str
     expected_run_url: str
@@ -303,6 +308,10 @@ class DeploymentVerificationRequest:
     workflow: DeploymentWorkflow
     workflow_run: DeploymentWorkflowRun | None
     runtime: DeployedRuntime | None
+    bundle_include: tuple[str, ...] = ("**",)
+    bundle_exclude: tuple[str, ...] = ()
+    bundle_dependency_resolution: str = "remote_build"
+    bundle_evidence_paths: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         _identifier(self.candidate_id, "candidate_id")
@@ -317,6 +326,8 @@ class DeploymentVerificationRequest:
             repository_path(self.evidence_path, "evidence_path"),
         )
         _sha256(self.expected_patch_sha256, "expected_patch_sha256")
+        if not _COMMIT.fullmatch(self.expected_base_commit):
+            raise ValueError("expected_base_commit is invalid")
         _tree_hash(self.expected_tree_hash, "expected_tree_hash")
         _tree_hash(self.deployed_tree_hash, "deployed_tree_hash")
         _sha256(
@@ -324,10 +335,19 @@ class DeploymentVerificationRequest:
             "expected_evidence_sha256",
         )
         _sha256(self.expected_bundle_sha256, "expected_bundle_sha256")
+        project_endpoint_components(self.expected_project_endpoint)
+        if not _AGENT_NAME.fullmatch(self.expected_agent_name):
+            raise ValueError("expected_agent_name is invalid")
+        if (
+            not isinstance(self.expected_base_version, int)
+            or isinstance(self.expected_base_version, bool)
+            or self.expected_base_version < 1
+        ):
+            raise ValueError("expected_base_version is invalid")
         if (
             not isinstance(self.expected_version, int)
             or isinstance(self.expected_version, bool)
-            or self.expected_version < 1
+            or self.expected_version <= self.expected_base_version
         ):
             raise ValueError("expected_version is invalid")
         if not _COMMIT.fullmatch(self.expected_commit):
@@ -341,6 +361,24 @@ class DeploymentVerificationRequest:
             self.expected_portal_url,
             {"ai.azure.com", "portal.azure.com"},
             "expected_portal_url",
+        )
+        if not self.bundle_include or any(
+            not pattern.strip()
+            for pattern in self.bundle_include + self.bundle_exclude
+        ):
+            raise ValueError("bundle patterns must not be empty")
+        if self.bundle_dependency_resolution not in {
+            "remote_build",
+            "bundled",
+        }:
+            raise ValueError("bundle_dependency_resolution is invalid")
+        object.__setattr__(
+            self,
+            "bundle_evidence_paths",
+            tuple(
+                repository_path(path, "bundle evidence path")
+                for path in self.bundle_evidence_paths
+            ),
         )
 
 

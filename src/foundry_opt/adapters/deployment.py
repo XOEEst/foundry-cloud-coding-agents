@@ -30,6 +30,7 @@ from foundry_opt.deployment.errors import (
     DeploymentConflictError,
     DeploymentError,
     DeploymentHashMismatchError,
+    DeploymentIdentityError,
     DeploymentResponseError,
 )
 from foundry_opt.deployment.models import (
@@ -52,6 +53,8 @@ _PROVENANCE_KEYS = (
 
 
 class CredentialProvider(Protocol):
+    def active_client_id(self) -> str: ...
+
     def create(self) -> Any: ...
 
 
@@ -81,6 +84,10 @@ class DeploymentGateway:
         self.deployment_client_id = deployment_client_id
 
     def publish(self, request: DeploymentRequest) -> DeploymentRecord:
+        _verify_active_principal(
+            self._credential_provider,
+            self.deployment_client_id,
+        )
         bundle_bytes = _verify_local_bundle(
             request.bundle.path,
             request.bundle.sha256,
@@ -118,7 +125,11 @@ class DeploymentGateway:
             headers = {
                 "Accept": "application/json",
                 "Content-Type": content_type,
-                "Idempotency-Key": _idempotency_key(request),
+                "Idempotency-Key": _idempotency_key(
+                    request,
+                    metadata_json,
+                    bundle_bytes,
+                ),
                 "x-ms-code-zip-sha256": request.bundle.sha256,
             }
             response: dict[str, Any] | None = None
@@ -326,19 +337,41 @@ def _multipart_body(
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
-def _idempotency_key(request: DeploymentRequest) -> str:
-    content = "\0".join(
-        (
-            request.project_endpoint,
-            request.agent_name,
-            str(request.base_version),
-            request.bundle.sha256,
-            request.patch_sha256,
-            request.tree_hash,
-            request.evidence_sha256,
-        )
-    ).encode("utf-8")
-    return hashlib.sha256(content).hexdigest()
+def _idempotency_key(
+    request: DeploymentRequest,
+    metadata_json: bytes,
+    bundle_bytes: bytes,
+) -> str:
+    bundle_digest = hashlib.sha256(bundle_bytes).hexdigest().encode("ascii")
+    canonical_payload = (
+        b"foundry-opt-published-version-v1\0"
+        + request.project_endpoint.encode("utf-8")
+        + b"\0"
+        + request.agent_name.encode("utf-8")
+        + b"\0"
+        + metadata_json
+        + b"\0"
+        + bundle_digest
+    )
+    return hashlib.sha256(canonical_payload).hexdigest()
+
+
+def _verify_active_principal(
+    provider: CredentialProvider,
+    expected_client_id: str,
+) -> None:
+    active_client_id = getattr(provider, "active_client_id", None)
+    if not callable(active_client_id):
+        raise DeploymentIdentityError()
+    try:
+        actual = active_client_id()
+    except Exception:
+        raise DeploymentIdentityError() from None
+    if (
+        not isinstance(actual, str)
+        or actual.casefold() != expected_client_id.casefold()
+    ):
+        raise DeploymentIdentityError()
 
 
 def _header(headers: Any, name: str) -> str | None:

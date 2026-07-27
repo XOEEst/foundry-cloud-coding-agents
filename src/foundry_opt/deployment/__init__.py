@@ -6,6 +6,7 @@ from foundry_opt.deployment.errors import (
     DeploymentConflictError,
     DeploymentError,
     DeploymentHashMismatchError,
+    DeploymentIdentityError,
     DeploymentResponseError,
 )
 from foundry_opt.deployment.models import (
@@ -42,6 +43,7 @@ __all__ = [
     "DeploymentError",
     "DeploymentGateway",
     "DeploymentHashMismatchError",
+    "DeploymentIdentityError",
     "DeploymentRecord",
     "DeploymentRequest",
     "DeploymentResponseError",

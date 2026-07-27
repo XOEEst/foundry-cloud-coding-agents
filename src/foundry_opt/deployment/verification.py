@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import subprocess
+import uuid
 
 from foundry_opt.deployment.models import (
     DeploymentCheck,
@@ -12,6 +15,7 @@ from foundry_opt.deployment.models import (
     DeploymentVerificationStatus,
     WorkflowRunStatus,
 )
+from foundry_opt.packaging import BundleRequest, build_source_bundle
 
 
 def verify_deployed_selection(
@@ -63,7 +67,13 @@ def verify_deployed_selection(
         request.repository_root,
         request.evidence_path,
     )
-    bundle_sha256 = _file_sha256(request.bundle.path)
+    bundle_content = _file_content(request.bundle.path)
+    bundle_sha256 = (
+        hashlib.sha256(bundle_content).hexdigest()
+        if bundle_content is not None
+        else None
+    )
+    reproduction = _reproduce_selection(request)
     checks = (
         DeploymentCheck(
             "patch_sha256",
@@ -72,6 +82,19 @@ def verify_deployed_selection(
         DeploymentCheck(
             "tree_hash",
             request.deployed_tree_hash == request.expected_tree_hash,
+        ),
+        DeploymentCheck(
+            "reproduced_tree",
+            reproduction is not None
+            and reproduction.tree_hash == request.expected_tree_hash,
+        ),
+        DeploymentCheck(
+            "reproduced_bundle",
+            reproduction is not None
+            and bundle_content is not None
+            and reproduction.bundle_bytes == bundle_content
+            and reproduction.bundle_sha256
+            == request.expected_bundle_sha256,
         ),
         DeploymentCheck(
             "bundle_sha256",
@@ -96,8 +119,16 @@ def verify_deployed_selection(
             ),
         ),
         DeploymentCheck(
-            "record_lineage",
-            request.record.patch_sha256 == request.expected_patch_sha256
+            "service_provenance_record",
+            request.record.project_endpoint
+            == request.expected_project_endpoint
+            and request.record.agent_name == request.expected_agent_name
+            and request.record.base_version
+            == request.expected_base_version
+            and request.record.version == request.expected_version
+            and request.record.sha256 == request.expected_bundle_sha256
+            and request.record.patch_sha256
+            == request.expected_patch_sha256
             and request.record.tree_hash == request.expected_tree_hash
             and request.record.evidence_sha256
             == request.expected_evidence_sha256,
@@ -175,12 +206,11 @@ def _contained_file(root: Path, relative: Path) -> tuple[bytes | None, str | Non
     return content, hashlib.sha256(content).hexdigest()
 
 
-def _file_sha256(path: Path) -> str | None:
+def _file_content(path: Path) -> bytes | None:
     try:
-        content = path.read_bytes()
+        return path.read_bytes()
     except OSError:
         return None
-    return hashlib.sha256(content).hexdigest()
 
 
 def _file_size(path: Path) -> int | None:
@@ -220,3 +250,100 @@ def _evidence_matches(
         and candidate_id in eligible
         and len(matching) == 1
     )
+
+
+class _Reproduction:
+    def __init__(
+        self,
+        tree_hash: str,
+        bundle_bytes: bytes,
+        bundle_sha256: str,
+    ) -> None:
+        self.tree_hash = tree_hash
+        self.bundle_bytes = bundle_bytes
+        self.bundle_sha256 = bundle_sha256
+
+
+def _reproduce_selection(
+    request: DeploymentVerificationRequest,
+) -> _Reproduction | None:
+    root = request.repository_root.expanduser().resolve()
+    patch = root / request.patch_path
+    try:
+        patch = patch.resolve(strict=True)
+    except OSError:
+        return None
+    if not patch.is_relative_to(root) or not patch.is_file():
+        return None
+    scratch = root / f".fv-{uuid.uuid4().hex[:8]}"
+    worktree = scratch / "w"
+    absolute_worktree = worktree.resolve()
+    added = False
+    try:
+        scratch.mkdir(parents=True, exist_ok=False)
+        _git(
+            root,
+            "worktree",
+            "add",
+            "--detach",
+            str(absolute_worktree),
+            request.expected_base_commit,
+        )
+        added = True
+        _git(
+            absolute_worktree,
+            "apply",
+            "--index",
+            "--binary",
+            str(patch),
+        )
+        tree_hash = _git(worktree, "write-tree")
+        artifact = build_source_bundle(
+            BundleRequest(
+                repository_root=absolute_worktree,
+                output_path=scratch / "rebuilt.zip",
+                include=request.bundle_include,
+                exclude=request.bundle_exclude,
+                dependency_resolution=(
+                    request.bundle_dependency_resolution
+                ),
+                evidence_paths=request.bundle_evidence_paths,
+            )
+        )
+        bundle_bytes = artifact.path.read_bytes()
+        return _Reproduction(
+            tree_hash,
+            bundle_bytes,
+            artifact.sha256,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None
+    finally:
+        if added:
+            subprocess.run(
+                (
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(absolute_worktree),
+                ),
+                cwd=root,
+                capture_output=True,
+            )
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _git(root: Path, *arguments: str) -> str:
+    try:
+        result = subprocess.run(
+            ("git", *arguments),
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise RuntimeError("git execution failed") from error
+    if result.returncode != 0:
+        raise RuntimeError("git verification failed")
+    return result.stdout.strip()
