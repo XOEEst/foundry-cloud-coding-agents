@@ -392,7 +392,26 @@ def _validate_evidence_identifiers(request: EvidenceRequest) -> None:
             telemetry_item.response_id,
             "telemetry response_id",
         )
+    _validate_telemetry_binding(request)
     _validate_pareto_binding(request)
+
+
+def _validate_telemetry_binding(request: EvidenceRequest) -> None:
+    serialized_response_ids = {
+        response_id
+        for result in (request.baseline, *request.candidates)
+        for case in result.cases
+        for response_id in case.response_ids
+    }
+    unrelated_response_ids = {
+        item.response_id
+        for item in request.telemetry
+        if item.response_id not in serialized_response_ids
+    }
+    if unrelated_response_ids:
+        raise ValueError(
+            "Evidence telemetry response IDs must match serialized cases."
+        )
 
 
 def _validate_pareto_binding(request: EvidenceRequest) -> None:

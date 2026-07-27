@@ -371,3 +371,66 @@ def test_funnel_rejects_attempts_outside_requested_subject_lineage(
 
     with pytest.raises(ValueError, match="lineage"):
         run_evaluation_funnel(request, evaluate)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda run: replace(
+            run,
+            dataset=replace(run.dataset, dataset_id="foreign-dataset"),
+        ),
+        lambda run: replace(
+            run,
+            dataset=replace(run.dataset, version="foreign-version"),
+        ),
+        lambda run: replace(
+            run,
+            evaluator=replace(
+                run.evaluator,
+                definition_id="foreign-definition",
+            ),
+        ),
+        lambda run: replace(
+            run,
+            evaluator=replace(run.evaluator, version="foreign-version"),
+        ),
+    ],
+)
+def test_funnel_rejects_repeat_attempts_with_different_evaluation_lineage(
+    mutate,
+) -> None:
+    request = EvaluationFunnelRequest(
+        baseline=_subject("baseline"),
+        candidates=(),
+        policy=EvaluationPolicy(
+            metrics=(
+                MetricPolicy(
+                    "quality",
+                    MetricDirection.MAXIMIZE,
+                    threshold=0.6,
+                    materiality=0.05,
+                ),
+                MetricPolicy(
+                    "latency",
+                    MetricDirection.MINIMIZE,
+                    threshold=2.0,
+                    materiality=0.2,
+                ),
+            )
+        ),
+    )
+
+    def evaluate(
+        subject: EvaluationSubject,
+        split: DatasetSplit,
+        attempt: int,
+    ):
+        result = _result(subject.subject_id, quality=0.70, latency=1.5)
+        result = replace(result, run=replace(result.run, split=split))
+        if attempt == 1:
+            return replace(result, needs_repeat=True)
+        return replace(result, run=mutate(result.run))
+
+    with pytest.raises(ValueError, match="lineage"):
+        run_evaluation_funnel(request, evaluate)

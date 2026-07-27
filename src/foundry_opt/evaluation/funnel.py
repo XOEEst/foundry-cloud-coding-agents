@@ -97,7 +97,12 @@ def _evaluate_with_repeat(
     if not first.needs_repeat:
         return first
     second = evaluate(subject, split, 2)
-    _validate_attempt_lineage(subject, split, second)
+    _validate_attempt_lineage(
+        subject,
+        split,
+        second,
+        expected_result=first,
+    )
     return _combine_attempts((first, second), policy)
 
 
@@ -105,13 +110,23 @@ def _validate_attempt_lineage(
     subject: EvaluationSubject,
     split: DatasetSplit,
     result: EvaluationResult,
+    *,
+    expected_result: EvaluationResult | None = None,
 ) -> None:
     runs = (result.run, *result.all_runs)
     if any(
         run.subject_id != subject.subject_id
         or run.split is not split
         or run.agent != subject.agent
+        or run.dataset != result.run.dataset
+        or run.evaluator != result.run.evaluator
         for run in runs
+    ) or (
+        expected_result is not None
+        and (
+            result.run.dataset != expected_result.run.dataset
+            or result.run.evaluator != expected_result.run.evaluator
+        )
     ):
         raise ValueError(
             "Evaluation attempt lineage does not match the requested subject."

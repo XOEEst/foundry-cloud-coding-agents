@@ -306,6 +306,14 @@ def test_evidence_writer_rejects_sensitive_values_in_every_string_field(
         )
     else:
         telemetry_response_id = f"response-{sensitive}"
+    baseline = baseline.with_case_reason(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=(telemetry_response_id,),
+        reason="safe",
+        scores={"quality": (3, 0.7, "pass"), "latency": (1.5, 1.5, "pass")},
+        duration_ms=10,
+    )
     output = tmp_path / "evidence.json"
 
     with pytest.raises(SensitiveEvidenceError):
@@ -333,6 +341,43 @@ def test_evidence_writer_rejects_sensitive_values_in_every_string_field(
         )
 
     assert not output.exists()
+
+
+def test_evidence_writer_rejects_telemetry_for_unserialized_response(
+    tmp_path: Path,
+) -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    baseline = baseline.with_case_reason(
+        case_id="case-1",
+        case_hash="sha256:case-1",
+        response_ids=("response-baseline",),
+        reason="safe",
+        scores={"quality": (3, 0.7, "pass"), "latency": (1.5, 1.5, "pass")},
+        duration_ms=10,
+    )
+
+    with pytest.raises(ValueError, match="telemetry response"):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=tmp_path / "evidence.json",
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(),
+                pareto=select_eligible_candidates(baseline, (), POLICY),
+                metric_policies=POLICY,
+                source_hash="sha256:source",
+                telemetry=(
+                    TelemetryEvidence(
+                        response_id="response-production",
+                        request_count=1,
+                        dependency_count=0,
+                        exception_count=0,
+                        duration_ms=10,
+                        success_rate=1.0,
+                    ),
+                ),
+            )
+        )
 
 
 @pytest.mark.parametrize(
