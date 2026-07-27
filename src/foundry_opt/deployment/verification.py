@@ -15,7 +15,14 @@ from foundry_opt.deployment.models import (
     DeploymentVerificationStatus,
     WorkflowRunStatus,
 )
+from foundry_opt.github_workflow.errors import CampaignPublicationError
+from foundry_opt.github_workflow.publication import (
+    _verify_redacted_evidence,
+)
 from foundry_opt.packaging import BundleRequest, build_source_bundle
+
+
+_SUCCESS_STATUSES = {"active", "completed", "ready", "succeeded"}
 
 
 def verify_deployed_selection(
@@ -73,6 +80,12 @@ def verify_deployed_selection(
         if bundle_content is not None
         else None
     )
+    baseline_bundle_content = _file_content(request.baseline_bundle.path)
+    baseline_bundle_sha256 = (
+        hashlib.sha256(baseline_bundle_content).hexdigest()
+        if baseline_bundle_content is not None
+        else None
+    )
     reproduction = _reproduce_selection(request)
     checks = (
         DeploymentCheck(
@@ -114,9 +127,24 @@ def verify_deployed_selection(
             "evidence_lineage",
             _evidence_matches(
                 evidence_content,
-                request.candidate_id,
-                request.expected_patch_sha256,
+                request,
             ),
+        ),
+        DeploymentCheck(
+            "baseline_bundle_sha256",
+            baseline_bundle_sha256
+            == request.expected_baseline_bundle_sha256
+            == request.baseline_bundle.sha256
+            and (
+                baseline_bundle_content is not None
+                and len(baseline_bundle_content)
+                == request.baseline_bundle.byte_size
+            ),
+        ),
+        DeploymentCheck(
+            "published_terminal_status",
+            (request.record.status or "").casefold()
+            in _SUCCESS_STATUSES,
         ),
         DeploymentCheck(
             "service_provenance_record",
@@ -131,7 +159,13 @@ def verify_deployed_selection(
             == request.expected_patch_sha256
             and request.record.tree_hash == request.expected_tree_hash
             and request.record.evidence_sha256
-            == request.expected_evidence_sha256,
+            == request.expected_evidence_sha256
+            and request.record.runtime == request.expected_runtime
+            and request.record.entry_point
+            == request.expected_entry_point
+            and request.record.dependency_resolution
+            == request.expected_dependency_resolution
+            and _record_metadata_matches(request),
         ),
         DeploymentCheck(
             "workflow_identity",
@@ -139,6 +173,13 @@ def verify_deployed_selection(
             and run.path == request.workflow.path
             and run.trigger is request.workflow.trigger
             and run.head_commit == request.expected_commit,
+        ),
+        DeploymentCheck(
+            "workflow_commit_tree",
+            reproduction is not None
+            and reproduction.workflow_commit_tree
+            == request.expected_tree_hash
+            == reproduction.tree_hash,
         ),
         DeploymentCheck(
             "workflow_run_url",
@@ -222,19 +263,30 @@ def _file_size(path: Path) -> int | None:
 
 def _evidence_matches(
     content: bytes | None,
-    candidate_id: str,
-    patch_sha256: str,
+    request: DeploymentVerificationRequest,
 ) -> bool:
     if content is None:
         return False
     try:
+        _verify_redacted_evidence(
+            content,
+            request.expected_campaign_id,
+            request.candidate_id,
+            request.expected_patch_sha256,
+            (),
+        )
         document = json.loads(content)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (
+        CampaignPublicationError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ):
         return False
     if not isinstance(document, dict):
         return False
     candidates = document.get("candidates")
     pareto = document.get("pareto")
+    baseline = document.get("baseline")
     if not isinstance(candidates, list) or not isinstance(pareto, dict):
         return False
     eligible = pareto.get("eligible_ids")
@@ -242,13 +294,35 @@ def _evidence_matches(
         candidate
         for candidate in candidates
         if isinstance(candidate, dict)
-        and candidate.get("subject_id") == candidate_id
-        and candidate.get("patch_hash") == patch_sha256
+        and candidate.get("subject_id") == request.candidate_id
+        and candidate.get("patch_hash") == request.expected_patch_sha256
     ]
     return (
-        isinstance(eligible, list)
-        and candidate_id in eligible
+        document.get("campaign_id") == request.expected_campaign_id
+        and document.get("source_hash")
+        == request.expected_baseline_bundle_sha256
+        and isinstance(baseline, dict)
+        and baseline.get("subject_id")
+        == request.expected_baseline_subject_id
+        and isinstance(eligible, list)
+        and request.candidate_id in eligible
         and len(matching) == 1
+    )
+
+
+def _record_metadata_matches(
+    request: DeploymentVerificationRequest,
+) -> bool:
+    expected = {
+        "foundry-opt-base-version": str(request.expected_base_version),
+        "foundry-opt-source-sha256": request.expected_bundle_sha256,
+        "foundry-opt-patch-sha256": request.expected_patch_sha256,
+        "foundry-opt-tree-hash": request.expected_tree_hash,
+        "foundry-opt-evidence-sha256": request.expected_evidence_sha256,
+    }
+    return all(
+        request.record.metadata.get(key) == value
+        for key, value in expected.items()
     )
 
 
@@ -256,10 +330,12 @@ class _Reproduction:
     def __init__(
         self,
         tree_hash: str,
+        workflow_commit_tree: str,
         bundle_bytes: bytes,
         bundle_sha256: str,
     ) -> None:
         self.tree_hash = tree_hash
+        self.workflow_commit_tree = workflow_commit_tree
         self.bundle_bytes = bundle_bytes
         self.bundle_sha256 = bundle_sha256
 
@@ -281,6 +357,11 @@ def _reproduce_selection(
     added = False
     try:
         scratch.mkdir(parents=True, exist_ok=False)
+        workflow_commit_tree = _git(
+            root,
+            "rev-parse",
+            f"{request.expected_commit}^{{tree}}",
+        )
         _git(
             root,
             "worktree",
@@ -313,6 +394,7 @@ def _reproduce_selection(
         bundle_bytes = artifact.path.read_bytes()
         return _Reproduction(
             tree_hash,
+            workflow_commit_tree,
             bundle_bytes,
             artifact.sha256,
         )

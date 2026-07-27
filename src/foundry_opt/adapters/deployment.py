@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import secrets
+import time
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 import zipfile
@@ -32,6 +33,7 @@ from foundry_opt.deployment.errors import (
     DeploymentHashMismatchError,
     DeploymentIdentityError,
     DeploymentResponseError,
+    DeploymentStatusError,
 )
 from foundry_opt.deployment.models import (
     DEPLOYMENT_OIDC_CLIENT_ID,
@@ -50,6 +52,16 @@ _PROVENANCE_KEYS = (
     "foundry-opt-tree-hash",
     "foundry-opt-evidence-sha256",
 )
+_SUCCESS_STATUSES = {"active", "completed", "ready", "succeeded"}
+_PENDING_STATUSES = {
+    "creating",
+    "in_progress",
+    "pending",
+    "provisioning",
+    "queued",
+    "updating",
+}
+_FAILURE_STATUSES = {"cancelled", "error", "failed"}
 
 
 class CredentialProvider(Protocol):
@@ -73,14 +85,26 @@ class DeploymentGateway:
         client_factory: ClientFactory = _create_client,
         deployment_client_id: str = DEPLOYMENT_OIDC_CLIENT_ID,
         conflict_retries: int = 1,
+        poll_attempts: int = 30,
+        poll_interval_seconds: float = 2,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if deployment_client_id != DEPLOYMENT_OIDC_CLIENT_ID:
             raise ValueError("deployment_client_id must use the deployment OIDC app")
         if conflict_retries not in {0, 1}:
             raise ValueError("conflict_retries must be zero or one")
+        if not 1 <= poll_attempts <= 120:
+            raise ValueError("poll_attempts must be between 1 and 120")
+        if not 0 <= poll_interval_seconds <= 60:
+            raise ValueError(
+                "poll_interval_seconds must be between zero and 60"
+            )
         self._credential_provider = credential_provider
         self._client_factory = client_factory
         self._conflict_retries = conflict_retries
+        self._poll_attempts = poll_attempts
+        self._poll_interval_seconds = poll_interval_seconds
+        self._sleep = sleep
         self.deployment_client_id = deployment_client_id
 
     def publish(self, request: DeploymentRequest) -> DeploymentRecord:
@@ -154,14 +178,52 @@ class DeploymentGateway:
                         raise
             if response is None:
                 raise DeploymentResponseError()
-            return _parse_published_response(
+            version = _parse_created_version(
                 response,
                 response_headers,
                 request,
             )
+            return self._poll_published_version(client, request, version)
         finally:
             _close_quietly(client)
             _close_quietly(credential)
+
+    def _poll_published_version(
+        self,
+        client: Any,
+        request: DeploymentRequest,
+        version: int,
+    ) -> DeploymentRecord:
+        for attempt in range(self._poll_attempts):
+            payload = _send_json(
+                client,
+                HttpRequest(
+                    "GET",
+                    _version_url(
+                        request.project_endpoint,
+                        request.agent_name,
+                        str(version),
+                    ),
+                    headers={"Accept": "application/json"},
+                ),
+            )
+            record = _parse_published_readback(
+                payload,
+                request.project_endpoint,
+                request.agent_name,
+                version,
+            )
+            status = (record.status or "").casefold()
+            if status in _SUCCESS_STATUSES:
+                _verify_readback_matches_request(record, request)
+                return record
+            if status in _FAILURE_STATUSES:
+                raise DeploymentStatusError(status)
+            if status not in _PENDING_STATUSES:
+                raise DeploymentStatusError()
+            if attempt + 1 < self._poll_attempts:
+                self._sleep(self._poll_interval_seconds)
+        raise DeploymentStatusError("pending")
 
 
 def _deployment_metadata(
@@ -197,13 +259,7 @@ def _deployment_metadata(
         baseline_metadata = {}
     if not isinstance(baseline_metadata, dict):
         raise DeploymentResponseError()
-    provenance = {
-        "foundry-opt-base-version": str(request.base_version),
-        "foundry-opt-source-sha256": request.bundle.sha256,
-        "foundry-opt-patch-sha256": request.patch_sha256,
-        "foundry-opt-tree-hash": request.tree_hash,
-        "foundry-opt-evidence-sha256": request.evidence_sha256,
-    }
+    provenance = _provenance_metadata(request)
     caller_metadata = dict(request.metadata)
     if set(_PROVENANCE_KEYS) & caller_metadata.keys():
         raise DeploymentResponseError()
@@ -234,6 +290,16 @@ def _deployment_metadata(
     return payload
 
 
+def _provenance_metadata(request: DeploymentRequest) -> dict[str, str]:
+    return {
+        "foundry-opt-base-version": str(request.base_version),
+        "foundry-opt-source-sha256": request.bundle.sha256,
+        "foundry-opt-patch-sha256": request.patch_sha256,
+        "foundry-opt-tree-hash": request.tree_hash,
+        "foundry-opt-evidence-sha256": request.evidence_sha256,
+    }
+
+
 def _verify_published_baseline(
     payload: dict[str, Any],
     expected_version: int,
@@ -245,11 +311,11 @@ def _verify_published_baseline(
         raise DeploymentResponseError()
 
 
-def _parse_published_response(
+def _parse_created_version(
     payload: dict[str, Any],
     headers: Any,
     request: DeploymentRequest,
-) -> DeploymentRecord:
+) -> int:
     raw_version = payload.get("version")
     if isinstance(raw_version, bool):
         raise DeploymentResponseError()
@@ -273,24 +339,101 @@ def _parse_published_response(
         or returned_hash.casefold() != request.bundle.sha256.casefold()
     ):
         raise DeploymentHashMismatchError()
+    return version
+
+
+def _parse_published_readback(
+    payload: dict[str, Any],
+    project_endpoint: str,
+    agent_name: str,
+    expected_version: int,
+) -> DeploymentRecord:
+    raw_version = payload.get("version")
+    if isinstance(raw_version, bool):
+        raise DeploymentResponseError()
+    if isinstance(raw_version, int):
+        version = raw_version
+    elif isinstance(raw_version, str) and raw_version.isdigit():
+        version = int(raw_version)
+    else:
+        raise DeploymentResponseError()
+    if version != expected_version or payload.get("draft") is not False:
+        raise DeploymentResponseError()
     status = payload.get("status")
-    portal_url = _safe_portal_url(
-        payload.get("portal_url")
-        or payload.get("portalUrl")
-        or _nested_portal_url(payload)
-    )
-    return DeploymentRecord(
-        project_endpoint=request.project_endpoint,
-        agent_name=request.agent_name,
-        version=version,
-        base_version=request.base_version,
-        sha256=request.bundle.sha256,
-        patch_sha256=request.patch_sha256,
-        tree_hash=request.tree_hash,
-        evidence_sha256=request.evidence_sha256,
-        status=status if isinstance(status, str) else None,
-        portal_url=portal_url,
-    )
+    if not isinstance(status, str) or not status:
+        raise DeploymentStatusError()
+    definition = payload.get("definition")
+    if (
+        not isinstance(definition, dict)
+        or definition.get("kind") != "hosted"
+    ):
+        raise DeploymentResponseError()
+    configuration = definition.get("code_configuration")
+    metadata = payload.get("metadata")
+    if not isinstance(configuration, dict) or not isinstance(metadata, dict):
+        raise DeploymentResponseError()
+    runtime = configuration.get("runtime")
+    entry_point = configuration.get("entry_point")
+    dependency_resolution = configuration.get("dependency_resolution")
+    source_sha256 = configuration.get("content_hash")
+    if (
+        not isinstance(runtime, str)
+        or not runtime
+        or not isinstance(entry_point, list)
+        or not entry_point
+        or any(not isinstance(part, str) or not part for part in entry_point)
+        or not isinstance(dependency_resolution, str)
+        or not isinstance(source_sha256, str)
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in metadata.items()
+        )
+    ):
+        raise DeploymentResponseError()
+    try:
+        return DeploymentRecord(
+            project_endpoint=project_endpoint,
+            agent_name=agent_name,
+            version=version,
+            base_version=int(metadata["foundry-opt-base-version"]),
+            sha256=source_sha256,
+            patch_sha256=metadata["foundry-opt-patch-sha256"],
+            tree_hash=metadata["foundry-opt-tree-hash"],
+            evidence_sha256=metadata["foundry-opt-evidence-sha256"],
+            status=status.casefold(),
+            portal_url=_safe_portal_url(
+                payload.get("portal_url")
+                or payload.get("portalUrl")
+                or _nested_portal_url(payload)
+            ),
+            runtime=runtime,
+            entry_point=tuple(entry_point),
+            dependency_resolution=dependency_resolution,
+            metadata=metadata,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise DeploymentResponseError() from error
+
+
+def _verify_readback_matches_request(
+    record: DeploymentRecord,
+    request: DeploymentRequest,
+) -> None:
+    if (
+        record.base_version != request.base_version
+        or record.sha256 != request.bundle.sha256
+        or record.patch_sha256 != request.patch_sha256
+        or record.tree_hash != request.tree_hash
+        or record.evidence_sha256 != request.evidence_sha256
+        or record.runtime != request.runtime
+        or record.entry_point != request.entry_point
+        or record.dependency_resolution != request.dependency_resolution
+        or any(
+            record.metadata.get(key) != value
+            for key, value in _provenance_metadata(request).items()
+        )
+    ):
+        raise DeploymentResponseError()
 
 
 def _nested_hash(payload: dict[str, Any]) -> str | None:

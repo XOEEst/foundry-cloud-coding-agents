@@ -20,6 +20,7 @@ from foundry_opt.adapters.deployment import (
     DeploymentHashMismatchError,
     DeploymentIdentityError,
     DeploymentResponseError,
+    DeploymentStatusError,
 )
 from foundry_opt.deployment import DeploymentRequest
 from foundry_opt.packaging import BundleRequest, build_source_bundle
@@ -160,6 +161,49 @@ def _published(
     )
 
 
+def _readback(
+    request: DeploymentRequest,
+    *,
+    status: str = "active",
+    runtime: str | None = None,
+    entry_point: list[str] | None = None,
+    dependency_resolution: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> FakeResponse:
+    provenance = metadata or {
+        "foundry-opt-base-version": str(request.base_version),
+        "foundry-opt-source-sha256": request.bundle.sha256,
+        "foundry-opt-patch-sha256": request.patch_sha256,
+        "foundry-opt-tree-hash": request.tree_hash,
+        "foundry-opt-evidence-sha256": request.evidence_sha256,
+    }
+    return FakeResponse(
+        200,
+        {
+            "version": "8",
+            "draft": False,
+            "status": status,
+            "portal_url": (
+                "https://ai.azure.com/projects/demo/agents/demo-agent/"
+                "versions/8"
+            ),
+            "metadata": provenance,
+            "definition": {
+                "kind": "hosted",
+                "code_configuration": {
+                    "runtime": runtime or request.runtime,
+                    "entry_point": entry_point or list(request.entry_point),
+                    "dependency_resolution": (
+                        dependency_resolution
+                        or request.dependency_resolution
+                    ),
+                    "content_hash": request.bundle.sha256,
+                },
+            },
+        },
+    )
+
+
 def _gateway(
     client: FakeClient,
 ) -> tuple[DeploymentGateway, FakeCredentialProvider]:
@@ -168,6 +212,7 @@ def _gateway(
         DeploymentGateway(
             credentials,
             client_factory=lambda endpoint, credential: client,
+            poll_interval_seconds=0,
         ),
         credentials,
     )
@@ -188,7 +233,14 @@ def test_publish_uses_source_zip_contract_and_inherits_pinned_base(
     tmp_path: Path,
 ) -> None:
     request = _request(tmp_path)
-    client = FakeClient([_baseline(), _published(request.bundle.sha256)])
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, status="creating"),
+            _readback(request),
+        ]
+    )
     gateway, credentials = _gateway(client)
 
     record = gateway.publish(request)
@@ -199,7 +251,14 @@ def test_publish_uses_source_zip_contract_and_inherits_pinned_base(
     assert record.patch_sha256 == SHA
     assert record.tree_hash == TREE
     assert record.evidence_sha256 == EVIDENCE
-    baseline_call, publish_call = client.requests
+    assert record.status == "active"
+    assert record.runtime == request.runtime
+    assert record.entry_point == request.entry_point
+    assert record.dependency_resolution == request.dependency_resolution
+    assert record.metadata["foundry-opt-source-sha256"] == (
+        request.bundle.sha256
+    )
+    baseline_call, publish_call, first_read, final_read = client.requests
     assert baseline_call.method == "GET"
     assert baseline_call.url == (
         f"{PROJECT_ENDPOINT}/agents/demo-agent/versions/7?api-version=v1"
@@ -208,6 +267,11 @@ def test_publish_uses_source_zip_contract_and_inherits_pinned_base(
     assert publish_call.url == (
         f"{PROJECT_ENDPOINT}/agents/demo-agent/versions?api-version=v1"
     )
+    assert first_read.method == "GET"
+    assert first_read.url == (
+        f"{PROJECT_ENDPOINT}/agents/demo-agent/versions/8?api-version=v1"
+    )
+    assert final_read.url == first_read.url
     assert all(
         marker not in publish_call.url.casefold()
         for marker in ("routing", "endpoint", "acr")
@@ -346,6 +410,7 @@ def test_publish_retries_one_conflict_with_identical_multipart_bytes(
             _baseline(),
             FakeResponse(409, {"error": {"message": "conflict"}}),
             _published(request.bundle.sha256),
+            _readback(request),
         ]
     )
     gateway, _ = _gateway(client)
@@ -353,7 +418,7 @@ def test_publish_retries_one_conflict_with_identical_multipart_bytes(
     record = gateway.publish(request)
 
     assert record.version == 8
-    first, second = client.requests[1:]
+    first, second = client.requests[1:3]
     assert first.content == second.content
     assert (
         first.headers["Idempotency-Key"]
@@ -430,12 +495,17 @@ def test_idempotency_key_covers_complete_canonical_publication(
     original = _request(tmp_path)
     changed = changed_request(original)
     original_client = FakeClient(
-        [_baseline(), _published(original.bundle.sha256)]
+        [
+            _baseline(),
+            _published(original.bundle.sha256),
+            _readback(original),
+        ]
     )
     changed_client = FakeClient(
         [
             _baseline(changed.base_version),
             _published(changed.bundle.sha256),
+            _readback(changed),
         ]
     )
 
@@ -446,6 +516,100 @@ def test_idempotency_key_covers_complete_canonical_publication(
         original_client.requests[1].headers["Idempotency-Key"]
         != changed_client.requests[1].headers["Idempotency-Key"]
     )
+
+
+def test_publish_requires_terminal_successful_readback(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, status="creating"),
+            _readback(request, status="pending"),
+        ]
+    )
+    gateway = DeploymentGateway(
+        FakeCredentialProvider(),
+        client_factory=lambda endpoint, credential: client,
+        poll_attempts=2,
+        poll_interval_seconds=0,
+    )
+
+    with pytest.raises(DeploymentStatusError):
+        gateway.publish(request)
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "error"])
+def test_publish_rejects_terminal_failure_readback(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, status=status),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DeploymentStatusError):
+        gateway.publish(request)
+
+
+@pytest.mark.parametrize(
+    "readback",
+    [
+        lambda request: _readback(request, runtime="python_3_12"),
+        lambda request: _readback(
+            request,
+            entry_point=["python", "other.py"],
+        ),
+        lambda request: _readback(
+            request,
+            dependency_resolution="bundled",
+        ),
+        lambda request: _readback(
+            request,
+            metadata={
+                "foundry-opt-base-version": "7",
+                "foundry-opt-source-sha256": "0" * 64,
+                "foundry-opt-patch-sha256": SHA,
+                "foundry-opt-tree-hash": TREE,
+                "foundry-opt-evidence-sha256": EVIDENCE,
+            },
+        ),
+        lambda request: _readback(
+            request,
+            metadata={
+                "foundry-opt-base-version": "07",
+                "foundry-opt-source-sha256": request.bundle.sha256,
+                "foundry-opt-patch-sha256": request.patch_sha256,
+                "foundry-opt-tree-hash": request.tree_hash,
+                "foundry-opt-evidence-sha256": request.evidence_sha256,
+            },
+        ),
+    ],
+)
+def test_publish_rejects_effective_readback_mismatch(
+    tmp_path: Path,
+    readback: Any,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            readback(request),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DeploymentResponseError):
+        gateway.publish(request)
 
 
 def test_deployment_request_rejects_noncanonical_endpoint_before_auth(

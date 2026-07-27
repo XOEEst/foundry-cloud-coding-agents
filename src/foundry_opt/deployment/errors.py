@@ -45,6 +45,15 @@ class DeploymentResponseError(DeploymentError):
         )
 
 
+class DeploymentStatusError(DeploymentError):
+    def __init__(self, status: str | None = None) -> None:
+        self.status = status
+        super().__init__(
+            "The published Foundry version did not reach a successful "
+            "terminal status."
+        )
+
+
 class DeploymentHashMismatchError(DeploymentError):
     def __init__(self) -> None:
         super().__init__("Deployment source or lineage hash verification failed.")

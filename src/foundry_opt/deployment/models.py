@@ -157,6 +157,10 @@ class DeploymentRecord:
     evidence_sha256: str
     status: str | None = None
     portal_url: str | None = None
+    runtime: str = ""
+    entry_point: tuple[str, ...] = ()
+    dependency_resolution: str = ""
+    metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         project_endpoint_components(self.project_endpoint)
@@ -174,6 +178,19 @@ class DeploymentRecord:
         _sha256(self.patch_sha256, "patch_sha256")
         _tree_hash(self.tree_hash, "tree_hash")
         _sha256(self.evidence_sha256, "evidence_sha256")
+        if not self.runtime:
+            raise ValueError("deployment runtime is required")
+        if not self.entry_point or any(not part for part in self.entry_point):
+            raise ValueError("deployment entry_point is required")
+        if self.dependency_resolution not in {"remote_build", "bundled"}:
+            raise ValueError("deployment dependency_resolution is invalid")
+        metadata = dict(self.metadata)
+        if any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in metadata.items()
+        ):
+            raise ValueError("deployment metadata must contain strings")
+        object.__setattr__(self, "metadata", MappingProxyType(metadata))
         if self.portal_url is not None:
             _safe_url(
                 self.portal_url,
@@ -295,12 +312,19 @@ class DeploymentVerificationRequest:
     deployed_tree_hash: str
     evidence_path: Path
     expected_evidence_sha256: str
+    expected_campaign_id: str
+    expected_baseline_subject_id: str
+    baseline_bundle: BundleArtifact
+    expected_baseline_bundle_sha256: str
     bundle: BundleArtifact
     expected_bundle_sha256: str
     expected_project_endpoint: str
     expected_agent_name: str
     expected_base_version: int
     expected_version: int
+    expected_runtime: str
+    expected_entry_point: tuple[str, ...]
+    expected_dependency_resolution: str
     expected_commit: str
     expected_run_url: str
     expected_portal_url: str
@@ -334,6 +358,17 @@ class DeploymentVerificationRequest:
             self.expected_evidence_sha256,
             "expected_evidence_sha256",
         )
+        _identifier(self.expected_campaign_id, "expected_campaign_id")
+        _identifier(
+            self.expected_baseline_subject_id,
+            "expected_baseline_subject_id",
+        )
+        if not isinstance(self.baseline_bundle, BundleArtifact):
+            raise ValueError("baseline_bundle must be a BundleArtifact")
+        _sha256(
+            self.expected_baseline_bundle_sha256,
+            "expected_baseline_bundle_sha256",
+        )
         _sha256(self.expected_bundle_sha256, "expected_bundle_sha256")
         project_endpoint_components(self.expected_project_endpoint)
         if not _AGENT_NAME.fullmatch(self.expected_agent_name):
@@ -350,6 +385,17 @@ class DeploymentVerificationRequest:
             or self.expected_version <= self.expected_base_version
         ):
             raise ValueError("expected_version is invalid")
+        if not self.expected_runtime:
+            raise ValueError("expected_runtime is required")
+        if not self.expected_entry_point or any(
+            not part for part in self.expected_entry_point
+        ):
+            raise ValueError("expected_entry_point is required")
+        if self.expected_dependency_resolution not in {
+            "remote_build",
+            "bundled",
+        }:
+            raise ValueError("expected_dependency_resolution is invalid")
         if not _COMMIT.fullmatch(self.expected_commit):
             raise ValueError("expected_commit is invalid")
         _safe_url(

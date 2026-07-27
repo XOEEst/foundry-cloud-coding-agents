@@ -8,6 +8,7 @@ from foundry_opt.deployment.errors import (
     DeploymentHashMismatchError,
     DeploymentIdentityError,
     DeploymentResponseError,
+    DeploymentStatusError,
 )
 from foundry_opt.deployment.models import (
     DEPLOYMENT_OIDC_CLIENT_ID,
@@ -47,6 +48,7 @@ __all__ = [
     "DeploymentRecord",
     "DeploymentRequest",
     "DeploymentResponseError",
+    "DeploymentStatusError",
     "DeploymentTrigger",
     "DeploymentVerification",
     "DeploymentVerificationRequest",
