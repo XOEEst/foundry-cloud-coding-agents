@@ -27,6 +27,7 @@ from foundry_opt.preflight.redaction import redact
 from foundry_opt.onboarding.repository import (
     ChangeSetConflictError,
     ChangeSetError,
+    ChangeSetWriteError,
     OnboardingPublishError,
     SafeChangeSetWriter,
     UnavailableOnboardingPublisher,
@@ -192,6 +193,32 @@ def run_onboarding(
             oidc=oidc,
             draft_probe=probe,
         )
+    except ChangeSetWriteError as error:
+        if error.residual_paths or error.cleanup_errors:
+            return OnboardingResult(
+                status=OnboardingStatus.PARTIAL,
+                changes=planned_changes,
+                draft_pull_request=draft_pr,
+                discovery=discovery,
+                oidc=oidc,
+                draft_probe=probe,
+                blockers=(_safe_error(error),),
+                residual_state=(
+                    *(
+                        path.as_posix()
+                        for path in error.residual_paths
+                    ),
+                    *error.cleanup_errors,
+                ),
+            )
+        return _blocked(
+            draft_pr,
+            _safe_error(error),
+            discovery=discovery,
+            oidc=oidc,
+            draft_probe=probe,
+            changes=planned_changes,
+        )
     except ChangeSetError as error:
         return _blocked(
             draft_pr,
@@ -208,7 +235,31 @@ def run_onboarding(
             changes,
             draft_pr,
         )
-    except (OnboardingPublishError, RuntimeError) as error:
+    except OnboardingPublishError as error:
+        if error.residual_state:
+            return OnboardingResult(
+                status=OnboardingStatus.PARTIAL,
+                changes=changes,
+                draft_pull_request=draft_pr,
+                discovery=discovery,
+                oidc=oidc,
+                draft_probe=probe,
+                blockers=(
+                    "Draft pull request publication failed during "
+                    f"{error.phase}: {_safe_error(error)}",
+                ),
+                residual_state=error.residual_state,
+            )
+        return _blocked(
+            draft_pr,
+            "Draft pull request publication failed during "
+            f"{error.phase}: {_safe_error(error)}",
+            discovery=discovery,
+            oidc=oidc,
+            draft_probe=probe,
+            changes=changes,
+        )
+    except RuntimeError as error:
         return _blocked(
             draft_pr,
             f"Draft pull request publication failed: {_safe_error(error)}",

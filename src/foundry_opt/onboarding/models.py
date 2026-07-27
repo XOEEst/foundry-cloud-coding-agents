@@ -9,6 +9,7 @@ class OnboardingStatus(StrEnum):
     READY = "ready"
     BLOCKED = "blocked"
     CONFLICT = "conflict"
+    PARTIAL = "partial"
 
 
 class ChangeStatus(StrEnum):
@@ -39,6 +40,7 @@ class DeployedModelDiscovery:
 class DatasetDiscovery:
     name: str
     versions: tuple[str, ...]
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class EvaluatorDiscovery:
     reference: str
     metrics: tuple[MetricDiscovery, ...] = ()
     needs_input: str | None = None
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,7 @@ class AppInsightsDiscovery:
 class DeploymentWorkflowDiscovery:
     path: Path
     trigger: str
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +151,7 @@ class OnboardingResult:
     draft_probe: DraftProbeResult | None = None
     published_pull_request: DraftPullRequestPublication | None = None
     blockers: tuple[str, ...] = ()
+    residual_state: tuple[str, ...] = ()
     guidance: tuple[str, ...] = field(default_factory=tuple)
 
     @property

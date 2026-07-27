@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import foundry_opt.onboarding.repository as repository_module
+from foundry_opt.adapters.commands import CommandExitError
 from foundry_opt.onboarding import (
     ChangeStatus,
     DraftPullRequest,
@@ -13,9 +14,11 @@ from foundry_opt.onboarding import (
     RepositoryDiscovery,
 )
 from foundry_opt.onboarding.repository import (
+    AtomicWriteUnsupportedError,
     ChangeSetConflictError,
     ChangeSetWriteError,
     GhOnboardingPublisher,
+    OnboardingPublishError,
     SafeChangeSetWriter,
     UnsafeChangePathError,
 )
@@ -23,6 +26,11 @@ from foundry_opt.onboarding.production import (
     build_production_onboarding_dependencies,
 )
 from foundry_opt.preflight.interfaces import CommandResult
+
+
+LINUX_ATOMIC_WRITES = (
+    os.name == "posix" and repository_module._secure_posix_writes_available()
+)
 
 
 def test_safe_writer_rejects_symlinked_parent_before_writing(
@@ -55,6 +63,10 @@ def test_safe_writer_rejects_paths_outside_resolved_repository(
         )
 
 
+@pytest.mark.skipif(
+    not LINUX_ATOMIC_WRITES,
+    reason="secure atomic writer requires Linux dirfd and renameat2",
+)
 def test_safe_writer_rolls_back_files_when_any_write_fails(
     tmp_path: Path,
     monkeypatch,
@@ -88,6 +100,10 @@ def test_safe_writer_rolls_back_files_when_any_write_fails(
     assert list(tmp_path.rglob(".foundry-opt-*.tmp")) == []
 
 
+@pytest.mark.skipif(
+    not LINUX_ATOMIC_WRITES,
+    reason="secure atomic writer requires Linux dirfd and renameat2",
+)
 def test_safe_writer_preserves_destination_won_by_another_process(
     tmp_path: Path,
     monkeypatch,
@@ -118,6 +134,10 @@ def test_safe_writer_preserves_destination_won_by_another_process(
     assert list(tmp_path.rglob(".foundry-opt-*.tmp")) == []
 
 
+@pytest.mark.skipif(
+    not LINUX_ATOMIC_WRITES,
+    reason="secure atomic writer requires Linux dirfd and renameat2",
+)
 def test_safe_writer_installs_only_fully_written_temporary_files(
     tmp_path: Path,
     monkeypatch,
@@ -152,6 +172,25 @@ def test_safe_writer_installs_only_fully_written_temporary_files(
     assert list(tmp_path.rglob(".foundry-opt-*.tmp")) == []
 
 
+@pytest.mark.skipif(
+    LINUX_ATOMIC_WRITES,
+    reason="platform provides secure Linux atomic primitives",
+)
+def test_safe_writer_fails_closed_before_writing_on_unsupported_platform(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        AtomicWriteUnsupportedError,
+        match="refusing to write",
+    ):
+        SafeChangeSetWriter().prevalidate(
+            tmp_path,
+            {Path(".github/foundry-optimizer.yaml"): "schema_version: '1'\n"},
+        )
+
+    assert not (tmp_path / ".github").exists()
+
+
 class FakeCommands:
     def __init__(self) -> None:
         self.invocations: list[tuple[str, ...]] = []
@@ -164,6 +203,12 @@ class FakeCommands:
     ) -> CommandResult:
         command = tuple(arguments)
         self.invocations.append(command)
+        if command == ("git", "branch", "--show-current"):
+            return CommandResult(0, "main\n", "")
+        if command[0:3] == ("git", "branch", "--list"):
+            return CommandResult(0, "", "")
+        if command[0:3] == ("git", "ls-remote", "--heads"):
+            return CommandResult(0, "", "")
         if command == ("git", "rev-parse", "HEAD"):
             return CommandResult(0, "abc123\n", "")
         if command[0:3] == ("gh", "pr", "create"):
@@ -224,6 +269,8 @@ def test_github_publisher_owns_branch_commit_push_and_draft_pr(
         "git",
         "push",
         "--set-upstream",
+        "--force-with-lease=refs/heads/"
+        "foundry-opt/onboarding-support-agent:",
         "origin",
         result.branch,
     ) in commands.invocations
@@ -243,3 +290,205 @@ def test_production_onboarding_uses_github_publisher() -> None:
     dependencies = build_production_onboarding_dependencies()
 
     assert isinstance(dependencies.publisher, GhOnboardingPublisher)
+
+
+def test_github_publisher_compensates_after_draft_pr_failure(
+    tmp_path: Path,
+) -> None:
+    class PrFailureCommands(FakeCommands):
+        def run(self, arguments, *, cwd=None):
+            command = tuple(arguments)
+            if command[0:3] == ("gh", "pr", "create"):
+                self.invocations.append(command)
+                raise CommandExitError(
+                    command,
+                    exit_code=1,
+                    stdout="",
+                    stderr="API failure",
+                )
+            return super().run(arguments, cwd=cwd)
+
+    commands = PrFailureCommands()
+    request, discovery, changes, draft_pr = _publication_inputs(tmp_path)
+
+    with pytest.raises(OnboardingPublishError) as raised:
+        GhOnboardingPublisher(commands).publish(
+            request,
+            discovery,
+            changes,
+            draft_pr,
+        )
+
+    assert raised.value.phase == "draft_pr"
+    assert raised.value.residual_state == ()
+    assert (
+        "git",
+        "push",
+        "--force-with-lease=refs/heads/"
+        "foundry-opt/onboarding-support-agent:abc123",
+        "origin",
+        ":refs/heads/foundry-opt/onboarding-support-agent",
+    ) in commands.invocations
+    assert ("git", "switch", "main") in commands.invocations
+    assert (
+        "git",
+        "branch",
+        "-D",
+        "foundry-opt/onboarding-support-agent",
+    ) in commands.invocations
+
+
+def test_github_publisher_surfaces_failed_compensation(
+    tmp_path: Path,
+) -> None:
+    class CompensationFailureCommands(FakeCommands):
+        def run(self, arguments, *, cwd=None):
+            command = tuple(arguments)
+            if command[0:3] == ("gh", "pr", "create"):
+                self.invocations.append(command)
+                raise CommandExitError(
+                    command,
+                    exit_code=1,
+                    stdout="",
+                    stderr="API failure",
+                )
+            if (
+                command[0:2] == ("git", "push")
+                and command[2].startswith("--force-with-lease=")
+            ):
+                self.invocations.append(command)
+                raise CommandExitError(
+                    command,
+                    exit_code=1,
+                    stdout="",
+                    stderr="lease mismatch",
+                )
+            return super().run(arguments, cwd=cwd)
+
+    request, discovery, changes, draft_pr = _publication_inputs(tmp_path)
+
+    with pytest.raises(OnboardingPublishError) as raised:
+        GhOnboardingPublisher(CompensationFailureCommands()).publish(
+            request,
+            discovery,
+            changes,
+            draft_pr,
+        )
+
+    assert raised.value.phase == "draft_pr"
+    assert raised.value.residual_state == (
+        "remote branch foundry-opt/onboarding-support-agent may remain at abc123",
+    )
+
+
+def test_github_publisher_cleans_staged_files_after_commit_failure(
+    tmp_path: Path,
+) -> None:
+    class CommitFailureCommands(FakeCommands):
+        def run(self, arguments, *, cwd=None):
+            command = tuple(arguments)
+            if command[0:2] == ("git", "commit"):
+                self.invocations.append(command)
+                raise CommandExitError(
+                    command,
+                    exit_code=1,
+                    stdout="",
+                    stderr="hook rejected commit",
+                )
+            return super().run(arguments, cwd=cwd)
+
+    commands = CommitFailureCommands()
+    request, discovery, changes, draft_pr = _publication_inputs(tmp_path)
+
+    with pytest.raises(OnboardingPublishError) as raised:
+        GhOnboardingPublisher(commands).publish(
+            request,
+            discovery,
+            changes,
+            draft_pr,
+        )
+
+    assert raised.value.phase == "commit"
+    assert raised.value.residual_state == ()
+    paths = tuple(change.path.as_posix() for change in changes)
+    assert ("git", "reset", "--", *paths) in commands.invocations
+    assert ("git", "clean", "-f", "--", *paths) in commands.invocations
+    assert ("git", "switch", "main") in commands.invocations
+    assert (
+        "git",
+        "branch",
+        "-D",
+        "foundry-opt/onboarding-support-agent",
+    ) in commands.invocations
+
+
+def test_github_publisher_cleans_partially_staged_files_after_add_failure(
+    tmp_path: Path,
+) -> None:
+    class AddFailureCommands(FakeCommands):
+        def run(self, arguments, *, cwd=None):
+            command = tuple(arguments)
+            if command[0:2] == ("git", "add"):
+                self.invocations.append(command)
+                raise CommandExitError(
+                    command,
+                    exit_code=1,
+                    stdout="",
+                    stderr="index write failed after partial update",
+                )
+            return super().run(arguments, cwd=cwd)
+
+    commands = AddFailureCommands()
+    request, discovery, changes, draft_pr = _publication_inputs(tmp_path)
+
+    with pytest.raises(OnboardingPublishError) as raised:
+        GhOnboardingPublisher(commands).publish(
+            request,
+            discovery,
+            changes,
+            draft_pr,
+        )
+
+    assert raised.value.phase == "stage"
+    assert raised.value.residual_state == ()
+    paths = tuple(change.path.as_posix() for change in changes)
+    assert ("git", "reset", "--", *paths) in commands.invocations
+    assert ("git", "clean", "-f", "--", *paths) in commands.invocations
+
+
+def _publication_inputs(tmp_path: Path):
+    changes = (
+        OnboardingChange(
+            path=Path(".github/foundry-optimizer.yaml"),
+            content="schema_version: '1'\n",
+            status=ChangeStatus.CREATED,
+        ),
+    )
+    request = OnboardingRequest(
+        repository_root=tmp_path,
+        environment_name="acceptance",
+        target_name="support-agent",
+        project_endpoint=(
+            "https://example.services.ai.azure.com/api/projects/demo"
+        ),
+        project_resource_id="/subscriptions/sub/projects/demo",
+        tenant_id="tenant",
+        client_id="client",
+        subscription_id="subscription",
+        product_install="foundry-cloud-coding-agent==0.1.0",
+    )
+    discovery = RepositoryDiscovery(
+        repository="octo-org/agents",
+        repository_id="123",
+        default_branch="main",
+        current_branch="main",
+        authenticated_login="octocat",
+        viewer_permission="ADMIN",
+        clean=True,
+    )
+    return (
+        request,
+        discovery,
+        changes,
+        DraftPullRequest("Configure onboarding", "Review this change."),
+    )

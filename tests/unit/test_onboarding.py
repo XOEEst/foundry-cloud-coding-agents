@@ -23,7 +23,11 @@ from foundry_opt.onboarding import (
     run_onboarding,
 )
 from foundry_opt.config import load_config
-from foundry_opt.onboarding.repository import ChangeSetConflictError
+from foundry_opt.onboarding.repository import (
+    ChangeSetConflictError,
+    ChangeSetWriteError,
+    OnboardingPublishError,
+)
 
 
 class FakeDiscovery:
@@ -145,6 +149,25 @@ class FailingPublisher:
         raise RuntimeError("push rejected")
 
 
+class TestChangeWriter:
+    def prevalidate(self, repository_root, contents):
+        return tuple(
+            OnboardingChange(path, content, ChangeStatus.PLANNED)
+            for path, content in contents.items()
+        )
+
+    def write(self, repository_root, contents):
+        changes = []
+        for path, content in contents.items():
+            destination = repository_root / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+            changes.append(
+                OnboardingChange(path, content, ChangeStatus.CREATED)
+            )
+        return tuple(changes)
+
+
 def _request(repository_root: Path) -> OnboardingRequest:
     return OnboardingRequest(
         repository_root=repository_root,
@@ -177,6 +200,7 @@ def test_run_onboarding_generates_secretless_draft_change_set(
             oidc=FakeOidc(),
             draft_probe=probe,
             publisher=FakePublisher(),
+            change_writer=TestChangeWriter(),
         ),
     )
 
@@ -284,6 +308,7 @@ def test_run_onboarding_rejects_non_draft_probe_without_deleting_it(
             discovery=FakeDiscovery(),
             oidc=FakeOidc(),
             draft_probe=probe,
+            change_writer=TestChangeWriter(),
         ),
     )
 
@@ -304,6 +329,7 @@ def test_run_onboarding_exposes_placeholder_probe_as_a_real_blocker(
             discovery=FakeDiscovery(),
             oidc=FakeOidc(),
             draft_probe=UnavailableProbe(),
+            change_writer=TestChangeWriter(),
         ),
     )
 
@@ -504,6 +530,7 @@ def test_run_onboarding_blocks_when_draft_pr_publication_fails(
             oidc=FakeOidc(),
             draft_probe=FakeDraftProbe(),
             publisher=FailingPublisher(),
+            change_writer=TestChangeWriter(),
         ),
     )
 
@@ -577,3 +604,228 @@ def test_run_onboarding_reports_destination_race_as_conflict(
     assert next(
         change for change in result.changes if change.path == raced_path
     ).status is ChangeStatus.CONFLICT
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        (
+            "datasets",
+            (
+                DatasetDiscovery("first", ("1",)),
+                DatasetDiscovery("second", ("1",)),
+            ),
+            "Dataset roles require exactly one development and one validation "
+            "dataset.",
+        ),
+        (
+            "evaluators",
+            (
+                EvaluatorDiscovery(
+                    "quality-a",
+                    "quality-a:1",
+                    metrics=(
+                        MetricDiscovery(
+                            "quality",
+                            "maximize",
+                            0.8,
+                            0.05,
+                            False,
+                        ),
+                    ),
+                ),
+                EvaluatorDiscovery(
+                    "quality-b",
+                    "quality-b:1",
+                    metrics=(
+                        MetricDiscovery(
+                            "quality",
+                            "maximize",
+                            0.8,
+                            0.05,
+                            False,
+                        ),
+                    ),
+                ),
+            ),
+            "Evaluator role is ambiguous; select exactly one optimization "
+            "evaluator.",
+        ),
+        (
+            "deployment_workflows",
+            (
+                DeploymentWorkflowDiscovery(
+                    Path(".github/workflows/deploy-a.yml"),
+                    "manual",
+                ),
+                DeploymentWorkflowDiscovery(
+                    Path(".github/workflows/deploy-b.yml"),
+                    "manual",
+                ),
+            ),
+            "Deployment workflow role is ambiguous; select exactly one "
+            "deployment workflow.",
+        ),
+    ],
+)
+def test_run_onboarding_blocks_ambiguous_discovered_roles(
+    tmp_path: Path,
+    field: str,
+    value: tuple,
+    expected: str,
+) -> None:
+    class AmbiguousRoleDiscovery(FakeDiscovery):
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            discovered = super().discover(request)
+            return RepositoryDiscovery(
+                **{**discovered.__dict__, field: value}
+            )
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=AmbiguousRoleDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+            publisher=FakePublisher(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert expected in result.blockers
+
+
+def test_run_onboarding_surfaces_residual_change_set_state(
+    tmp_path: Path,
+) -> None:
+    class ResidualWriter(TestChangeWriter):
+        def write(self, repository_root, contents):
+            raise ChangeSetWriteError(
+                "cleanup failed",
+                residual_paths=(
+                    Path(".github/foundry-optimizer.yaml"),
+                ),
+                cleanup_errors=("permission denied",),
+            )
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+            publisher=FakePublisher(),
+            change_writer=ResidualWriter(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.PARTIAL
+    assert result.residual_state == (
+        ".github/foundry-optimizer.yaml",
+        "permission denied",
+    )
+
+
+def test_run_onboarding_surfaces_publication_compensation_residuals(
+    tmp_path: Path,
+) -> None:
+    class ResidualPublisher:
+        def publish(self, request, discovery, changes, draft_pull_request):
+            raise OnboardingPublishError(
+                "draft PR failed",
+                phase="draft_pr",
+                residual_state=(
+                    "remote branch foundry-opt/onboarding-support-agent "
+                    "may remain at abc123",
+                ),
+            )
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+            publisher=ResidualPublisher(),
+            change_writer=TestChangeWriter(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.PARTIAL
+    assert result.residual_state == (
+        "remote branch foundry-opt/onboarding-support-agent may remain at "
+        "abc123",
+    )
+
+
+def test_run_onboarding_accepts_explicit_discovery_roles(
+    tmp_path: Path,
+) -> None:
+    class ExplicitRoleDiscovery(FakeDiscovery):
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            discovered = super().discover(request)
+            metric = discovered.evaluators[0].metrics
+            return RepositoryDiscovery(
+                **{
+                    **discovered.__dict__,
+                    "datasets": (
+                        DatasetDiscovery(
+                            "first",
+                            ("1",),
+                            role="validation",
+                        ),
+                        DatasetDiscovery(
+                            "second",
+                            ("1",),
+                            role="development",
+                        ),
+                    ),
+                    "evaluators": (
+                        EvaluatorDiscovery(
+                            "unused",
+                            "unused:1",
+                            metrics=(),
+                            needs_input="metric policy is not configured",
+                        ),
+                        EvaluatorDiscovery(
+                            "quality",
+                            "quality:1",
+                            metrics=metric,
+                            role="optimization",
+                        ),
+                    ),
+                    "deployment_workflows": (
+                        DeploymentWorkflowDiscovery(
+                            Path(".github/workflows/other.yml"),
+                            "manual",
+                        ),
+                        DeploymentWorkflowDiscovery(
+                            Path(".github/workflows/deploy.yml"),
+                            "manual",
+                            role="deployment",
+                        ),
+                    ),
+                }
+            )
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=ExplicitRoleDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+            publisher=FakePublisher(),
+            change_writer=TestChangeWriter(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.READY
+    config = load_config(tmp_path / ".github/foundry-optimizer.yaml")
+    target = config.targets["support-agent"]
+    assert target.datasets.development[0].name == "second"
+    assert target.datasets.validation[0].name == "first"
+    assert target.evaluators[0].name == "quality"
+    assert (
+        config.environments["acceptance"].deployment_workflow.path.as_posix()
+        == ".github/workflows/deploy.yml"
+    )

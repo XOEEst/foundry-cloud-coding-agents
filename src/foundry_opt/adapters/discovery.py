@@ -343,6 +343,10 @@ def _discover_deployment_workflows(
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
+        try:
+            document = yaml.safe_load(content) or {}
+        except yaml.YAMLError:
+            document = {}
         lowered = f"{path.name}\n{content}".casefold()
         if "deploy" not in lowered or not any(
             marker in lowered for marker in ("foundry", "azure", "azd")
@@ -357,6 +361,12 @@ def _discover_deployment_workflows(
             DeploymentWorkflowDiscovery(
                 path=path.relative_to(root),
                 trigger=trigger,
+                role=(
+                    "deployment"
+                    if isinstance(document, dict)
+                    and document.get("x-foundry-opt-role") == "deployment"
+                    else None
+                ),
             )
         )
     return tuple(discoveries)
@@ -367,16 +377,30 @@ def _group_versions(
     factory: type[DatasetDiscovery],
 ) -> tuple[DatasetDiscovery, ...]:
     grouped: dict[str, set[str]] = {}
+    roles: dict[str, set[str]] = {}
     for item in items:
         name = _attribute(item, "name")
         version = _attribute(item, "version", "id")
         if name is None or version is None:
             continue
-        grouped.setdefault(str(name), set()).add(str(version))
+        name = str(name)
+        grouped.setdefault(name, set()).add(str(version))
+        role = _role_tag(item, {"development", "validation"})
+        if role is not None:
+            roles.setdefault(name, set()).add(role)
     return tuple(
         factory(
             name=name,
             versions=tuple(sorted(versions, key=_version_sort_key)),
+            role=(
+                next(iter(roles[name]))
+                if len(roles.get(name, ())) == 1
+                else (
+                    None
+                    if name in roles
+                    else _inferred_dataset_role(name)
+                )
+            ),
         )
         for name, versions in sorted(grouped.items())
     )
@@ -418,6 +442,7 @@ def _discover_evaluators(
             reference=f"{name}:{version}",
             metrics=metrics,
             needs_input=needs_input,
+            role=_explicit_role(item, "optimization"),
         )
     return tuple(discovered[key] for key in sorted(discovered))
 
@@ -480,6 +505,27 @@ def _attribute(value: Any, *names: str) -> Any | None:
             return getattr(result, "value", result)
         if isinstance(value, dict) and value.get(name) is not None:
             return value[name]
+    return None
+
+
+def _explicit_role(value: Any, expected: str) -> str | None:
+    return _role_tag(value, {expected})
+
+
+def _role_tag(value: Any, allowed: set[str]) -> str | None:
+    tags = _attribute(value, "tags")
+    role = tags.get("foundry-opt.role") if isinstance(tags, dict) else None
+    return role if role in allowed else None
+
+
+def _inferred_dataset_role(name: str) -> str | None:
+    normalized = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")
+    if normalized in {"dev", "development"} or "development" in normalized:
+        return "development"
+    if normalized in {"validation", "held-out", "heldout"}:
+        return "validation"
+    if "validation" in normalized or "held-out" in normalized:
+        return "validation"
     return None
 
 

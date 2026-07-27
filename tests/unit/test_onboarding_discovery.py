@@ -195,7 +195,11 @@ def test_sdk_inventory_uses_supported_read_only_collections(
         DeployedModelDiscovery("gpt-5.1"),
     )
     assert inventory.datasets == (
-        DatasetDiscovery("development", ("1", "2")),
+        DatasetDiscovery(
+            "development",
+            ("1", "2"),
+            role="development",
+        ),
     )
     assert inventory.evaluators == (
         EvaluatorDiscovery(

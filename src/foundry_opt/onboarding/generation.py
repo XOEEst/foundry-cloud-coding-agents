@@ -230,17 +230,32 @@ def validate_generation_inputs(
         blockers.append(
             "Development and held-out validation datasets must be discovered."
         )
+    elif _dataset_roles(discovery) is None:
+        blockers.append(
+            "Dataset roles require exactly one development and one validation "
+            "dataset."
+        )
     if not discovery.evaluators:
         blockers.append("No evaluator was discovered.")
     else:
-        blockers.extend(
-            f"Evaluator {evaluator.reference} needs input: "
-            f"{evaluator.needs_input or 'metric policy semantics are missing.'}"
-            for evaluator in discovery.evaluators
-            if not evaluator.metrics
-        )
+        evaluator = _optimization_evaluator(discovery)
+        if evaluator is None:
+            blockers.append(
+                "Evaluator role is ambiguous; select exactly one optimization "
+                "evaluator."
+            )
+        elif not evaluator.metrics:
+            blockers.append(
+                f"Evaluator {evaluator.reference} needs input: "
+                f"{evaluator.needs_input or 'metric policy semantics are missing.'}"
+            )
     if not discovery.deployment_workflows:
         blockers.append("No deployment workflow was discovered.")
+    elif _deployment_workflow(discovery) is None:
+        blockers.append(
+            "Deployment workflow role is ambiguous; select exactly one "
+            "deployment workflow."
+        )
     local_matches = tuple(
         agent
         for agent in discovery.python_agents
@@ -329,18 +344,84 @@ def _select_foundry_agent(
 
 
 def _select_evaluator(discovery: RepositoryDiscovery) -> EvaluatorDiscovery:
-    return next(
-        evaluator
-        for evaluator in discovery.evaluators
-        if evaluator.metrics
-    )
+    evaluator = _optimization_evaluator(discovery)
+    if evaluator is None:
+        raise ValueError("optimization evaluator role is ambiguous")
+    return evaluator
 
 
 def _select_datasets(discovery: RepositoryDiscovery):
-    return discovery.datasets[0], discovery.datasets[1]
+    datasets = _dataset_roles(discovery)
+    if datasets is None:
+        raise ValueError("development and validation dataset roles are ambiguous")
+    return datasets
 
 
 def _select_deployment_workflow(
     discovery: RepositoryDiscovery,
 ) -> DeploymentWorkflowDiscovery:
-    return discovery.deployment_workflows[0]
+    workflow = _deployment_workflow(discovery)
+    if workflow is None:
+        raise ValueError("deployment workflow role is ambiguous")
+    return workflow
+
+
+def _dataset_roles(
+    discovery: RepositoryDiscovery,
+) -> tuple[DatasetDiscovery, DatasetDiscovery] | None:
+    development = tuple(
+        dataset
+        for dataset in discovery.datasets
+        if (dataset.role or _inferred_dataset_role(dataset.name))
+        == "development"
+    )
+    validation = tuple(
+        dataset
+        for dataset in discovery.datasets
+        if (dataset.role or _inferred_dataset_role(dataset.name))
+        == "validation"
+    )
+    if len(development) != 1 or len(validation) != 1:
+        return None
+    if development[0] is validation[0]:
+        return None
+    return development[0], validation[0]
+
+
+def _inferred_dataset_role(name: str) -> str | None:
+    normalized = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")
+    if normalized in {"dev", "development"} or "development" in normalized:
+        return "development"
+    if normalized in {"validation", "held-out", "heldout"}:
+        return "validation"
+    if "validation" in normalized or "held-out" in normalized:
+        return "validation"
+    return None
+
+
+def _optimization_evaluator(
+    discovery: RepositoryDiscovery,
+) -> EvaluatorDiscovery | None:
+    explicit = tuple(
+        evaluator
+        for evaluator in discovery.evaluators
+        if evaluator.role == "optimization"
+    )
+    if explicit:
+        return explicit[0] if len(explicit) == 1 else None
+    evaluators = discovery.evaluators
+    return evaluators[0] if len(evaluators) == 1 else None
+
+
+def _deployment_workflow(
+    discovery: RepositoryDiscovery,
+) -> DeploymentWorkflowDiscovery | None:
+    explicit = tuple(
+        workflow
+        for workflow in discovery.deployment_workflows
+        if workflow.role == "deployment"
+    )
+    if explicit:
+        return explicit[0] if len(explicit) == 1 else None
+    workflows = discovery.deployment_workflows
+    return workflows[0] if len(workflows) == 1 else None

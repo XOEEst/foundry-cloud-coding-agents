@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 import foundry_opt.cli as cli
 from foundry_opt.onboarding import (
     AppInsightsDiscovery,
+    ChangeStatus,
     DatasetDiscovery,
     DeployedModelDiscovery,
     DeploymentWorkflowDiscovery,
@@ -15,6 +16,7 @@ from foundry_opt.onboarding import (
     MetricDiscovery,
     OidcTrustResult,
     OnboardingDependencies,
+    OnboardingChange,
     PythonAgentCandidate,
     RepositoryDiscovery,
 )
@@ -100,6 +102,25 @@ class Publisher:
         )
 
 
+class TestChangeWriter:
+    def prevalidate(self, repository_root, contents):
+        return tuple(
+            OnboardingChange(path, content, ChangeStatus.PLANNED)
+            for path, content in contents.items()
+        )
+
+    def write(self, repository_root, contents):
+        changes = []
+        for path, content in contents.items():
+            destination = repository_root / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+            changes.append(
+                OnboardingChange(path, content, ChangeStatus.CREATED)
+            )
+        return tuple(changes)
+
+
 def _arguments() -> list[str]:
     return [
         "init",
@@ -134,6 +155,7 @@ def test_init_cli_returns_zero_and_describes_draft_pr(
             Oidc(),
             Probe(),
             publisher=Publisher(),
+            change_writer=TestChangeWriter(),
         ),
     )
 
@@ -158,6 +180,7 @@ def test_init_cli_returns_one_when_draft_probe_is_unavailable(
             Discovery(),
             Oidc(),
             Probe(fail=True),
+            change_writer=TestChangeWriter(),
         ),
     )
 

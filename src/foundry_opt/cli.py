@@ -72,6 +72,8 @@ def _render_onboarding(result: OnboardingResult) -> str:
         )
     for blocker in result.blockers:
         lines.append(f"Blocked: {redact(blocker)}")
+    for residual in result.residual_state:
+        lines.append(f"Residual state: {redact(residual)}")
     for guidance in result.guidance:
         lines.append(f"Next: {guidance}")
     lines.append(f"Draft PR: {result.draft_pull_request.title}")
