@@ -84,7 +84,7 @@ class Probe:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
 
-    def probe(self, request, agent):
+    def probe(self, request, agent, source):
         if self.fail:
             raise RuntimeError("source-bundle draft API unavailable")
         return DraftProbeResult(agent.name, "draft-cli-probe")

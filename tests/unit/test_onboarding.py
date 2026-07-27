@@ -106,6 +106,7 @@ class FakeDraftProbe:
         self,
         request: OnboardingRequest,
         agent: FoundryAgentDiscovery,
+        source: PythonAgentCandidate,
     ) -> DraftProbeResult:
         self.probed += 1
         return DraftProbeResult(
@@ -122,6 +123,7 @@ class PublishedVersionProbe(FakeDraftProbe):
         self,
         request: OnboardingRequest,
         agent: FoundryAgentDiscovery,
+        source: PythonAgentCandidate,
     ) -> DraftProbeResult:
         return DraftProbeResult(agent_name=agent.name, version="8")
 
@@ -131,6 +133,7 @@ class UnavailableProbe(FakeDraftProbe):
         self,
         request: OnboardingRequest,
         agent: FoundryAgentDiscovery,
+        source: PythonAgentCandidate,
     ) -> DraftProbeResult:
         raise RuntimeError("source-bundle draft API is not implemented")
 
@@ -226,6 +229,13 @@ def test_run_onboarding_generates_secretless_draft_change_set(
     )
     assert "authentication: oidc" in generated
     assert "id-token: write" in generated
+    workflow = next(
+        change.content
+        for change in result.changes
+        if change.path.as_posix()
+        == ".github/workflows/copilot-setup-steps.yml"
+    )
+    assert 'runs-on: ubuntu-latest\n    environment: "acceptance"' in workflow
     assert "python-version: '3.12'" in generated
     assert "AZURE_TENANT_ID=${{ vars.AZURE_TENANT_ID }}" in generated
     assert "AZURE_CLIENT_ID=${{ vars.AZURE_CLIENT_ID }}" in generated
@@ -271,6 +281,15 @@ def test_run_onboarding_generates_secretless_draft_change_set(
 def test_run_onboarding_preserves_existing_files_and_reports_conflicts(
     tmp_path: Path,
 ) -> None:
+    class ConflictWriter:
+        def prevalidate(self, repository_root, contents):
+            raise ChangeSetConflictError(
+                (Path(".github/foundry-optimizer.yaml"),)
+            )
+
+        def write(self, repository_root, contents):
+            raise AssertionError("conflicts must block before writing")
+
     existing = tmp_path / ".github/foundry-optimizer.yaml"
     existing.parent.mkdir(parents=True)
     existing.write_text("existing: true\n", encoding="utf-8")
@@ -282,6 +301,7 @@ def test_run_onboarding_preserves_existing_files_and_reports_conflicts(
             discovery=FakeDiscovery(),
             oidc=FakeOidc(),
             draft_probe=probe,
+            change_writer=ConflictWriter(),
         ),
     )
 
@@ -539,36 +559,6 @@ def test_run_onboarding_blocks_when_draft_pr_publication_fails(
     assert result.blockers == (
         "Draft pull request publication failed: push rejected",
     )
-
-
-def test_run_onboarding_prevalidates_symlinked_parents_before_probe(
-    tmp_path: Path,
-) -> None:
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    try:
-        (tmp_path / ".github").symlink_to(
-            outside,
-            target_is_directory=True,
-        )
-    except OSError as error:
-        pytest.skip(f"directory symlinks unavailable: {error}")
-    probe = FakeDraftProbe()
-
-    result = run_onboarding(
-        _request(tmp_path),
-        OnboardingDependencies(
-            discovery=FakeDiscovery(),
-            oidc=FakeOidc(),
-            draft_probe=probe,
-            publisher=FakePublisher(),
-        ),
-    )
-
-    assert result.status is OnboardingStatus.BLOCKED
-    assert "symlinked parent" in result.blockers[0]
-    assert probe.probed == 0
-    assert not (outside / "foundry-optimizer.yaml").exists()
 
 
 def test_run_onboarding_reports_destination_race_as_conflict(

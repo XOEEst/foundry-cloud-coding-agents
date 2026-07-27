@@ -9,6 +9,7 @@ from foundry_opt.onboarding.models import (
     OnboardingChange,
     OidcTrustResult,
     OnboardingRequest,
+    PythonAgentCandidate,
     RepositoryDiscovery,
 )
 
@@ -30,6 +31,7 @@ class DraftProbe(Protocol):
         self,
         request: OnboardingRequest,
         agent: FoundryAgentDiscovery,
+        source: PythonAgentCandidate,
     ) -> DraftProbeResult: ...
 
     def delete_probe(self, agent_name: str, version: str) -> None: ...

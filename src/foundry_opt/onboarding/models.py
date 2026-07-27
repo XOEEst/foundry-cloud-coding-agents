@@ -126,6 +126,8 @@ class OnboardingChange:
     content: str
     status: ChangeStatus
     detail: str | None = None
+    base_commit: str | None = None
+    commit_sha: str | None = None
 
 
 @dataclass(frozen=True)

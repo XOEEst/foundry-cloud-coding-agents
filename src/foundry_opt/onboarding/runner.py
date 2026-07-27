@@ -140,8 +140,17 @@ def run_onboarding(
         for agent in discovery.foundry_agents
         if agent.name == request.target_name
     )
+    local_agent = next(
+        agent
+        for agent in discovery.python_agents
+        if agent.name == request.target_name
+    )
     try:
-        probe = dependencies.draft_probe.probe(request, foundry_agent)
+        probe = dependencies.draft_probe.probe(
+            request,
+            foundry_agent,
+            local_agent,
+        )
     except Exception as error:
         return _blocked(
             draft_pr,

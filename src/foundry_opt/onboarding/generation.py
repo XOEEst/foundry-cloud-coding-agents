@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 
@@ -154,6 +155,7 @@ on:
 jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
+    environment: {json.dumps(request.environment_name)}
     permissions:
       contents: read
       id-token: write

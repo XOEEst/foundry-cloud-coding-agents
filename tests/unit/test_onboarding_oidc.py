@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import json
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,16 @@ from foundry_opt.preflight.interfaces import CommandResult
 
 
 class FakeCommands:
-    def __init__(self, *, federated_subject: str) -> None:
+    def __init__(
+        self,
+        *,
+        federated_subject: str,
+        use_default: bool = False,
+        user_type: str = "user",
+        user_name: str = "operator@example.com",
+        accessible_subscription: str = "subscription",
+        application_id: str = "client",
+    ) -> None:
         self.invocations: list[tuple[str, ...]] = []
         self.responses = {
             (
@@ -20,8 +30,10 @@ class FakeCommands:
                 "api",
                 "repos/octo-org/agents/actions/oidc/customization/sub",
             ): (
-                '{"use_default":false,"use_immutable_subject":true,'
-                '"include_claim_keys":["repository_id"],'
+                f'{{"use_default":{str(use_default).lower()},'
+                '"use_immutable_subject":true,'
+                f'"include_claim_keys":'
+                f'{json.dumps([] if use_default else ["repository_id"])},'
                 '"sub_claim_prefix":"repo:octo-org@42/agents@123456"}'
             ),
             (
@@ -29,13 +41,41 @@ class FakeCommands:
                 "account",
                 "show",
                 "--query",
-                "{tenant:tenantId,subscription:id,client:user.name,"
+                "{tenant:tenantId,subscription:id,userName:user.name,"
                 "userType:user.type}",
                 "-o",
                 "json",
             ): (
                 '{"tenant":"tenant","subscription":"subscription",'
-                '"client":"client","userType":"servicePrincipal"}'
+                f'"userName":"{user_name}","userType":"{user_type}"}}'
+            ),
+            (
+                "az",
+                "rest",
+                "--method",
+                "get",
+                "--url",
+                "https://management.azure.com/subscriptions/subscription"
+                "?api-version=2022-12-01",
+                "--query",
+                "subscriptionId",
+                "-o",
+                "tsv",
+            ): accessible_subscription,
+            (
+                "az",
+                "ad",
+                "app",
+                "show",
+                "--id",
+                "client",
+                "--query",
+                "{appId:appId,id:id}",
+                "-o",
+                "json",
+            ): (
+                f'{{"appId":"{application_id}",'
+                '"id":"00000000-0000-0000-0000-000000000001"}'
             ),
             (
                 "az",
@@ -44,7 +84,7 @@ class FakeCommands:
                 "federated-credential",
                 "list",
                 "--id",
-                "client",
+                "00000000-0000-0000-0000-000000000001",
                 "-o",
                 "json",
             ): (
@@ -97,7 +137,9 @@ def test_oidc_verifier_requires_exact_immutable_repository_id_trust(
     tmp_path: Path,
 ) -> None:
     commands = FakeCommands(
-        federated_subject="repo:octo-org@42/agents@123456",
+        federated_subject=(
+            "repo:octo-org@42/agents@123456:repository_id:123456"
+        ),
     )
 
     result = CommandOidcVerifier(commands).verify(
@@ -107,12 +149,61 @@ def test_oidc_verifier_requires_exact_immutable_repository_id_trust(
 
     assert result.verified is True
     assert result.repository_id == "123456"
-    assert result.subject == "repo:octo-org@42/agents@123456"
+    assert result.subject == (
+        "repo:octo-org@42/agents@123456:repository_id:123456"
+    )
     assert all(
         "secret" not in argument.casefold()
         for invocation in commands.invocations
         for argument in invocation
     )
+
+
+def test_oidc_verifier_accepts_default_immutable_subject_for_human_operator(
+    tmp_path: Path,
+) -> None:
+    commands = FakeCommands(
+        federated_subject=(
+            "repo:octo-org@42/agents@123456:environment:acceptance"
+        ),
+        use_default=True,
+        user_type="user",
+        user_name="operator@example.com",
+    )
+
+    result = CommandOidcVerifier(commands).verify(
+        _request(tmp_path),
+        _discovery(),
+    )
+
+    assert result.verified is True
+    assert result.subject == (
+        "repo:octo-org@42/agents@123456:environment:acceptance"
+    )
+    assert any(command[0:2] == ("az", "rest") for command in commands.invocations)
+    assert (
+        "az",
+        "ad",
+        "app",
+        "show",
+        "--id",
+        "client",
+        "--query",
+        "{appId:appId,id:id}",
+        "-o",
+        "json",
+    ) in commands.invocations
+    assert (
+        "az",
+        "ad",
+        "app",
+        "federated-credential",
+        "list",
+        "--id",
+        "00000000-0000-0000-0000-000000000001",
+        "-o",
+        "json",
+    ) in commands.invocations
 
 
 def test_oidc_verifier_rejects_a_different_federated_subject(
@@ -125,5 +216,39 @@ def test_oidc_verifier_rejects_a_different_federated_subject(
     with pytest.raises(
         OidcVerificationError,
         match="exact repository-ID subject",
+    ):
+        verifier.verify(_request(tmp_path), _discovery())
+
+
+def test_oidc_verifier_rejects_operator_without_subscription_access(
+    tmp_path: Path,
+) -> None:
+    verifier = CommandOidcVerifier(
+        FakeCommands(
+            federated_subject="repo:octo-org@42/agents@123456",
+            accessible_subscription="",
+        )
+    )
+
+    with pytest.raises(
+        OidcVerificationError,
+        match="cannot access the requested subscription",
+    ):
+        verifier.verify(_request(tmp_path), _discovery())
+
+
+def test_oidc_verifier_rejects_a_different_target_application(
+    tmp_path: Path,
+) -> None:
+    verifier = CommandOidcVerifier(
+        FakeCommands(
+            federated_subject="repo:octo-org@42/agents@123456",
+            application_id="different-client",
+        )
+    )
+
+    with pytest.raises(
+        OidcVerificationError,
+        match="target Entra application",
     ):
         verifier.verify(_request(tmp_path), _discovery())

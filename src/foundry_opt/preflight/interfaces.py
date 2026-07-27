@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Mapping, Protocol, Sequence
 
 from foundry_opt.preflight.models import CheckResult, PreflightRequest
 
@@ -24,6 +24,8 @@ class CommandRunner(Protocol):
         arguments: Sequence[str],
         *,
         cwd: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+        input_text: str | None = None,
     ) -> CommandResult: ...
 
 
