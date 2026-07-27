@@ -25,6 +25,7 @@ from azure.core.exceptions import (
 from azure.core.rest import HttpRequest
 
 from foundry_opt.drafts import DraftRecord, DraftRequest
+from foundry_opt.drafts.models import project_endpoint_components
 
 
 _API_VERSION = "v1"
@@ -103,7 +104,11 @@ class DraftGateway:
                 client,
                 HttpRequest(
                     "GET",
-                    _version_url(request.agent_name, str(request.base_version)),
+                    _version_url(
+                        request.project_endpoint,
+                        request.agent_name,
+                        str(request.base_version),
+                    ),
                     headers={"Accept": "application/json"},
                 ),
             )
@@ -112,7 +117,7 @@ class DraftGateway:
             metadata = _draft_metadata(request, baseline)
             create_request = HttpRequest(
                 "POST",
-                _versions_url(request.agent_name),
+                _versions_url(request.project_endpoint, request.agent_name),
                 headers={
                     "Accept": "application/json",
                     "Foundry-Features": _PREVIEW_HEADER,
@@ -186,7 +191,11 @@ class DraftGateway:
                 client,
                 HttpRequest(
                     "DELETE",
-                    _version_url(record.agent_name, record.version_id),
+                    _version_url(
+                        record.project_endpoint,
+                        record.agent_name,
+                        record.version_id,
+                    ),
                     headers={"Foundry-Features": _PREVIEW_HEADER},
                 ),
             )
@@ -425,16 +434,28 @@ def _probe_signature(record: DraftRecord, token: str) -> bytes:
     return hmac.digest(token.encode("utf-8"), identity, "sha256")
 
 
-def _versions_url(agent_name: str) -> str:
+def _project_url(project_endpoint: str) -> str:
+    host, project = project_endpoint_components(project_endpoint)
     return (
-        "{endpoint}/agents/"
+        f"https://{host}/api/projects/"
+        f"{quote(project, safe='')}"
+    )
+
+
+def _versions_url(project_endpoint: str, agent_name: str) -> str:
+    return (
+        f"{_project_url(project_endpoint)}/agents/"
         f"{quote(agent_name, safe='')}/versions?api-version={_API_VERSION}"
     )
 
 
-def _version_url(agent_name: str, version: str) -> str:
+def _version_url(
+    project_endpoint: str,
+    agent_name: str,
+    version: str,
+) -> str:
     return (
-        "{endpoint}/agents/"
+        f"{_project_url(project_endpoint)}/agents/"
         f"{quote(agent_name, safe='')}/versions/{quote(version, safe='')}"
         f"?api-version={_API_VERSION}"
     )

@@ -3,13 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Mapping
-from urllib.parse import urlsplit
 import re
 
 from foundry_opt.packaging import BundleArtifact
 
 
 _AGENT_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_PROJECT_ENDPOINT = re.compile(
+    r"https://"
+    r"(?P<resource>[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)"
+    r"\.services\.ai\.azure\.com/api/projects/"
+    r"(?P<project>[A-Za-z0-9](?:[A-Za-z0-9._~-]{0,127})?)"
+)
 _SENSITIVE_ENV_MARKERS = (
     "SECRET",
     "PASSWORD",
@@ -40,21 +45,7 @@ class DraftRequest:
     probe: bool = False
 
     def __post_init__(self) -> None:
-        parsed = urlsplit(self.project_endpoint)
-        hostname = parsed.hostname.casefold() if parsed.hostname else ""
-        path_parts = parsed.path.split("/")
-        if (
-            parsed.scheme.casefold() != "https"
-            or not hostname.endswith(".services.ai.azure.com")
-            or hostname == ".services.ai.azure.com"
-            or parsed.port is not None
-            or parsed.query
-            or parsed.fragment
-            or len(path_parts) != 4
-            or path_parts[:3] != ["", "api", "projects"]
-            or not path_parts[3]
-        ):
-            raise ValueError("project_endpoint must be a Foundry project HTTPS URL")
+        project_endpoint_components(self.project_endpoint)
         if not _AGENT_NAME.fullmatch(self.agent_name):
             raise ValueError("agent_name is invalid")
         if (
@@ -114,6 +105,16 @@ class DraftRequest:
             MappingProxyType(environment),
         )
         object.__setattr__(self, "metadata", MappingProxyType(metadata))
+
+
+def project_endpoint_components(value: str) -> tuple[str, str]:
+    match = _PROJECT_ENDPOINT.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError(
+            "project_endpoint must be a canonical Foundry project HTTPS URL"
+        )
+    host = f"{match.group('resource')}.services.ai.azure.com"
+    return host, match.group("project")
 
 
 @dataclass(frozen=True)

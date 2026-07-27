@@ -209,10 +209,12 @@ def test_create_draft_uses_preview_rest_contract_and_preserves_binary_zip(
     assert record.probe is False
     baseline_call, create_call = client.requests
     assert baseline_call.method == "GET"
-    assert baseline_call.url.endswith("/agents/demo-agent/versions/7?api-version=v1")
+    assert baseline_call.url == (
+        f"{PROJECT_ENDPOINT}/agents/demo-agent/versions/7?api-version=v1"
+    )
     assert create_call.method == "POST"
-    assert create_call.url.endswith(
-        "/agents/demo-agent/versions?api-version=v1"
+    assert create_call.url == (
+        f"{PROJECT_ENDPOINT}/agents/demo-agent/versions?api-version=v1"
     )
     assert create_call.headers["Foundry-Features"] == "DraftAgents=V1Preview"
     assert create_call.headers["x-ms-code-zip-sha256"] == request.bundle.sha256
@@ -468,6 +470,31 @@ def test_draft_request_rejects_non_foundry_endpoint(tmp_path: Path) -> None:
                 "project_endpoint": "https://evil.example/api/projects/demo",
             }
         )
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://user@example.services.ai.azure.com/api/projects/demo",
+        "https://user:password@example.services.ai.azure.com/api/projects/demo",
+        "https://example.services.ai.azure.com\\@evil.example/api/projects/demo",
+        "https:\\\\example.services.ai.azure.com\\api\\projects\\demo",
+        "https://example.services.ai.azure.com/api/projects/demo/",
+        "https://example.services.ai.azure.com//api/projects/demo",
+        "https://example.services.ai.azure.com/api/projects/demo%2fother",
+        "https://example.services.ai.azure.com/api/projects/../demo",
+        "HTTPS://example.services.ai.azure.com/api/projects/demo",
+        "https://EXAMPLE.services.ai.azure.com/api/projects/demo",
+    ],
+)
+def test_draft_request_rejects_noncanonical_ambiguous_endpoints(
+    tmp_path: Path,
+    endpoint: str,
+) -> None:
+    values = _request(tmp_path).__dict__
+
+    with pytest.raises(ValueError):
+        DraftRequest(**{**values, "project_endpoint": endpoint})
 
 
 def test_delete_probe_deletes_only_the_probe_version(tmp_path: Path) -> None:

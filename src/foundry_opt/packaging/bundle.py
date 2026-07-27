@@ -45,12 +45,14 @@ _ROOT_MANDATORY_DIRECTORIES = {
     "dist": "build artifact",
     "build": "build artifact",
 }
-_MANDATORY_FILE_SUFFIXES = {
+_MANDATORY_CACHE_FILE_SUFFIXES = {
     ".pyc",
     ".pyo",
+    ".coverage",
+}
+_MANDATORY_BUILD_FILE_SUFFIXES = {
     ".whl",
     ".egg",
-    ".coverage",
 }
 _SECRET_EXACT_NAMES = {
     ".env",
@@ -90,6 +92,7 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
     partial_path = output.with_suffix(f"{output.suffix}.partial")
     generated_paths = {output, manifest_path, partial_path}
     _reject_artifact_collisions(generated_paths)
+    bundled_runtime_roots = _bundled_runtime_roots(request)
 
     included: list[tuple[str, bytes]] = []
     excluded: list[ExcludedFile] = []
@@ -97,8 +100,12 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
         root,
         excluded,
         request.exclude,
+        bundled_runtime_roots,
     ):
-        mandatory_reason = _mandatory_exclusion(archive_path)
+        mandatory_reason = _mandatory_exclusion(
+            archive_path,
+            bundled_runtime_roots,
+        )
         if mandatory_reason is not None:
             excluded.append(
                 ExcludedFile(archive_path, f"mandatory: {mandatory_reason}")
@@ -182,6 +189,7 @@ def _source_files(
     root: Path,
     excluded: list[ExcludedFile],
     exclude_patterns: tuple[str, ...],
+    bundled_runtime_roots: frozenset[str],
 ):
     for current, directory_names, file_names in os.walk(
         root,
@@ -192,7 +200,10 @@ def _source_files(
         retained_directories: list[str] = []
         for name in sorted(directory_names):
             relative = (current_path / name).relative_to(root).as_posix()
-            mandatory_reason = _mandatory_directory_exclusion(relative)
+            mandatory_reason = _mandatory_directory_exclusion(
+                relative,
+                bundled_runtime_roots,
+            )
             if mandatory_reason is not None:
                 excluded.append(
                     ExcludedFile(
@@ -241,13 +252,39 @@ def _excluded_directory_pattern(
     return None
 
 
+def _bundled_runtime_roots(request: BundleRequest) -> frozenset[str]:
+    if request.dependency_resolution != "bundled":
+        return frozenset()
+    return frozenset(
+        directory
+        for directory in ("node_modules", "dist")
+        if _explicitly_includes_root(directory, request.include)
+    )
+
+
+def _explicitly_includes_root(
+    directory: str,
+    patterns: tuple[str, ...],
+) -> bool:
+    prefixes = (f"{directory}/", f"**/{directory}/")
+    for pattern in patterns:
+        normalized = pattern.replace("\\", "/").removeprefix("./")
+        if normalized == directory or normalized.startswith(prefixes):
+            return True
+    return False
+
+
 def _snapshot_contained_file(path: Path, root: Path) -> tuple[Path, bytes]:
     try:
         before = os.stat(path, follow_symlinks=False)
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError) as error:
         raise UnsafeSourcePathError(path) from error
-    if not stat.S_ISREG(before.st_mode) or not resolved.is_relative_to(root):
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or not resolved.is_relative_to(root)
+    ):
         raise UnsafeSourcePathError(path)
 
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
@@ -260,6 +297,7 @@ def _snapshot_contained_file(path: Path, root: Path) -> tuple[Path, bytes]:
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
             or _file_identity(before) != _file_identity(opened)
             or _file_state(before) != _file_state(opened)
         ):
@@ -271,7 +309,7 @@ def _snapshot_contained_file(path: Path, root: Path) -> tuple[Path, bytes]:
                 break
             chunks.append(chunk)
         after = os.fstat(descriptor)
-        if _file_state(opened) != _file_state(after):
+        if after.st_nlink != 1 or _file_state(opened) != _file_state(after):
             raise UnsafeSourcePathError(path)
         return resolved, b"".join(chunks)
     finally:
@@ -286,34 +324,64 @@ def _file_state(value: os.stat_result) -> tuple[int, int]:
     return value.st_size, value.st_mtime_ns
 
 
-def _mandatory_exclusion(archive_path: str) -> str | None:
+def _mandatory_exclusion(
+    archive_path: str,
+    bundled_runtime_roots: frozenset[str],
+) -> str | None:
     path = PurePosixPath(archive_path)
     if path.name.casefold() == ".git":
         return "version-control metadata"
     for index in range(len(path.parts) - 1):
         directory = PurePosixPath(*path.parts[:index + 1]).as_posix()
-        reason = _mandatory_directory_exclusion(directory)
+        reason = _mandatory_directory_exclusion(
+            directory,
+            bundled_runtime_roots,
+        )
         if reason is not None:
             return reason
     name = path.name.casefold()
     if name in {".coverage", "coverage.xml"}:
         return "build artifact"
-    if any(name.endswith(suffix) for suffix in _MANDATORY_FILE_SUFFIXES):
+    if any(
+        name.endswith(suffix)
+        for suffix in _MANDATORY_CACHE_FILE_SUFFIXES
+    ):
+        return "build artifact"
+    if any(
+        name.endswith(suffix)
+        for suffix in _MANDATORY_BUILD_FILE_SUFFIXES
+    ) and not (
+        path.parts
+        and path.parts[0].casefold() == "dist"
+        and "dist" in bundled_runtime_roots
+    ):
         return "build artifact"
     return None
 
 
-def _mandatory_directory_exclusion(archive_path: str) -> str | None:
+def _mandatory_directory_exclusion(
+    archive_path: str,
+    bundled_runtime_roots: frozenset[str],
+) -> str | None:
     path = PurePosixPath(archive_path)
     normalized = path.name.casefold()
+    top_level = path.parts[0].casefold()
     if len(path.parts) == 1:
         reason = _ROOT_MANDATORY_DIRECTORIES.get(normalized)
-        if reason is not None:
+        if reason is not None and normalized not in bundled_runtime_roots:
             return reason
     reason = _MANDATORY_DIRECTORIES.get(normalized)
+    if (
+        normalized == "node_modules"
+        and top_level == "node_modules"
+        and "node_modules" in bundled_runtime_roots
+    ):
+        reason = None
     if reason is not None:
         return reason
-    if normalized.endswith(".egg-info"):
+    if normalized.endswith(".egg-info") and not (
+        top_level == "dist" and "dist" in bundled_runtime_roots
+    ):
         return "build artifact"
     return None
 

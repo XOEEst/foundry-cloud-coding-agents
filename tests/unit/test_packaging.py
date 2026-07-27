@@ -130,6 +130,121 @@ def test_build_source_bundle_keeps_nested_env_build_and_dist_source(
     assert reasons["env/"] == "mandatory: virtual environment"
 
 
+def test_build_source_bundle_allows_explicit_bundled_runtime_dependencies(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src" / "main.py").write_text("main = True\n", encoding="utf-8")
+    package = repository / "node_modules" / "runtime-package"
+    package.mkdir(parents=True)
+    (package / "index.js").write_text("export default 1;\n", encoding="utf-8")
+    cache = repository / "node_modules" / ".cache"
+    cache.mkdir()
+    (cache / "state.json").write_text("generated", encoding="utf-8")
+    dist = repository / "dist"
+    dist.mkdir()
+    (dist / "agent.js").write_text("console.log('agent');\n", encoding="utf-8")
+    (dist / "runtime.whl").write_bytes(b"bundled-wheel")
+    metadata = dist / "runtime.egg-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Name: runtime\n", encoding="utf-8")
+
+    artifact = build_source_bundle(
+        BundleRequest(
+            repository,
+            tmp_path / "bundle.zip",
+            include=("src/**", "node_modules/**", "dist/**"),
+            dependency_resolution="bundled",
+        )
+    )
+
+    assert artifact.included_files == (
+        "dist/agent.js",
+        "dist/runtime.egg-info/METADATA",
+        "dist/runtime.whl",
+        "node_modules/runtime-package/index.js",
+        "src/main.py",
+    )
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons["node_modules/.cache/"] == "mandatory: cache"
+
+
+def test_build_source_bundle_remote_build_excludes_runtime_artifacts(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src" / "main.py").write_text("main = True\n", encoding="utf-8")
+    package = repository / "node_modules" / "runtime-package"
+    package.mkdir(parents=True)
+    (package / "index.js").write_text("export default 1;\n", encoding="utf-8")
+    dist = repository / "dist"
+    dist.mkdir()
+    (dist / "agent.js").write_text("console.log('agent');\n", encoding="utf-8")
+
+    artifact = build_source_bundle(
+        BundleRequest(
+            repository,
+            tmp_path / "bundle.zip",
+            include=("src/**", "node_modules/**", "dist/**"),
+            dependency_resolution="remote_build",
+        )
+    )
+
+    assert artifact.included_files == ("src/main.py",)
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons["node_modules/"] == "mandatory: cache"
+    assert reasons["dist/"] == "mandatory: build artifact"
+
+
+def test_build_source_bundle_bundled_mode_requires_explicit_runtime_include(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src" / "main.py").write_text("main = True\n", encoding="utf-8")
+    package = repository / "node_modules" / "runtime-package"
+    package.mkdir(parents=True)
+    (package / "index.js").write_text("export default 1;\n", encoding="utf-8")
+    dist = repository / "dist"
+    dist.mkdir()
+    (dist / "agent.js").write_text("console.log('agent');\n", encoding="utf-8")
+
+    artifact = build_source_bundle(
+        BundleRequest(
+            repository,
+            tmp_path / "bundle.zip",
+            dependency_resolution="bundled",
+        )
+    )
+
+    assert artifact.included_files == ("src/main.py",)
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons["node_modules/"] == "mandatory: cache"
+    assert reasons["dist/"] == "mandatory: build artifact"
+
+
+def test_build_source_bundle_rejects_secrets_in_bundled_dependencies(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    package = repository / "node_modules" / "runtime-package"
+    package.mkdir(parents=True)
+    (package / "index.js").write_text("export default 1;\n", encoding="utf-8")
+    (package / ".env").write_text("TOKEN=must-not-leak\n", encoding="utf-8")
+
+    with pytest.raises(SecretSourceFileError):
+        build_source_bundle(
+            BundleRequest(
+                repository,
+                tmp_path / "bundle.zip",
+                include=("node_modules/**",),
+                dependency_resolution="bundled",
+            )
+        )
+
+
 def test_build_source_bundle_excludes_root_git_file(tmp_path: Path) -> None:
     repository = tmp_path / "worktree"
     repository.mkdir()
@@ -189,6 +304,25 @@ def test_build_source_bundle_rejects_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(UnsafeSourcePathError):
         build_source_bundle(BundleRequest(repository, tmp_path / "bundle.zip"))
+
+
+def test_build_source_bundle_rejects_multiply_linked_source_files(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("outside", encoding="utf-8")
+    linked = repository / "linked.py"
+    try:
+        os.link(outside, linked)
+    except OSError:
+        pytest.skip("hardlink creation is unavailable")
+
+    with pytest.raises(UnsafeSourcePathError):
+        build_source_bundle(BundleRequest(repository, tmp_path / "bundle.zip"))
+
+    assert not (tmp_path / "bundle.zip").exists()
 
 
 def test_build_source_bundle_uses_validated_file_snapshot(

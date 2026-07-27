@@ -10,12 +10,15 @@ class BundleRequest:
     output_path: Path
     include: tuple[str, ...] = ("**",)
     exclude: tuple[str, ...] = ()
+    dependency_resolution: str = "remote_build"
 
     def __post_init__(self) -> None:
         if not self.include:
             raise ValueError("include must contain at least one pattern")
         if any(not pattern.strip() for pattern in self.include + self.exclude):
             raise ValueError("bundle patterns must not be empty")
+        if self.dependency_resolution not in {"remote_build", "bundled"}:
+            raise ValueError("dependency_resolution is invalid")
 
 
 @dataclass(frozen=True)
