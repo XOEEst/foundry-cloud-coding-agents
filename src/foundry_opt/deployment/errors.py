@@ -1,0 +1,42 @@
+class DeploymentError(RuntimeError):
+    """Base class for stable, redacted deployment failures."""
+
+
+class DeploymentAuthenticationError(DeploymentError):
+    def __init__(self) -> None:
+        super().__init__("Azure authentication failed during deployment.")
+
+
+class DeploymentAuthorizationError(DeploymentError):
+    def __init__(self) -> None:
+        super().__init__(
+            "The deployment identity cannot publish Foundry versions."
+        )
+
+
+class DeploymentApiError(DeploymentError):
+    def __init__(self, status_code: int | None = None) -> None:
+        self.status_code = status_code
+        suffix = (
+            f" with status {status_code}"
+            if isinstance(status_code, int)
+            else ""
+        )
+        super().__init__(f"The Foundry deployment API request failed{suffix}.")
+
+
+class DeploymentConflictError(DeploymentApiError):
+    def __init__(self) -> None:
+        super().__init__(409)
+
+
+class DeploymentResponseError(DeploymentError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Foundry did not return a confirmed published version."
+        )
+
+
+class DeploymentHashMismatchError(DeploymentError):
+    def __init__(self) -> None:
+        super().__init__("Deployment source or lineage hash verification failed.")
