@@ -142,6 +142,15 @@ def verify_deployed_selection(
             ),
         ),
         DeploymentCheck(
+            "reproduced_baseline_bundle",
+            reproduction is not None
+            and baseline_bundle_content is not None
+            and reproduction.baseline_bundle_bytes
+            == baseline_bundle_content
+            and reproduction.baseline_bundle_sha256
+            == request.expected_baseline_bundle_sha256,
+        ),
+        DeploymentCheck(
             "published_terminal_status",
             (request.record.status or "").casefold()
             in _SUCCESS_STATUSES,
@@ -290,6 +299,8 @@ def _evidence_matches(
     if not isinstance(candidates, list) or not isinstance(pareto, dict):
         return False
     eligible = pareto.get("eligible_ids")
+    frontier = pareto.get("frontier_ids")
+    decisions = pareto.get("decisions")
     matching = [
         candidate
         for candidate in candidates
@@ -297,6 +308,46 @@ def _evidence_matches(
         and candidate.get("subject_id") == request.candidate_id
         and candidate.get("patch_hash") == request.expected_patch_sha256
     ]
+    candidate_ids = [
+        candidate.get("subject_id")
+        for candidate in candidates
+        if isinstance(candidate, dict)
+    ]
+    if (
+        len(candidate_ids) != len(candidates)
+        or any(not isinstance(identifier, str) for identifier in candidate_ids)
+        or not isinstance(frontier, list)
+        or not isinstance(eligible, list)
+        or not isinstance(decisions, list)
+        or any(not isinstance(identifier, str) for identifier in frontier)
+        or any(not isinstance(identifier, str) for identifier in eligible)
+    ):
+        return False
+    decision_by_id: dict[str, bool] = {}
+    for decision in decisions:
+        if (
+            not isinstance(decision, dict)
+            or not isinstance(decision.get("subject_id"), str)
+            or not isinstance(decision.get("eligible"), bool)
+            or decision["subject_id"] in decision_by_id
+        ):
+            return False
+        decision_by_id[decision["subject_id"]] = decision["eligible"]
+    candidate_set = set(candidate_ids)
+    frontier_set = set(frontier)
+    eligible_set = set(eligible)
+    consistent_selection = (
+        len(candidate_set) == len(candidate_ids)
+        and len(frontier_set) == len(frontier)
+        and len(eligible_set) == len(eligible)
+        and frontier_set <= candidate_set
+        and eligible_set <= frontier_set
+        and set(decision_by_id) == candidate_set
+        and all(
+            decision_by_id[identifier] == (identifier in eligible_set)
+            for identifier in candidate_set
+        )
+    )
     return (
         document.get("campaign_id") == request.expected_campaign_id
         and document.get("source_hash")
@@ -304,8 +355,10 @@ def _evidence_matches(
         and isinstance(baseline, dict)
         and baseline.get("subject_id")
         == request.expected_baseline_subject_id
-        and isinstance(eligible, list)
-        and request.candidate_id in eligible
+        and consistent_selection
+        and request.candidate_id in frontier_set
+        and request.candidate_id in eligible_set
+        and decision_by_id.get(request.candidate_id) is True
         and len(matching) == 1
     )
 
@@ -331,11 +384,15 @@ class _Reproduction:
         self,
         tree_hash: str,
         workflow_commit_tree: str,
+        baseline_bundle_bytes: bytes,
+        baseline_bundle_sha256: str,
         bundle_bytes: bytes,
         bundle_sha256: str,
     ) -> None:
         self.tree_hash = tree_hash
         self.workflow_commit_tree = workflow_commit_tree
+        self.baseline_bundle_bytes = baseline_bundle_bytes
+        self.baseline_bundle_sha256 = baseline_bundle_sha256
         self.bundle_bytes = bundle_bytes
         self.bundle_sha256 = bundle_sha256
 
@@ -371,6 +428,14 @@ def _reproduce_selection(
             request.expected_base_commit,
         )
         added = True
+        baseline_artifact = build_source_bundle(
+            _bundle_request(
+                request,
+                absolute_worktree,
+                scratch / "rebuilt-baseline.zip",
+            )
+        )
+        baseline_bundle_bytes = baseline_artifact.path.read_bytes()
         _git(
             absolute_worktree,
             "apply",
@@ -380,21 +445,18 @@ def _reproduce_selection(
         )
         tree_hash = _git(worktree, "write-tree")
         artifact = build_source_bundle(
-            BundleRequest(
-                repository_root=absolute_worktree,
-                output_path=scratch / "rebuilt.zip",
-                include=request.bundle_include,
-                exclude=request.bundle_exclude,
-                dependency_resolution=(
-                    request.bundle_dependency_resolution
-                ),
-                evidence_paths=request.bundle_evidence_paths,
+            _bundle_request(
+                request,
+                absolute_worktree,
+                scratch / "rebuilt.zip",
             )
         )
         bundle_bytes = artifact.path.read_bytes()
         return _Reproduction(
             tree_hash,
             workflow_commit_tree,
+            baseline_bundle_bytes,
+            baseline_artifact.sha256,
             bundle_bytes,
             artifact.sha256,
         )
@@ -414,6 +476,21 @@ def _reproduce_selection(
                 capture_output=True,
             )
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _bundle_request(
+    request: DeploymentVerificationRequest,
+    repository_root: Path,
+    output_path: Path,
+) -> BundleRequest:
+    return BundleRequest(
+        repository_root=repository_root,
+        output_path=output_path,
+        include=request.bundle_include,
+        exclude=request.bundle_exclude,
+        dependency_resolution=request.bundle_dependency_resolution,
+        evidence_paths=request.bundle_evidence_paths,
+    )
 
 
 def _git(root: Path, *arguments: str) -> str:

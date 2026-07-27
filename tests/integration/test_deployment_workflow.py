@@ -512,6 +512,94 @@ def test_verify_rejects_tampered_baseline_bundle(
     assert "baseline_bundle_sha256" in verification.failed_checks
 
 
+def test_verify_rebuilds_baseline_bundle_from_exact_patch_base(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    wrong_baseline = build_source_bundle(
+        BundleRequest(
+            request.repository_root,
+            tmp_path / "wrong-baseline.zip",
+            exclude=request.bundle_exclude,
+        )
+    )
+    evidence = request.repository_root / request.evidence_path
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    document["source_hash"] = wrong_baseline.sha256
+    evidence.write_text(
+        json.dumps(document, sort_keys=True),
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    request = replace(
+        request,
+        baseline_bundle=wrong_baseline,
+        expected_baseline_bundle_sha256=wrong_baseline.sha256,
+        expected_evidence_sha256=digest,
+        record=replace(
+            request.record,
+            evidence_sha256=digest,
+            metadata={
+                **request.record.metadata,
+                "foundry-opt-evidence-sha256": digest,
+            },
+        ),
+    )
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is False
+    assert "reproduced_baseline_bundle" in verification.failed_checks
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda document: document["pareto"].update({"frontier_ids": []}),
+        lambda document: document["pareto"].update(
+            {"eligible_ids": ["candidate-1", "candidate-1"]}
+        ),
+        lambda document: document["pareto"]["decisions"][0].update(
+            {"eligible": False}
+        ),
+        lambda document: document["pareto"].update({"decisions": []}),
+        lambda document: document["pareto"].update(
+            {"frontier_ids": ["candidate-1", "unknown-candidate"]}
+        ),
+    ],
+)
+def test_verify_enforces_exact_evidence_selection_consistency(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    request = _request(tmp_path)
+    evidence = request.repository_root / request.evidence_path
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    mutation(document)
+    evidence.write_text(
+        json.dumps(document, sort_keys=True),
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    request = replace(
+        request,
+        expected_evidence_sha256=digest,
+        record=replace(
+            request.record,
+            evidence_sha256=digest,
+            metadata={
+                **request.record.metadata,
+                "foundry-opt-evidence-sha256": digest,
+            },
+        ),
+    )
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is False
+    assert "evidence_lineage" in verification.failed_checks
+
+
 def test_verify_deployed_selection_does_not_fallback_on_failed_run(
     tmp_path: Path,
 ) -> None:

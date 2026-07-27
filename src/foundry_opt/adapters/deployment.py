@@ -183,7 +183,12 @@ class DeploymentGateway:
                 response_headers,
                 request,
             )
-            return self._poll_published_version(client, request, version)
+            return self._poll_published_version(
+                client,
+                request,
+                version,
+                metadata,
+            )
         finally:
             _close_quietly(client)
             _close_quietly(credential)
@@ -193,6 +198,7 @@ class DeploymentGateway:
         client: Any,
         request: DeploymentRequest,
         version: int,
+        expected_payload: dict[str, Any],
     ) -> DeploymentRecord:
         for attempt in range(self._poll_attempts):
             payload = _send_json(
@@ -215,6 +221,11 @@ class DeploymentGateway:
             )
             status = (record.status or "").casefold()
             if status in _SUCCESS_STATUSES:
+                _verify_effective_payload(
+                    payload,
+                    expected_payload,
+                    request.bundle.sha256,
+                )
                 _verify_readback_matches_request(record, request)
                 return record
             if status in _FAILURE_STATUSES:
@@ -432,6 +443,31 @@ def _verify_readback_matches_request(
             record.metadata.get(key) != value
             for key, value in _provenance_metadata(request).items()
         )
+    ):
+        raise DeploymentResponseError()
+
+
+def _verify_effective_payload(
+    payload: dict[str, Any],
+    expected_payload: dict[str, Any],
+    bundle_sha256: str,
+) -> None:
+    expected = deepcopy(expected_payload)
+    definition = expected.get("definition")
+    if not isinstance(definition, dict):
+        raise DeploymentResponseError()
+    configuration = definition.get("code_configuration")
+    if not isinstance(configuration, dict):
+        raise DeploymentResponseError()
+    configuration["content_hash"] = bundle_sha256
+    for key in ("definition", "description", "metadata", "draft"):
+        if key not in payload or payload[key] != expected.get(key):
+            raise DeploymentResponseError()
+    if (
+        ("blueprint_reference" in payload)
+        != ("blueprint_reference" in expected)
+        or payload.get("blueprint_reference")
+        != expected.get("blueprint_reference")
     ):
         raise DeploymentResponseError()
 

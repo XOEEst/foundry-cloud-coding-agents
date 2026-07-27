@@ -169,39 +169,60 @@ def _readback(
     entry_point: list[str] | None = None,
     dependency_resolution: str | None = None,
     metadata: dict[str, str] | None = None,
+    mutate: Any = None,
 ) -> FakeResponse:
-    provenance = metadata or {
+    provenance = {
         "foundry-opt-base-version": str(request.base_version),
         "foundry-opt-source-sha256": request.bundle.sha256,
         "foundry-opt-patch-sha256": request.patch_sha256,
         "foundry-opt-tree-hash": request.tree_hash,
         "foundry-opt-evidence-sha256": request.evidence_sha256,
     }
-    return FakeResponse(
-        200,
-        {
-            "version": "8",
-            "draft": False,
-            "status": status,
-            "portal_url": (
-                "https://ai.azure.com/projects/demo/agents/demo-agent/"
-                "versions/8"
-            ),
-            "metadata": provenance,
-            "definition": {
-                "kind": "hosted",
-                "code_configuration": {
-                    "runtime": runtime or request.runtime,
-                    "entry_point": entry_point or list(request.entry_point),
-                    "dependency_resolution": (
-                        dependency_resolution
-                        or request.dependency_resolution
-                    ),
-                    "content_hash": request.bundle.sha256,
-                },
+    persisted_metadata = {
+        **provenance,
+        **dict(request.metadata),
+    }
+    persisted_metadata.setdefault("owner", "platform")
+    if metadata is not None:
+        persisted_metadata = metadata
+    payload = {
+        "version": "8",
+        "draft": False,
+        "status": status,
+        "portal_url": (
+            "https://ai.azure.com/projects/demo/agents/demo-agent/"
+            "versions/8"
+        ),
+        "description": (
+            request.description
+            if request.description is not None
+            else "published baseline"
+        ),
+        "metadata": persisted_metadata,
+        "blueprint_reference": {"blueprint_id": "pinned-blueprint"},
+        "definition": {
+            "kind": "hosted",
+            "cpu": "2",
+            "memory": "4Gi",
+            "protocol_versions": [
+                {"protocol": "invocations", "version": "1.0.0"}
+            ],
+            "environment_variables": {"MODEL": "baseline-model"},
+            "code_configuration": {
+                "runtime": runtime or request.runtime,
+                "entry_point": entry_point or list(request.entry_point),
+                "dependency_resolution": (
+                    dependency_resolution or request.dependency_resolution
+                ),
+                "content_hash": request.bundle.sha256,
             },
+            "responsible_ai": {"policy_name": "baseline"},
+            "future_operational_field": {"preserve": True},
         },
-    )
+    }
+    if mutate is not None:
+        mutate(payload)
+    return FakeResponse(200, payload)
 
 
 def _gateway(
@@ -610,6 +631,86 @@ def test_publish_rejects_effective_readback_mismatch(
 
     with pytest.raises(DeploymentResponseError):
         gateway.publish(request)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload["definition"].update({"cpu": "4"}),
+        lambda payload: payload["definition"].update({"memory": "8Gi"}),
+        lambda payload: payload["definition"]["environment_variables"].update(
+            {"MODEL": "different"}
+        ),
+        lambda payload: payload["definition"].update(
+            {
+                "protocol_versions": [
+                    {"protocol": "responses", "version": "1.0.0"}
+                ]
+            }
+        ),
+        lambda payload: payload["definition"]["responsible_ai"].update(
+            {"policy_name": "different"}
+        ),
+        lambda payload: payload["definition"].update(
+            {"future_operational_field": {"preserve": False}}
+        ),
+        lambda payload: payload["definition"]["code_configuration"].update(
+            {"content_hash": "0" * 64}
+        ),
+        lambda payload: payload.update({"description": "different"}),
+        lambda payload: payload["blueprint_reference"].update(
+            {"blueprint_id": "different"}
+        ),
+        lambda payload: payload["metadata"].pop("owner"),
+        lambda payload: payload["metadata"].update({"unexpected": "value"}),
+    ],
+)
+def test_publish_rejects_any_effective_operational_payload_mismatch(
+    tmp_path: Path,
+    mutation: Any,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, mutate=mutation),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DeploymentResponseError):
+        gateway.publish(request)
+
+
+def test_publish_verifies_all_caller_and_inherited_metadata(
+    tmp_path: Path,
+) -> None:
+    request = replace(
+        _request(tmp_path),
+        description="release description",
+        metadata={"release": "candidate", "owner": "delivery"},
+    )
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.publish(request)
+
+    assert record.metadata == {
+        "foundry-opt-base-version": "7",
+        "foundry-opt-source-sha256": request.bundle.sha256,
+        "foundry-opt-patch-sha256": request.patch_sha256,
+        "foundry-opt-tree-hash": request.tree_hash,
+        "foundry-opt-evidence-sha256": request.evidence_sha256,
+        "release": "candidate",
+        "owner": "delivery",
+    }
 
 
 def test_deployment_request_rejects_noncanonical_endpoint_before_auth(
