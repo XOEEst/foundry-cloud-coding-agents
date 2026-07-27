@@ -276,3 +276,48 @@ def test_baseline_missing_required_metric_rejects_all_candidates() -> None:
     reason = result.decision_for("candidate").reason.casefold()
     assert "baseline" in reason
     assert "undefined" in reason
+
+
+def test_differing_ignored_metric_sets_are_incomparable_without_cycle() -> None:
+    policy = EvaluationPolicy(
+        metrics=tuple(
+            MetricPolicy(
+                name=name,
+                direction=MetricDirection.MAXIMIZE,
+                threshold=0,
+                materiality=0.1,
+                undefined_behavior=UndefinedBehavior.IGNORE,
+            )
+            for name in ("m1", "m2", "m3")
+        )
+    )
+
+    def result(subject_id: str, values: tuple[float | None, ...]):
+        evaluation = _result(subject_id, quality=0.7, latency=1.5)
+        return replace(
+            evaluation,
+            metrics={
+                name: MetricAggregate(
+                    name,
+                    value,
+                    value,
+                    value,
+                    0 if value is not None else None,
+                    Outcome.PASS if value is not None else Outcome.UNDEFINED,
+                    1 if value is not None else 0,
+                )
+                for name, value in zip(("m1", "m2", "m3"), values)
+            },
+        )
+
+    baseline = result("baseline", (0, 0, 0))
+    candidates = (
+        result("a", (3, None, 1)),
+        result("b", (1, 3, None)),
+        result("c", (None, 1, 3)),
+    )
+
+    pareto = select_eligible_candidates(baseline, candidates, policy)
+
+    assert pareto.frontier_ids == ("a", "b", "c")
+    assert pareto.eligible_ids == ("a", "b", "c")

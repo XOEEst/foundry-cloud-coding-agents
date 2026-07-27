@@ -207,19 +207,22 @@ def _dominates(
     for metric in policy.metrics:
         left_aggregate = left.metrics.get(metric.name)
         right_aggregate = right.metrics.get(metric.name)
-        if (
-            left_aggregate is None
-            or right_aggregate is None
-            or left_aggregate.median is None
-            or right_aggregate.median is None
-        ):
+        left_value = (
+            left_aggregate.median if left_aggregate is not None else None
+        )
+        right_value = (
+            right_aggregate.median if right_aggregate is not None else None
+        )
+        if (left_value is None) != (right_value is None):
+            return False
+        if left_value is None or right_value is None:
             if metric.undefined_behavior is UndefinedBehavior.IGNORE:
                 continue
             return False
         compared = True
         improvement = metric.improvement(
-            right_aggregate.median,
-            left_aggregate.median,
+            right_value,
+            left_value,
         )
         if improvement < 0:
             return False

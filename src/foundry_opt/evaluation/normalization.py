@@ -25,6 +25,7 @@ def normalize_evaluation(
 ) -> EvaluationResult:
     resolved_policy = _coerce_policy(policy)
     item_tuple = tuple(items)
+    _validate_unique_cases(item_tuple)
     normalized_cases = tuple(
         _normalize_case(item, resolved_policy) for item in item_tuple
     )
@@ -181,6 +182,7 @@ def _aggregate_metric(
     outcome = (
         Outcome.UNDEFINED
         if has_undefined
+        and policy.undefined_behavior is not UndefinedBehavior.IGNORE
         else Outcome.PASS
         if policy.passes(middle)
         else Outcome.FAIL
@@ -194,6 +196,23 @@ def _aggregate_metric(
         outcome=outcome,
         sample_count=len(values),
     )
+
+
+def _validate_unique_cases(items: tuple[EvaluationItem, ...]) -> None:
+    hashes_by_case: dict[str, str] = {}
+    for item in items:
+        previous_hash = hashes_by_case.get(item.case_id)
+        if previous_hash is not None:
+            detail = (
+                " with conflicting hashes"
+                if previous_hash != item.case_hash
+                else ""
+            )
+            raise ValueError(
+                f"Evaluation contains duplicate case ID {item.case_id!r}"
+                f"{detail}."
+            )
+        hashes_by_case[item.case_id] = item.case_hash
 
 
 def _coerce_policy(

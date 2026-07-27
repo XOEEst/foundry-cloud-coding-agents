@@ -230,3 +230,85 @@ def test_normalization_revalidates_mutated_non_finite_score() -> None:
 
     with pytest.raises(ValueError):
         normalize_evaluation(_run(), (item,), _policy())
+
+
+def test_ignored_metric_aggregates_defined_samples_and_keeps_failure() -> None:
+    policy = EvaluationPolicy(
+        metrics=(
+            MetricPolicy(
+                name="safety",
+                direction=MetricDirection.MAXIMIZE,
+                threshold=0.8,
+                materiality=0.05,
+                hard_guardrail=True,
+                undefined_behavior=UndefinedBehavior.IGNORE,
+            ),
+        )
+    )
+    items = (
+        EvaluationItem(
+            case_id="case-1",
+            case_hash="sha256:case-1",
+            response_ids=("response-1",),
+            scores=(EvaluationScore("safety", None, None, "undefined"),),
+            usage=Usage(),
+        ),
+        EvaluationItem(
+            case_id="case-2",
+            case_hash="sha256:case-2",
+            response_ids=("response-2",),
+            scores=(EvaluationScore("safety", 0.4, 0.4, "failed"),),
+            usage=Usage(),
+        ),
+    )
+
+    result = normalize_evaluation(_run(), items, policy)
+
+    assert result.metrics["safety"].median == 0.4
+    assert result.metrics["safety"].sample_count == 1
+    assert result.metrics["safety"].outcome is Outcome.FAIL
+    assert result.complete is True
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        (
+            EvaluationItem(
+                case_id="case-1",
+                case_hash="sha256:case-1",
+                response_ids=("response-1",),
+                scores=(EvaluationScore("quality", 4, 0.8, "first"),),
+                usage=Usage(),
+            ),
+            EvaluationItem(
+                case_id="case-1",
+                case_hash="sha256:case-1",
+                response_ids=("response-2",),
+                scores=(EvaluationScore("quality", 3, 0.7, "duplicate"),),
+                usage=Usage(),
+            ),
+        ),
+        (
+            EvaluationItem(
+                case_id="case-1",
+                case_hash="sha256:case-1",
+                response_ids=("response-1",),
+                scores=(EvaluationScore("quality", 4, 0.8, "first"),),
+                usage=Usage(),
+            ),
+            EvaluationItem(
+                case_id="case-1",
+                case_hash="sha256:other",
+                response_ids=("response-2",),
+                scores=(EvaluationScore("quality", 3, 0.7, "conflict"),),
+                usage=Usage(),
+            ),
+        ),
+    ],
+)
+def test_normalization_rejects_duplicate_case_ids_before_aggregation(
+    items: tuple[EvaluationItem, ...],
+) -> None:
+    with pytest.raises(ValueError, match="case"):
+        normalize_evaluation(_run(), items, _policy())

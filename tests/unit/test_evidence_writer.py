@@ -6,12 +6,14 @@ from pathlib import Path
 import pytest
 
 from foundry_opt.evaluation import (
+    CandidateDecision,
     EvaluationItem,
     EvaluationPolicy,
     EvaluationScore,
     ToolCallMetadata,
     TrajectoryMetadata,
     Usage,
+    ParetoResult,
     normalize_evaluation,
     select_eligible_candidates,
 )
@@ -450,3 +452,115 @@ def test_evidence_writer_rejects_unsafe_case_and_trace_identifiers(
                 source_hash="sha256:source",
             )
         )
+
+
+@pytest.mark.parametrize(
+    "pareto_factory",
+    [
+        lambda valid: replace(valid, decisions=()),
+        lambda valid: replace(
+            valid,
+            decisions=(valid.decisions[0], valid.decisions[0]),
+        ),
+        lambda valid: replace(valid, frontier_ids=("ghost",)),
+        lambda valid: replace(
+            valid,
+            frontier_ids=(),
+            eligible_ids=("candidate",),
+        ),
+        lambda valid: ParetoResult(
+            decisions=(
+                CandidateDecision("candidate", True, "eligible"),
+                CandidateDecision("ghost", False, "missing"),
+            ),
+            frontier_ids=("candidate",),
+            eligible_ids=("candidate",),
+        ),
+    ],
+)
+def test_evidence_writer_requires_pareto_exactly_bound_to_candidates(
+    tmp_path: Path,
+    pareto_factory,
+) -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    valid = select_eligible_candidates(baseline, (candidate,), POLICY)
+
+    with pytest.raises(ValueError, match="Pareto"):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=tmp_path / "evidence.json",
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(candidate,),
+                pareto=pareto_factory(valid),
+                source_hash="sha256:source",
+            )
+        )
+
+
+def test_evidence_writer_rejects_duplicate_candidate_subject_ids(
+    tmp_path: Path,
+) -> None:
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    pareto = select_eligible_candidates(baseline, (candidate,), POLICY)
+
+    with pytest.raises(ValueError, match="candidate"):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=tmp_path / "evidence.json",
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(candidate, candidate),
+                pareto=pareto,
+                source_hash="sha256:source",
+            )
+        )
+
+
+def test_evidence_writer_does_not_overwrite_existing_destination(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "evidence.json"
+    output.write_text("external-content", encoding="utf-8")
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+
+    with pytest.raises(FileExistsError):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=output,
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(),
+                pareto=select_eligible_candidates(baseline, (), POLICY),
+                source_hash="sha256:source",
+            )
+        )
+
+    assert output.read_text(encoding="utf-8") == "external-content"
+
+
+def test_evidence_writer_rejects_symlink_destination(tmp_path: Path) -> None:
+    target = tmp_path / "external.json"
+    target.write_text("external-content", encoding="utf-8")
+    output = tmp_path / "evidence.json"
+    try:
+        output.symlink_to(target)
+    except OSError:
+        pytest.skip("Symlinks are unavailable in this environment.")
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+
+    with pytest.raises(ValueError, match="symlink"):
+        write_redacted_evidence(
+            EvidenceRequest(
+                output_path=output,
+                campaign_id="campaign-1",
+                baseline=baseline,
+                candidates=(),
+                pareto=select_eligible_candidates(baseline, (), POLICY),
+                source_hash="sha256:source",
+            )
+        )
+
+    assert target.read_text(encoding="utf-8") == "external-content"

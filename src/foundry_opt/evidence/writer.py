@@ -1,6 +1,9 @@
 import hashlib
 import json
+import os
+import secrets
 from math import isfinite
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from foundry_opt.evaluation import (
@@ -30,11 +33,27 @@ def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
         )
         + "\n"
     ).encode("utf-8")
-    output_path = request.output_path.resolve()
+    output_path = request.output_path.absolute()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(f".{output_path.name}.writing")
-    temporary_path.write_bytes(serialized)
-    temporary_path.replace(output_path)
+    _reject_symlink_components(output_path)
+    if output_path.exists():
+        raise FileExistsError(output_path)
+    temporary_path = output_path.with_name(
+        f".{output_path.name}.{secrets.token_hex(12)}.writing"
+    )
+    _write_exclusive_no_follow(temporary_path, serialized)
+    try:
+        _reject_symlink_components(output_path)
+        os.link(
+            temporary_path,
+            output_path,
+            follow_symlinks=False,
+        )
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
     runs = tuple(
         run
         for result in (request.baseline, *request.candidates)
@@ -372,6 +391,43 @@ def _validate_evidence_identifiers(request: EvidenceRequest) -> None:
             telemetry_item.response_id,
             "telemetry response_id",
         )
+    _validate_pareto_binding(request)
+
+
+def _validate_pareto_binding(request: EvidenceRequest) -> None:
+    candidate_ids = tuple(
+        candidate.run.subject_id for candidate in request.candidates
+    )
+    if (
+        len(candidate_ids) != len(set(candidate_ids))
+        or request.baseline.run.subject_id in candidate_ids
+    ):
+        raise ValueError(
+            "Evidence candidate subject IDs must be unique and exclude baseline."
+        )
+    decision_ids = tuple(
+        decision.subject_id for decision in request.pareto.decisions
+    )
+    frontier_ids = request.pareto.frontier_ids
+    eligible_ids = request.pareto.eligible_ids
+    candidate_set = set(candidate_ids)
+    if (
+        len(decision_ids) != len(set(decision_ids))
+        or set(decision_ids) != candidate_set
+        or len(frontier_ids) != len(set(frontier_ids))
+        or len(eligible_ids) != len(set(eligible_ids))
+        or not set(frontier_ids) <= candidate_set
+        or not set(eligible_ids) <= set(frontier_ids)
+        or {
+            decision.subject_id
+            for decision in request.pareto.decisions
+            if decision.eligible
+        }
+        != set(eligible_ids)
+    ):
+        raise ValueError(
+            "Pareto evidence must exactly describe the serialized candidates."
+        )
 
 
 def _validate_result_identifiers(result: EvaluationResult) -> None:
@@ -417,6 +473,29 @@ def _require_identifier(value: object, field: str) -> str:
     if not isinstance(value, str) or not _safe_identifier(value):
         raise ValueError(f"{field} must be a safe bounded identifier.")
     return value
+
+
+def _reject_symlink_components(path: Path) -> None:
+    current = path
+    while True:
+        if current.is_symlink():
+            raise ValueError("Evidence destination cannot contain a symlink.")
+        if current.parent == current:
+            return
+        current = current.parent
+
+
+def _write_exclusive_no_follow(path: Path, content: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
 
 
 def _reject_sensitive_strings(
