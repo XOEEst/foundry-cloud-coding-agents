@@ -285,11 +285,12 @@ def _batch_run_request() -> dict[str, object]:
     }
 
 
-def _list_single_score(
+def _list_single_item(
     result: Mapping[str, object],
     *,
     normalization: Mapping[str, object] | None = None,
     include_normalization: bool = True,
+    default_completed_status: bool = True,
 ) -> Mapping[str, object]:
     transport, client = _transport()
     _create_definition(
@@ -318,7 +319,13 @@ def _list_single_score(
                         "case_hash": "sha256:case-1",
                         "response_id": "resp-1",
                     },
-                    "results": [dict(result)],
+                    "results": [
+                        (
+                            {"status": "completed", **dict(result)}
+                            if default_completed_status
+                            else dict(result)
+                        )
+                    ],
                     "sample": {
                         "usage": {
                             "prompt_tokens": 10,
@@ -336,7 +343,21 @@ def _list_single_score(
         continuation_token=None,
         page_size=10,
     )
-    return page["items"][0]["scores"][0]
+    return page["items"][0]
+
+
+def _list_single_score(
+    result: Mapping[str, object],
+    *,
+    normalization: Mapping[str, object] | None = None,
+    include_normalization: bool = True,
+) -> Mapping[str, object]:
+    item = _list_single_item(
+        result,
+        normalization=normalization,
+        include_normalization=include_normalization,
+    )
+    return item["scores"][0]
 
 
 def test_create_definition_uses_openai_v1_eval_and_round_trips_binding() -> None:
@@ -560,19 +581,21 @@ def test_run_rejects_claimed_evaluator_version_mismatch() -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider_status", "errored", "expected"),
+    ("provider_status", "errored", "skipped", "expected"),
     [
-        ("queued", 0, "queued"),
-        ("in_progress", 0, "running"),
-        ("completed", 0, "completed"),
-        ("completed", 1, "partial"),
-        ("failed", 0, "failed"),
-        ("canceled", 0, "cancelled"),
+        ("queued", 0, 0, "queued"),
+        ("in_progress", 0, 0, "running"),
+        ("completed", 0, 0, "completed"),
+        ("completed", 1, 0, "partial"),
+        ("completed", 0, 1, "partial"),
+        ("failed", 0, 0, "failed"),
+        ("canceled", 0, 0, "cancelled"),
     ],
 )
 def test_get_run_maps_provider_statuses(
     provider_status: str,
     errored: int,
+    skipped: int,
     expected: str,
 ) -> None:
     transport, client = _transport()
@@ -594,6 +617,7 @@ def test_get_run_maps_provider_statuses(
                 "passed": 1,
                 "failed": 0,
                 "errored": errored,
+                "skipped": skipped,
             },
         )
     ]
@@ -631,6 +655,7 @@ def test_output_pagination_preserves_opaque_token_and_normalizes_batch() -> None
                     },
                     "results": [
                         {
+                            "status": "completed",
                             "name": "quality",
                             "score": 0.8,
                             "reason": "met rubric",
@@ -724,6 +749,57 @@ def test_provider_normalized_score_is_not_replaced_by_raw_scale() -> None:
 
     assert score["raw_score"] == 4
     assert score["normalized_score"] == 0.75
+
+
+def test_skipped_evaluator_result_does_not_produce_a_score() -> None:
+    item = _list_single_item(
+        {
+            "status": "skipped",
+            "name": "quality",
+            "score": 1.0,
+            "normalized_score": 1.0,
+            "passed": True,
+            "label": "pass",
+        }
+    )
+
+    assert item["scores"] == []
+    assert item["error"] is None
+
+
+def test_errored_evaluator_result_becomes_item_error_not_score() -> None:
+    item = _list_single_item(
+        {
+            "status": "errored",
+            "name": "quality",
+            "score": 1.0,
+            "normalized_score": 1.0,
+            "passed": True,
+            "label": "pass",
+        }
+    )
+
+    assert item["scores"] == []
+    assert item["error"] == "Evaluator quality errored."
+
+
+@pytest.mark.parametrize("status", [None, "running", "mystery"])
+def test_only_explicitly_completed_evaluator_results_can_score(
+    status: str | None,
+) -> None:
+    result: dict[str, object] = {
+        "name": "quality",
+        "score": 1.0,
+        "normalized_score": 1.0,
+    }
+    if status is not None:
+        result["status"] = status
+
+    with pytest.raises(EvaluationSchemaError, match="status"):
+        _list_single_item(
+            result,
+            default_completed_status=status is not None,
+        )
 
 
 def test_evaluator_min_max_contract_normalizes_natural_scale() -> None:
@@ -869,7 +945,13 @@ def test_simulation_output_remains_separately_tagged_with_trajectory() -> None:
                             },
                         ],
                     },
-                    "results": [{"name": "quality", "score": 0.9}],
+                    "results": [
+                        {
+                            "status": "completed",
+                            "name": "quality",
+                            "score": 0.9,
+                        }
+                    ],
                     "sample": {
                         "usage": {
                             "prompt_tokens": 20,

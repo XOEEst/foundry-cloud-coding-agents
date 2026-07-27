@@ -471,7 +471,14 @@ class FoundryEvaluationTransport(EvaluationTransport):
         )
         sample = _required_mapping(payload.get("sample"), "output sample")
         usage = _usage(sample)
-        scores = _scores(payload.get("results"), normalization)
+        scores, evaluator_errors = _scores(
+            payload.get("results"),
+            normalization,
+        )
+        error = _combined_error(
+            _provider_error(sample.get("error")),
+            *evaluator_errors,
+        )
         kind = _required_string(context.get("kind"), "evaluation kind")
         common: dict[str, object] = {
             "kind": kind,
@@ -484,7 +491,7 @@ class FoundryEvaluationTransport(EvaluationTransport):
             ),
             "scores": scores,
             "usage": usage,
-            "error": _provider_error(sample.get("error")),
+            "error": error,
             # The v1 output item does not expose elapsed time.
             "duration_ms": 0,
         }
@@ -785,7 +792,11 @@ def _map_status(
             counts.get("errored"),
             "result_counts.errored",
         )
-        return "partial" if errored else "completed"
+        skipped = _optional_nonnegative_integer(
+            counts.get("skipped"),
+            "result_counts.skipped",
+        )
+        return "partial" if errored or skipped else "completed"
     if provider_status == "failed":
         return "failed"
     if provider_status in {"canceled", "cancelled"}:
@@ -798,15 +809,30 @@ def _map_status(
 def _scores(
     value: object,
     normalization: Mapping[str, object],
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], tuple[str, ...]]:
     results = _required_list(value, "output results")
     scores = []
+    errors = []
     for raw_result in results:
         result = _provider_mapping(raw_result, "evaluator result")
         metric = _required_string(
             result.get("metric", result.get("name")),
             "evaluator metric",
         )
+        status = _required_string(
+            result.get("status"),
+            "evaluator result status",
+        )
+        if status == "skipped":
+            continue
+        if status in {"error", "errored"}:
+            errors.append(f"Evaluator {metric} errored.")
+            continue
+        if status != "completed":
+            raise EvaluationSchemaError(
+                f"Foundry evaluator result status {status!r} has unknown "
+                "semantics."
+            )
         raw_score = result.get("score")
         if raw_score is not None and not isinstance(
             raw_score,
@@ -831,7 +857,7 @@ def _scores(
                 "reason": _optional_string(result.get("reason")),
             }
         )
-    return scores
+    return scores, tuple(errors)
 
 
 def _provider_outcome(result: Mapping[str, object]) -> bool | None:
@@ -1176,6 +1202,11 @@ def _provider_error(value: object) -> str | None:
     return _required_string(mapping.get("message"), "provider error message")
 
 
+def _combined_error(*errors: str | None) -> str | None:
+    present = tuple(error for error in errors if error is not None)
+    return " ".join(present) if present else None
+
+
 def _json_value(value: object) -> Any:
     try:
         return json.loads(json.dumps(value, separators=(",", ":")))
@@ -1234,6 +1265,12 @@ def _nonnegative_integer(value: object, field: str) -> int:
             f"{field} must be a non-negative integer."
         )
     return value
+
+
+def _optional_nonnegative_integer(value: object, field: str) -> int:
+    if value is None:
+        return 0
+    return _nonnegative_integer(value, field)
 
 
 __all__ = [
