@@ -54,17 +54,65 @@ _MANIFEST_BYTES = json.dumps(
     },
     sort_keys=True,
 ).encode()
+_BASELINE_RESULT = {
+    "subject_id": "baseline",
+    "agent": {
+        "agent_id": "agent-1",
+        "draft_id": "draft-baseline",
+        "version": "version-1",
+    },
+    "dataset": {"dataset_id": "dataset-1", "version": "version-1"},
+    "evaluator": {
+        "definition_id": "evaluator-1",
+        "version": "version-1",
+    },
+    "evaluation_id": "evaluation-baseline",
+    "run_id": "run-baseline",
+    "attempts": [],
+    "split": "validation",
+    "portal_url": None,
+    "complete": True,
+    "repeat_count": 0,
+    "duration_ms": 10.0,
+    "usage": {
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "cached_tokens": 0,
+    },
+    "error_count": 0,
+    "metrics": {},
+    "cases": [],
+}
+_CANDIDATE_RESULT = {
+    **_BASELINE_RESULT,
+    "subject_id": "candidate-1",
+    "agent": {
+        "agent_id": "agent-1",
+        "draft_id": "draft-candidate-1",
+        "version": "version-2",
+    },
+    "evaluation_id": "evaluation-candidate-1",
+    "run_id": "run-candidate-1",
+    "patch_hash": hashlib.sha256(_PATCH_BYTES).hexdigest(),
+}
 _EVIDENCE_BYTES = json.dumps(
     {
         "schema_version": 1,
         "campaign_id": "campaign-1",
-        "pareto": {"eligible_ids": ["candidate-1"]},
-        "candidates": [
-            {
-                "subject_id": "candidate-1",
-                "patch_hash": hashlib.sha256(_PATCH_BYTES).hexdigest(),
-            }
-        ],
+        "source_hash": "source-1",
+        "baseline": _BASELINE_RESULT,
+        "candidates": [_CANDIDATE_RESULT],
+        "pareto": {
+            "frontier_ids": ["candidate-1"],
+            "eligible_ids": ["candidate-1"],
+            "decisions": [
+                {
+                    "subject_id": "candidate-1",
+                    "eligible": True,
+                    "reason_code": "eligible",
+                }
+            ],
+        },
     },
     sort_keys=True,
 ).encode()
@@ -571,6 +619,35 @@ def test_permission_denial_happens_before_any_write() -> None:
     assert gateway.created_issues == []
 
 
+def test_publication_rejects_ineligible_pareto_candidate() -> None:
+    eligible = _report().candidates[0]
+    ineligible = CandidateArtifact(
+        candidate_id=eligible.candidate_id,
+        patch=eligible.patch,
+        draft_id=eligible.draft_id,
+        evidence_path=eligible.evidence_path,
+        eligible=False,
+        metrics=eligible.metrics,
+    )
+    report = CampaignReport(
+        campaign_id="campaign-1",
+        target="support-agent",
+        base_commit="b" * 40,
+        baseline_draft_id="draft-baseline",
+        candidates=(ineligible,),
+        pareto_candidate_ids=("candidate-1",),
+    )
+    request = _request()
+
+    with pytest.raises(ValueError, match="eligible"):
+        CampaignPublicationRequest(
+            **{
+                **request.__dict__,
+                "report": report,
+            }
+        )
+
+
 def test_cleanup_waits_until_every_candidate_pr_is_available() -> None:
     request = _request()
     waiting = CampaignPublicationRequest(
@@ -805,15 +882,49 @@ def test_publication_requires_manifest_redaction_provenance() -> None:
     assert gateway.created_campaigns == []
 
 
+def test_publication_rejects_manifest_payload_fields_and_sensitive_values() -> None:
+    secret = "sentinel-sensitive-value"
+    manifest = json.loads(_MANIFEST_BYTES)
+    manifest["content"] = {"messages": ["raw payload"]}
+    manifest["redaction_provenance"]["generator"] = secret
+    content = json.dumps(manifest, sort_keys=True).encode()
+    request = _request()
+    request = CampaignPublicationRequest(
+        **{
+            **request.__dict__,
+            "manifests": (
+                ArtifactReference(
+                    path=_MANIFEST_PATH,
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    provenance=RedactionProvenance(
+                        generator=secret,
+                        schema_version=1,
+                        source_sha256="1" * 64,
+                    ),
+                ),
+            ),
+            "sensitive_values": (secret,),
+        }
+    )
+    gateway = FakeGateway(
+        artifact_contents={
+            _PATCH_PATH: _PATCH_BYTES,
+            _EVIDENCE_PATH: _EVIDENCE_BYTES,
+            _MANIFEST_PATH: content,
+        }
+    )
+
+    with pytest.raises(CampaignPublicationError, match="schema|sensitive"):
+        publish_campaign(request, gateway)
+
+
 def test_publication_rejects_evidence_not_bound_to_exact_patch() -> None:
     bad_evidence = json.dumps(
         {
-            "schema_version": 1,
-            "campaign_id": "campaign-1",
-            "pareto": {"eligible_ids": ["candidate-1"]},
+            **json.loads(_EVIDENCE_BYTES),
             "candidates": [
                 {
-                    "subject_id": "candidate-1",
+                    **_CANDIDATE_RESULT,
                     "patch_hash": "9" * 64,
                 }
             ],
@@ -838,4 +949,73 @@ def test_publication_rejects_evidence_not_bound_to_exact_patch() -> None:
     )
 
     with pytest.raises(CampaignPublicationError, match="provenance"):
+        publish_campaign(request, gateway)
+
+
+@pytest.mark.parametrize(
+    ("path", "field"),
+    [
+        (("baseline",), "messages"),
+        (("candidates", 0, "agent"), "content"),
+        (("candidates", 0, "cases"), "messages"),
+    ],
+)
+def test_publication_rejects_nested_payload_bearing_evidence_fields(
+    path: tuple[object, ...],
+    field: str,
+) -> None:
+    document = json.loads(_EVIDENCE_BYTES)
+    current: object = document
+    for part in path:
+        current = current[part]  # type: ignore[index]
+    if isinstance(current, list):
+        current.append({field: ["raw payload"]})
+    else:
+        current[field] = "raw payload"  # type: ignore[index]
+    content = json.dumps(document, sort_keys=True).encode()
+    request = _request()
+    request = CampaignPublicationRequest(
+        **{
+            **request.__dict__,
+            "evidence_sha256": {
+                "candidate-1": hashlib.sha256(content).hexdigest()
+            },
+        }
+    )
+    gateway = FakeGateway(
+        artifact_contents={
+            _PATCH_PATH: _PATCH_BYTES,
+            _EVIDENCE_PATH: content,
+            _MANIFEST_PATH: _MANIFEST_BYTES,
+        }
+    )
+
+    with pytest.raises(CampaignPublicationError, match="schema"):
+        publish_campaign(request, gateway)
+
+
+def test_publication_rejects_sensitive_values_inside_allowed_evidence_fields() -> None:
+    secret = "sentinel-sensitive-value"
+    document = json.loads(_EVIDENCE_BYTES)
+    document["candidates"][0]["agent"]["version"] = secret
+    content = json.dumps(document, sort_keys=True).encode()
+    request = _request()
+    request = CampaignPublicationRequest(
+        **{
+            **request.__dict__,
+            "evidence_sha256": {
+                "candidate-1": hashlib.sha256(content).hexdigest()
+            },
+            "sensitive_values": (secret,),
+        }
+    )
+    gateway = FakeGateway(
+        artifact_contents={
+            _PATCH_PATH: _PATCH_BYTES,
+            _EVIDENCE_PATH: content,
+            _MANIFEST_PATH: _MANIFEST_BYTES,
+        }
+    )
+
+    with pytest.raises(CampaignPublicationError, match="sensitive"):
         publish_campaign(request, gateway)

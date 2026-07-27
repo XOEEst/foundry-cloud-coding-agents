@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+from math import isfinite
 import re
 from typing import Protocol
 
@@ -14,6 +15,7 @@ from foundry_opt.github_workflow.models import (
     CampaignPublication,
     CampaignPublicationRequest,
     CandidateIssuePublication,
+    ArtifactReference,
     GitHubCapabilities,
     GitHubPermissionReport,
     IssueReference,
@@ -200,14 +202,10 @@ def publish_campaign(
     candidates = {
         candidate.candidate_id: candidate
         for candidate in request.report.candidates
-        if candidate.eligible
     }
-    required_candidate_ids: set[str] = set()
+    required_candidate_ids = set(request.report.pareto_candidate_ids)
     for candidate_id in request.report.pareto_candidate_ids:
-        candidate = candidates.get(candidate_id)
-        if candidate is None:
-            continue
-        required_candidate_ids.add(candidate_id)
+        candidate = candidates[candidate_id]
         marker = _candidate_marker(request.report.campaign_id, candidate_id)
         issue = gateway.find_candidate_issue(
             request.repository_root,
@@ -548,7 +546,11 @@ def _verify_campaign_commit(
             raise CampaignPublicationError(
                 "Campaign manifest hash does not match the exact head blob"
             )
-        _verify_manifest_provenance(blob.content, manifest)
+        _verify_manifest_provenance(
+            blob.content,
+            manifest,
+            request.sensitive_values,
+        )
     for candidate_id in request.report.pareto_candidate_ids:
         candidate = candidate_by_id[candidate_id]
         if blobs[candidate.patch.path].sha256 != candidate.patch.sha256:
@@ -565,16 +567,32 @@ def _verify_campaign_commit(
             request.report.campaign_id,
             candidate_id,
             candidate.patch.sha256,
+            request.sensitive_values,
         )
 
 
 def _verify_manifest_provenance(
     content: bytes,
-    manifest: object,
+    manifest: ArtifactReference,
+    sensitive_values: tuple[str, ...],
 ) -> None:
     try:
         document = json.loads(content)
+        _strict_object(
+            document,
+            required={"schema_version", "redaction_provenance"},
+        )
+        if document["schema_version"] != 1:
+            raise ValueError
         provenance = document["redaction_provenance"]
+        _strict_object(
+            provenance,
+            required={
+                "generator",
+                "schema_version",
+                "source_sha256",
+            },
+        )
         expected = manifest.provenance
         if (
             not isinstance(provenance, dict)
@@ -585,6 +603,11 @@ def _verify_manifest_provenance(
             != expected.source_sha256
         ):
             raise ValueError
+        _reject_sensitive_values(document, sensitive_values)
+    except _SensitiveArtifactError as error:
+        raise CampaignPublicationError(
+            "Campaign manifest contains a sensitive value"
+        ) from error
     except (
         UnicodeDecodeError,
         json.JSONDecodeError,
@@ -593,12 +616,8 @@ def _verify_manifest_provenance(
         ValueError,
     ) as error:
         raise CampaignPublicationError(
-            "Campaign manifest redaction provenance is invalid"
+            "Campaign manifest schema or redaction provenance is invalid"
         ) from error
-    if _contains_sensitive_payload_key(document):
-        raise CampaignPublicationError(
-            "Campaign manifest contains a prohibited raw payload"
-        )
 
 
 def _verify_redacted_evidence(
@@ -606,9 +625,11 @@ def _verify_redacted_evidence(
     campaign_id: str,
     candidate_id: str,
     patch_sha256: str,
+    sensitive_values: tuple[str, ...],
 ) -> None:
     try:
         document = json.loads(content)
+        _validate_evidence_document(document)
         candidates = document["candidates"]
         pareto = document["pareto"]
         if (
@@ -625,6 +646,11 @@ def _verify_redacted_evidence(
             )
         ):
             raise ValueError
+        _reject_sensitive_values(document, sensitive_values)
+    except _SensitiveArtifactError as error:
+        raise CampaignPublicationError(
+            "Campaign evidence contains a sensitive value"
+        ) from error
     except (
         UnicodeDecodeError,
         json.JSONDecodeError,
@@ -633,33 +659,366 @@ def _verify_redacted_evidence(
         ValueError,
     ) as error:
         raise CampaignPublicationError(
-            "Campaign evidence redaction provenance is invalid"
+            "Campaign evidence schema or redaction provenance is invalid"
         ) from error
-    if _contains_sensitive_payload_key(document):
-        raise CampaignPublicationError(
-            "Campaign evidence contains a prohibited raw payload"
-        )
 
 
-def _contains_sensitive_payload_key(value: object) -> bool:
-    prohibited = {
-        "prompt",
-        "raw_prompt",
-        "response",
-        "raw_response",
-        "dataset_rows",
-        "tool_payload",
-        "tool_payloads",
+class _SensitiveArtifactError(ValueError):
+    pass
+
+
+def _strict_object(
+    value: object,
+    *,
+    required: set[str],
+    optional: set[str] | None = None,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError
+    keys = set(value)
+    allowed = required | (optional or set())
+    if not required <= keys or not keys <= allowed:
+        raise ValueError
+    return value
+
+
+def _validate_evidence_document(value: object) -> None:
+    document = _strict_object(
+        value,
+        required={
+            "schema_version",
+            "campaign_id",
+            "source_hash",
+            "baseline",
+            "candidates",
+            "pareto",
+        },
+        optional={"generated_at", "telemetry"},
+    )
+    if document["schema_version"] != 1:
+        raise ValueError
+    _metadata_string(document["campaign_id"])
+    _metadata_string(document["source_hash"])
+    if "generated_at" in document:
+        _nullable_metadata_string(document["generated_at"])
+    _validate_result(document["baseline"], candidate=False)
+    candidates = document["candidates"]
+    if not isinstance(candidates, list):
+        raise ValueError
+    for candidate in candidates:
+        _validate_result(candidate, candidate=True)
+    _validate_pareto(document["pareto"])
+    if "telemetry" in document:
+        telemetry = document["telemetry"]
+        if not isinstance(telemetry, list):
+            raise ValueError
+        for item in telemetry:
+            _validate_telemetry(item)
+
+
+def _validate_result(value: object, *, candidate: bool) -> None:
+    required = {
+        "subject_id",
+        "agent",
+        "dataset",
+        "evaluator",
+        "evaluation_id",
+        "run_id",
+        "attempts",
+        "split",
+        "portal_url",
+        "complete",
+        "repeat_count",
+        "duration_ms",
+        "usage",
+        "error_count",
+        "metrics",
+        "cases",
     }
-    if isinstance(value, dict):
-        return any(
-            str(key).casefold() in prohibited
-            or _contains_sensitive_payload_key(item)
-            for key, item in value.items()
+    if candidate:
+        required.add("patch_hash")
+    result = _strict_object(value, required=required)
+    for key in ("subject_id", "evaluation_id", "run_id", "split"):
+        _metadata_string(result[key])
+    _nullable_metadata_string(result["portal_url"])
+    _boolean(result["complete"])
+    _nonnegative_integer(result["repeat_count"])
+    _nonnegative_number(result["duration_ms"])
+    _nonnegative_integer(result["error_count"])
+    if candidate:
+        _sha256(result["patch_hash"])
+    _validate_identity(
+        result["agent"],
+        {"agent_id", "draft_id", "version"},
+    )
+    _validate_identity(
+        result["dataset"],
+        {"dataset_id", "version"},
+    )
+    _validate_identity(
+        result["evaluator"],
+        {"definition_id", "version"},
+    )
+    attempts = result["attempts"]
+    if not isinstance(attempts, list):
+        raise ValueError
+    for attempt in attempts:
+        _validate_attempt(attempt)
+    _validate_usage(result["usage"])
+    metrics = result["metrics"]
+    if not isinstance(metrics, dict):
+        raise ValueError
+    for name, metric in metrics.items():
+        _metadata_string(name)
+        _validate_metric(metric)
+    cases = result["cases"]
+    if not isinstance(cases, list):
+        raise ValueError
+    for case in cases:
+        _validate_case(case)
+
+
+def _validate_identity(value: object, keys: set[str]) -> None:
+    identity = _strict_object(value, required=keys)
+    for item in identity.values():
+        _metadata_string(item)
+
+
+def _validate_attempt(value: object) -> None:
+    attempt = _strict_object(
+        value,
+        required={
+            "evaluation_id",
+            "run_id",
+            "status",
+            "started_at",
+            "completed_at",
+            "error_code",
+        },
+    )
+    for key in ("evaluation_id", "run_id", "status"):
+        _metadata_string(attempt[key])
+    for key in ("started_at", "completed_at", "error_code"):
+        _nullable_metadata_string(attempt[key])
+
+
+def _validate_usage(value: object) -> None:
+    usage = _strict_object(
+        value,
+        required={"input_tokens", "output_tokens", "cached_tokens"},
+    )
+    for item in usage.values():
+        _nonnegative_integer(item)
+
+
+def _validate_metric(value: object) -> None:
+    metric = _strict_object(
+        value,
+        required={
+            "median",
+            "minimum",
+            "maximum",
+            "spread",
+            "outcome",
+            "sample_count",
+        },
+    )
+    for key in ("median", "minimum", "maximum", "spread"):
+        _nullable_number(metric[key])
+    _metadata_string(metric["outcome"])
+    _nonnegative_integer(metric["sample_count"])
+
+
+def _validate_case(value: object) -> None:
+    case = _strict_object(
+        value,
+        required={
+            "case_id",
+            "case_hash",
+            "response_ids",
+            "duration_ms",
+            "reason_code",
+            "error_code",
+            "scores",
+            "usage",
+            "trajectory",
+        },
+    )
+    for key in ("case_id", "case_hash", "reason_code"):
+        _metadata_string(case[key])
+    _nullable_metadata_string(case["error_code"])
+    _nonnegative_number(case["duration_ms"])
+    response_ids = case["response_ids"]
+    if not isinstance(response_ids, list):
+        raise ValueError
+    for response_id in response_ids:
+        _metadata_string(response_id)
+    scores = case["scores"]
+    if not isinstance(scores, list):
+        raise ValueError
+    for score in scores:
+        _validate_score(score)
+    _validate_usage(case["usage"])
+    trajectory = case["trajectory"]
+    if trajectory is not None:
+        _validate_trajectory(trajectory)
+
+
+def _validate_score(value: object) -> None:
+    score = _strict_object(
+        value,
+        required={
+            "metric",
+            "raw_score",
+            "raw_score_code",
+            "normalized_score",
+            "outcome",
+            "reason_code",
+        },
+    )
+    for key in ("metric", "outcome", "reason_code"):
+        _metadata_string(score[key])
+    _nullable_metadata_string(score["raw_score_code"])
+    raw_score = score["raw_score"]
+    if raw_score is not None and not isinstance(
+        raw_score,
+        (str, int, float, bool),
+    ):
+        raise ValueError
+    if isinstance(raw_score, str):
+        _metadata_string(raw_score)
+    _nullable_number(score["normalized_score"])
+
+
+def _validate_trajectory(value: object) -> None:
+    trajectory = _strict_object(
+        value,
+        required={"trajectory_id", "turn_count", "tool_calls"},
+    )
+    _metadata_string(trajectory["trajectory_id"])
+    _nonnegative_integer(trajectory["turn_count"])
+    tool_calls = trajectory["tool_calls"]
+    if not isinstance(tool_calls, list):
+        raise ValueError
+    for value in tool_calls:
+        tool_call = _strict_object(
+            value,
+            required={"call_id", "status_code", "duration_ms"},
         )
-    if isinstance(value, list):
-        return any(_contains_sensitive_payload_key(item) for item in value)
-    return False
+        _metadata_string(tool_call["call_id"])
+        _metadata_string(tool_call["status_code"])
+        _nonnegative_number(tool_call["duration_ms"])
+
+
+def _validate_pareto(value: object) -> None:
+    pareto = _strict_object(
+        value,
+        required={"frontier_ids", "eligible_ids", "decisions"},
+    )
+    for key in ("frontier_ids", "eligible_ids"):
+        identifiers = pareto[key]
+        if not isinstance(identifiers, list):
+            raise ValueError
+        for identifier in identifiers:
+            _metadata_string(identifier)
+    decisions = pareto["decisions"]
+    if not isinstance(decisions, list):
+        raise ValueError
+    for value in decisions:
+        decision = _strict_object(
+            value,
+            required={"subject_id", "eligible", "reason_code"},
+        )
+        _metadata_string(decision["subject_id"])
+        _boolean(decision["eligible"])
+        _metadata_string(decision["reason_code"])
+
+
+def _validate_telemetry(value: object) -> None:
+    telemetry = _strict_object(
+        value,
+        required={
+            "response_id",
+            "request_count",
+            "dependency_count",
+            "exception_count",
+            "duration_ms",
+            "success_rate",
+        },
+    )
+    _metadata_string(telemetry["response_id"])
+    for key in ("request_count", "dependency_count", "exception_count"):
+        _nonnegative_integer(telemetry[key])
+    _nonnegative_number(telemetry["duration_ms"])
+    _nullable_number(telemetry["success_rate"])
+
+
+def _metadata_string(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 2048
+        or any(character.isspace() for character in value)
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError
+    return value
+
+
+def _nullable_metadata_string(value: object) -> None:
+    if value is not None:
+        _metadata_string(value)
+
+
+def _nonnegative_integer(value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError
+
+
+def _nonnegative_number(value: object) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or value < 0
+    ):
+        raise ValueError
+
+
+def _nullable_number(value: object) -> None:
+    if value is not None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(value)
+        ):
+            raise ValueError
+
+
+def _boolean(value: object) -> None:
+    if not isinstance(value, bool):
+        raise ValueError
+
+
+def _sha256(value: object) -> None:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError
+
+
+def _reject_sensitive_values(
+    value: object,
+    sensitive_values: tuple[str, ...],
+) -> None:
+    secrets = tuple(secret for secret in sensitive_values if secret)
+    if isinstance(value, str):
+        if any(secret in value for secret in secrets):
+            raise _SensitiveArtifactError
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _reject_sensitive_values(key, secrets)
+            _reject_sensitive_values(item, secrets)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_sensitive_values(item, secrets)
 
 
 def _candidate_body(

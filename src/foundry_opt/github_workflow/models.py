@@ -249,6 +249,16 @@ class CampaignPublicationRequest:
             for candidate in self.report.candidates
             if candidate.candidate_id in self.report.pareto_candidate_ids
         }
+        if (
+            set(pareto_candidates) != set(self.report.pareto_candidate_ids)
+            or any(
+                not candidate.eligible
+                for candidate in pareto_candidates.values()
+            )
+        ):
+            raise ValueError(
+                "Pareto candidate IDs must reference eligible candidates"
+            )
         if set(self.evidence_sha256) != set(pareto_candidates):
             raise ValueError(
                 "evidence_sha256 must exactly cover eligible Pareto candidates"
