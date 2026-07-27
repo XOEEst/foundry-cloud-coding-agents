@@ -422,6 +422,8 @@ def _serialize_run_request(
             else "batch"
         ),
         "display_name": request.display_name,
+        "subject_id": request.subject_id,
+        "split": request.split.value,
         "agent": {
             "agent_id": request.agent.agent_id,
             "draft_id": request.agent.draft_id,

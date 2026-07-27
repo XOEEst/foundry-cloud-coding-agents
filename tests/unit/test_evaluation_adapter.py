@@ -143,6 +143,8 @@ def test_create_run_serializes_only_pinned_batch_inputs() -> None:
         {
             "kind": "batch",
             "display_name": "candidate development",
+            "subject_id": "candidate",
+            "split": "development",
             "agent": {
                 "agent_id": "agent-1",
                 "draft_id": "draft-9",
@@ -170,6 +172,8 @@ def test_create_run_keeps_multi_turn_schema_inside_adapter() -> None:
     )
 
     assert transport.created_runs[0]["kind"] == "multi_turn_simulation"
+    assert transport.created_runs[0]["subject_id"] == "candidate"
+    assert transport.created_runs[0]["split"] == "development"
     assert transport.created_runs[0]["simulation"] == {
         "max_turns": 8,
         "personas": ["developer", "reviewer"],
