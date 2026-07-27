@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 @dataclass(frozen=True)
@@ -11,6 +11,7 @@ class BundleRequest:
     include: tuple[str, ...] = ("**",)
     exclude: tuple[str, ...] = ()
     dependency_resolution: str = "remote_build"
+    evidence_paths: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.include:
@@ -19,6 +20,27 @@ class BundleRequest:
             raise ValueError("bundle patterns must not be empty")
         if self.dependency_resolution not in {"remote_build", "bundled"}:
             raise ValueError("dependency_resolution is invalid")
+        normalized_evidence_paths: list[Path] = []
+        for value in self.evidence_paths:
+            raw = str(value)
+            windows_path = PureWindowsPath(raw)
+            posix_path = PurePosixPath(raw.replace("\\", "/"))
+            if (
+                not raw
+                or windows_path.drive
+                or raw.startswith(("/", "\\"))
+                or posix_path == PurePosixPath(".")
+                or ".." in posix_path.parts
+            ):
+                raise ValueError(
+                    "evidence_paths must be repository-relative paths"
+                )
+            normalized_evidence_paths.append(Path(posix_path.as_posix()))
+        object.__setattr__(
+            self,
+            "evidence_paths",
+            tuple(dict.fromkeys(normalized_evidence_paths)),
+        )
 
 
 @dataclass(frozen=True)

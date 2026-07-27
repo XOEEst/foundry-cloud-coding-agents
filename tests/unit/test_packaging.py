@@ -426,6 +426,56 @@ def test_build_source_bundle_mandatorily_prunes_pytest_tmp_recursively(
     assert reasons["tests/.pytest-tmp/"] == "mandatory: cache"
 
 
+def test_build_source_bundle_excludes_optimizer_and_configured_evidence_paths(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    built_in_campaign = (
+        repository
+        / ".foundry-optimizer"
+        / "campaigns"
+        / "campaign-001"
+    )
+    built_in_campaign.mkdir(parents=True)
+    (built_in_campaign / "evaluation.json").write_text(
+        "sensitive optimizer evidence",
+        encoding="utf-8",
+    )
+    configured_campaign = (
+        repository
+        / "artifacts"
+        / "optimization-evidence"
+        / "campaign-002"
+    )
+    configured_campaign.mkdir(parents=True)
+    (configured_campaign / "candidate.json").write_text(
+        "sensitive candidate evidence",
+        encoding="utf-8",
+    )
+    (repository / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    artifact = build_source_bundle(
+        BundleRequest(
+            repository,
+            tmp_path / "bundle.zip",
+            evidence_paths=(Path("artifacts/optimization-evidence"),),
+        )
+    )
+
+    assert artifact.included_files == ("main.py",)
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons[".foundry-optimizer/"] == (
+        "mandatory: optimizer evidence"
+    )
+    assert reasons["artifacts/optimization-evidence/"] == (
+        "mandatory: optimizer evidence"
+    )
+    with zipfile.ZipFile(artifact.path) as archive:
+        content = b"".join(archive.read(name) for name in archive.namelist())
+    assert b"sensitive optimizer evidence" not in content
+    assert b"sensitive candidate evidence" not in content
+
+
 def test_build_source_bundle_rejects_empty_bundle(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()

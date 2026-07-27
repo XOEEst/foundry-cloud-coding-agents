@@ -35,6 +35,7 @@ _MANDATORY_DIRECTORIES = {
     "node_modules": "cache",
     ".foundry-opt": "optimizer evidence",
     ".foundry_opt": "optimizer evidence",
+    ".foundry-optimizer": "optimizer evidence",
     "foundry-opt-evidence": "optimizer evidence",
     "optimizer-evidence": "optimizer evidence",
     "htmlcov": "build artifact",
@@ -93,6 +94,9 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
     generated_paths = {output, manifest_path, partial_path}
     _reject_artifact_collisions(generated_paths)
     bundled_runtime_roots = _bundled_runtime_roots(request)
+    evidence_paths = frozenset(
+        path.as_posix().casefold() for path in request.evidence_paths
+    )
 
     included: list[tuple[str, bytes]] = []
     excluded: list[ExcludedFile] = []
@@ -101,10 +105,12 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
         excluded,
         request.exclude,
         bundled_runtime_roots,
+        evidence_paths,
     ):
         mandatory_reason = _mandatory_exclusion(
             archive_path,
             bundled_runtime_roots,
+            evidence_paths,
         )
         if mandatory_reason is not None:
             excluded.append(
@@ -190,6 +196,7 @@ def _source_files(
     excluded: list[ExcludedFile],
     exclude_patterns: tuple[str, ...],
     bundled_runtime_roots: frozenset[str],
+    evidence_paths: frozenset[str],
 ):
     for current, directory_names, file_names in os.walk(
         root,
@@ -203,6 +210,7 @@ def _source_files(
             mandatory_reason = _mandatory_directory_exclusion(
                 relative,
                 bundled_runtime_roots,
+                evidence_paths,
             )
             if mandatory_reason is not None:
                 excluded.append(
@@ -327,8 +335,11 @@ def _file_state(value: os.stat_result) -> tuple[int, int]:
 def _mandatory_exclusion(
     archive_path: str,
     bundled_runtime_roots: frozenset[str],
+    evidence_paths: frozenset[str],
 ) -> str | None:
     path = PurePosixPath(archive_path)
+    if _is_configured_evidence_path(path, evidence_paths):
+        return "optimizer evidence"
     if path.name.casefold() == ".git":
         return "version-control metadata"
     for index in range(len(path.parts) - 1):
@@ -336,6 +347,7 @@ def _mandatory_exclusion(
         reason = _mandatory_directory_exclusion(
             directory,
             bundled_runtime_roots,
+            evidence_paths,
         )
         if reason is not None:
             return reason
@@ -362,8 +374,11 @@ def _mandatory_exclusion(
 def _mandatory_directory_exclusion(
     archive_path: str,
     bundled_runtime_roots: frozenset[str],
+    evidence_paths: frozenset[str],
 ) -> str | None:
     path = PurePosixPath(archive_path)
+    if _is_configured_evidence_path(path, evidence_paths):
+        return "optimizer evidence"
     normalized = path.name.casefold()
     top_level = path.parts[0].casefold()
     if len(path.parts) == 1:
@@ -384,6 +399,18 @@ def _mandatory_directory_exclusion(
     ):
         return "build artifact"
     return None
+
+
+def _is_configured_evidence_path(
+    archive_path: PurePosixPath,
+    evidence_paths: frozenset[str],
+) -> bool:
+    candidate = archive_path.as_posix().casefold()
+    return any(
+        candidate == evidence_path
+        or candidate.startswith(f"{evidence_path}/")
+        for evidence_path in evidence_paths
+    )
 
 
 def _secret_shaped(archive_path: str) -> bool:
