@@ -488,3 +488,48 @@ def test_run_validation_fully_redacts_quoted_json_and_whitespace_credentials(
     ):
         assert fragment not in persisted
     assert persisted.count("[REDACTED]") >= 5
+
+
+def test_run_validation_redacts_complete_multiline_private_key_blocks(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+
+    class PrivateKeyRunner(RecordingRunner):
+        def run(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            cwd: Path | None = None,
+        ) -> CommandResult:
+            return CommandResult(
+                1,
+                (
+                    "PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n"
+                    "base64-private-key-body\n"
+                    "second-private-key-line\n"
+                    "-----END RSA PRIVATE KEY-----"
+                ),
+                (
+                    "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                    "standalone-private-key-body\n"
+                    "-----END OPENSSH PRIVATE KEY-----"
+                ),
+            )
+
+    report = run_validation(
+        ValidationRequest(
+            repository,
+            commands=(("python", "-c", "pass"),),
+        ),
+        PrivateKeyRunner(),
+    )
+
+    persisted = f"{report.results[0].stdout}\n{report.results[0].stderr}"
+    assert "base64-private-key-body" not in persisted
+    assert "second-private-key-line" not in persisted
+    assert "standalone-private-key-body" not in persisted
+    assert "BEGIN" not in persisted
+    assert "END" not in persisted
+    assert persisted.count("[REDACTED]") == 2

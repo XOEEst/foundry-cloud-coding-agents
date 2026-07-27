@@ -160,3 +160,24 @@ parser.parse_args()
     assert report.passed
     assert len(report.results) == 3
     assert not list(repository.rglob("__pycache__"))
+
+
+def test_configured_module_entry_rejects_ambient_installed_module(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "module-agent"
+    repository.mkdir()
+
+    report = run_validation(
+        ValidationRequest(
+            repository,
+            commands=(("python", "-c", "pass"),),
+            entry_point=("python", "-m", "pytest"),
+        ),
+        SubprocessCommandRunner(),
+    )
+
+    assert report.discovered
+    assert report.passed is False
+    assert report.results[0].passed
+    assert report.results[1].passed is False

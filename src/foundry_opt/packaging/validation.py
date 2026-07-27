@@ -484,9 +484,26 @@ def _entry_point_import(arguments: list[str], root: Path) -> str:
     if "-m" in arguments:
         index = arguments.index("-m")
         if index + 1 < len(arguments):
+            source_root = (
+                (root / "src").resolve()
+                if (root / "src").is_dir()
+                else root.resolve()
+            )
+            module = arguments[index + 1]
             return (
-                "import importlib;"
-                f"importlib.import_module({arguments[index + 1]!r})"
+                "import importlib,importlib.util,pathlib;"
+                f"source_root=pathlib.Path({str(source_root)!r});"
+                f"module_name={module!r};"
+                "spec=importlib.util.find_spec(module_name);"
+                "assert spec is not None;"
+                "locations=list(spec.submodule_search_locations or ());"
+                "origin=spec.origin;"
+                "paths=[pathlib.Path(path).resolve() for path in locations];"
+                "paths += ([pathlib.Path(origin).resolve()] "
+                "if origin and origin not in {'built-in','frozen'} else []);"
+                "assert paths and all(path.is_relative_to(source_root) "
+                "for path in paths);"
+                "importlib.import_module(module_name)"
             )
     return (
         "import pathlib,shutil;"
@@ -554,7 +571,13 @@ def _logical_lines(value: str) -> tuple[str, ...]:
 
 
 def _redact_output(value: str, secrets: tuple[str, ...] = ()) -> str:
-    redacted = value
+    private_key_block = re.compile(
+        r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY)-----"
+        r".*?"
+        r"-----END (?P=label)-----",
+        re.IGNORECASE | re.DOTALL,
+    )
+    redacted = private_key_block.sub("[REDACTED]", value)
     key = (
         r"(?:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY|"
         r"PRIVATE_KEY|CONNECTION_STRING)[A-Z0-9_]*|api[-_]?key|token|"

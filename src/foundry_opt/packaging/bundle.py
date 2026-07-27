@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -22,8 +23,6 @@ _MANDATORY_DIRECTORIES = {
     ".git": "version-control metadata",
     ".azure": "Azure local state",
     ".venv": "virtual environment",
-    "venv": "virtual environment",
-    "env": "virtual environment",
     ".tox": "virtual environment",
     ".nox": "virtual environment",
     "__pycache__": "cache",
@@ -36,9 +35,13 @@ _MANDATORY_DIRECTORIES = {
     ".foundry_opt": "optimizer evidence",
     "foundry-opt-evidence": "optimizer evidence",
     "optimizer-evidence": "optimizer evidence",
+    "htmlcov": "build artifact",
+}
+_ROOT_MANDATORY_DIRECTORIES = {
+    "venv": "virtual environment",
+    "env": "virtual environment",
     "dist": "build artifact",
     "build": "build artifact",
-    "htmlcov": "build artifact",
 }
 _MANDATORY_FILE_SUFFIXES = {
     ".pyc",
@@ -82,7 +85,9 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
 
     output = _resolve_output(request.output_path, root)
     manifest_path = output.with_name(f"{output.name}.manifest.json")
-    generated_paths = {output, manifest_path, output.with_suffix(f"{output.suffix}.partial")}
+    partial_path = output.with_suffix(f"{output.suffix}.partial")
+    generated_paths = {output, manifest_path, partial_path}
+    _reject_artifact_collisions(generated_paths)
 
     included: list[tuple[str, bytes]] = []
     excluded: list[ExcludedFile] = []
@@ -117,37 +122,38 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
     included.sort(key=lambda item: item[0])
     excluded.sort(key=lambda item: item.path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    partial = output.with_suffix(f"{output.suffix}.partial")
-    try:
-        with zipfile.ZipFile(
-            partial,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-            compresslevel=9,
-        ) as archive:
-            for archive_path, content in included:
-                info = zipfile.ZipInfo(archive_path, _FIXED_TIMESTAMP)
-                info.create_system = 3
-                info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = (
-                    stat.S_IFREG | stat.S_IRUSR | stat.S_IWUSR
-                    | stat.S_IRGRP | stat.S_IROTH
-                ) << 16
-                archive.writestr(info, content, compresslevel=9)
-        partial.replace(output)
-    finally:
-        partial.unlink(missing_ok=True)
-
-    digest = _sha256(output)
+    bundle_stream = BytesIO()
+    with zipfile.ZipFile(
+        bundle_stream,
+        mode="w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as archive:
+        for archive_path, content in included:
+            info = zipfile.ZipInfo(archive_path, _FIXED_TIMESTAMP)
+            info.create_system = 3
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (
+                stat.S_IFREG | stat.S_IRUSR | stat.S_IWUSR
+                | stat.S_IRGRP | stat.S_IROTH
+            ) << 16
+            archive.writestr(info, content, compresslevel=9)
+    bundle_bytes = bundle_stream.getvalue()
+    digest = hashlib.sha256(bundle_bytes).hexdigest()
     artifact = BundleArtifact(
         path=output,
         sha256=digest,
         included_files=tuple(path for path, _ in included),
         excluded_files=tuple(excluded),
-        byte_size=output.stat().st_size,
+        byte_size=len(bundle_bytes),
         manifest_path=manifest_path,
     )
-    _write_manifest(artifact)
+    output_state = _write_exclusive(output, bundle_bytes)
+    try:
+        _write_exclusive(manifest_path, _manifest_bytes(artifact))
+    except Exception:
+        _unlink_owned(output, output_state)
+        raise
     return artifact
 
 
@@ -155,7 +161,13 @@ def _resolve_output(path: Path, root: Path) -> Path:
     expanded = path.expanduser()
     if not expanded.is_absolute():
         expanded = root / expanded
-    return expanded.resolve()
+    return expanded.parent.resolve() / expanded.name
+
+
+def _reject_artifact_collisions(paths: set[Path]) -> None:
+    for path in sorted(paths):
+        if os.path.lexists(path):
+            raise UnsafeSourcePathError(path)
 
 
 def _source_files(root: Path, excluded: list[ExcludedFile]):
@@ -168,7 +180,7 @@ def _source_files(root: Path, excluded: list[ExcludedFile]):
         retained_directories: list[str] = []
         for name in sorted(directory_names):
             relative = (current_path / name).relative_to(root).as_posix()
-            mandatory_reason = _mandatory_directory_exclusion(name)
+            mandatory_reason = _mandatory_directory_exclusion(relative)
             if mandatory_reason is not None:
                 excluded.append(
                     ExcludedFile(
@@ -237,8 +249,9 @@ def _mandatory_exclusion(archive_path: str) -> str | None:
     path = PurePosixPath(archive_path)
     if path.name.casefold() == ".git":
         return "version-control metadata"
-    for part in path.parts[:-1]:
-        reason = _mandatory_directory_exclusion(part)
+    for index in range(len(path.parts) - 1):
+        directory = PurePosixPath(*path.parts[:index + 1]).as_posix()
+        reason = _mandatory_directory_exclusion(directory)
         if reason is not None:
             return reason
     name = path.name.casefold()
@@ -249,8 +262,13 @@ def _mandatory_exclusion(archive_path: str) -> str | None:
     return None
 
 
-def _mandatory_directory_exclusion(name: str) -> str | None:
-    normalized = name.casefold()
+def _mandatory_directory_exclusion(archive_path: str) -> str | None:
+    path = PurePosixPath(archive_path)
+    normalized = path.name.casefold()
+    if len(path.parts) == 1:
+        reason = _ROOT_MANDATORY_DIRECTORIES.get(normalized)
+        if reason is not None:
+            return reason
     reason = _MANDATORY_DIRECTORIES.get(normalized)
     if reason is not None:
         return reason
@@ -298,15 +316,7 @@ def _first_match(path: str, patterns: tuple[str, ...]) -> str | None:
     return None
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _write_manifest(artifact: BundleArtifact) -> None:
+def _manifest_bytes(artifact: BundleArtifact) -> bytes:
     payload = {
         "archive": artifact.path.name,
         "byte_size": artifact.byte_size,
@@ -317,7 +327,37 @@ def _write_manifest(artifact: BundleArtifact) -> None:
         "included_files": list(artifact.included_files),
         "sha256": artifact.sha256,
     }
-    artifact.manifest_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    return (
+        json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _write_exclusive(path: Path, content: bytes) -> os.stat_result:
+    try:
+        stream = path.open("xb")
+    except FileExistsError as error:
+        raise UnsafeSourcePathError(path) from error
+    try:
+        stream.write(content)
+        stream.flush()
+        return os.fstat(stream.fileno())
+    except Exception:
+        state = os.fstat(stream.fileno())
+        stream.close()
+        _unlink_owned(path, state)
+        raise
+    finally:
+        if not stream.closed:
+            stream.close()
+
+
+def _unlink_owned(path: Path, expected: os.stat_result) -> None:
+    try:
+        actual = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return
+    if (
+        _file_identity(actual) == _file_identity(expected)
+        and _file_state(actual) == _file_state(expected)
+    ):
+        path.unlink(missing_ok=True)

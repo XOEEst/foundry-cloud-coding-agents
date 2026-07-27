@@ -96,6 +96,39 @@ def test_build_source_bundle_applies_declared_and_mandatory_exclusions(
     assert reasons["tests/test_main.py"] == "declared exclude: tests/**"
 
 
+def test_build_source_bundle_keeps_nested_env_build_and_dist_source(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    for name in ("env", "build", "dist"):
+        root_artifact = repository / name
+        root_artifact.mkdir(parents=True)
+        (root_artifact / "generated.txt").write_text(
+            "excluded",
+            encoding="utf-8",
+        )
+        nested_source = repository / "src" / name
+        nested_source.mkdir(parents=True)
+        (nested_source / "module.py").write_text(
+            f"NAME = {name!r}\n",
+            encoding="utf-8",
+        )
+
+    artifact = build_source_bundle(
+        BundleRequest(repository, tmp_path / "bundle.zip")
+    )
+
+    assert artifact.included_files == (
+        "src/build/module.py",
+        "src/dist/module.py",
+        "src/env/module.py",
+    )
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons["build/"] == "mandatory: build artifact"
+    assert reasons["dist/"] == "mandatory: build artifact"
+    assert reasons["env/"] == "mandatory: virtual environment"
+
+
 def test_build_source_bundle_excludes_root_git_file(tmp_path: Path) -> None:
     repository = tmp_path / "worktree"
     repository.mkdir()
@@ -224,18 +257,24 @@ def test_build_source_bundle_requires_output_outside_repository_root_parent(
         )
 
 
-def test_build_source_bundle_excludes_previous_generated_output(
+@pytest.mark.parametrize("collision", ["output", "manifest", "partial"])
+def test_build_source_bundle_rejects_repository_artifact_collisions(
     tmp_path: Path,
+    collision: str,
 ) -> None:
     repository = tmp_path / "repo"
-    repository.mkdir()
+    output_directory = repository / "artifacts"
+    output_directory.mkdir(parents=True)
     (repository / "main.py").write_text("print('ok')\n", encoding="utf-8")
-    output = repository / "agent.zip"
+    output = output_directory / "agent.zip"
+    collision_path = {
+        "output": output,
+        "manifest": output.with_name(f"{output.name}.manifest.json"),
+        "partial": output.with_suffix(f"{output.suffix}.partial"),
+    }[collision]
+    collision_path.write_bytes(b"repository-source-must-survive")
 
-    first = build_source_bundle(BundleRequest(repository, output))
-    second = build_source_bundle(BundleRequest(repository, output))
+    with pytest.raises(UnsafeSourcePathError):
+        build_source_bundle(BundleRequest(repository, output))
 
-    assert first.sha256 == second.sha256
-    reasons = {entry.path: entry.reason for entry in second.excluded_files}
-    assert reasons["agent.zip"] == "generated bundle output"
-    assert reasons["agent.zip.manifest.json"] == "generated bundle output"
+    assert collision_path.read_bytes() == b"repository-source-must-survive"
