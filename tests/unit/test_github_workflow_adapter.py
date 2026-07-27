@@ -69,19 +69,30 @@ def _gateway(
     }
     responses.update(extra or {})
     commands = FakeCommands(responses)
-    return GhCampaignGateway(commands, Path("repository")), commands
-
-
-def test_runtime_permission_probe_accepts_write_installation_token_without_admin() -> None:
-    gateway, commands = _gateway()
-
-    report = gateway.verify_permissions(
-        GitHubCapabilities.CAMPAIGN_PUBLICATION
+    return (
+        GhCampaignGateway(
+            commands,
+            Path("repository"),
+            granted_capabilities=GitHubCapabilities.CAMPAIGN_PUBLICATION,
+        ),
+        commands,
     )
 
-    assert report.granted == GitHubCapabilities.CAMPAIGN_PUBLICATION
-    assert ("gh", "api", "user") not in commands.invocations
-    assert not any("viewerPermission" in part for call in commands.invocations for part in call)
+
+def test_runtime_requires_explicit_granular_token_capabilities() -> None:
+    commands = FakeCommands(
+        {
+            ("git", "remote", "get-url", "origin"): (
+                "https://github.com/octo-org/optimizer.git\n"
+            ),
+            ("gh", "api", "repos/octo-org/optimizer"): _metadata(),
+        }
+    )
+
+    with pytest.raises(ValueError, match="granted_capabilities"):
+        GhCampaignGateway(commands, Path("repository"))
+
+    assert commands.invocations == []
 
 
 def test_runtime_can_use_declared_installation_token_capabilities() -> None:
@@ -104,7 +115,12 @@ def test_runtime_can_use_declared_installation_token_capabilities() -> None:
     gateway = GhCampaignGateway(
         commands,
         Path("repository"),
-        granted_capabilities=GitHubCapabilities.CAMPAIGN_PUBLICATION,
+        granted_capabilities=(
+            GitHubCapabilities.METADATA_READ
+            | GitHubCapabilities.CONTENTS_WRITE
+            | GitHubCapabilities.ISSUES_WRITE
+            | GitHubCapabilities.PULL_REQUESTS_WRITE
+        ),
     )
 
     report = gateway.verify_permissions(
@@ -153,6 +169,8 @@ def test_all_gh_operations_are_argument_arrays_with_explicit_repo() -> None:
         "d" * 40,
         True,
         "Safe body",
+        "main",
+        "OPEN",
     )
     assert create in commands.invocations
     assert (
@@ -185,3 +203,79 @@ def test_gateway_errors_are_stable_and_do_not_expose_command_output() -> None:
 
     assert raised.value.operation == "repository_metadata"
     assert secret not in str(raised.value)
+
+
+def test_pr_creation_resumes_when_remote_branch_has_exact_commit() -> None:
+    branch = "foundry-opt/campaign-1"
+    commit = "d" * 40
+    branch_ref = f"refs/heads/{branch}"
+    create = (
+        "gh",
+        "pr",
+        "create",
+        "--repo",
+        "octo-org/optimizer",
+        "--draft",
+        "--base",
+        "main",
+        "--head",
+        branch,
+        "--title",
+        "Campaign",
+        "--body",
+        "Safe body",
+    )
+    gateway, commands = _gateway(
+        {
+            (
+                "git",
+                "ls-remote",
+                "--heads",
+                "origin",
+                branch_ref,
+            ): f"{commit}\t{branch_ref}\n",
+            create: "https://github.com/octo-org/optimizer/pull/42\n",
+        }
+    )
+
+    result = gateway.create_campaign_pull_request(
+        Path("repository"),
+        base_branch="main",
+        head_branch=branch,
+        head_commit=commit,
+        title="Campaign",
+        body="Safe body",
+    )
+
+    assert result.head_commit == commit
+    assert not any(call[:2] == ("git", "push") for call in commands.invocations)
+
+
+def test_pr_creation_rejects_conflicting_remote_branch() -> None:
+    branch = "foundry-opt/campaign-1"
+    branch_ref = f"refs/heads/{branch}"
+    gateway, commands = _gateway(
+        {
+            (
+                "git",
+                "ls-remote",
+                "--heads",
+                "origin",
+                branch_ref,
+            ): f"{'9' * 40}\t{branch_ref}\n",
+        }
+    )
+
+    with pytest.raises(GitHubCampaignGatewayError) as raised:
+        gateway.create_campaign_pull_request(
+            Path("repository"),
+            base_branch="main",
+            head_branch=branch,
+            head_commit="d" * 40,
+            title="Campaign",
+            body="Safe body",
+        )
+
+    assert raised.value.operation == "remote_branch_conflict"
+    assert raised.value.resumable is False
+    assert not any(call[:2] == ("gh", "pr") for call in commands.invocations)

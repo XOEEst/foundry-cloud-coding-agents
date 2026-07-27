@@ -13,11 +13,14 @@ from foundry_opt.adapters.github import github_repository_from_remote_url
 from foundry_opt.github_workflow import (
     AppliedPatch,
     ArtifactInspection,
+    CommitBlob,
+    CommitInspection,
     ExactPatchRequest,
     GitHubCapabilities,
     GitHubPermissionReport,
     IssueReference,
     PatchApplicationError,
+    PatchTreeMismatchError,
     PatchTraversalError,
     PullRequestReference,
     RepositoryState,
@@ -29,8 +32,18 @@ from foundry_opt.preflight.interfaces import CommandRunner
 class GitHubCampaignGatewayError(RuntimeError):
     code = "github_campaign_gateway_failed"
 
-    def __init__(self, operation: str) -> None:
+    def __init__(
+        self,
+        operation: str,
+        *,
+        remote_branch: str | None = None,
+        remote_commit: str | None = None,
+        resumable: bool = False,
+    ) -> None:
         self.operation = operation
+        self.remote_branch = remote_branch
+        self.remote_commit = remote_commit
+        self.resumable = resumable
         super().__init__(f"GitHub campaign operation failed: {operation}")
 
 
@@ -50,6 +63,8 @@ class GhCampaignGateway:
         self._repository_root = repository_root
         self._repository: str | None = None
         self._metadata: dict[str, Any] | None = None
+        if not isinstance(granted_capabilities, GitHubCapabilities):
+            raise ValueError("granted_capabilities must be explicit")
         self._granted_capabilities = granted_capabilities
 
     def verify_permissions(
@@ -57,29 +72,11 @@ class GhCampaignGateway:
         required: GitHubCapabilities,
     ) -> GitHubPermissionReport:
         metadata = self._repository_metadata()
-        if self._granted_capabilities is not None:
-            return GitHubPermissionReport(
-                self._granted_capabilities & required
-            )
-        permissions = metadata.get("permissions")
-        if not isinstance(permissions, dict):
+        if not metadata:
             raise GitHubCampaignResponseError("repository_metadata")
-        push = bool(
-            permissions.get("push")
-            or permissions.get("maintain")
-            or permissions.get("admin")
+        return GitHubPermissionReport(
+            self._granted_capabilities & required
         )
-        triage = bool(permissions.get("triage") or push)
-        granted = GitHubCapabilities.NONE
-        if triage:
-            granted |= (
-                GitHubCapabilities.ISSUES
-                | GitHubCapabilities.LABELS
-                | GitHubCapabilities.COMMENTS
-            )
-        if push:
-            granted |= GitHubCapabilities.PULL_REQUESTS
-        return GitHubPermissionReport(granted & required)
 
     def repository_state(self, repository_root: Path) -> RepositoryState:
         metadata = self._repository_metadata()
@@ -102,6 +99,58 @@ class GhCampaignGateway:
             return RepositoryState(repository, default_branch, commit)
         except ValueError as error:
             raise GitHubCampaignResponseError("default_commit") from error
+
+    def inspect_commit(
+        self,
+        repository_root: Path,
+        *,
+        base_commit: str,
+        head_commit: str,
+        artifact_paths: tuple[Path, ...],
+    ) -> CommitInspection:
+        try:
+            merge_base = self._commands.run(
+                ("git", "merge-base", base_commit, head_commit),
+                cwd=repository_root,
+            ).stdout.strip()
+        except CommandError:
+            merge_base = ""
+        changed_raw = self._run(
+            "inspect_commit_paths",
+            (
+                "git",
+                "diff",
+                "--name-only",
+                "-z",
+                base_commit,
+                head_commit,
+            ),
+            cwd=repository_root,
+        )
+        changed_paths = tuple(
+            Path(path)
+            for path in changed_raw.split("\0")
+            if path
+        )
+        blobs: list[CommitBlob] = []
+        for path in artifact_paths:
+            content = self._run(
+                "inspect_commit_blob",
+                (
+                    "git",
+                    "show",
+                    f"{head_commit}:{path.as_posix()}",
+                ),
+                cwd=repository_root,
+            ).encode("utf-8")
+            blobs.append(CommitBlob(path, content))
+        return CommitInspection(
+            base_commit=base_commit,
+            head_commit=head_commit,
+            base_is_ancestor=merge_base == base_commit,
+            changed_paths=changed_paths,
+            blobs=tuple(blobs),
+        )
 
     def artifact_url(
         self,
@@ -149,29 +198,38 @@ class GhCampaignGateway:
             branch=head_branch,
             commit=head_commit,
         )
-        url = self._run(
-            "create_campaign_pr",
-            (
-                "gh",
-                "pr",
-                "create",
-                "--repo",
-                self._repository_name(),
-                "--draft",
-                "--base",
-                base_branch,
-                "--head",
-                head_branch,
-                "--title",
-                title,
-                "--body",
-                body,
-            ),
-            cwd=repository_root,
-        ).strip()
+        try:
+            url = self._run(
+                "create_campaign_pr",
+                (
+                    "gh",
+                    "pr",
+                    "create",
+                    "--repo",
+                    self._repository_name(),
+                    "--draft",
+                    "--base",
+                    base_branch,
+                    "--head",
+                    head_branch,
+                    "--title",
+                    title,
+                    "--body",
+                    body,
+                ),
+                cwd=repository_root,
+            ).strip()
+        except GitHubCampaignGatewayError as error:
+            raise GitHubCampaignGatewayError(
+                error.operation,
+                remote_branch=head_branch,
+                remote_commit=head_commit,
+                resumable=True,
+            ) from error
         return _created_pull_request(
             url,
             repository=self._repository_name(),
+            base_branch=base_branch,
             head_branch=head_branch,
             head_commit=head_commit,
             draft=True,
@@ -193,28 +251,37 @@ class GhCampaignGateway:
             branch=head_branch,
             commit=commit_sha,
         )
-        url = self._run(
-            "create_candidate_pr",
-            (
-                "gh",
-                "pr",
-                "create",
-                "--repo",
-                self._repository_name(),
-                "--base",
-                base_branch,
-                "--head",
-                head_branch,
-                "--title",
-                title,
-                "--body",
-                body,
-            ),
-            cwd=repository_root,
-        ).strip()
+        try:
+            url = self._run(
+                "create_candidate_pr",
+                (
+                    "gh",
+                    "pr",
+                    "create",
+                    "--repo",
+                    self._repository_name(),
+                    "--base",
+                    base_branch,
+                    "--head",
+                    head_branch,
+                    "--title",
+                    title,
+                    "--body",
+                    body,
+                ),
+                cwd=repository_root,
+            ).strip()
+        except GitHubCampaignGatewayError as error:
+            raise GitHubCampaignGatewayError(
+                error.operation,
+                remote_branch=head_branch,
+                remote_commit=commit_sha,
+                resumable=True,
+            ) from error
         return _created_pull_request(
             url,
             repository=self._repository_name(),
+            base_branch=base_branch,
             head_branch=head_branch,
             head_commit=commit_sha,
             draft=False,
@@ -239,7 +306,7 @@ class GhCampaignGateway:
                 "--search",
                 f'"{marker}" in:body',
                 "--json",
-                "number,url,title,body",
+                "number,url,title,body,state,labels",
                 "--limit",
                 "20",
             ),
@@ -303,6 +370,65 @@ class GhCampaignGateway:
         for label in labels:
             arguments.extend(("--add-label", label))
         self._run("add_labels", tuple(arguments), cwd=repository_root)
+
+    def remove_labels(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        labels: tuple[str, ...],
+    ) -> None:
+        arguments = [
+            "gh",
+            "issue",
+            "edit",
+            str(issue_number),
+            "--repo",
+            self._repository_name(),
+        ]
+        for label in labels:
+            arguments.extend(("--remove-label", label))
+        self._run("remove_labels", tuple(arguments), cwd=repository_root)
+
+    def reopen_issue(
+        self,
+        repository_root: Path,
+        issue_number: int,
+    ) -> None:
+        self._run(
+            "reopen_issue",
+            (
+                "gh",
+                "issue",
+                "reopen",
+                str(issue_number),
+                "--repo",
+                self._repository_name(),
+            ),
+            cwd=repository_root,
+        )
+
+    def is_sub_issue(
+        self,
+        repository_root: Path,
+        parent_number: int,
+        child_number: int,
+    ) -> bool:
+        raw = self._run(
+            "list_sub_issues",
+            (
+                "gh",
+                "api",
+                (
+                    f"repos/{self._repository_name()}/issues/"
+                    f"{parent_number}/sub_issues"
+                ),
+                "--paginate",
+                "--jq",
+                ".[].number",
+            ),
+            cwd=repository_root,
+        )
+        return str(child_number) in raw.splitlines()
 
     def link_sub_issue(
         self,
@@ -475,7 +601,10 @@ class GhCampaignGateway:
                 "--head",
                 head_branch,
                 "--json",
-                "number,url,headRefName,headRefOid,isDraft,body",
+                (
+                    "number,url,headRefName,headRefOid,isDraft,body,"
+                    "baseRefName,state"
+                ),
                 "--limit",
                 "2",
             ),
@@ -494,6 +623,31 @@ class GhCampaignGateway:
         commit: str,
     ) -> None:
         branch_ref = f"refs/heads/{branch}"
+        remote = self._run(
+            "inspect_remote_branch",
+            (
+                "git",
+                "ls-remote",
+                "--heads",
+                "origin",
+                branch_ref,
+            ),
+            cwd=repository_root,
+        ).strip()
+        if remote:
+            fields = remote.split()
+            if len(fields) != 2 or fields[1] != branch_ref:
+                raise GitHubCampaignResponseError(
+                    "inspect_remote_branch"
+                )
+            if fields[0] == commit:
+                return
+            raise GitHubCampaignGatewayError(
+                "remote_branch_conflict",
+                remote_branch=branch,
+                remote_commit=fields[0],
+                resumable=False,
+            )
         self._run(
             "push_branch",
             (
@@ -625,8 +779,16 @@ class GitExactPatchApplier:
         changed_paths = _patch_paths(inspection.content)
         root = request.repository_root
         branch_created = False
+        original_branch = ""
+        original_head = ""
         try:
             head = self._git(root, "rev-parse", "--verify", "HEAD").strip()
+            original_head = head
+            original_branch = self._git(
+                root,
+                "branch",
+                "--show-current",
+            ).strip()
             status = self._git(
                 root,
                 "status",
@@ -635,6 +797,12 @@ class GitExactPatchApplier:
             )
             if head != request.base_commit or status:
                 raise PatchApplicationError()
+            existing = self._existing_exact_branch(
+                request,
+                changed_paths,
+            )
+            if existing is not None:
+                return existing
             self._git(
                 root,
                 "switch",
@@ -677,6 +845,8 @@ class GitExactPatchApplier:
                 root,
                 "write-tree",
             ).strip()
+            if expected_tree != request.expected_tree_sha:
+                raise PatchTreeMismatchError()
             self._git(
                 root,
                 "commit",
@@ -713,24 +883,134 @@ class GitExactPatchApplier:
                 changed_paths=changed_paths,
                 exact=True,
                 substantive_repair=False,
+                tree_sha=committed_tree,
             )
         except (CommandError, PatchApplicationError) as error:
             if branch_created:
-                self._cleanup_failed_branch(request)
+                self._cleanup_failed_branch(
+                    request,
+                    original_branch=original_branch,
+                    original_head=original_head,
+                )
             if isinstance(error, PatchApplicationError):
                 raise
             raise PatchApplicationError() from error
 
-    def _cleanup_failed_branch(self, request: ExactPatchRequest) -> None:
+    def _cleanup_failed_branch(
+        self,
+        request: ExactPatchRequest,
+        *,
+        original_branch: str,
+        original_head: str,
+    ) -> None:
+        restore = (
+            ("switch", original_branch)
+            if original_branch
+            else ("switch", "--detach", original_head)
+        )
         for arguments in (
             ("reset", "--hard", request.base_commit),
-            ("switch", "--detach", request.base_commit),
+            restore,
             ("branch", "-D", request.branch),
         ):
             try:
                 self._git(request.repository_root, *arguments)
             except CommandError:
                 pass
+
+    def resolve_tree(
+        self,
+        repository_root: Path,
+        commit: str,
+    ) -> str | None:
+        try:
+            tree = self._git(
+                repository_root,
+                "rev-parse",
+                "--verify",
+                f"{commit}^{{tree}}",
+            ).strip()
+        except CommandError:
+            return None
+        return tree if len(tree) == 40 else None
+
+    def resolve_branch_commit(
+        self,
+        repository_root: Path,
+        branch: str,
+    ) -> str | None:
+        try:
+            commit = self._git(
+                repository_root,
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{branch}",
+            ).strip()
+        except CommandError:
+            return None
+        return commit if len(commit) == 40 else None
+
+    def restore_after_publication_failure(
+        self,
+        repository_root: Path,
+        base_commit: str,
+        base_branch: str,
+    ) -> None:
+        self._git(repository_root, "switch", base_branch)
+        head = self._git(
+            repository_root,
+            "rev-parse",
+            "--verify",
+            "HEAD",
+        ).strip()
+        status = self._git(
+            repository_root,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        )
+        if head != base_commit or status:
+            raise PatchApplicationError()
+
+    def _existing_exact_branch(
+        self,
+        request: ExactPatchRequest,
+        changed_paths: tuple[Path, ...],
+    ) -> AppliedPatch | None:
+        try:
+            commit = self._git(
+                request.repository_root,
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{request.branch}",
+            ).strip()
+        except CommandError:
+            return None
+        try:
+            parent = self._git(
+                request.repository_root,
+                "rev-parse",
+                "--verify",
+                f"{commit}^",
+            ).strip()
+            tree = self._git(
+                request.repository_root,
+                "rev-parse",
+                "--verify",
+                f"{commit}^{{tree}}",
+            ).strip()
+        except CommandError as error:
+            raise PatchApplicationError() from error
+        if parent != request.base_commit or tree != request.expected_tree_sha:
+            raise PatchApplicationError()
+        return AppliedPatch(
+            branch=request.branch,
+            commit_sha=commit,
+            changed_paths=changed_paths,
+            exact=True,
+            substantive_repair=False,
+            tree_sha=tree,
+        )
 
     def _git(self, root: Path, *arguments: str) -> str:
         return self._commands.run(
@@ -821,6 +1101,8 @@ def _pull_request_from_json(value: dict[str, Any]) -> PullRequestReference:
             head_commit=str(value["headRefOid"]),
             draft=bool(value["isDraft"]),
             body=str(value.get("body") or ""),
+            base_branch=str(value["baseRefName"]),
+            state=str(value["state"]).upper(),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise GitHubCampaignResponseError(
@@ -835,6 +1117,12 @@ def _issue_from_json(value: dict[str, Any]) -> IssueReference:
             url=str(value["url"]),
             title=str(value["title"]),
             body=str(value["body"]),
+            state=str(value.get("state") or "OPEN").upper(),
+            labels=tuple(
+                str(label["name"])
+                for label in value.get("labels", ())
+                if isinstance(label, dict) and "name" in label
+            ),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise GitHubCampaignResponseError(
@@ -846,6 +1134,7 @@ def _created_pull_request(
     url: str,
     *,
     repository: str,
+    base_branch: str,
     head_branch: str,
     head_commit: str,
     draft: bool,
@@ -864,6 +1153,8 @@ def _created_pull_request(
         head_commit,
         draft,
         body,
+        base_branch,
+        "OPEN",
     )
 
 

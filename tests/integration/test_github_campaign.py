@@ -26,6 +26,7 @@ def _repository(tmp_path: Path) -> tuple[
     str,
     Path,
     bytes,
+    str,
 ]:
     repository = tmp_path / "repository"
     repository.mkdir()
@@ -53,6 +54,8 @@ def _repository(tmp_path: Path) -> tuple[
     (repository / "agent.py").write_text("VALUE = 2\n", encoding="utf-8")
     expected_binary = b"\x00\xffcandidate\x00binary\xfe"
     (repository / "asset.bin").write_bytes(expected_binary)
+    _run(runner, repository, "add", "agent.py", "asset.bin")
+    expected_tree = _run(runner, repository, "write-tree").strip()
     patch = _run(
         runner,
         repository,
@@ -68,13 +71,15 @@ def _repository(tmp_path: Path) -> tuple[
     destination = repository / patch_path
     destination.parent.mkdir(parents=True)
     destination.write_bytes(patch)
-    return repository, base, patch_path, expected_binary
+    return repository, base, patch_path, expected_binary, expected_tree
 
 
 def test_git_patch_applier_applies_text_and_binary_patch_exactly(
     tmp_path: Path,
 ) -> None:
-    repository, base, patch_path, expected_binary = _repository(tmp_path)
+    repository, base, patch_path, expected_binary, expected_tree = _repository(
+        tmp_path
+    )
     patch_sha = hashlib.sha256((repository / patch_path).read_bytes()).hexdigest()
     applier = GitExactPatchApplier(SubprocessCommandRunner())
 
@@ -84,6 +89,7 @@ def test_git_patch_applier_applies_text_and_binary_patch_exactly(
             base_commit=base,
             patch_path=patch_path,
             expected_patch_sha256=patch_sha,
+            expected_tree_sha=expected_tree,
             branch="foundry-opt/campaign-1/candidate-1/session-1",
             commit_message="Apply exact candidate",
         )
@@ -103,7 +109,7 @@ def test_git_patch_applier_applies_text_and_binary_patch_exactly(
 def test_git_patch_applier_rejects_patch_path_traversal_before_branching(
     tmp_path: Path,
 ) -> None:
-    repository, base, patch_path, _ = _repository(tmp_path)
+    repository, base, patch_path, _, expected_tree = _repository(tmp_path)
     malicious = (
         "diff --git a/../outside.txt b/../outside.txt\n"
         "new file mode 100644\n"
@@ -123,6 +129,7 @@ def test_git_patch_applier_rejects_patch_path_traversal_before_branching(
                 base_commit=base,
                 patch_path=patch_path,
                 expected_patch_sha256=hashlib.sha256(malicious).hexdigest(),
+                expected_tree_sha=expected_tree,
                 branch="foundry-opt/campaign-1/malicious/session-1",
                 commit_message="Reject traversal",
             )
@@ -138,3 +145,47 @@ def test_git_patch_applier_rejects_patch_path_traversal_before_branching(
     assert current_branch not in {
         "foundry-opt/campaign-1/malicious/session-1"
     }
+
+
+def test_git_patch_applier_reuses_exact_local_branch_after_restore(
+    tmp_path: Path,
+) -> None:
+    repository, base, patch_path, _, expected_tree = _repository(tmp_path)
+    request = ExactPatchRequest(
+        repository_root=repository,
+        base_commit=base,
+        patch_path=patch_path,
+        expected_patch_sha256=hashlib.sha256(
+            (repository / patch_path).read_bytes()
+        ).hexdigest(),
+        expected_tree_sha=expected_tree,
+        branch="foundry-opt/campaign-1/candidate-1/session-1",
+        commit_message="Apply exact candidate",
+    )
+    applier = GitExactPatchApplier(SubprocessCommandRunner())
+    base_branch = _run(
+        SubprocessCommandRunner(),
+        repository,
+        "branch",
+        "--show-current",
+    ).strip()
+    first = applier.apply_exact(request)
+    applier.restore_after_publication_failure(
+        repository,
+        base,
+        base_branch,
+    )
+
+    second = applier.apply_exact(request)
+
+    assert second.commit_sha == first.commit_sha
+    assert second.tree_sha == expected_tree
+    assert (
+        _run(
+            SubprocessCommandRunner(),
+            repository,
+            "branch",
+            "--show-current",
+        ).strip()
+        == base_branch
+    )

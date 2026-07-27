@@ -12,6 +12,7 @@ from foundry_opt.github_workflow import (
     ArtifactInspection,
     CandidateApplicationRequest,
     CandidateApplicationStatus,
+    CandidatePublicationError,
     ExactPatchRequest,
     GitHubCapabilities,
     GitHubPermissionReport,
@@ -29,6 +30,8 @@ class FakePatchApplier:
         self,
         artifacts: dict[Path, bytes | Exception],
         applied: AppliedPatch | Exception | None = None,
+        *,
+        fail_restore: bool = False,
     ) -> None:
         self.artifacts = artifacts
         self.applied = applied or AppliedPatch(
@@ -37,8 +40,11 @@ class FakePatchApplier:
             changed_paths=(Path("agent.py"),),
             exact=True,
             substantive_repair=False,
+            tree_sha="e" * 40,
         )
         self.apply_requests: list[ExactPatchRequest] = []
+        self.restored: list[tuple[Path, str, str]] = []
+        self.fail_restore = fail_restore
 
     def inspect_artifact(
         self,
@@ -61,6 +67,30 @@ class FakePatchApplier:
             raise self.applied
         return self.applied
 
+    def resolve_tree(
+        self,
+        repository_root: Path,
+        commit: str,
+    ) -> str | None:
+        return "e" * 40
+
+    def resolve_branch_commit(
+        self,
+        repository_root: Path,
+        branch: str,
+    ) -> str | None:
+        return "d" * 40
+
+    def restore_after_publication_failure(
+        self,
+        repository_root: Path,
+        base_commit: str,
+        base_branch: str,
+    ) -> None:
+        if self.fail_restore:
+            raise RuntimeError("token=secret restore failure")
+        self.restored.append((repository_root, base_commit, base_branch))
+
 
 class FakeCandidateGateway:
     def __init__(
@@ -69,10 +99,14 @@ class FakeCandidateGateway:
         default_branch: str = "main",
         default_commit: str = "b" * 40,
         existing_pr: PullRequestReference | None = None,
+        fail_create_pr: bool = False,
+        created_pr_changes: dict[str, object] | None = None,
     ) -> None:
         self.default_branch = default_branch
         self.default_commit = default_commit
         self.existing_pr = existing_pr
+        self.fail_create_pr = fail_create_pr
+        self.created_pr_changes = created_pr_changes or {}
         self.created_prs: list[tuple[str, str, str]] = []
         self.comments: list[tuple[int, str]] = []
         self.closed_issues: list[int] = []
@@ -108,14 +142,22 @@ class FakeCandidateGateway:
         title: str,
         body: str,
     ) -> PullRequestReference:
+        if self.fail_create_pr:
+            raise RuntimeError("PR create failed")
         self.created_prs.append((head_branch, title, body))
+        values: dict[str, object] = {
+            "number": 55,
+            "url": "https://github.com/octo-org/optimizer/pull/55",
+            "head_branch": head_branch,
+            "head_commit": commit_sha,
+            "draft": False,
+            "body": body,
+            "base_branch": base_branch,
+            "state": "OPEN",
+        }
+        values.update(self.created_pr_changes)
         return PullRequestReference(
-            number=55,
-            url="https://github.com/octo-org/optimizer/pull/55",
-            head_branch=head_branch,
-            head_commit=commit_sha,
-            draft=False,
-            body=body,
+            **values,
         )
 
     def comment_issue(
@@ -179,6 +221,7 @@ def _inputs() -> tuple[
                 {
                     "subject_id": "candidate-1",
                     "patch_hash": patch_sha,
+                    "result_tree": "e" * 40,
                     "agent": {"draft_id": "draft-candidate-1"},
                 }
             ],
@@ -196,6 +239,7 @@ def _inputs() -> tuple[
         candidate_issue_number=101,
         candidate=candidate,
         evidence_sha256=evidence_sha,
+        expected_pull_request_head_commit="d" * 40,
     )
     return request, {
         candidate.patch.path: patch,
@@ -236,6 +280,7 @@ def test_exact_candidate_patch_creates_one_branch_commit_and_pr() -> None:
         ("lineage", "evidence_lineage_mismatch"),
         ("traversal", "path_traversal"),
         ("repair", "substantive_repair"),
+        ("tree", "result_tree_mismatch"),
     ],
 )
 def test_candidate_rejects_unverifiable_or_repaired_artifacts(
@@ -279,6 +324,16 @@ def test_candidate_rejects_unverifiable_or_repaired_artifacts(
             changed_paths=(Path("agent.py"),),
             exact=False,
             substantive_repair=True,
+            tree_sha="e" * 40,
+        )
+    elif mutation == "tree":
+        applied = AppliedPatch(
+            branch="foundry-opt/campaign-1/candidate-1/session-1",
+            commit_sha="d" * 40,
+            changed_paths=(Path("agent.py"),),
+            exact=True,
+            substantive_repair=False,
+            tree_sha="9" * 40,
         )
     applier = FakePatchApplier(artifacts, applied)
 
@@ -299,6 +354,15 @@ def test_candidate_application_is_idempotent_per_session_branch() -> None:
         "foundry-opt/campaign-1/candidate-1/session-1",
         "d" * 40,
         False,
+        (
+            "<!-- foundry-opt:candidate-pr:"
+            "campaign-1:candidate-1:session-1 -->\n"
+            "Base commit: `" + "b" * 40 + "`\n"
+            "Patch SHA-256: `" + request.candidate.patch.sha256 + "`\n"
+            "Evidence SHA-256: `" + request.evidence_sha256 + "`"
+        ),
+        base_branch="main",
+        state="OPEN",
     )
     gateway = FakeCandidateGateway(existing_pr=existing)
     applier = FakePatchApplier(artifacts)
@@ -309,6 +373,82 @@ def test_candidate_application_is_idempotent_per_session_branch() -> None:
     assert result.pull_request == existing
     assert applier.apply_requests == []
     assert gateway.created_prs == []
+
+
+def test_candidate_retry_derives_exact_head_from_retained_local_branch() -> None:
+    request, artifacts = _inputs()
+    request = CandidateApplicationRequest(
+        **{
+            **request.__dict__,
+            "expected_pull_request_head_commit": None,
+        }
+    )
+    existing = PullRequestReference(
+        55,
+        "https://github.com/octo-org/optimizer/pull/55",
+        "foundry-opt/campaign-1/candidate-1/session-1",
+        "d" * 40,
+        False,
+        (
+            "<!-- foundry-opt:candidate-pr:"
+            "campaign-1:candidate-1:session-1 -->\n"
+            "Base commit: `" + "b" * 40 + "`\n"
+            "Patch SHA-256: `" + request.candidate.patch.sha256 + "`\n"
+            "Evidence SHA-256: `" + request.evidence_sha256 + "`"
+        ),
+        base_branch="main",
+        state="OPEN",
+    )
+    gateway = FakeCandidateGateway(existing_pr=existing)
+    applier = FakePatchApplier(artifacts)
+
+    result = verify_and_apply_candidate(request, gateway, applier)
+
+    assert result.status is CandidateApplicationStatus.ALREADY_APPLIED
+    assert result.commit_sha == "d" * 40
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"state": "CLOSED"},
+        {"base_branch": "release"},
+        {"head_commit": "9" * 40},
+        {"draft": True},
+        {"body": "<!-- unrelated -->"},
+    ],
+)
+def test_candidate_pr_reuse_rejects_stale_or_unrelated_prs(
+    changes: dict[str, object],
+) -> None:
+    request, artifacts = _inputs()
+    values: dict[str, object] = {
+        "number": 55,
+        "url": "https://github.com/octo-org/optimizer/pull/55",
+        "head_branch": "foundry-opt/campaign-1/candidate-1/session-1",
+        "head_commit": "d" * 40,
+        "draft": False,
+        "body": (
+            "<!-- foundry-opt:candidate-pr:"
+            "campaign-1:candidate-1:session-1 -->\n"
+            "Base commit: `" + "b" * 40 + "`\n"
+            "Patch SHA-256: `" + request.candidate.patch.sha256 + "`\n"
+            "Evidence SHA-256: `" + request.evidence_sha256 + "`"
+        ),
+        "base_branch": "main",
+        "state": "OPEN",
+    }
+    values.update(changes)
+    gateway = FakeCandidateGateway(
+        existing_pr=PullRequestReference(**values)
+    )
+    applier = FakePatchApplier(artifacts)
+
+    result = verify_and_apply_candidate(request, gateway, applier)
+
+    assert result.status is CandidateApplicationStatus.REJECTED
+    assert result.reason_code == "existing_pr_mismatch"
+    assert applier.apply_requests == []
 
 
 def test_rejected_issue_and_pr_close_only_when_explicitly_requested() -> None:
@@ -331,3 +471,48 @@ def test_rejected_issue_and_pr_close_only_when_explicitly_requested() -> None:
     assert result.status is CandidateApplicationStatus.REJECTED
     assert gateway.closed_issues == [101]
     assert gateway.closed_prs == [54]
+
+
+def test_candidate_pr_failure_restores_checkout_for_safe_retry() -> None:
+    request, artifacts = _inputs()
+    gateway = FakeCandidateGateway(fail_create_pr=True)
+    applier = FakePatchApplier(artifacts)
+
+    with pytest.raises(RuntimeError, match="PR create failed"):
+        verify_and_apply_candidate(request, gateway, applier)
+
+    assert applier.restored == [
+        (
+            request.repository_root,
+            request.candidate.patch.base_commit,
+            request.expected_default_branch,
+        )
+    ]
+
+
+def test_created_candidate_pr_must_match_exact_publication() -> None:
+    request, artifacts = _inputs()
+    gateway = FakeCandidateGateway(
+        created_pr_changes={"base_branch": "release"}
+    )
+
+    with pytest.raises(CandidatePublicationError):
+        verify_and_apply_candidate(
+            request,
+            gateway,
+            FakePatchApplier(artifacts),
+        )
+
+
+def test_candidate_pr_failure_reports_checkout_restore_failure_safely() -> None:
+    request, artifacts = _inputs()
+
+    with pytest.raises(CandidatePublicationError) as raised:
+        verify_and_apply_candidate(
+            request,
+            FakeCandidateGateway(fail_create_pr=True),
+            FakePatchApplier(artifacts, fail_restore=True),
+        )
+
+    assert "restore" in str(raised.value).casefold()
+    assert "secret" not in str(raised.value)

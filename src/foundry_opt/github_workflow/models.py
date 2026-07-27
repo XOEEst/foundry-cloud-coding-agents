@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntFlag, StrEnum
+import hashlib
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from typing import Mapping
@@ -46,13 +47,20 @@ def git_branch(value: str, field: str) -> str:
 
 class GitHubCapabilities(IntFlag):
     NONE = 0
-    ISSUES = 1
-    LABELS = 2
-    COMMENTS = 4
-    PULL_REQUESTS = 8
+    METADATA_READ = 1
+    CONTENTS_WRITE = 2
+    ISSUES_WRITE = 4
+    PULL_REQUESTS_WRITE = 8
 
-    CAMPAIGN_PUBLICATION = ISSUES | LABELS | COMMENTS | PULL_REQUESTS
-    CANDIDATE_PUBLICATION = COMMENTS | PULL_REQUESTS
+    ISSUES = ISSUES_WRITE
+    LABELS = ISSUES_WRITE
+    COMMENTS = ISSUES_WRITE
+    PULL_REQUESTS = PULL_REQUESTS_WRITE
+
+    CAMPAIGN_PUBLICATION = (
+        METADATA_READ | CONTENTS_WRITE | ISSUES_WRITE | PULL_REQUESTS_WRITE
+    )
+    CANDIDATE_PUBLICATION = CAMPAIGN_PUBLICATION
 
 
 @dataclass(frozen=True)
@@ -81,12 +89,72 @@ class RepositoryState:
 class ArtifactReference:
     path: Path
     sha256: str
-    redacted: bool = True
+    provenance: RedactionProvenance
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", repository_path(self.path, "path"))
         if not _SHA256.fullmatch(self.sha256):
             raise ValueError("sha256 is invalid")
+
+
+@dataclass(frozen=True)
+class RedactionProvenance:
+    generator: str
+    schema_version: int
+    source_sha256: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            self.generator,
+        ):
+            raise ValueError("redaction generator is invalid")
+        if self.schema_version < 1:
+            raise ValueError("redaction schema_version is invalid")
+        if not _SHA256.fullmatch(self.source_sha256):
+            raise ValueError("redaction source_sha256 is invalid")
+
+
+@dataclass(frozen=True)
+class CommitBlob:
+    path: Path
+    content: bytes
+    sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "path",
+            repository_path(self.path, "blob path"),
+        )
+        object.__setattr__(
+            self,
+            "sha256",
+            hashlib.sha256(self.content).hexdigest(),
+        )
+
+
+@dataclass(frozen=True)
+class CommitInspection:
+    base_commit: str
+    head_commit: str
+    base_is_ancestor: bool
+    changed_paths: tuple[Path, ...]
+    blobs: tuple[CommitBlob, ...]
+
+    def __post_init__(self) -> None:
+        if not _COMMIT.fullmatch(self.base_commit):
+            raise ValueError("base_commit is invalid")
+        if not _COMMIT.fullmatch(self.head_commit):
+            raise ValueError("head_commit is invalid")
+        object.__setattr__(
+            self,
+            "changed_paths",
+            tuple(
+                repository_path(path, "changed path")
+                for path in self.changed_paths
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -97,6 +165,8 @@ class PullRequestReference:
     head_commit: str
     draft: bool
     body: str = ""
+    base_branch: str = ""
+    state: str = "OPEN"
 
     def __post_init__(self) -> None:
         if self.number < 1:
@@ -105,6 +175,10 @@ class PullRequestReference:
         git_branch(self.head_branch, "head_branch")
         if not _COMMIT.fullmatch(self.head_commit):
             raise ValueError("head_commit is invalid")
+        if self.base_branch:
+            git_branch(self.base_branch, "base_branch")
+        if self.state not in {"OPEN", "CLOSED", "MERGED"}:
+            raise ValueError("pull request state is invalid")
 
 
 @dataclass(frozen=True)
@@ -113,6 +187,8 @@ class IssueReference:
     url: str
     title: str
     body: str
+    state: str = "OPEN"
+    labels: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.number < 1:
@@ -120,6 +196,8 @@ class IssueReference:
         _github_reference_url(self.url, "issues", self.number)
         if not self.title:
             raise ValueError("issue title is required")
+        if self.state not in {"OPEN", "CLOSED"}:
+            raise ValueError("issue state is invalid")
 
 
 @dataclass(frozen=True)
@@ -159,8 +237,13 @@ class CampaignPublicationRequest:
                 raise ValueError("evidence_sha256 is invalid")
         if not self.reproduction_instructions:
             raise ValueError("reproduction_instructions are required")
-        if any(not manifest.redacted for manifest in self.manifests):
-            raise ValueError("campaign manifests must be redacted")
+        if any(
+            not isinstance(manifest.provenance, RedactionProvenance)
+            for manifest in self.manifests
+        ):
+            raise ValueError(
+                "campaign manifests require redaction provenance"
+            )
         pareto_candidates = {
             candidate.candidate_id: candidate
             for candidate in self.report.candidates
@@ -243,6 +326,7 @@ class ExactPatchRequest:
     base_commit: str
     patch_path: Path
     expected_patch_sha256: str
+    expected_tree_sha: str
     branch: str
     commit_message: str
 
@@ -256,6 +340,8 @@ class ExactPatchRequest:
         )
         if not _SHA256.fullmatch(self.expected_patch_sha256):
             raise ValueError("expected_patch_sha256 is invalid")
+        if not _COMMIT.fullmatch(self.expected_tree_sha):
+            raise ValueError("expected_tree_sha is invalid")
         git_branch(self.branch, "branch")
         if not self.commit_message:
             raise ValueError("commit_message is required")
@@ -268,11 +354,14 @@ class AppliedPatch:
     changed_paths: tuple[Path, ...]
     exact: bool
     substantive_repair: bool
+    tree_sha: str
 
     def __post_init__(self) -> None:
         git_branch(self.branch, "branch")
         if not _COMMIT.fullmatch(self.commit_sha):
             raise ValueError("applied patch identity is invalid")
+        if not _COMMIT.fullmatch(self.tree_sha):
+            raise ValueError("applied tree_sha is invalid")
         object.__setattr__(
             self,
             "changed_paths",
@@ -294,6 +383,7 @@ class CandidateApplicationRequest:
     candidate_issue_number: int
     candidate: CandidateArtifact
     evidence_sha256: str
+    expected_pull_request_head_commit: str | None = None
     close_rejected: bool = False
     rejected_pull_request_number: int | None = None
 
@@ -321,6 +411,15 @@ class CandidateApplicationRequest:
             raise ValueError("candidate must be eligible")
         if not _SHA256.fullmatch(self.evidence_sha256):
             raise ValueError("evidence_sha256 is invalid")
+        if (
+            self.expected_pull_request_head_commit is not None
+            and not _COMMIT.fullmatch(
+                self.expected_pull_request_head_commit
+            )
+        ):
+            raise ValueError(
+                "expected_pull_request_head_commit is invalid"
+            )
         if (
             self.rejected_pull_request_number is not None
             and self.rejected_pull_request_number < 1

@@ -29,3 +29,7 @@ class PatchApplicationError(GitHubWorkflowError):
 
 class PatchTraversalError(PatchApplicationError):
     code = "path_traversal"
+
+
+class PatchTreeMismatchError(PatchApplicationError):
+    code = "result_tree_mismatch"

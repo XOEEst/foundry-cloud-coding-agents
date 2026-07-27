@@ -7,6 +7,7 @@ from foundry_opt.github_workflow.errors import (
     GitHubWorkflowError,
     PatchApplicationError,
     PatchTraversalError,
+    PatchTreeMismatchError,
 )
 from foundry_opt.github_workflow.models import (
     AppliedPatch,
@@ -14,6 +15,8 @@ from foundry_opt.github_workflow.models import (
     ArtifactInspection,
     CampaignPublication,
     CampaignPublicationRequest,
+    CommitBlob,
+    CommitInspection,
     CandidateApplicationResult,
     CandidateApplicationStatus,
     CandidateApplicationRequest,
@@ -23,6 +26,7 @@ from foundry_opt.github_workflow.models import (
     ExactPatchRequest,
     IssueReference,
     PullRequestReference,
+    RedactionProvenance,
     RepositoryState,
     WorkflowFailure,
 )
@@ -36,6 +40,8 @@ __all__ = [
     "CampaignPublication",
     "CampaignPublicationError",
     "CampaignPublicationRequest",
+    "CommitBlob",
+    "CommitInspection",
     "CandidateApplicationRequest",
     "CandidateApplicationResult",
     "CandidateApplicationStatus",
@@ -49,7 +55,9 @@ __all__ = [
     "IssueReference",
     "PatchApplicationError",
     "PatchTraversalError",
+    "PatchTreeMismatchError",
     "PullRequestReference",
+    "RedactionProvenance",
     "RepositoryState",
     "WorkflowFailure",
     "publish_campaign",
