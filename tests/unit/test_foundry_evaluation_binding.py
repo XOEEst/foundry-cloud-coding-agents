@@ -6,6 +6,8 @@ import openai
 import pytest
 
 from foundry_opt.adapters.evaluation import (
+    BatchEvaluationRequest,
+    EvaluationGateway,
     EvaluationSchemaError,
 )
 from foundry_opt.adapters.foundry_evaluation import (
@@ -16,6 +18,12 @@ from foundry_opt.adapters.foundry_evaluation import (
     EvaluationRateLimitError,
     EvaluationServiceError,
     FoundryEvaluationTransport,
+)
+from foundry_opt.evaluation import (
+    AgentVersionRef,
+    DatasetSplit,
+    DatasetVersionRef,
+    EvaluatorDefinitionRef,
 )
 
 
@@ -691,14 +699,33 @@ def test_simulation_output_remains_separately_tagged_with_trajectory() -> None:
     }
 
 
-def test_run_rejects_missing_pinned_subject_or_split_context() -> None:
+def test_gateway_subject_and_split_are_metadata_not_provider_fields() -> None:
     transport, client = _transport()
     _create_definition(transport, client)
-    request = _batch_run_request()
-    request.pop("subject_id")
 
-    with pytest.raises(EvaluationSchemaError, match="subject_id"):
-        transport.create_run(request)
+    def create(**kwargs: object) -> object:
+        client.evals.runs.create_calls.append(kwargs)
+        return _run_payload(kwargs["metadata"])
+
+    client.evals.runs.create = create  # type: ignore[method-assign]
+    run = EvaluationGateway(transport).create_run(
+        BatchEvaluationRequest(
+            display_name="candidate validation",
+            subject_id="candidate-42",
+            split=DatasetSplit.VALIDATION,
+            agent=AgentVersionRef("agent-name", "draft-9", "draft-9"),
+            dataset=DatasetVersionRef("development", "12"),
+            evaluator=EvaluatorDefinitionRef("eval-definition", "1"),
+        )
+    )
+
+    call = client.evals.runs.create_calls[0]
+    assert "subject_id" not in call
+    assert "split" not in call
+    assert call["metadata"]["foundry_opt_subject_id"] == "candidate-42"
+    assert call["metadata"]["foundry_opt_split"] == "validation"
+    assert run.subject_id == "candidate-42"
+    assert run.split is DatasetSplit.VALIDATION
 
 
 def test_run_response_rejects_context_mismatch() -> None:
