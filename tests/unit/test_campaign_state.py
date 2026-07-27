@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from foundry_opt.campaign.models import CandidateArtifact, PatchArtifact
 from foundry_opt.campaign.state import (
     CampaignState,
     CandidateState,
+    DraftMetadata,
     FileCampaignStateStore,
 )
 
@@ -32,6 +34,15 @@ def test_file_campaign_state_round_trips_safe_resumable_metadata(
         {"quality": 0.9},
     )
     now = datetime(2026, 7, 26, 12, tzinfo=UTC)
+    draft = DraftMetadata(
+        "agent",
+        "draft-candidate-1",
+        7,
+        "d" * 64,
+        "ready",
+        False,
+        "https://resource.services.ai.azure.com/api/projects/project",
+    )
     state = CampaignState(
         "campaign-1",
         "agent",
@@ -43,25 +54,29 @@ def test_file_campaign_state_round_trips_safe_resumable_metadata(
         {"quality": 0.5},
         (
             CandidateState(
-                "candidate-1",
-                1,
-                "evaluated",
-                1,
-                IdeaLineage(
+                candidate_id="candidate-1",
+                slot=1,
+                status="evaluated",
+                attempts=1,
+                lineage=IdeaLineage(
                     "idea-1",
                     (),
                     "system_instructions",
                     (Path("agent/instructions.md"),),
                 ),
-                artifact,
-                {"quality": 0.9},
-                None,
-                {"generation_seconds": 12.0, "total_seconds": 30.0},
+                artifact=artifact,
+                metrics={"quality": 0.9},
+                timings={
+                    "generation_seconds": 12.0,
+                    "total_seconds": 30.0,
+                },
+                draft=draft,
             ),
         ),
         1,
         0,
         ("candidate-1",),
+        baseline_draft=replace(draft, version_id="draft-baseline"),
     )
     store = FileCampaignStateStore()
 
@@ -79,6 +94,7 @@ def test_file_campaign_state_round_trips_safe_resumable_metadata(
     text = state_path.read_text(encoding="utf-8")
     assert "instructions.md" in text
     assert "generation_seconds" in text
+    assert "draft-baseline" in text
     assert "response" not in text
     assert "secret" not in text
 

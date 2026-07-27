@@ -12,9 +12,33 @@ from typing import Mapping, Protocol
 
 from foundry_opt.campaign.lineage import IdeaLineage
 from foundry_opt.campaign.models import CandidateArtifact, PatchArtifact
+from foundry_opt.drafts import DraftRecord
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+@dataclass(frozen=True)
+class DraftMetadata:
+    agent_name: str
+    version_id: str
+    base_version: int
+    sha256: str
+    status: str | None
+    probe: bool
+    project_endpoint: str
+
+    @classmethod
+    def from_record(cls, record: DraftRecord) -> "DraftMetadata":
+        return cls(
+            agent_name=record.agent_name,
+            version_id=record.version_id,
+            base_version=record.base_version,
+            sha256=record.sha256,
+            status=record.status,
+            probe=record.probe,
+            project_endpoint=record.project_endpoint,
+        )
 
 
 @dataclass(frozen=True)
@@ -28,6 +52,7 @@ class CandidateState:
     metrics: Mapping[str, float] = field(default_factory=dict)
     error_code: str | None = None
     timings: Mapping[str, float] = field(default_factory=dict)
+    draft: DraftMetadata | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
@@ -58,6 +83,7 @@ class CampaignState:
     transient_retries_used: int = 0
     pareto_candidate_ids: tuple[str, ...] = ()
     error_code: str | None = None
+    baseline_draft: DraftMetadata | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -217,6 +243,7 @@ def _ensure_safe_directory(path: Path, repository_root: Path) -> None:
 def _state_document(state: CampaignState) -> dict[str, object]:
     return {
         "baseline_draft_id": state.baseline_draft_id,
+        "baseline_draft": _draft_document(state.baseline_draft),
         "baseline_metrics": dict(state.baseline_metrics),
         "base_commit": state.base_commit,
         "campaign_id": state.campaign_id,
@@ -259,6 +286,7 @@ def _candidate_document(candidate: CandidateState) -> dict[str, object]:
         "attempts": candidate.attempts,
         "candidate_id": candidate.candidate_id,
         "error_code": candidate.error_code,
+        "draft": _draft_document(candidate.draft),
         "lineage": (
             {
                 "changed_paths": [
@@ -303,6 +331,7 @@ def _state_from_document(document: object) -> CampaignState:
             document.get("pareto_candidate_ids", ())
         ),
         error_code=document.get("error_code"),
+        baseline_draft=_draft_from_document(document.get("baseline_draft")),
     )
 
 
@@ -341,6 +370,7 @@ def _candidate_from_document(document: object) -> CandidateState:
             eligible=bool(artifact_document["eligible"]),
             metrics=dict(artifact_document["metrics"]),
         )
+    draft = _draft_from_document(document.get("draft"))
     return CandidateState(
         candidate_id=str(document["candidate_id"]),
         slot=int(document["slot"]),
@@ -351,4 +381,41 @@ def _candidate_from_document(document: object) -> CandidateState:
         metrics=dict(document.get("metrics", {})),
         error_code=document.get("error_code"),
         timings=dict(document.get("timings", {})),
+        draft=draft,
+    )
+
+
+def _draft_document(
+    draft: DraftMetadata | None,
+) -> dict[str, object] | None:
+    if draft is None:
+        return None
+    return {
+        "agent_name": draft.agent_name,
+        "base_version": draft.base_version,
+        "probe": draft.probe,
+        "project_endpoint": draft.project_endpoint,
+        "sha256": draft.sha256,
+        "status": draft.status,
+        "version_id": draft.version_id,
+    }
+
+
+def _draft_from_document(document: object) -> DraftMetadata | None:
+    if document is None:
+        return None
+    if not isinstance(document, dict):
+        raise ValueError("draft metadata document is invalid")
+    return DraftMetadata(
+        agent_name=str(document["agent_name"]),
+        version_id=str(document["version_id"]),
+        base_version=int(document["base_version"]),
+        sha256=str(document["sha256"]),
+        status=(
+            str(document["status"])
+            if document.get("status") is not None
+            else None
+        ),
+        probe=bool(document["probe"]),
+        project_endpoint=str(document["project_endpoint"]),
     )

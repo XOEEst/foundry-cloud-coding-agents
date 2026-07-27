@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+import sys
 
 from foundry_opt.campaign.lineage import IdeaLineage
 from foundry_opt.campaign.models import CampaignReport, CandidateArtifact
@@ -26,6 +26,7 @@ from foundry_opt.campaign.state import (
     CampaignState,
     CampaignStateStore,
     CandidateState,
+    DraftMetadata,
 )
 from foundry_opt.evaluation import (
     AgentVersionRef,
@@ -58,26 +59,32 @@ def run_campaign(
     guarded = replace(dependencies, repository=tracked)
     try:
         return _run_campaign(request, guarded)
-    except CampaignStateError:
-        if tracked.acquired:
-            tracked.release()
-        raise
     except Exception as error:
         if tracked.acquired:
-            root = request.repository_root.expanduser().resolve()
-            state = dependencies.state.load(root, request.campaign_id)
-            if state is not None and state.status == "active":
-                dependencies.state.save(
-                    root,
-                    replace(
-                        state,
-                        status="failed",
-                        updated_at=dependencies.clock.now(),
-                        error_code=type(error).__name__,
-                    ),
-                )
-            tracked.release()
+            try:
+                root = request.repository_root.expanduser().resolve()
+                state = dependencies.state.load(root, request.campaign_id)
+                if state is not None and state.status == "active":
+                    dependencies.state.save(
+                        root,
+                        replace(
+                            state,
+                            status="failed",
+                            updated_at=dependencies.clock.now(),
+                            error_code=type(error).__name__,
+                        ),
+                    )
+            except Exception:
+                pass
         raise
+    finally:
+        if tracked.acquired:
+            active_error = sys.exc_info()[0] is not None
+            try:
+                tracked.release()
+            except Exception:
+                if not active_error:
+                    raise
 
 
 def _run_campaign(
@@ -112,25 +119,10 @@ def _run_campaign(
             error_code="campaign_state_mismatch",
         )
         dependencies.state.save(root, state)
-        dependencies.repository.release_lock(
-            repository_root=root,
-            target=request.target,
-            campaign_id=request.campaign_id,
-        )
         raise CampaignStateError(state)
     if state is not None and state.status == "completed":
-        dependencies.repository.release_lock(
-            repository_root=root,
-            target=request.target,
-            campaign_id=request.campaign_id,
-        )
         return _report_from_state(state)
     if state is not None and state.status in {"failed", "stale"}:
-        dependencies.repository.release_lock(
-            repository_root=root,
-            target=request.target,
-            campaign_id=request.campaign_id,
-        )
         raise CampaignStateError(state)
     if state is not None and state.status == "active":
         state = replace(
@@ -140,11 +132,6 @@ def _run_campaign(
             error_code="orphaned_active_state",
         )
         dependencies.state.save(root, state)
-        dependencies.repository.release_lock(
-            repository_root=root,
-            target=request.target,
-            campaign_id=request.campaign_id,
-        )
         raise CampaignStateError(state)
 
     started = dependencies.clock.now()
@@ -174,6 +161,13 @@ def _run_campaign(
             "baseline",
             baseline_bundle,
         )
+        state = replace(
+            state,
+            baseline_draft_id=baseline_draft.version_id,
+            baseline_draft=DraftMetadata.from_record(baseline_draft),
+            updated_at=dependencies.clock.now(),
+        )
+        dependencies.state.save(root, state)
         baseline_subject = _subject(
             request.target,
             "baseline",
@@ -183,10 +177,14 @@ def _run_campaign(
             dependencies,
             baseline_subject,
             DatasetSplit.DEVELOPMENT,
+            deadline=lambda: _deadline_reached(
+                request,
+                state,
+                dependencies,
+            ),
         )
         state = replace(
             state,
-            baseline_draft_id=baseline_draft.version_id,
             baseline_metrics=_metrics(baseline_development),
             updated_at=dependencies.clock.now(),
         )
@@ -422,6 +420,62 @@ def _run_campaign(
                 )
                 dependencies.state.save(root, state)
                 continue
+            post_validation_paths = dependencies.repository.changed_paths(
+                worktree
+            )
+            lineage = IdeaLineage(
+                idea.idea_id,
+                idea.parent_idea_ids,
+                idea.mutation_class,
+                post_validation_paths,
+            )
+            try:
+                _enforce_paths(request.edit_paths, post_validation_paths)
+            except ValueError:
+                state = _replace_candidate(
+                    state,
+                    candidate_id,
+                    status="guardrail_rejected",
+                    lineage=lineage,
+                    error_code="post_validation_guardrail_rejected",
+                    timings={
+                        **timings,
+                        "total_seconds": _seconds(
+                            dependencies.clock.now() - candidate_started
+                        ),
+                    },
+                )
+                feedback.append(
+                    CandidateFeedback(
+                        candidate_id,
+                        idea.idea_id,
+                        "guardrail_rejected",
+                    )
+                )
+                dependencies.state.save(root, state)
+                continue
+            if not post_validation_paths:
+                state = _replace_candidate(
+                    state,
+                    candidate_id,
+                    status="unchanged",
+                    lineage=lineage,
+                    timings={
+                        **timings,
+                        "total_seconds": _seconds(
+                            dependencies.clock.now() - candidate_started
+                        ),
+                    },
+                )
+                feedback.append(
+                    CandidateFeedback(
+                        candidate_id,
+                        idea.idea_id,
+                        "unchanged",
+                    )
+                )
+                dependencies.state.save(root, state)
+                continue
             patch_started = dependencies.clock.now()
             result_commit = dependencies.repository.commit_worktree(
                 worktree,
@@ -469,6 +523,17 @@ def _run_campaign(
             timings["draft_seconds"] = _seconds(
                 dependencies.clock.now() - draft_started
             )
+            state = replace(
+                _replace_candidate(
+                    state,
+                    candidate_id,
+                    lineage=lineage,
+                    draft=DraftMetadata.from_record(draft),
+                    timings=timings,
+                ),
+                updated_at=dependencies.clock.now(),
+            )
+            dependencies.state.save(root, state)
             if _deadline_reached(request, state, dependencies):
                 state = _replace_candidate(
                     state,
@@ -490,6 +555,11 @@ def _run_campaign(
                 dependencies,
                 _subject(request.target, candidate_id, draft.version_id),
                 DatasetSplit.DEVELOPMENT,
+                deadline=lambda: _deadline_reached(
+                    request,
+                    state,
+                    dependencies,
+                ),
             )
             timings["development_evaluation_seconds"] = _seconds(
                 dependencies.clock.now() - evaluation_started
@@ -612,32 +682,58 @@ def _run_campaign(
     final_ids: tuple[str, ...] = ()
     validation_results: list[EvaluationResult] = []
     validation_timings: dict[str, float] = {}
+    baseline_validation: EvaluationResult | None = None
     if (
         development_pareto.eligible_ids
-        and (
-            dependencies.clock.now() - state.started_at
-        ).total_seconds()
-        < request.limits.deadline_minutes * 60
+        and not _deadline_reached(request, state, dependencies)
     ):
-        baseline_validation = _evaluate(
-            dependencies,
-            baseline_subject,
-            DatasetSplit.VALIDATION,
-        )
-        by_id = {result.run.subject_id: result for result in development_results}
-        for candidate_id in development_pareto.eligible_ids:
-            development = by_id[candidate_id]
-            validation_started = dependencies.clock.now()
-            validation_results.append(
-                _evaluate(
+        try:
+            baseline_validation = _evaluate(
+                dependencies,
+                baseline_subject,
+                DatasetSplit.VALIDATION,
+                deadline=lambda: _deadline_reached(
+                    request,
+                    state,
                     dependencies,
-                    EvaluationSubject(candidate_id, development.run.agent),
-                    DatasetSplit.VALIDATION,
+                ),
+                check_initial_deadline=True,
+            )
+            by_id = {
+                result.run.subject_id: result
+                for result in development_results
+            }
+            for candidate_id in development_pareto.eligible_ids:
+                development = by_id[candidate_id]
+                validation_started = dependencies.clock.now()
+                validation_results.append(
+                    _evaluate(
+                        dependencies,
+                        EvaluationSubject(
+                            candidate_id,
+                            development.run.agent,
+                        ),
+                        DatasetSplit.VALIDATION,
+                        deadline=lambda: _deadline_reached(
+                            request,
+                            state,
+                            dependencies,
+                        ),
+                        check_initial_deadline=True,
+                    )
                 )
-            )
-            validation_timings[candidate_id] = _seconds(
-                dependencies.clock.now() - validation_started
-            )
+                validation_timings[candidate_id] = _seconds(
+                    dependencies.clock.now() - validation_started
+                )
+        except _CampaignDeadlineExceeded:
+            baseline_validation = None
+            validation_results.clear()
+            validation_timings.clear()
+    if (
+        baseline_validation is not None
+        and len(validation_results)
+        == len(development_pareto.eligible_ids)
+    ):
         validation_pareto = select_eligible_candidates(
             baseline_validation,
             tuple(validation_results),
@@ -727,11 +823,6 @@ def _run_campaign(
         updated_at=dependencies.clock.now(),
     )
     dependencies.state.save(root, state)
-    dependencies.repository.release_lock(
-        repository_root=root,
-        target=request.target,
-        campaign_id=request.campaign_id,
-    )
     return _report_from_state(state)
 
 
@@ -775,11 +866,22 @@ def _evaluate(
     dependencies: CampaignDependencies,
     subject: EvaluationSubject,
     split: DatasetSplit,
+    *,
+    deadline: Callable[[], bool],
+    check_initial_deadline: bool = False,
 ) -> EvaluationResult:
+    if check_initial_deadline and deadline():
+        raise _CampaignDeadlineExceeded()
     result = dependencies.evaluate(subject, split, 1)
     if result.needs_repeat:
+        if deadline():
+            raise _CampaignDeadlineExceeded()
         result = dependencies.evaluate(subject, split, 2)
     return result
+
+
+class _CampaignDeadlineExceeded(RuntimeError):
+    pass
 
 
 def _metrics(result: EvaluationResult) -> dict[str, float]:

@@ -65,6 +65,7 @@ class FakeRepository:
         self.reset: list[str] = []
         self.released = 0
         self.changed: dict[str, tuple[Path, ...]] = {}
+        self.committed: list[str] = []
 
     def pin_default_branch(self, repository_root: Path) -> PinnedRepository:
         assert repository_root == self.root
@@ -110,6 +111,7 @@ class FakeRepository:
         worktree: CampaignWorktree,
         message: str,
     ) -> str:
+        self.committed.append(worktree.candidate_id)
         return (
             "b" * 40
             if worktree.candidate_id == "candidate-1"
@@ -490,6 +492,38 @@ def test_validation_failure_consumes_a_slot_and_informs_next_idea(
     assert repository.created == ["baseline", "candidate-1", "candidate-2"]
 
 
+def test_validation_generated_disallowed_paths_are_never_committed(
+    tmp_path: Path,
+) -> None:
+    repository = FakeRepository(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        repository=repository,
+        generator=FakeGenerator(),
+        clock=FakeClock(),
+    )
+
+    def validate(path: Path) -> ValidationReport:
+        repository.changed["candidate-1"] = (
+            Path("production/generated-secret.txt"),
+        )
+        return ValidationReport(
+            (
+                ValidationResult(("test",), path, True, 0, "", ""),
+            ),
+            discovered=True,
+        )
+
+    dependencies = replace(dependencies, validate=validate)
+    report = run_campaign(_request(tmp_path, candidates=1), dependencies)
+
+    assert report.candidates == ()
+    assert repository.committed == []
+    state = dependencies.state.load(tmp_path, "campaign-1")
+    assert state is not None
+    assert state.candidates[0].status == "guardrail_rejected"
+
+
 def test_non_transient_generation_failure_consumes_slot_without_retry(
     tmp_path: Path,
 ) -> None:
@@ -611,6 +645,130 @@ def test_hard_deadline_skips_held_out_work_but_still_returns_report(
     ]
     assert report.pareto_candidate_ids == ()
     assert report.candidates == ()
+
+
+def test_retained_drafts_are_persisted_before_deadline_paths(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = FakeRepository(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        repository=repository,
+        generator=FakeGenerator(),
+        clock=clock,
+    )
+
+    def create_draft(target, subject_id, bundle):
+        record = DraftRecord(
+            target,
+            f"draft-{subject_id}",
+            7,
+            bundle.sha256,
+            "ready",
+            project_endpoint=(
+                "https://resource.services.ai.azure.com/api/projects/project"
+            ),
+        )
+        if subject_id == "candidate-1":
+            clock.advance(minutes=50)
+        return record
+
+    dependencies = replace(dependencies, create_draft=create_draft)
+    report = run_campaign(_request(tmp_path, candidates=1), dependencies)
+
+    assert report.candidates == ()
+    state = dependencies.state.load(tmp_path, "campaign-1")
+    assert state is not None
+    assert state.baseline_draft is not None
+    assert state.baseline_draft.version_id == "draft-baseline"
+    assert state.candidates[0].draft is not None
+    assert state.candidates[0].draft.version_id == "draft-candidate-1"
+    assert state.candidates[0].status == "deadline_exceeded"
+
+
+def test_baseline_draft_is_persisted_before_evaluation_failure(
+    tmp_path: Path,
+) -> None:
+    repository = FakeRepository(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        repository=repository,
+        generator=FakeGenerator(),
+        clock=FakeClock(),
+    )
+
+    def fail_evaluation(subject, split, attempt):
+        raise RuntimeError("evaluation unavailable")
+
+    with pytest.raises(RuntimeError, match="evaluation unavailable"):
+        run_campaign(
+            _request(tmp_path),
+            replace(dependencies, evaluate=fail_evaluation),
+        )
+
+    state = dependencies.state.load(tmp_path, "campaign-1")
+    assert state is not None
+    assert state.status == "failed"
+    assert state.baseline_draft is not None
+    assert state.baseline_draft.version_id == "draft-baseline"
+
+
+def test_deadline_stops_held_out_candidates_and_repeat_attempts(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    repository = FakeRepository(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        repository=repository,
+        generator=FakeGenerator(),
+        clock=clock,
+    )
+    calls: list[tuple[str, DatasetSplit, int]] = []
+    base_evaluate = dependencies.evaluate
+
+    def held_out_deadline(subject, split, attempt):
+        calls.append((subject.subject_id, split, attempt))
+        result = base_evaluate(subject, split, attempt)
+        if subject.subject_id == "baseline" and split is DatasetSplit.VALIDATION:
+            clock.advance(minutes=50)
+        return result
+
+    report = run_campaign(
+        _request(tmp_path, candidates=1),
+        replace(dependencies, evaluate=held_out_deadline),
+    )
+
+    assert report.pareto_candidate_ids == ()
+    assert ("candidate-1", DatasetSplit.VALIDATION, 1) not in calls
+
+    retry_clock = FakeClock()
+    retry_repository = FakeRepository(tmp_path / "retry")
+    (tmp_path / "retry").mkdir()
+    retry_dependencies = _dependencies(
+        tmp_path / "retry",
+        repository=retry_repository,
+        generator=FakeGenerator(),
+        clock=retry_clock,
+    )
+    retry_calls: list[tuple[str, DatasetSplit, int]] = []
+    retry_base = retry_dependencies.evaluate
+
+    def repeat_deadline(subject, split, attempt):
+        retry_calls.append((subject.subject_id, split, attempt))
+        result = retry_base(subject, split, attempt)
+        if subject.subject_id == "candidate-1" and attempt == 1:
+            retry_clock.advance(minutes=50)
+            return replace(result, needs_repeat=True)
+        return result
+
+    retry_report = run_campaign(
+        _request(tmp_path / "retry", candidates=1),
+        replace(retry_dependencies, evaluate=repeat_deadline),
+    )
+    assert retry_report.candidates == ()
+    assert ("candidate-1", DatasetSplit.DEVELOPMENT, 2) not in retry_calls
 
 
 def test_hard_guardrail_blocks_provisional_pareto_and_held_out_funnel(
@@ -859,4 +1017,39 @@ def test_fatal_campaign_failure_is_persisted_and_releases_the_lock(
     assert state.error_code == "RuntimeError"
     assert "customer content" not in repr(state)
     assert repository.cleaned == ["baseline"]
+    assert repository.released == 1
+
+
+def test_failure_state_errors_cannot_strand_campaign_lock(
+    tmp_path: Path,
+) -> None:
+    class FragileStateStore(MemoryCampaignStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loads = 0
+
+        def load(self, repository_root: Path, campaign_id: str):
+            self.loads += 1
+            if self.loads > 1:
+                raise OSError("state storage unavailable")
+            return super().load(repository_root, campaign_id)
+
+    repository = FakeRepository(tmp_path)
+    dependencies = _dependencies(
+        tmp_path,
+        repository=repository,
+        generator=FakeGenerator(),
+        clock=FakeClock(),
+    )
+    dependencies = replace(
+        dependencies,
+        state=FragileStateStore(),
+        build_bundle=lambda root, output: (_ for _ in ()).throw(
+            RuntimeError("bundle failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="bundle failed"):
+        run_campaign(_request(tmp_path), dependencies)
+
     assert repository.released == 1
