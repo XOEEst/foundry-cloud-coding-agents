@@ -352,6 +352,8 @@ def test_create_draft_translates_api_failures_without_response_details(
         gateway.create_draft(request)
 
     assert "secret-value" not in str(raised.value)
+    if isinstance(raised.value, DraftApiError):
+        assert raised.value.status_code == status
 
 
 def test_create_draft_rejects_service_zip_hash_mismatch(tmp_path: Path) -> None:

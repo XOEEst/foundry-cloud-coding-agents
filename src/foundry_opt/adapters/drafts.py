@@ -51,8 +51,11 @@ class DraftAuthorizationError(DraftError):
 
 
 class DraftApiError(DraftError):
-    def __init__(self) -> None:
-        super().__init__("The Foundry draft API request failed.")
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__(
+            f"The Foundry draft API request failed with status {status_code}."
+        )
 
 
 class DraftResponseError(DraftError):
@@ -375,7 +378,7 @@ def _require_success(response: Any) -> None:
         raise DraftAuthenticationError()
     if status == 403:
         raise DraftAuthorizationError()
-    raise DraftApiError()
+    raise DraftApiError(status)
 
 
 def _translate_exception(error: Exception) -> DraftError:
