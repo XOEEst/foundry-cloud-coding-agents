@@ -120,6 +120,8 @@ def _definition_payload(
     *,
     fingerprint: str = "sha256:definition",
     mode: str = "batch",
+    normalization: Mapping[str, object] | None = None,
+    include_normalization: bool = True,
 ) -> dict[str, object]:
     profile: dict[str, object]
     if mode == "batch":
@@ -152,31 +154,44 @@ def _definition_payload(
                 },
             }
         }
+    configuration: dict[str, object] = {
+        "data_source_config": {
+            "type": "custom",
+            "item_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        },
+        "testing_criteria": [
+            {
+                "type": "azure_ai_evaluator",
+                "name": "quality",
+                "evaluator_name": "builtin.coherence",
+                "data_mapping": {
+                    "query": "{{item.query}}",
+                    "response": "{{sample.output_text}}",
+                },
+            }
+        ],
+        **profile,
+    }
+    if include_normalization:
+        configuration["normalization"] = (
+            dict(normalization)
+            if normalization is not None
+            else {
+                "quality": {
+                    "type": "min_max",
+                    "minimum": 0,
+                    "maximum": 1,
+                }
+            }
+        )
     return {
         "name": f"quality-{mode}",
         "evaluator_type": "azure_ai_evaluator",
-        "schema_version": "1",
-        "configuration": {
-            "data_source_config": {
-                "type": "custom",
-                "item_schema": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                },
-            },
-            "testing_criteria": [
-                {
-                    "type": "azure_ai_evaluator",
-                    "name": "quality",
-                    "evaluator_name": "builtin.coherence",
-                    "data_mapping": {
-                        "query": "{{item.query}}",
-                        "response": "{{sample.output_text}}",
-                    },
-                }
-            ],
-            **profile,
-        },
+        "schema_version": "7",
+        "configuration": configuration,
         "fingerprint": fingerprint,
     }
 
@@ -200,8 +215,14 @@ def _create_definition(
     client: FakeOpenAIClient,
     *,
     mode: str = "batch",
+    normalization: Mapping[str, object] | None = None,
+    include_normalization: bool = True,
 ) -> None:
-    payload = _definition_payload(mode=mode)
+    payload = _definition_payload(
+        mode=mode,
+        normalization=normalization,
+        include_normalization=include_normalization,
+    )
     client.evals.create_response = {
         "id": "eval-definition",
         "name": payload["name"],
@@ -254,14 +275,68 @@ def _batch_run_request() -> dict[str, object]:
         "agent": {
             "agent_id": "agent-name",
             "draft_id": "draft-9",
-            "version": "draft-9",
+            "version": "3",
         },
         "dataset": {"dataset_id": "development", "version": "12"},
         "evaluator": {
             "definition_id": "eval-definition",
-            "version": "1",
+            "version": "7",
         },
     }
+
+
+def _list_single_score(
+    result: Mapping[str, object],
+    *,
+    normalization: Mapping[str, object] | None = None,
+    include_normalization: bool = True,
+) -> Mapping[str, object]:
+    transport, client = _transport()
+    _create_definition(
+        transport,
+        client,
+        normalization=normalization,
+        include_normalization=include_normalization,
+    )
+
+    def create(**kwargs: object) -> object:
+        client.evals.runs.create_calls.append(kwargs)
+        return _run_payload(kwargs["metadata"])
+
+    client.evals.runs.create = create  # type: ignore[method-assign]
+    transport.create_run(_batch_run_request())
+    client.evals.runs.output_items.responses = [
+        FakePage(
+            [
+                {
+                    "id": "output-1",
+                    "run_id": "evalrun-1",
+                    "eval_id": "eval-definition",
+                    "status": "pass",
+                    "datasource_item": {
+                        "case_id": "case-1",
+                        "case_hash": "sha256:case-1",
+                        "response_id": "resp-1",
+                    },
+                    "results": [dict(result)],
+                    "sample": {
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 4,
+                            "cached_tokens": 0,
+                        },
+                        "error": None,
+                    },
+                }
+            ]
+        )
+    ]
+    page = transport.list_output_items(
+        "evalrun-1",
+        continuation_token=None,
+        page_size=10,
+    )
+    return page["items"][0]["scores"][0]
 
 
 def test_create_definition_uses_openai_v1_eval_and_round_trips_binding() -> None:
@@ -278,7 +353,7 @@ def test_create_definition_uses_openai_v1_eval_and_round_trips_binding() -> None
 
     assert result == {
         "id": "eval-definition",
-        "version": "1",
+        "version": "7",
         "fingerprint": "sha256:definition",
         "portal_url": None,
     }
@@ -293,7 +368,7 @@ def test_create_definition_uses_openai_v1_eval_and_round_trips_binding() -> None
     metadata = call["metadata"]
     assert isinstance(metadata, dict)
     assert metadata["foundry_opt_fingerprint"] == "sha256:definition"
-    assert metadata["foundry_opt_schema_version"] == "1"
+    assert metadata["foundry_opt_schema_version"] == "7"
     assert "foundry_opt_binding_0" in metadata
 
 
@@ -313,7 +388,7 @@ def test_find_definition_reuses_exact_fingerprint_and_restores_profile() -> None
     second_client.evals.list_response = FakePage([provider_definition])
     assert second.find_definition("sha256:definition") == {
         "id": "eval-definition",
-        "version": "1",
+        "version": "7",
         "fingerprint": "sha256:definition",
         "portal_url": None,
     }
@@ -326,11 +401,11 @@ def test_find_definition_reuses_exact_fingerprint_and_restores_profile() -> None
                 "foundry_opt_split": "development",
                 "foundry_opt_agent_id": "agent-name",
                 "foundry_opt_draft_id": "draft-9",
-                "foundry_opt_agent_version": "draft-9",
+                "foundry_opt_agent_version": "3",
                 "foundry_opt_dataset_id": "development",
                 "foundry_opt_dataset_version": "12",
                 "foundry_opt_evaluator_id": "eval-definition",
-                "foundry_opt_evaluator_version": "1",
+                "foundry_opt_evaluator_version": "7",
             }
         )
     ]
@@ -353,6 +428,38 @@ def test_find_definition_rejects_duplicate_fingerprint() -> None:
 
     with pytest.raises(EvaluationConflictError):
         transport.find_definition("sha256:definition")
+
+
+def test_find_definition_skips_unrelated_null_or_malformed_metadata() -> None:
+    creator, creator_client = _transport()
+
+    def create(**kwargs: object) -> object:
+        creator_client.evals.create_calls.append(kwargs)
+        return _created_definition(kwargs)
+
+    creator_client.evals.create = create  # type: ignore[method-assign]
+    creator.create_definition(_definition_payload())
+    matching = _created_definition(creator_client.evals.create_calls[0])
+
+    transport, client = _transport()
+    client.evals.list_response = FakePage(
+        [
+            {"id": "unrelated-null", "metadata": None},
+            {"id": "unrelated-list", "metadata": ["not", "metadata"]},
+            {
+                "id": "unrelated-other",
+                "metadata": {"foundry_opt_fingerprint": "sha256:other"},
+            },
+            matching,
+        ]
+    )
+
+    assert transport.find_definition("sha256:definition") == {
+        "id": "eval-definition",
+        "version": "7",
+        "fingerprint": "sha256:definition",
+        "portal_url": None,
+    }
 
 
 def test_batch_run_pins_exact_draft_dataset_evaluator_and_context() -> None:
@@ -384,13 +491,14 @@ def test_batch_run_pins_exact_draft_dataset_evaluator_and_context() -> None:
         "target": {
             "type": "azure_ai_agent",
             "name": "agent-name",
-            "version": "draft-9",
+            "version": "3",
         },
     }
     assert "extra_body" not in call
     assert result["kind"] == "batch"
     assert result["subject_id"] == "candidate-1"
     assert result["agent"]["draft_id"] == "draft-9"
+    assert result["agent"]["version"] == "3"
     assert result["dataset"] == {
         "dataset_id": "development",
         "version": "12",
@@ -436,6 +544,19 @@ def test_simulation_run_uses_separate_tagged_preview_schema() -> None:
     )
     assert result["kind"] == "multi_turn_simulation"
     assert result["split"] == "validation"
+
+
+def test_run_rejects_claimed_evaluator_version_mismatch() -> None:
+    transport, client = _transport()
+    _create_definition(transport, client)
+    request = _batch_run_request()
+    request["evaluator"] = {
+        "definition_id": "eval-definition",
+        "version": "8",
+    }
+
+    with pytest.raises(EvaluationSchemaError, match="version"):
+        transport.create_run(request)
 
 
 @pytest.mark.parametrize(
@@ -551,12 +672,12 @@ def test_output_pagination_preserves_opaque_token_and_normalizes_batch() -> None
         "agent": {
             "agent_id": "agent-name",
             "draft_id": "draft-9",
-            "version": "draft-9",
+            "version": "3",
         },
         "dataset": {"dataset_id": "development", "version": "12"},
         "evaluator": {
             "definition_id": "eval-definition",
-            "version": "1",
+            "version": "7",
         },
         "items": [
             {
@@ -587,6 +708,92 @@ def test_output_pagination_preserves_opaque_token_and_normalizes_batch() -> None
     }
     assert second["continuation_token"] is None
     assert client.evals.runs.output_items.calls[1]["after"] == "opaque+/=token"
+
+
+def test_provider_normalized_score_is_not_replaced_by_raw_scale() -> None:
+    score = _list_single_score(
+        {
+            "name": "quality",
+            "score": 4,
+            "normalized_score": 0.75,
+            "passed": True,
+            "label": "pass",
+        },
+        include_normalization=False,
+    )
+
+    assert score["raw_score"] == 4
+    assert score["normalized_score"] == 0.75
+
+
+def test_evaluator_min_max_contract_normalizes_natural_scale() -> None:
+    score = _list_single_score(
+        {
+            "name": "quality",
+            "score": 4,
+            "passed": True,
+            "label": "pass",
+        },
+        normalization={
+            "quality": {
+                "type": "min_max",
+                "minimum": 1,
+                "maximum": 5,
+            }
+        },
+    )
+
+    assert score["raw_score"] == 4
+    assert score["normalized_score"] == 0.75
+
+
+def test_pass_fail_contract_respects_provider_failed_label() -> None:
+    score = _list_single_score(
+        {
+            "name": "quality",
+            "score": "needs_work",
+            "passed": False,
+            "label": "fail",
+        },
+        normalization={"quality": {"type": "pass_fail"}},
+    )
+
+    assert score["raw_score"] == "needs_work"
+    assert score["normalized_score"] == 0.0
+
+
+def test_score_without_normalized_value_or_contract_is_rejected() -> None:
+    with pytest.raises(EvaluationSchemaError, match="normalization"):
+        _list_single_score(
+            {"name": "quality", "score": 4, "passed": True},
+            include_normalization=False,
+        )
+
+
+def test_unknown_normalization_contract_is_rejected() -> None:
+    with pytest.raises(EvaluationSchemaError, match="unknown normalization"):
+        _list_single_score(
+            {"name": "quality", "score": 4},
+            normalization={"quality": {"type": "provider_magic"}},
+        )
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"name": "quality", "score": 4, "passed": "yes", "label": "pass"},
+        {"name": "quality", "score": 4, "passed": True, "label": "excellent"},
+        {"name": "quality", "score": 4, "passed": True, "label": "fail"},
+    ],
+)
+def test_unknown_or_conflicting_provider_outcome_is_rejected(
+    result: Mapping[str, object],
+) -> None:
+    with pytest.raises(EvaluationSchemaError, match="passed|label|conflict"):
+        _list_single_score(
+            result,
+            normalization={"quality": {"type": "pass_fail"}},
+        )
 
 
 def test_output_page_rejects_cross_run_item() -> None:
@@ -713,9 +920,9 @@ def test_gateway_subject_and_split_are_metadata_not_provider_fields() -> None:
             display_name="candidate validation",
             subject_id="candidate-42",
             split=DatasetSplit.VALIDATION,
-            agent=AgentVersionRef("agent-name", "draft-9", "draft-9"),
+            agent=AgentVersionRef("agent-name", "draft-9", "3"),
             dataset=DatasetVersionRef("development", "12"),
-            evaluator=EvaluatorDefinitionRef("eval-definition", "1"),
+            evaluator=EvaluatorDefinitionRef("eval-definition", "7"),
         )
     )
 

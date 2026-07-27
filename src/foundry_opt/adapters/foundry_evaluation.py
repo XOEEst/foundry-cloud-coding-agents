@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from typing import Any, TypeVar
 from urllib.parse import quote, unquote, urlparse
 
@@ -51,6 +53,12 @@ _MAX_BINDING_CHUNKS = 10
 _MAX_DEFINITION_PAGES = 1000
 
 
+@dataclass(frozen=True)
+class _DefinitionBinding:
+    version: str
+    profiles: Mapping[str, object]
+
+
 class FoundryEvaluationTransport(EvaluationTransport):
     """Bind the strict evaluation adapter to Foundry's OpenAI v1 Evals API."""
 
@@ -69,7 +77,7 @@ class FoundryEvaluationTransport(EvaluationTransport):
         self._account, self._project = _parse_project_endpoint(
             project_endpoint
         )
-        self._bindings: dict[str, dict[str, object]] = {}
+        self._bindings: dict[str, _DefinitionBinding] = {}
         self._runs: dict[str, dict[str, object]] = {}
 
     def find_definition(
@@ -89,8 +97,14 @@ class FoundryEvaluationTransport(EvaluationTransport):
                     raw_definition,
                     "evaluation definition",
                 )
-                metadata = _metadata(definition)
-                if metadata.get(f"{_METADATA_PREFIX}fingerprint") != fingerprint:
+                raw_metadata = definition.get("metadata")
+                if (
+                    not isinstance(raw_metadata, Mapping)
+                    or raw_metadata.get(
+                        f"{_METADATA_PREFIX}fingerprint"
+                    )
+                    != fingerprint
+                ):
                     continue
                 matches.append(self._definition_from_provider(definition))
             continuation = _next_token(page)
@@ -169,8 +183,18 @@ class FoundryEvaluationTransport(EvaluationTransport):
             raise EvaluationSchemaError(
                 "The Foundry evaluation definition binding was not loaded."
             )
+        requested_version = _reference_value(
+            context["evaluator"],
+            "version",
+            "evaluator version",
+        )
+        if requested_version != binding.version:
+            raise EvaluationSchemaError(
+                "The requested evaluator version conflicts with the loaded "
+                "Foundry evaluation definition version."
+            )
         kind = _required_string(context["kind"], "evaluation kind")
-        profile = binding.get(kind)
+        profile = binding.profiles.get(kind)
         if not isinstance(profile, Mapping):
             raise EvaluationSchemaError(
                 f"The Foundry evaluation definition does not support {kind}."
@@ -253,6 +277,7 @@ class FoundryEvaluationTransport(EvaluationTransport):
                 context=context,
                 run_id=run_id,
                 evaluation_id=evaluation_id,
+                normalization=self._normalization_for(evaluation_id),
             )
             for raw_item in _page_data(page)
         ]
@@ -279,7 +304,10 @@ class FoundryEvaluationTransport(EvaluationTransport):
             "evaluation schema version metadata",
         )
         binding = _binding_from_metadata(metadata)
-        self._bindings[definition_id] = binding
+        self._bindings[definition_id] = _DefinitionBinding(
+            version=version,
+            profiles=binding,
+        )
         return {
             "id": definition_id,
             "version": version,
@@ -301,7 +329,7 @@ class FoundryEvaluationTransport(EvaluationTransport):
         target = {
             "type": "azure_ai_agent",
             "name": _reference_value(agent, "agent_id", "agent_id"),
-            "version": _reference_value(agent, "draft_id", "draft_id"),
+            "version": _reference_value(agent, "version", "agent version"),
         }
         kind = _required_string(context.get("kind"), "evaluation kind")
         if kind == "batch":
@@ -418,6 +446,7 @@ class FoundryEvaluationTransport(EvaluationTransport):
         context: Mapping[str, object],
         run_id: str,
         evaluation_id: str,
+        normalization: Mapping[str, object],
     ) -> dict[str, object]:
         provider_run_id = _required_string(
             payload.get("run_id"),
@@ -442,7 +471,7 @@ class FoundryEvaluationTransport(EvaluationTransport):
         )
         sample = _required_mapping(payload.get("sample"), "output sample")
         usage = _usage(sample)
-        scores = _scores(payload.get("results"))
+        scores = _scores(payload.get("results"), normalization)
         kind = _required_string(context.get("kind"), "evaluation kind")
         common: dict[str, object] = {
             "kind": kind,
@@ -474,6 +503,21 @@ class FoundryEvaluationTransport(EvaluationTransport):
             raise EvaluationSchemaError(
                 "The Foundry evaluation run has no retained pinned context."
             ) from None
+
+    def _normalization_for(
+        self,
+        evaluation_id: str,
+    ) -> Mapping[str, object]:
+        binding = self._bindings.get(evaluation_id)
+        if binding is None:
+            raise EvaluationSchemaError(
+                "The Foundry evaluation definition binding was not loaded."
+            )
+        normalization = binding.profiles.get("normalization", {})
+        return _required_mapping(
+            normalization,
+            "evaluation normalization binding",
+        )
 
 
 def _configuration(value: object) -> dict[str, object]:
@@ -526,6 +570,10 @@ def _configuration(value: object) -> dict[str, object]:
         raise EvaluationSchemaError(
             "Definition configuration must include batch or simulation binding."
         )
+    normalization = configuration.get("normalization", {})
+    binding["normalization"] = dict(
+        _required_mapping(normalization, "normalization")
+    )
     return {
         "data_source_config": _json_value(data_source_config),
         "testing_criteria": _json_value(testing_criteria),
@@ -747,11 +795,18 @@ def _map_status(
     )
 
 
-def _scores(value: object) -> list[dict[str, object]]:
+def _scores(
+    value: object,
+    normalization: Mapping[str, object],
+) -> list[dict[str, object]]:
     results = _required_list(value, "output results")
     scores = []
     for raw_result in results:
         result = _provider_mapping(raw_result, "evaluator result")
+        metric = _required_string(
+            result.get("metric", result.get("name")),
+            "evaluator metric",
+        )
         raw_score = result.get("score")
         if raw_score is not None and not isinstance(
             raw_score,
@@ -760,23 +815,141 @@ def _scores(value: object) -> list[dict[str, object]]:
             raise EvaluationSchemaError(
                 "Foundry evaluator score is not scalar."
             )
-        normalized = result.get("normalized_score", raw_score)
-        if normalized is not None and not isinstance(normalized, (int, float)):
-            raise EvaluationSchemaError(
-                "Foundry normalized evaluator score is not numeric."
-            )
+        outcome = _provider_outcome(result)
+        normalized = _normalized_score(
+            result.get("normalized_score"),
+            raw_score=raw_score,
+            outcome=outcome,
+            contract=normalization.get(metric),
+            metric=metric,
+        )
         scores.append(
             {
-                "metric": _required_string(
-                    result.get("metric", result.get("name")),
-                    "evaluator metric",
-                ),
+                "metric": metric,
                 "raw_score": raw_score,
                 "normalized_score": normalized,
                 "reason": _optional_string(result.get("reason")),
             }
         )
     return scores
+
+
+def _provider_outcome(result: Mapping[str, object]) -> bool | None:
+    raw_passed = result.get("passed")
+    passed: bool | None
+    if raw_passed is None:
+        passed = None
+    elif isinstance(raw_passed, bool):
+        passed = raw_passed
+    else:
+        raise EvaluationSchemaError(
+            "Foundry evaluator passed must be a boolean."
+        )
+    raw_label = result.get("label")
+    label: bool | None
+    if raw_label is None:
+        label = None
+    elif isinstance(raw_label, str):
+        lowered = raw_label.lower()
+        if lowered in {"pass", "passed"}:
+            label = True
+        elif lowered in {"fail", "failed"}:
+            label = False
+        else:
+            raise EvaluationSchemaError(
+                "Foundry evaluator label has unknown pass/fail semantics."
+            )
+    else:
+        raise EvaluationSchemaError(
+            "Foundry evaluator label must be a string."
+        )
+    if passed is not None and label is not None and passed != label:
+        raise EvaluationSchemaError(
+            "Foundry evaluator passed and label semantics conflict."
+        )
+    return passed if passed is not None else label
+
+
+def _normalized_score(
+    provider_value: object,
+    *,
+    raw_score: object,
+    outcome: bool | None,
+    contract: object,
+    metric: str,
+) -> float:
+    if provider_value is not None:
+        return _unit_interval(provider_value, f"{metric} normalized_score")
+    if contract is None:
+        raise EvaluationSchemaError(
+            f"Foundry evaluator {metric} omitted normalized_score and has no "
+            "normalization contract."
+        )
+    contract_mapping = _required_mapping(
+        contract,
+        f"{metric} normalization contract",
+    )
+    contract_type = _required_string(
+        contract_mapping.get("type"),
+        f"{metric} normalization type",
+    )
+    if contract_type == "pass_fail":
+        if outcome is None:
+            raise EvaluationSchemaError(
+                f"Foundry evaluator {metric} pass/fail normalization requires "
+                "provider passed or label semantics."
+            )
+        return 1.0 if outcome else 0.0
+    if contract_type == "min_max":
+        if (
+            not isinstance(raw_score, (int, float))
+            or isinstance(raw_score, bool)
+            or not isfinite(float(raw_score))
+        ):
+            raise EvaluationSchemaError(
+                f"Foundry evaluator {metric} min/max normalization requires "
+                "a finite numeric score."
+            )
+        minimum = _finite_number(
+            contract_mapping.get("minimum"),
+            f"{metric} normalization minimum",
+        )
+        maximum = _finite_number(
+            contract_mapping.get("maximum"),
+            f"{metric} normalization maximum",
+        )
+        if maximum <= minimum:
+            raise EvaluationSchemaError(
+                f"Foundry evaluator {metric} normalization maximum must exceed "
+                "minimum."
+            )
+        numeric_score = float(raw_score)
+        if numeric_score < minimum or numeric_score > maximum:
+            raise EvaluationSchemaError(
+                f"Foundry evaluator {metric} score is outside its normalization "
+                "contract."
+            )
+        return (numeric_score - minimum) / (maximum - minimum)
+    raise EvaluationSchemaError(
+        f"Foundry evaluator {metric} has unknown normalization semantics."
+    )
+
+
+def _unit_interval(value: object, field: str) -> float:
+    parsed = _finite_number(value, field)
+    if parsed < 0 or parsed > 1:
+        raise EvaluationSchemaError(f"{field} must be between 0 and 1.")
+    return parsed
+
+
+def _finite_number(value: object, field: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not isfinite(float(value))
+    ):
+        raise EvaluationSchemaError(f"{field} must be a finite number.")
+    return float(value)
 
 
 def _usage(sample: Mapping[str, object]) -> dict[str, int]:
