@@ -199,6 +199,11 @@ class FoundryEvaluationTransport(EvaluationTransport):
             raise EvaluationSchemaError(
                 f"The Foundry evaluation definition does not support {kind}."
             )
+        if kind == "multi_turn_simulation":
+            raise EvaluationSchemaError(
+                "The current Foundry conversation simulation API cannot bind "
+                "the requested personas into supported scenario inputs."
+            )
         metadata = _run_metadata(context)
         data_source = self._run_data_source(context, profile)
         kwargs: dict[str, object] = {
@@ -545,9 +550,8 @@ def _configuration(value: object) -> dict[str, object]:
     if "batch" in configuration:
         batch = _required_mapping(configuration["batch"], "batch binding")
         binding["batch"] = {
-            "input_messages": _required_mapping(
-                batch.get("input_messages"),
-                "batch input_messages",
+            "input_messages": _batch_input_messages(
+                batch.get("input_messages")
             )
         }
     if "simulation" in configuration:
@@ -586,6 +590,79 @@ def _configuration(value: object) -> dict[str, object]:
         "testing_criteria": _json_value(testing_criteria),
         "binding": _json_value(binding),
     }
+
+
+def _batch_input_messages(value: object) -> dict[str, str]:
+    input_messages = _required_mapping(value, "batch input_messages")
+    input_type = _required_string(
+        input_messages.get("type"),
+        "batch input_messages type",
+    )
+    if input_type == "item_reference":
+        return {
+            "type": "item_reference",
+            "item_reference": _item_reference(
+                input_messages.get("item_reference")
+            ),
+        }
+    if input_type != "template":
+        raise EvaluationSchemaError(
+            "batch input_messages must use item_reference or a convertible "
+            "single-item template."
+        )
+    template = _required_list(
+        input_messages.get("template"),
+        "batch input_messages template",
+    )
+    if len(template) != 1:
+        raise EvaluationSchemaError(
+            "batch input_messages template must contain one user message."
+        )
+    message = _required_mapping(
+        template[0],
+        "batch input_messages template message",
+    )
+    content = _required_mapping(
+        message.get("content"),
+        "batch input_messages template content",
+    )
+    if (
+        message.get("type") != "message"
+        or message.get("role") != "user"
+        or content.get("type") != "input_text"
+    ):
+        raise EvaluationSchemaError(
+            "batch input_messages template must be one user input_text message."
+        )
+    text = _required_string(
+        content.get("text"),
+        "batch input_messages template text",
+    )
+    if not text.startswith("{{item.") or not text.endswith("}}"):
+        raise EvaluationSchemaError(
+            "batch input_messages template must contain one item reference."
+        )
+    reference = _item_reference(text[2:-2])
+    return {"type": "item_reference", "item_reference": reference}
+
+
+def _item_reference(value: object) -> str:
+    reference = _required_string(value, "batch input_messages item_reference")
+    segments = reference.split(".")
+    if (
+        len(segments) < 2
+        or segments[0] != "item"
+        or any(
+            not segment
+            or not segment.replace("_", "").isalnum()
+            or segment[0].isdigit()
+            for segment in segments[1:]
+        )
+    ):
+        raise EvaluationSchemaError(
+            "batch input_messages item_reference must reference item.<field>."
+        )
+    return reference
 
 
 def _binding_metadata(binding: object) -> dict[str, str]:
@@ -819,10 +896,20 @@ def _scores(
             result.get("metric", result.get("name")),
             "evaluator metric",
         )
-        status = _required_string(
-            result.get("status"),
-            "evaluator result status",
-        )
+        raw_status = result.get("status")
+        if raw_status is None or raw_status == "":
+            if "score" not in result and "passed" not in result:
+                raise EvaluationSchemaError(
+                    "Foundry evaluator result status is omitted without score "
+                    "or passed completion evidence."
+                )
+            status = "completed"
+        elif isinstance(raw_status, str):
+            status = raw_status
+        else:
+            raise EvaluationSchemaError(
+                "Foundry evaluator result status must be a string or null."
+            )
         if status == "skipped":
             continue
         if status in {"error", "errored"}:

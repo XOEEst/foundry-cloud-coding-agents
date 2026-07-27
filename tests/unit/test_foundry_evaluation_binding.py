@@ -506,9 +506,10 @@ def test_batch_run_pins_exact_draft_dataset_evaluator_and_context() -> None:
                 "development/versions/12"
             ),
         },
-        "input_messages": _definition_payload()["configuration"]["batch"][
-            "input_messages"
-        ],
+        "input_messages": {
+            "type": "item_reference",
+            "item_reference": "item.query",
+        },
         "target": {
             "type": "azure_ai_agent",
             "name": "agent-name",
@@ -526,7 +527,7 @@ def test_batch_run_pins_exact_draft_dataset_evaluator_and_context() -> None:
     }
 
 
-def test_simulation_run_uses_separate_tagged_preview_schema() -> None:
+def test_simulation_personas_are_rejected_when_api_cannot_bind_them() -> None:
     transport, client = _transport()
     _create_definition(transport, client, mode="simulation")
     request = _batch_run_request()
@@ -538,33 +539,74 @@ def test_simulation_run_uses_separate_tagged_preview_schema() -> None:
         "personas": ["developer", "reviewer"],
     }
 
+    with pytest.raises(EvaluationSchemaError, match="persona"):
+        transport.create_run(request)
+
+    assert client.evals.runs.create_calls == []
+
+
+def test_batch_binding_accepts_supported_item_reference_shape() -> None:
+    transport, client = _transport()
+    payload = _definition_payload()
+    payload["configuration"]["batch"]["input_messages"] = {
+        "type": "item_reference",
+        "item_reference": "item.conversation_input",
+    }
+
     def create(**kwargs: object) -> object:
+        client.evals.create_calls.append(kwargs)
+        return _created_definition(kwargs)
+
+    client.evals.create = create  # type: ignore[method-assign]
+    transport.create_definition(payload)
+
+    def create_run(**kwargs: object) -> object:
         client.evals.runs.create_calls.append(kwargs)
         return _run_payload(kwargs["metadata"])
 
-    client.evals.runs.create = create  # type: ignore[method-assign]
-    result = transport.create_run(request)
+    client.evals.runs.create = create_run  # type: ignore[method-assign]
+    transport.create_run(_batch_run_request())
 
-    call = client.evals.runs.create_calls[0]
-    source = call["data_source"]
-    assert source["type"] == "azure_ai_target_completions"
-    assert source["item_generation_params"] == {
-        "type": "conversation_gen_preview",
-        "model": "gpt-5-mini",
-        "num_conversations": 1,
-        "max_turns": 7,
-        "sampling_params": {"temperature": 0.2},
-        "data_mapping": {
-            "test_case_description": "test_case_description",
-            "id": "case_id",
-        },
+    assert client.evals.runs.create_calls[0]["data_source"][
+        "input_messages"
+    ] == {
+        "type": "item_reference",
+        "item_reference": "item.conversation_input",
     }
-    assert call["extra_body"] == {"evaluation_level": "conversation"}
-    assert call["metadata"]["foundry_opt_personas"] == (
-        '["developer","reviewer"]'
-    )
-    assert result["kind"] == "multi_turn_simulation"
-    assert result["split"] == "validation"
+
+
+@pytest.mark.parametrize(
+    "input_messages",
+    [
+        {"type": "item_reference"},
+        {"type": "item_reference", "item_reference": ""},
+        {"type": "template", "template": []},
+        {
+            "type": "template",
+            "template": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": {
+                        "type": "input_text",
+                        "text": "{{item.query}}",
+                    },
+                }
+            ],
+        },
+    ],
+)
+def test_batch_binding_rejects_unsupported_input_messages(
+    input_messages: Mapping[str, object],
+) -> None:
+    transport, client = _transport()
+    payload = _definition_payload()
+    payload["configuration"]["batch"]["input_messages"] = dict(input_messages)
+
+    with pytest.raises(EvaluationSchemaError, match="input_messages"):
+        transport.create_definition(payload)
+
+    assert client.evals.create_calls == []
 
 
 def test_run_rejects_claimed_evaluator_version_mismatch() -> None:
@@ -783,8 +825,8 @@ def test_errored_evaluator_result_becomes_item_error_not_score() -> None:
     assert item["error"] == "Evaluator quality errored."
 
 
-@pytest.mark.parametrize("status", [None, "running", "mystery"])
-def test_only_explicitly_completed_evaluator_results_can_score(
+@pytest.mark.parametrize("status", ["omitted", None, ""])
+def test_omitted_or_null_result_status_is_completed_when_score_exists(
     status: str | None,
 ) -> None:
     result: dict[str, object] = {
@@ -792,13 +834,36 @@ def test_only_explicitly_completed_evaluator_results_can_score(
         "score": 1.0,
         "normalized_score": 1.0,
     }
-    if status is not None:
+    if status != "omitted":
         result["status"] = status
 
+    item = _list_single_item(result, default_completed_status=False)
+
+    assert item["scores"][0]["normalized_score"] == 1.0
+
+
+def test_omitted_result_status_is_completed_when_passed_exists() -> None:
+    item = _list_single_item(
+        {"name": "quality", "passed": False, "label": "fail"},
+        normalization={"quality": {"type": "pass_fail"}},
+        default_completed_status=False,
+    )
+
+    assert item["scores"][0]["normalized_score"] == 0.0
+
+
+@pytest.mark.parametrize("status", ["running", "mystery"])
+def test_unknown_nonempty_evaluator_result_status_fails_closed(
+    status: str,
+) -> None:
     with pytest.raises(EvaluationSchemaError, match="status"):
         _list_single_item(
-            result,
-            default_completed_status=status is not None,
+            {
+                "status": status,
+                "name": "quality",
+                "score": 1.0,
+                "normalized_score": 1.0,
+            }
         )
 
 
@@ -905,19 +970,25 @@ def test_output_page_rejects_cross_run_item() -> None:
 def test_simulation_output_remains_separately_tagged_with_trajectory() -> None:
     transport, client = _transport()
     _create_definition(transport, client, mode="simulation")
-    request = _batch_run_request()
-    request["kind"] = "multi_turn_simulation"
-    request["simulation"] = {
-        "max_turns": 5,
-        "personas": ["developer"],
+    transport._runs["evalrun-1"] = {
+        "kind": "multi_turn_simulation",
+        "subject_id": "candidate-1",
+        "split": "development",
+        "agent": {
+            "agent_id": "agent-name",
+            "draft_id": "draft-9",
+            "version": "3",
+        },
+        "dataset": {"dataset_id": "development", "version": "12"},
+        "evaluator": {
+            "definition_id": "eval-definition",
+            "version": "7",
+        },
+        "simulation": {
+            "max_turns": 5,
+            "personas": ["developer"],
+        },
     }
-
-    def create(**kwargs: object) -> object:
-        client.evals.runs.create_calls.append(kwargs)
-        return _run_payload(kwargs["metadata"])
-
-    client.evals.runs.create = create  # type: ignore[method-assign]
-    transport.create_run(request)
     client.evals.runs.output_items.responses = [
         FakePage(
             [
