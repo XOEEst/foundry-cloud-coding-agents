@@ -38,6 +38,11 @@ class BundleError(RuntimeError):
     """Base class for source bundle failures."""
 
 
+class EmptySourceBundleError(BundleError):
+    def __init__(self) -> None:
+        super().__init__("Source bundle must not be empty.")
+
+
 class UnsafeSourcePathError(BundleError):
     def __init__(self, path: Path) -> None:
         self.path = path

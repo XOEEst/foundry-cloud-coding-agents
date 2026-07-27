@@ -8,6 +8,7 @@ import zipfile
 import pytest
 
 from foundry_opt.packaging import (
+    BundleError,
     BundleRequest,
     SecretSourceFileError,
     UnsafeSourcePathError,
@@ -93,7 +94,7 @@ def test_build_source_bundle_applies_declared_and_mandatory_exclusions(
     assert reasons["__pycache__/"] == "mandatory: cache"
     assert reasons["dist/"] == "mandatory: build artifact"
     assert reasons[".foundry-opt/"] == "mandatory: optimizer evidence"
-    assert reasons["tests/test_main.py"] == "declared exclude: tests/**"
+    assert reasons["tests/"] == "declared exclude: tests/**"
 
 
 def test_build_source_bundle_keeps_nested_env_build_and_dist_source(
@@ -243,6 +244,64 @@ def test_build_source_bundle_prunes_excluded_symlink_directories(
     assert artifact.included_files == ("main.py",)
     reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
     assert reasons[".venv/"] == "mandatory: virtual environment"
+
+
+def test_build_source_bundle_prunes_declared_excluded_symlink_directories(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    outside = tmp_path / "outside-generated"
+    outside.mkdir()
+    (outside / "secret.py").write_text("outside", encoding="utf-8")
+    link = repository / "generated"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    (repository / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    artifact = build_source_bundle(
+        BundleRequest(
+            repository,
+            tmp_path / "bundle.zip",
+            exclude=("generated/**",),
+        )
+    )
+
+    assert artifact.included_files == ("main.py",)
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons["generated/"] == "declared exclude: generated/**"
+
+
+def test_build_source_bundle_mandatorily_prunes_pytest_tmp_recursively(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    pytest_tmp = repository / "tests" / ".pytest-tmp"
+    pytest_tmp.mkdir(parents=True)
+    (pytest_tmp / "captured.py").write_text("generated", encoding="utf-8")
+    (repository / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    artifact = build_source_bundle(
+        BundleRequest(repository, tmp_path / "bundle.zip")
+    )
+
+    assert artifact.included_files == ("main.py",)
+    reasons = {entry.path: entry.reason for entry in artifact.excluded_files}
+    assert reasons["tests/.pytest-tmp/"] == "mandatory: cache"
+
+
+def test_build_source_bundle_rejects_empty_bundle(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    output = tmp_path / "bundle.zip"
+
+    with pytest.raises(BundleError, match="empty"):
+        build_source_bundle(BundleRequest(repository, output))
+
+    assert not output.exists()
+    assert not output.with_name("bundle.zip.manifest.json").exists()
 
 
 def test_build_source_bundle_requires_output_outside_repository_root_parent(

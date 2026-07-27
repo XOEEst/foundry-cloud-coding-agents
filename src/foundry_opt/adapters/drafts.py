@@ -400,6 +400,12 @@ def _verify_local_bundle(
         raise DraftHashMismatchError()
     if not zipfile.is_zipfile(BytesIO(content)):
         raise DraftHashMismatchError()
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as archive:
+            if not any(not item.is_dir() for item in archive.infolist()):
+                raise DraftHashMismatchError()
+    except zipfile.BadZipFile as error:
+        raise DraftHashMismatchError() from error
     digest = hashlib.sha256(content).hexdigest()
     if digest.casefold() != expected_sha256.casefold():
         raise DraftHashMismatchError()

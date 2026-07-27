@@ -533,3 +533,38 @@ def test_run_validation_redacts_complete_multiline_private_key_blocks(
     assert "BEGIN" not in persisted
     assert "END" not in persisted
     assert persisted.count("[REDACTED]") == 2
+
+
+def test_run_validation_redacts_truncated_unprefixed_private_key_to_end(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+
+    class TruncatedPrivateKeyRunner(RecordingRunner):
+        def run(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            cwd: Path | None = None,
+        ) -> CommandResult:
+            return CommandResult(
+                1,
+                (
+                    "safe diagnostic\n"
+                    "-----BEGIN PRIVATE KEY-----\n"
+                    "truncated-private-key-body\n"
+                    "last-private-key-line"
+                ),
+                "",
+            )
+
+    report = run_validation(
+        ValidationRequest(
+            repository,
+            commands=(("python", "-c", "pass"),),
+        ),
+        TruncatedPrivateKeyRunner(),
+    )
+
+    assert report.results[0].stdout == "safe diagnostic\n[REDACTED]"

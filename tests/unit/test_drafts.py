@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,11 @@ from foundry_opt.adapters.drafts import (
     DraftResponseError,
 )
 from foundry_opt.drafts import DraftRequest
-from foundry_opt.packaging import BundleRequest, build_source_bundle
+from foundry_opt.packaging import (
+    BundleArtifact,
+    BundleRequest,
+    build_source_bundle,
+)
 
 
 PROJECT_ENDPOINT = "https://example.services.ai.azure.com/api/projects/demo"
@@ -366,6 +371,33 @@ def test_create_draft_rejects_locally_tampered_zip_before_api_call(
 
     with pytest.raises(DraftHashMismatchError):
         gateway.create_draft(request)
+
+    assert client.requests == []
+
+
+def test_create_draft_rejects_empty_zip_before_api_call(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    empty_zip = BytesIO()
+    with zipfile.ZipFile(empty_zip, "w"):
+        pass
+    content = empty_zip.getvalue()
+    path = tmp_path / "empty.zip"
+    path.write_bytes(content)
+    empty_bundle = BundleArtifact(
+        path=path,
+        sha256=hashlib.sha256(content).hexdigest(),
+        included_files=(),
+        excluded_files=(),
+        byte_size=len(content),
+        manifest_path=tmp_path / "empty.zip.manifest.json",
+    )
+    client = FakeProjectClient([])
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DraftHashMismatchError):
+        gateway.create_draft(replace(request, bundle=empty_bundle))
 
     assert client.requests == []
 

@@ -574,7 +574,7 @@ def _redact_output(value: str, secrets: tuple[str, ...] = ()) -> str:
     private_key_block = re.compile(
         r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY)-----"
         r".*?"
-        r"-----END (?P=label)-----",
+        r"(?:-----END (?P=label)-----|\Z)",
         re.IGNORECASE | re.DOTALL,
     )
     redacted = private_key_block.sub("[REDACTED]", value)

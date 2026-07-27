@@ -12,6 +12,7 @@ import zipfile
 from foundry_opt.packaging.models import (
     BundleArtifact,
     BundleRequest,
+    EmptySourceBundleError,
     ExcludedFile,
     SecretSourceFileError,
     UnsafeSourcePathError,
@@ -27,6 +28,7 @@ _MANDATORY_DIRECTORIES = {
     ".nox": "virtual environment",
     "__pycache__": "cache",
     ".pytest_cache": "cache",
+    ".pytest-tmp": "cache",
     ".mypy_cache": "cache",
     ".ruff_cache": "cache",
     ".cache": "cache",
@@ -91,7 +93,11 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
 
     included: list[tuple[str, bytes]] = []
     excluded: list[ExcludedFile] = []
-    for archive_path, source_path in _source_files(root, excluded):
+    for archive_path, source_path in _source_files(
+        root,
+        excluded,
+        request.exclude,
+    ):
         mandatory_reason = _mandatory_exclusion(archive_path)
         if mandatory_reason is not None:
             excluded.append(
@@ -121,6 +127,8 @@ def build_source_bundle(request: BundleRequest) -> BundleArtifact:
 
     included.sort(key=lambda item: item[0])
     excluded.sort(key=lambda item: item.path)
+    if not included:
+        raise EmptySourceBundleError()
     output.parent.mkdir(parents=True, exist_ok=True)
     bundle_stream = BytesIO()
     with zipfile.ZipFile(
@@ -170,7 +178,11 @@ def _reject_artifact_collisions(paths: set[Path]) -> None:
             raise UnsafeSourcePathError(path)
 
 
-def _source_files(root: Path, excluded: list[ExcludedFile]):
+def _source_files(
+    root: Path,
+    excluded: list[ExcludedFile],
+    exclude_patterns: tuple[str, ...],
+):
     for current, directory_names, file_names in os.walk(
         root,
         topdown=True,
@@ -189,6 +201,18 @@ def _source_files(root: Path, excluded: list[ExcludedFile]):
                     )
                 )
                 continue
+            exclude_pattern = _excluded_directory_pattern(
+                relative,
+                exclude_patterns,
+            )
+            if exclude_pattern is not None:
+                excluded.append(
+                    ExcludedFile(
+                        f"{relative}/",
+                        f"declared exclude: {exclude_pattern}",
+                    )
+                )
+                continue
             candidate = current_path / name
             if candidate.is_symlink():
                 raise UnsafeSourcePathError(candidate)
@@ -198,6 +222,23 @@ def _source_files(root: Path, excluded: list[ExcludedFile]):
             candidate = current_path / name
             relative = candidate.relative_to(root)
             yield relative.as_posix(), candidate
+
+
+def _excluded_directory_pattern(
+    archive_path: str,
+    patterns: tuple[str, ...],
+) -> str | None:
+    for pattern in patterns:
+        normalized = pattern.replace("\\", "/").rstrip("/")
+        if normalized.endswith("/**"):
+            directory_pattern = normalized[:-3].rstrip("/")
+        elif not any(character in normalized for character in "*?["):
+            directory_pattern = normalized
+        else:
+            continue
+        if _first_match(archive_path, (directory_pattern,)) is not None:
+            return pattern
+    return None
 
 
 def _snapshot_contained_file(path: Path, root: Path) -> tuple[Path, bytes]:
