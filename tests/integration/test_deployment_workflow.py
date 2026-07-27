@@ -20,6 +20,7 @@ from foundry_opt.deployment import (
     verify_deployed_selection,
 )
 from foundry_opt.evaluation import (
+    AgentVersionRef,
     EvaluationPolicy,
     MetricDirection,
     MetricPolicy,
@@ -52,13 +53,16 @@ def _evidence_result(
     safety: float = 1.0,
     complete: bool = True,
     status: str = "completed",
+    agent_id: str = "demo-agent",
+    draft_id: str | None = None,
+    version: str = "1",
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "subject_id": subject_id,
         "agent": {
-            "agent_id": f"agent-{subject_id}",
-            "draft_id": f"draft-{subject_id}",
-            "version": "1",
+            "agent_id": agent_id,
+            "draft_id": draft_id or f"draft-{subject_id}",
+            "version": version,
         },
         "dataset": {"dataset_id": "dataset-1", "version": "1"},
         "evaluator": {"definition_id": "evaluator-1", "version": "1"},
@@ -205,12 +209,14 @@ def _request(tmp_path: Path) -> DeploymentVerificationRequest:
                 "baseline": _evidence_result(
                     "baseline-1",
                     quality=0.5,
+                    version="draft-baseline-1",
                 ),
                 "candidates": [
                     _evidence_result(
                         "candidate-1",
                         patch_sha256=patch_sha,
                         quality=0.8,
+                        version="draft-candidate-1",
                     ),
                 ],
                 "pareto": {
@@ -292,6 +298,18 @@ def _request(tmp_path: Path) -> DeploymentVerificationRequest:
         expected_runtime="python_3_13",
         expected_entry_point=("python", "main.py"),
         expected_dependency_resolution="remote_build",
+        expected_baseline_agent=AgentVersionRef(
+            agent_id="demo-agent",
+            draft_id="draft-baseline-1",
+            version="draft-baseline-1",
+        ),
+        expected_candidate_agents={
+            "candidate-1": AgentVersionRef(
+                agent_id="demo-agent",
+                draft_id="draft-candidate-1",
+                version="draft-candidate-1",
+            )
+        },
         expected_metric_policy=EvaluationPolicy(
             metrics=(
                 MetricPolicy(
@@ -508,13 +526,18 @@ def test_verify_rejects_baseline_source_provenance_mismatch(
     }.issubset(verification.failed_checks)
 
 
-def test_verify_rejects_nonterminal_published_record(
+@pytest.mark.parametrize(
+    "status",
+    ["creating", "completed", "ready", "succeeded", "ACTIVE"],
+)
+def test_verify_rejects_nonactive_published_record(
     tmp_path: Path,
+    status: str,
 ) -> None:
     request = _request(tmp_path)
     request = replace(
         request,
-        record=replace(request.record, status="creating"),
+        record=replace(request.record, status=status),
     )
 
     verification = verify_deployed_selection(request)
@@ -688,6 +711,61 @@ def test_verify_rebuilds_baseline_bundle_from_exact_patch_base(
     ],
 )
 def test_verify_enforces_exact_evidence_selection_consistency(
+    tmp_path: Path,
+    mutation,
+) -> None:
+    request = _request(tmp_path)
+    evidence = request.repository_root / request.evidence_path
+    document = json.loads(evidence.read_text(encoding="utf-8"))
+    mutation(document)
+    evidence.write_text(
+        json.dumps(document, sort_keys=True),
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    request = replace(
+        request,
+        expected_evidence_sha256=digest,
+        record=replace(
+            request.record,
+            evidence_sha256=digest,
+            metadata={
+                **request.record.metadata,
+                "foundry-opt-evidence-sha256": digest,
+            },
+        ),
+    )
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is False
+    assert "evidence_lineage" in verification.failed_checks
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda document: document["baseline"]["agent"].update(
+            {"agent_id": "other-agent"}
+        ),
+        lambda document: document["baseline"]["agent"].update(
+            {"draft_id": "wrong-baseline-draft"}
+        ),
+        lambda document: document["baseline"]["agent"].update(
+            {"version": "6"}
+        ),
+        lambda document: document["candidates"][0]["agent"].update(
+            {"agent_id": "other-agent"}
+        ),
+        lambda document: document["candidates"][0]["agent"].update(
+            {"draft_id": "wrong-candidate-draft"}
+        ),
+        lambda document: document["candidates"][0]["agent"].update(
+            {"version": "9"}
+        ),
+    ],
+)
+def test_verify_binds_evidence_agent_and_draft_identities(
     tmp_path: Path,
     mutation,
 ) -> None:

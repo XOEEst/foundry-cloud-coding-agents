@@ -394,6 +394,7 @@ def test_publish_rejects_service_hash_mismatch(tmp_path: Path) -> None:
     [
         lambda: _baseline(status="creating"),
         lambda: _baseline(status="failed"),
+        lambda: _baseline(status="ACTIVE"),
         lambda: _baseline(source_sha256="0" * 64),
     ],
 )
@@ -610,6 +611,28 @@ def test_publish_requires_terminal_successful_readback(
 
 @pytest.mark.parametrize("status", ["failed", "cancelled", "error"])
 def test_publish_rejects_terminal_failure_readback(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, status=status),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DeploymentStatusError):
+        gateway.publish(request)
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["completed", "ready", "succeeded", "ACTIVE"],
+)
+def test_publish_rejects_undocumented_success_status(
     tmp_path: Path,
     status: str,
 ) -> None:

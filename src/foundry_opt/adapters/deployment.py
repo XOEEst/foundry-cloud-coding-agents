@@ -53,7 +53,7 @@ _PROVENANCE_KEYS = (
     "foundry-opt-tree-hash",
     "foundry-opt-evidence-sha256",
 )
-_SUCCESS_STATUSES = {"active", "completed", "ready", "succeeded"}
+_SUCCESS_STATUSES = {"active"}
 _PENDING_STATUSES = {
     "creating",
     "in_progress",
@@ -220,7 +220,7 @@ class DeploymentGateway:
                 request.agent_name,
                 version,
             )
-            status = (record.status or "").casefold()
+            status = record.status or ""
             if status in _SUCCESS_STATUSES:
                 _verify_effective_payload(
                     payload,
@@ -322,7 +322,7 @@ def _verify_published_baseline(
     if (
         str(payload.get("version", "")) != str(request.base_version)
         or payload.get("draft") is not False
-        or str(payload.get("status", "")).casefold() != "active"
+        or payload.get("status") != "active"
         or _nested_hash(payload)
         != request.expected_baseline_source_sha256
     ):
@@ -421,7 +421,7 @@ def _parse_published_readback(
             patch_sha256=metadata["foundry-opt-patch-sha256"],
             tree_hash=metadata["foundry-opt-tree-hash"],
             evidence_sha256=metadata["foundry-opt-evidence-sha256"],
-            status=status.casefold(),
+            status=status,
             portal_url=_safe_portal_url(
                 payload.get("portal_url")
                 or payload.get("portalUrl")

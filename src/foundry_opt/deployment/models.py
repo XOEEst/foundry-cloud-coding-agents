@@ -9,7 +9,7 @@ from typing import Mapping
 from urllib.parse import urlsplit
 
 from foundry_opt.drafts.models import project_endpoint_components
-from foundry_opt.evaluation import EvaluationPolicy
+from foundry_opt.evaluation import AgentVersionRef, EvaluationPolicy
 from foundry_opt.packaging import BundleArtifact
 
 
@@ -338,6 +338,8 @@ class DeploymentVerificationRequest:
     expected_runtime: str
     expected_entry_point: tuple[str, ...]
     expected_dependency_resolution: str
+    expected_baseline_agent: AgentVersionRef
+    expected_candidate_agents: Mapping[str, AgentVersionRef]
     expected_metric_policy: EvaluationPolicy
     expected_commit: str
     expected_run_url: str
@@ -414,6 +416,31 @@ class DeploymentVerificationRequest:
             "bundled",
         }:
             raise ValueError("expected_dependency_resolution is invalid")
+        if (
+            not isinstance(self.expected_baseline_agent, AgentVersionRef)
+            or self.expected_baseline_agent.agent_id
+            != self.expected_agent_name
+        ):
+            raise ValueError("expected_baseline_agent is invalid")
+        candidate_agents = dict(self.expected_candidate_agents)
+        if (
+            self.candidate_id not in candidate_agents
+            or self.expected_baseline_agent in candidate_agents.values()
+            or len(set(candidate_agents.values())) != len(candidate_agents)
+            or any(
+                not isinstance(subject_id, str)
+                or not _IDENTIFIER.fullmatch(subject_id)
+                or not isinstance(agent, AgentVersionRef)
+                or agent.agent_id != self.expected_agent_name
+                for subject_id, agent in candidate_agents.items()
+            )
+        ):
+            raise ValueError("expected_candidate_agents is invalid")
+        object.__setattr__(
+            self,
+            "expected_candidate_agents",
+            MappingProxyType(candidate_agents),
+        )
         if not isinstance(self.expected_metric_policy, EvaluationPolicy):
             raise ValueError(
                 "expected_metric_policy must be an EvaluationPolicy"

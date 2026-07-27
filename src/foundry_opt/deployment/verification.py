@@ -41,7 +41,7 @@ from foundry_opt.github_workflow.publication import (
 from foundry_opt.packaging import BundleRequest, build_source_bundle
 
 
-_SUCCESS_STATUSES = {"active", "completed", "ready", "succeeded"}
+_SUCCESS_STATUSES = {"active"}
 
 
 def verify_deployed_selection(
@@ -173,8 +173,7 @@ def verify_deployed_selection(
         ),
         DeploymentCheck(
             "published_terminal_status",
-            (request.record.status or "").casefold()
-            in _SUCCESS_STATUSES,
+            request.record.status in _SUCCESS_STATUSES,
         ),
         DeploymentCheck(
             "service_provenance_record",
@@ -407,6 +406,17 @@ def _selection_matches_evidence(
             _serialized_result(candidate, request.expected_metric_policy)
             for candidate in candidates
         )
+        candidate_agents = {
+            candidate.run.subject_id: candidate.run.agent
+            for candidate in candidate_results
+        }
+        if (
+            baseline_result.run.agent
+            != request.expected_baseline_agent
+            or len(candidate_agents) != len(candidate_results)
+            or candidate_agents != dict(request.expected_candidate_agents)
+        ):
+            return False
         recomputed = select_eligible_candidates(
             baseline_result,
             candidate_results,
