@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -592,8 +593,10 @@ def _configuration(value: object) -> dict[str, object]:
     }
 
 
-def _batch_input_messages(value: object) -> dict[str, str]:
+def _batch_input_messages(value: object) -> dict[str, Any]:
     input_messages = _required_mapping(value, "batch input_messages")
+    if "type" not in input_messages:
+        return _invocation_input_messages(input_messages)
     input_type = _required_string(
         input_messages.get("type"),
         "batch input_messages type",
@@ -644,6 +647,66 @@ def _batch_input_messages(value: object) -> dict[str, str]:
         )
     reference = _item_reference(text[2:-2])
     return {"type": "item_reference", "item_reference": reference}
+
+
+def _invocation_input_messages(
+    input_messages: Mapping[str, object],
+) -> dict[str, Any]:
+    if not input_messages:
+        raise EvaluationSchemaError(
+            "batch input_messages invocation payload cannot be empty."
+        )
+    found_reference = _validate_invocation_json(input_messages)
+    if not found_reference:
+        raise EvaluationSchemaError(
+            "batch input_messages invocation payload must contain an item "
+            "reference."
+        )
+    cloned = _json_value(input_messages)
+    if not isinstance(cloned, dict):
+        raise EvaluationSchemaError(
+            "batch input_messages invocation payload must be a JSON object."
+        )
+    return cloned
+
+
+def _validate_invocation_json(value: object) -> bool:
+    if isinstance(value, Mapping):
+        found = False
+        for key, nested in value.items():
+            if not isinstance(key, str) or not key:
+                raise EvaluationSchemaError(
+                    "batch input_messages invocation JSON keys must be "
+                    "non-empty strings."
+                )
+            found = _validate_invocation_json(nested) or found
+        return found
+    if isinstance(value, list):
+        return any(_validate_invocation_json(item) for item in value)
+    if isinstance(value, str):
+        matches = list(
+            re.finditer(
+                r"\{\{(item\.[A-Za-z_][A-Za-z0-9_]*(?:\."
+                r"[A-Za-z_][A-Za-z0-9_]*)*)\}\}",
+                value,
+            )
+        )
+        remainder = value
+        for match in reversed(matches):
+            remainder = remainder[: match.start()] + remainder[match.end() :]
+        if "{{" in remainder or "}}" in remainder:
+            raise EvaluationSchemaError(
+                "batch input_messages invocation payload contains a malformed "
+                "item reference."
+            )
+        return bool(matches)
+    if value is None or isinstance(value, (bool, int)):
+        return False
+    if isinstance(value, float) and isfinite(value):
+        return False
+    raise EvaluationSchemaError(
+        "batch input_messages invocation payload must contain JSON values."
+    )
 
 
 def _item_reference(value: object) -> str:

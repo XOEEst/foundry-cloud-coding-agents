@@ -575,6 +575,68 @@ def test_batch_binding_accepts_supported_item_reference_shape() -> None:
     }
 
 
+def test_batch_binding_preserves_hosted_invocation_freeform_shape() -> None:
+    transport, client = _transport()
+    payload = _definition_payload()
+    payload["configuration"]["batch"]["input_messages"] = {
+        "message": "{{item.query}}",
+        "context": {
+            "case_id": "{{item.case_id}}",
+            "attempt": 1,
+        },
+    }
+
+    def create(**kwargs: object) -> object:
+        client.evals.create_calls.append(kwargs)
+        return _created_definition(kwargs)
+
+    client.evals.create = create  # type: ignore[method-assign]
+    transport.create_definition(payload)
+
+    def create_run(**kwargs: object) -> object:
+        client.evals.runs.create_calls.append(kwargs)
+        return _run_payload(kwargs["metadata"])
+
+    client.evals.runs.create = create_run  # type: ignore[method-assign]
+    transport.create_run(_batch_run_request())
+
+    assert client.evals.runs.create_calls[0]["data_source"][
+        "input_messages"
+    ] == {
+        "message": "{{item.query}}",
+        "context": {
+            "case_id": "{{item.case_id}}",
+            "attempt": 1,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "input_messages",
+    [
+        {},
+        {"message": "constant without an item reference"},
+        {"message": "{{query}}"},
+        {"message": "{{item.}}"},
+        {"message": object()},
+    ],
+)
+def test_batch_binding_rejects_invalid_invocation_freeform_shape(
+    input_messages: Mapping[str, object],
+) -> None:
+    transport, client = _transport()
+    payload = _definition_payload()
+    payload["configuration"]["batch"]["input_messages"] = dict(input_messages)
+
+    with pytest.raises(
+        EvaluationSchemaError,
+        match="input_messages|item reference|JSON",
+    ):
+        transport.create_definition(payload)
+
+    assert client.evals.create_calls == []
+
+
 @pytest.mark.parametrize(
     "input_messages",
     [
