@@ -1564,6 +1564,37 @@ def test_resume_does_not_re_register_assets(tmp_path: Path) -> None:
     assert len(harness.registration_gateway.registered) == 2
 
 
+def test_run_accepts_equivalent_windows_asset_line_endings(
+    tmp_path: Path,
+) -> None:
+    spec, dev_content, evaluator_content = _spec_with_registration()
+    dev_path = ".foundry-optimizer/specs/issue-7/assets/dataset-dev.jsonl"
+    evaluator_path = "agent/evaluators/quality.py"
+    (tmp_path / dev_path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / dev_path).write_bytes(
+        dev_content.replace(b"\n", b"\r\n")
+    )
+    (tmp_path / evaluator_path).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / evaluator_path).write_bytes(
+        evaluator_content.replace(b"\n", b"\r\n")
+    )
+    _write_spec_bundle(
+        tmp_path,
+        spec,
+        {
+            "dataset-dev": dev_path,
+            "dataset-val": None,
+            "evaluator-quality": evaluator_path,
+        },
+    )
+    harness = _harness(tmp_path)
+
+    result = harness.runner().execute(_request(tmp_path, OptimizePhase.RUN))
+
+    assert result.status is OptimizeCommandStatus.AWAITING_AGENT
+    assert len(harness.registration_gateway.registered) == 2
+
+
 def test_run_blocks_when_asset_content_tampered(tmp_path: Path) -> None:
     spec, _, evaluator_content = _spec_with_registration()
     dev_path = ".foundry-optimizer/specs/issue-7/assets/dataset-dev.jsonl"

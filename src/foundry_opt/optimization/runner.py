@@ -96,6 +96,7 @@ from foundry_opt.optimization.assets import (
     EvaluationAssetError,
     EvaluationAssetRegistrationGateway,
     TraceAssetRegistrationBlockedError,
+    canonicalize_repository_asset_content,
     materialize_prepared_asset,
 )
 from foundry_opt.optimization.commands import (
@@ -1803,7 +1804,9 @@ class IssueOptimizationRunner:
                 )
             return provenance
         absolute = root / path
-        content = _read_repo_file(root, absolute)
+        content = canonicalize_repository_asset_content(
+            _read_repo_file(root, absolute)
+        )
         if (
             provenance.content_sha256 is not None
             and hashlib.sha256(content).hexdigest() != provenance.content_sha256

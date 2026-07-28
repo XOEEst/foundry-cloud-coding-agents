@@ -124,10 +124,11 @@ def _read_repository_relative_file(
     repository_root: Path,
     relative_path: Path,
 ) -> bytes:
-    """Read the exact bytes of ``relative_path`` under ``repository_root``.
+    """Read canonical bytes for ``relative_path`` under ``repository_root``.
 
     Rejects symlinked path components, paths that resolve outside of
-    ``repository_root``, and missing files.
+    ``repository_root``, and missing files. UTF-8 text uses LF line endings so
+    its provenance hash is stable across Git checkouts on Windows and Linux.
     """
 
     root = Path(repository_root)
@@ -149,7 +150,17 @@ def _read_repository_relative_file(
     if not current.is_file():
         raise MissingAssetFileError(relative_path)
 
-    return current.read_bytes()
+    return canonicalize_repository_asset_content(current.read_bytes())
+
+
+def canonicalize_repository_asset_content(content: bytes) -> bytes:
+    """Normalize UTF-8 text line endings without changing binary content."""
+
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
 
 
 def _require_source(request: EvaluationAssetRequest, source_type: str) -> None:
@@ -652,4 +663,3 @@ def materialize_prepared_asset(
     return provenance.model_copy(
         update={"remote_id": identity.remote_id, "version": identity.version}
     )
-

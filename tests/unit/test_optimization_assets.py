@@ -179,6 +179,30 @@ def test_repository_provider_reads_exact_bytes_and_hashes(tmp_path: Path) -> Non
     assert prepared.provenance.metrics == ()
 
 
+def test_repository_provider_canonicalizes_text_line_endings(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "datasets").mkdir()
+    windows_content = (
+        b'{"query": "hi", "expected_behavior": "greet"}\r\n'
+        b'{"query": "bye", "expected_behavior": "close"}\r\n'
+    )
+    canonical_content = windows_content.replace(b"\r\n", b"\n")
+    (tmp_path / "datasets" / "development.jsonl").write_bytes(
+        windows_content
+    )
+
+    prepared = RepositoryAssetProvider().prepare(
+        _request(), _context(tmp_path)
+    )
+
+    path = Path("datasets/development.jsonl")
+    assert prepared.files[path] == canonical_content
+    assert prepared.provenance.content_sha256 == __import__("hashlib").sha256(
+        canonical_content
+    ).hexdigest()
+
+
 def test_repository_provider_rejects_missing_file(tmp_path: Path) -> None:
     provider = RepositoryAssetProvider()
     request = _request()
