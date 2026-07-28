@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum, StrEnum
 import hashlib
 import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -314,7 +314,7 @@ class OptimizationSpec(StrictContract):
     @property
     def canonical_json(self) -> str:
         return json.dumps(
-            self.model_dump(mode="json"),
+            _canonical_value(self.model_dump(mode="python")),
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -323,6 +323,32 @@ class OptimizationSpec(StrictContract):
     @property
     def sha256(self) -> str:
         return hashlib.sha256(self.canonical_json.encode("utf-8")).hexdigest()
+
+
+def _canonical_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (set, frozenset)):
+        normalized = (_canonical_value(item) for item in value)
+        return sorted(
+            normalized,
+            key=lambda item: json.dumps(
+                item,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ),
+        )
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    if isinstance(value, Enum):
+        return _canonical_value(value.value)
+    if isinstance(value, Path):
+        return value.as_posix()
+    return value
 
 
 class OptimizationSpecApproval(StrictContract):

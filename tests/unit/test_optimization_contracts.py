@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 from pydantic import ValidationError
 import pytest
@@ -216,6 +220,58 @@ def test_spec_hash_is_deterministic_and_goal_sensitive() -> None:
     assert first.sha256 == same.sha256
     assert first.canonical_json == same.canonical_json
     assert first.sha256 != changed.sha256
+
+
+def test_spec_hash_sorts_unordered_contract_fields() -> None:
+    values = _spec().model_dump()
+    values["metrics"]["quality"]["repeat"] = {
+        "max_repeats": 1,
+        "conditions": {"noisy", "borderline", "partial"},
+    }
+    spec = OptimizationSpec.model_validate(values)
+
+    document = json.loads(spec.canonical_json)
+
+    assert document["allowed_mutations"] == [
+        "python_logic",
+        "system_instructions",
+    ]
+    assert document["metrics"]["quality"]["repeat"]["conditions"] == [
+        "borderline",
+        "noisy",
+        "partial",
+    ]
+
+
+def test_spec_hash_is_stable_across_python_hash_seeds() -> None:
+    values = _spec().model_dump(mode="json")
+    values["metrics"]["quality"]["repeat"] = {
+        "max_repeats": 1,
+        "conditions": ["noisy", "borderline", "partial"],
+    }
+    script = (
+        "import json, os;"
+        "from foundry_opt.optimization import OptimizationSpec;"
+        "print(OptimizationSpec.model_validate("
+        "json.loads(os.environ['SPEC_DOCUMENT'])).sha256)"
+    )
+    hashes = set()
+    for seed in ("1", "2", "3", "4"):
+        environment = {
+            **os.environ,
+            "PYTHONHASHSEED": seed,
+            "SPEC_DOCUMENT": json.dumps(values),
+        }
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        hashes.add(completed.stdout.strip())
+
+    assert len(hashes) == 1
 
 
 def test_spec_approval_binds_hash_and_merge_commit() -> None:
