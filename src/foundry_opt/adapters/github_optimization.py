@@ -177,7 +177,7 @@ class GhOptimizationGateway:
                 "--repo",
                 repository,
                 "--state",
-                "all",
+                "open",
                 "--search",
                 f'"{marker}" in:body',
                 "--json",
