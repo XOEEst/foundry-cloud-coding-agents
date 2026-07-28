@@ -122,6 +122,7 @@ def test_bundle_generates_control_and_verification_workflows() -> None:
         assert document["jobs"]
         text = files[path]
         assert "foundry-opt" in text
+        assert "GH_TOKEN: ${{ github.token }}" in text
         assert "@main" not in text
         assert "@master" not in text
 

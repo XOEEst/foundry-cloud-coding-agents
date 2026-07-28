@@ -333,6 +333,8 @@ jobs:
   control:
     runs-on: ubuntu-latest
     environment: {json.dumps(request.environment_name)}
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
     steps:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
       - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
@@ -374,6 +376,8 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'foundry-opt/') &&
       contains(github.event.pull_request.body, '<!-- foundry-opt:candidate-pr:')
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
     steps:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
         with:
@@ -439,6 +443,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     environment: {json.dumps(request.environment_name)}
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
     steps:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
       - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
