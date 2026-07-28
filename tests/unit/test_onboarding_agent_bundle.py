@@ -188,3 +188,12 @@ def test_dispatch_inputs_are_passed_through_environment_variables() -> None:
     assert '--issue "$OPTIMIZATION_ISSUE"' in control
     assert '--issue "${{ inputs.issue }}"' not in deployed
     assert "OPTIMIZATION_ISSUE: ${{ inputs.issue }}" in deployed
+
+
+def test_control_workflow_fetches_specification_base_history() -> None:
+    control = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )[Path(".github/workflows/foundry-optimization-control.yml")]
+
+    assert "fetch-depth: 0" in control

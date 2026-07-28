@@ -337,6 +337,8 @@ jobs:
       GH_TOKEN: ${{{{ github.token }}}}
     steps:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
         with:
           client-id: ${{{{ vars.AZURE_CLIENT_ID }}}}
