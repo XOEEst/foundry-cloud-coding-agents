@@ -335,6 +335,9 @@ jobs:
     environment: {json.dumps(request.environment_name)}
     env:
       GH_TOKEN: ${{{{ github.token }}}}
+      AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
+      AZURE_CLIENT_ID: ${{{{ vars.AZURE_CLIENT_ID }}}}
+      AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
     steps:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
         with:

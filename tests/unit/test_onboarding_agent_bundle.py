@@ -197,3 +197,16 @@ def test_control_workflow_fetches_specification_base_history() -> None:
     )[Path(".github/workflows/foundry-optimization-control.yml")]
 
     assert "fetch-depth: 0" in control
+
+
+def test_control_workflow_exports_oidc_identity_to_optimizer() -> None:
+    control = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )[Path(".github/workflows/foundry-optimization-control.yml")]
+
+    assert "AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}" in control
+    assert "AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}" in control
+    assert (
+        "AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}" in control
+    )
