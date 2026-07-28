@@ -6,6 +6,7 @@ from foundry_opt.onboarding.models import (
     DraftPullRequestPublication,
     DraftProbeResult,
     FoundryAgentDiscovery,
+    GitHubVariableChange,
     OnboardingChange,
     OidcTrustResult,
     OnboardingRequest,
@@ -59,3 +60,11 @@ class OnboardingPublisher(Protocol):
         changes: tuple[OnboardingChange, ...],
         draft_pull_request: DraftPullRequest,
     ) -> DraftPullRequestPublication: ...
+
+
+class GitHubVariableConfigurer(Protocol):
+    def configure(
+        self,
+        request: OnboardingRequest,
+        discovery: RepositoryDiscovery,
+    ) -> tuple[GitHubVariableChange, ...]: ...

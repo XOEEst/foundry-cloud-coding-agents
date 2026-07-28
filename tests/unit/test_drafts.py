@@ -15,6 +15,7 @@ from foundry_opt.adapters.drafts import (
     DraftApiError,
     DraftAuthenticationError,
     DraftAuthorizationError,
+    DraftConflictError,
     DraftGateway,
     DraftHashMismatchError,
     DraftResponseError,
@@ -260,6 +261,79 @@ def test_create_draft_uses_preview_rest_contract_and_preserves_binary_zip(
         assert archive.read("main.py") == binary
     assert client.closed is True
     assert credentials.credential.closed is True
+
+
+def test_create_draft_inherits_baseline_runtime_when_config_omitted(
+    tmp_path: Path,
+) -> None:
+    # A DraftRequest with no runtime/dependency override (the safe default)
+    # must inherit the published baseline's code runtime/dependency and hosted
+    # CPU/memory/protocol, updating only the entry point for the new bundle.
+    request = DraftRequest(
+        project_endpoint=PROJECT_ENDPOINT,
+        agent_name="demo-agent",
+        base_version=7,
+        bundle=_bundle(tmp_path),
+        entry_point=("python", "main.py"),
+    )
+    assert request.runtime is None
+    assert request.dependency_resolution is None
+    assert request.cpu is None and request.memory is None
+    assert request.protocol is None and request.protocol_version is None
+
+    client = FakeProjectClient([_baseline(), _draft(request.bundle.sha256)])
+    gateway, _ = _gateway(client)
+
+    gateway.create_draft(request)
+
+    _, create_call = client.requests
+    definition = json.loads(_multipart_part(create_call, "metadata")[1])[
+        "definition"
+    ]
+    # Code runtime/dependency inherited from the baseline; entry_point updated.
+    assert definition["code_configuration"] == {
+        "runtime": "python_3_14",
+        "entry_point": ["python", "main.py"],
+        "dependency_resolution": "bundled",
+    }
+    # Hosted CPU/memory/protocol remain inherited untouched.
+    assert definition["cpu"] == "2"
+    assert definition["memory"] == "4Gi"
+    assert definition["protocol_versions"] == [
+        {"protocol": "invocations", "version": "1.0.0"}
+    ]
+
+
+def test_create_draft_overrides_only_configured_code_fields(
+    tmp_path: Path,
+) -> None:
+    # An explicit runtime override replaces only the baseline code runtime;
+    # dependency stays inherited when unset, entry_point always updates, and
+    # the hosted CPU/memory/protocol remain inherited.
+    request = DraftRequest(
+        project_endpoint=PROJECT_ENDPOINT,
+        agent_name="demo-agent",
+        base_version=7,
+        bundle=_bundle(tmp_path),
+        entry_point=("python", "main.py"),
+        runtime="python_3_13",
+    )
+    client = FakeProjectClient([_baseline(), _draft(request.bundle.sha256)])
+    gateway, _ = _gateway(client)
+
+    gateway.create_draft(request)
+
+    _, create_call = client.requests
+    definition = json.loads(_multipart_part(create_call, "metadata")[1])[
+        "definition"
+    ]
+    assert definition["code_configuration"] == {
+        "runtime": "python_3_13",
+        "entry_point": ["python", "main.py"],
+        "dependency_resolution": "bundled",
+    }
+    assert definition["cpu"] == "2"
+    assert definition["memory"] == "4Gi"
 
 
 def test_create_draft_rejects_release_shaped_response(tmp_path: Path) -> None:
@@ -570,3 +644,139 @@ def test_delete_probe_rejects_replayed_record(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         gateway.delete_probe(record)
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe draft idempotency
+# ---------------------------------------------------------------------------
+
+
+_IDEMPOTENCY_KEY = hashlib.sha256(b"campaign\0candidate-1").hexdigest()
+
+
+def _idempotent_request(tmp_path: Path) -> DraftRequest:
+    values = _request(tmp_path).__dict__
+    return DraftRequest(
+        **{
+            **values,
+            "idempotency_key": _IDEMPOTENCY_KEY,
+            "subject": "candidate-1",
+        }
+    )
+
+
+def _versions_list(*items: dict[str, Any]) -> FakeResponse:
+    return FakeResponse(200, {"value": list(items)})
+
+
+def _existing_draft_version(
+    source_sha256: str,
+    *,
+    version: str = "draft-candidate-1",
+    idempotency_key: str = _IDEMPOTENCY_KEY,
+) -> dict[str, Any]:
+    return {
+        "version": version,
+        "draft": True,
+        "status": "ready",
+        "metadata": {
+            "foundry-opt-idempotency-key": idempotency_key,
+            "foundry-opt-source-sha256": source_sha256,
+            "foundry-opt-subject": "candidate-1",
+        },
+    }
+
+
+def test_create_draft_reuses_existing_draft_for_idempotency_key(
+    tmp_path: Path,
+) -> None:
+    request = _idempotent_request(tmp_path)
+    client = FakeProjectClient(
+        [
+            _baseline(),
+            _versions_list(_existing_draft_version(request.bundle.sha256)),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.create_draft(request)
+
+    assert record.version_id == "draft-candidate-1"
+    assert record.sha256 == request.bundle.sha256
+    # No POST was issued: only the baseline GET and the versions LIST.
+    methods = [call.method for call in client.requests]
+    assert methods == ["GET", "GET"]
+
+
+def test_create_draft_posts_when_no_matching_draft_exists(
+    tmp_path: Path,
+) -> None:
+    request = _idempotent_request(tmp_path)
+    client = FakeProjectClient(
+        [
+            _baseline(),
+            _versions_list(
+                _existing_draft_version(
+                    "f" * 64, idempotency_key=hashlib.sha256(b"other").hexdigest()
+                )
+            ),
+            _draft(request.bundle.sha256, version="draft-candidate-1"),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.create_draft(request)
+
+    assert record.version_id == "draft-candidate-1"
+    methods = [call.method for call in client.requests]
+    assert methods == ["GET", "GET", "POST"]
+
+
+def test_create_draft_rejects_conflicting_idempotency_key(
+    tmp_path: Path,
+) -> None:
+    request = _idempotent_request(tmp_path)
+    # Same idempotency key, different source bundle hash: a genuine conflict.
+    client = FakeProjectClient(
+        [
+            _baseline(),
+            _versions_list(_existing_draft_version("a" * 64)),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DraftConflictError):
+        gateway.create_draft(request)
+
+
+def test_create_draft_without_idempotency_key_skips_listing(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeProjectClient([_baseline(), _draft(request.bundle.sha256)])
+    gateway, _ = _gateway(client)
+
+    gateway.create_draft(request)
+
+    # No LIST call: the sequence is exactly baseline GET then create POST.
+    methods = [call.method for call in client.requests]
+    assert methods == ["GET", "POST"]
+
+
+def test_idempotent_draft_embeds_key_and_subject_in_metadata(
+    tmp_path: Path,
+) -> None:
+    request = _idempotent_request(tmp_path)
+    client = FakeProjectClient(
+        [_baseline(), _versions_list(), _draft(request.bundle.sha256)]
+    )
+    gateway, _ = _gateway(client)
+
+    gateway.create_draft(request)
+
+    post = client.requests[-1]
+    _, metadata_bytes = _multipart_part(post, "metadata")
+    metadata = json.loads(metadata_bytes)["metadata"]
+    assert metadata["foundry-opt-idempotency-key"] == _IDEMPOTENCY_KEY
+    assert metadata["foundry-opt-subject"] == "candidate-1"
+    assert metadata["foundry-opt-source-sha256"] == request.bundle.sha256

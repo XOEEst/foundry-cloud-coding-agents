@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,7 @@ from foundry_opt.evaluation import (
     Outcome,
     Usage,
 )
-from foundry_opt.evidence import EvidenceManifest
+from foundry_opt.evidence import EvaluationAssetReference, EvidenceManifest
 from foundry_opt.packaging import (
     BundleArtifact,
     ValidationReport,
@@ -44,6 +45,34 @@ from foundry_opt.packaging import (
 
 
 BASE_COMMIT = "a" * 40
+GOAL = (
+    "Improve response quality for the acceptance agent while preserving "
+    "safety guardrails across every candidate."
+)
+GOAL_SHA256 = hashlib.sha256(GOAL.encode("utf-8")).hexdigest()
+SPEC_SHA256 = "9" * 64
+ASSETS = (
+    EvaluationAssetReference(
+        asset_id="dataset-dev",
+        kind="dataset",
+        source="repository",
+        role="development",
+    ),
+    EvaluationAssetReference(
+        asset_id="dataset-val",
+        kind="dataset",
+        source="repository",
+        role="validation",
+    ),
+    EvaluationAssetReference(
+        asset_id="evaluator-quality",
+        kind="evaluator",
+        source="builtin",
+        name="quality",
+        version="1",
+        metrics=("quality",),
+    ),
+)
 
 
 class FakeClock:
@@ -255,6 +284,9 @@ def _request(tmp_path: Path, *, candidates: int = 2) -> CampaignRequest:
                 ),
             )
         ),
+        goal=GOAL,
+        spec_sha256=SPEC_SHA256,
+        assets=ASSETS,
     )
 
 
@@ -306,6 +338,8 @@ def _dependencies(
             8,
             (),
             (),
+            "f" * 64,
+            request.spec_sha256,
         )
 
     return CampaignDependencies(
@@ -394,6 +428,8 @@ def test_campaign_runs_exact_base_and_adapts_candidates_sequentially(
                 result.run.run_id
                 for result in (request.baseline, *request.candidates)
             ),
+            "f" * 64,
+            request.spec_sha256,
         )
 
     request = _request(tmp_path)
@@ -990,6 +1026,9 @@ def test_hard_guardrail_blocks_provisional_pareto_and_held_out_funnel(
                 ),
             )
         ),
+        goal=GOAL,
+        spec_sha256=SPEC_SHA256,
+        assets=ASSETS,
     )
 
     report = run_campaign(request, dependencies)
@@ -1079,6 +1118,9 @@ def test_stale_active_state_is_reported_without_restarting_slots(
             "active",
             clock.now() - timedelta(hours=2),
             clock.now() - timedelta(hours=2),
+            GOAL_SHA256,
+            SPEC_SHA256,
+            ASSETS,
             launched_slots=1,
         ),
     )
@@ -1113,6 +1155,9 @@ def test_orphaned_active_state_is_not_silently_restarted(
             "active",
             clock.now() - timedelta(minutes=30),
             clock.now() - timedelta(minutes=30),
+            GOAL_SHA256,
+            SPEC_SHA256,
+            ASSETS,
             launched_slots=1,
         ),
     )

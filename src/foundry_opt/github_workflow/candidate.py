@@ -18,6 +18,7 @@ from foundry_opt.github_workflow.models import (
     CandidateApplicationRequest,
     CandidateApplicationResult,
     CandidateApplicationStatus,
+    CandidateMergeMode,
     ExactPatchRequest,
     GitHubCapabilities,
     GitHubPermissionReport,
@@ -347,6 +348,35 @@ def _candidate_pull_request_body(
     changed = "\n".join(
         f"- `{path.as_posix()}`" for path in applied.changed_paths
     )
+    if request.decision_policy.mode is CandidateMergeMode.HUMAN:
+        policy = (
+            "This PR contains only the exact verified patch. Automation must "
+            "not merge or deploy it."
+        )
+    else:
+        checks = "\n".join(
+            f"- `{check}`"
+            for check in request.decision_policy.required_checks
+        )
+        policy = "\n".join(
+            (
+                "This PR contains only the exact verified patch.",
+                "",
+                "Autopilot eligible only through "
+                "`foundry-opt optimize reconcile`.",
+                "Spec SHA-256: "
+                f"`{request.decision_policy.spec_sha256}`",
+                f"Merge actor: `{request.decision_policy.merge_actor}`",
+                "Required checks:",
+                checks,
+                "Deployment dispatch: "
+                + (
+                    "allowed after verified merge"
+                    if request.decision_policy.deployment_allowed
+                    else "not allowed"
+                ),
+            )
+        )
     return "\n".join(
         (
             "<!-- foundry-opt:candidate-pr:"
@@ -359,8 +389,7 @@ def _candidate_pull_request_body(
             f"Patch SHA-256: `{request.candidate.patch.sha256}`",
             f"Evidence SHA-256: `{request.evidence_sha256}`",
             "",
-            "This PR contains only the exact verified patch. Automation must "
-            "not merge or deploy it.",
+            policy,
             "",
             "## Changed paths",
             changed,
@@ -404,6 +433,23 @@ def _candidate_pr_matches(
         in pull_request.body
         and f"Evidence SHA-256: `{request.evidence_sha256}`"
         in pull_request.body
+        and _policy_matches(pull_request.body, request)
+    )
+
+
+def _policy_matches(
+    body: str,
+    request: CandidateApplicationRequest,
+) -> bool:
+    policy = request.decision_policy
+    if policy.mode is CandidateMergeMode.HUMAN:
+        return True
+    return (
+        "Autopilot eligible only through "
+        "`foundry-opt optimize reconcile`." in body
+        and f"Spec SHA-256: `{policy.spec_sha256}`" in body
+        and f"Merge actor: `{policy.merge_actor}`" in body
+        and all(f"- `{check}`" in body for check in policy.required_checks)
     )
 
 

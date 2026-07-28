@@ -1,4 +1,7 @@
-from foundry_opt.evaluation.funnel import run_evaluation_funnel
+from foundry_opt.evaluation.funnel import (
+    evaluate_with_repeat,
+    run_evaluation_funnel,
+)
 from foundry_opt.evaluation.models import (
     AgentVersionRef,
     CandidateDecision,
@@ -59,5 +62,6 @@ __all__ = [
     "Usage",
     "normalize_evaluation",
     "run_evaluation_funnel",
+    "evaluate_with_repeat",
     "select_eligible_candidates",
 ]

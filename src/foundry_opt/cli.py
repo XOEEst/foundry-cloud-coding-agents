@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 from typing import Annotated
 
 import typer
@@ -12,6 +13,11 @@ from foundry_opt.onboarding import (
     OnboardingResult,
     run_onboarding,
 )
+from foundry_opt.optimization import (
+    OptimizeCommandRequest,
+    OptimizationCommandService,
+    OptimizePhase,
+)
 from foundry_opt.preflight.models import PreflightRequest
 from foundry_opt.preflight.redaction import redact
 from foundry_opt.preflight.rendering import render_human, render_json
@@ -22,6 +28,17 @@ app = typer.Typer(
     help="Optimize Microsoft Foundry coding agents with reviewable evidence.",
     no_args_is_help=True,
 )
+optimize_app = typer.Typer(
+    help="Run an issue-driven Foundry optimization workflow.",
+    invoke_without_command=True,
+    no_args_is_help=False,
+)
+app.add_typer(optimize_app, name="optimize")
+candidate_app = typer.Typer(
+    help="Drive the filesystem candidate handoff for a running campaign.",
+    no_args_is_help=True,
+)
+optimize_app.add_typer(candidate_app, name="candidate")
 
 
 def _version_callback(value: bool) -> None:
@@ -64,6 +81,15 @@ def build_onboarding_dependencies() -> OnboardingDependencies:
     return build_production_onboarding_dependencies()
 
 
+def build_optimization_command_service() -> OptimizationCommandService:
+    """Return the issue-driven optimization command service."""
+    from foundry_opt.optimization.production import (
+        build_optimization_command_service as build_service,
+    )
+
+    return build_service()
+
+
 def _render_onboarding(result: OnboardingResult) -> str:
     lines = [f"Onboarding {result.status.value}"]
     for change in result.changes:
@@ -74,6 +100,14 @@ def _render_onboarding(result: OnboardingResult) -> str:
         lines.append(f"Blocked: {redact(blocker)}")
     for residual in result.residual_state:
         lines.append(f"Residual state: {redact(residual)}")
+    for variable in result.variable_changes:
+        location = variable.scope.value
+        if variable.environment is not None:
+            location += f"/{variable.environment}"
+        lines.append(
+            "GitHub variable: "
+            f"[{variable.status.value}] {location}/{variable.name}"
+        )
     for guidance in result.guidance:
         lines.append(f"Next: {guidance}")
     lines.append(f"Draft PR: {result.draft_pull_request.title}")
@@ -81,6 +115,221 @@ def _render_onboarding(result: OnboardingResult) -> str:
     if result.published_pull_request is not None:
         lines.append(f"Draft PR URL: {result.published_pull_request.url}")
     return "\n".join(lines)
+
+
+def _execute_optimize(
+    *,
+    issue_number: int,
+    phase: OptimizePhase,
+    candidate_id: str | None = None,
+    idea_file: Path | None = None,
+    verify_only: bool = False,
+    json_output: bool = False,
+) -> None:
+    try:
+        request = OptimizeCommandRequest(
+            repository_root=Path.cwd(),
+            issue_number=issue_number,
+            phase=phase,
+            candidate_id=candidate_id,
+            idea_file=idea_file,
+            verify_only=verify_only,
+        )
+    except ValueError as error:
+        typer.echo(f"Optimization input error: {redact(str(error))}", err=True)
+        raise typer.Exit(2) from None
+    result = build_optimization_command_service().execute(request)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Optimization {result.status.value}: {redact(result.summary)}"
+        )
+        for key, value in result.details.items():
+            typer.echo(f"- {key}: {redact(str(value))}")
+        if result.next_action is not None:
+            typer.echo(f"Next action: {redact(result.next_action)}")
+    raise typer.Exit(result.exit_code)
+
+
+@optimize_app.callback()
+def optimize_command(
+    context: typer.Context,
+    issue_number: Annotated[
+        int | None,
+        typer.Option(
+            "--issue",
+            min=1,
+            help="GitHub issue number defining the optimization job.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Run the next valid optimization phase for an issue."""
+    if context.invoked_subcommand is not None:
+        return
+    if issue_number is None:
+        raise typer.BadParameter("--issue is required")
+    _execute_optimize(
+        issue_number=issue_number,
+        phase=OptimizePhase.AUTO,
+        json_output=json_output,
+    )
+
+
+@optimize_app.command("spec")
+def optimize_spec(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Prepare or reconcile an optimization specification PR."""
+    _execute_optimize(
+        issue_number=issue_number,
+        phase=OptimizePhase.SPEC,
+        json_output=json_output,
+    )
+
+
+@optimize_app.command("run")
+def optimize_run(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Run an approved optimization specification."""
+    _execute_optimize(
+        issue_number=issue_number,
+        phase=OptimizePhase.RUN,
+        json_output=json_output,
+    )
+
+
+@optimize_app.command("apply")
+def optimize_apply(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Candidate issue number."),
+    ],
+    candidate_id: Annotated[
+        str,
+        typer.Option(
+            "--candidate",
+            help="Exact evaluated candidate identifier.",
+        ),
+    ] = ...,
+    verify_only: Annotated[
+        bool,
+        typer.Option(
+            "--verify-only",
+            help="Verify the existing candidate PR without publishing changes.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Apply one exact evaluated candidate patch."""
+    _execute_optimize(
+        issue_number=issue_number,
+        phase=OptimizePhase.APPLY,
+        candidate_id=candidate_id,
+        verify_only=verify_only,
+        json_output=json_output,
+    )
+
+
+@optimize_app.command("reconcile")
+def optimize_reconcile(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Reconcile candidate decisions, deployment, and issue state."""
+    _execute_optimize(
+        issue_number=issue_number,
+        phase=OptimizePhase.RECONCILE,
+        json_output=json_output,
+    )
+
+
+@candidate_app.command("request")
+def optimize_candidate_request(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Reserve the next candidate slot and prepare an isolated worktree."""
+    _execute_optimize(
+        issue_number=issue_number,
+        phase=OptimizePhase.CANDIDATE_REQUEST,
+        json_output=json_output,
+    )
+
+
+@candidate_app.command("submit")
+def optimize_candidate_submit(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    candidate_id: Annotated[
+        str,
+        typer.Option(
+            "--candidate",
+            help="Reserved candidate identifier awaiting an idea.",
+        ),
+    ] = ...,
+    idea_file: Annotated[
+        Path,
+        typer.Option(
+            "--idea-file",
+            help="Path to the strict candidate idea JSON file.",
+        ),
+    ] = ...,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Validate, evaluate, and package one agent-authored candidate idea."""
+    _execute_optimize(
+        issue_number=issue_number,
+        phase=OptimizePhase.CANDIDATE_SUBMIT,
+        candidate_id=candidate_id,
+        idea_file=idea_file,
+        json_output=json_output,
+    )
 
 
 @app.command()
@@ -219,19 +468,56 @@ def init_command(
             help="Exact version or 40-character Git commit install spec.",
         ),
     ] = f"foundry-cloud-coding-agent=={__version__}",
+    set_github_variables: Annotated[
+        bool,
+        typer.Option(
+            "--set-github-variables",
+            help=(
+                "Create repository-level GitHub Agents variables for Azure "
+                "OIDC identifiers."
+            ),
+        ),
+    ] = False,
+    mirror_actions_environment: Annotated[
+        str | None,
+        typer.Option(
+            "--mirror-actions-environment",
+            help=(
+                "Also create the identifiers in an existing Actions "
+                "deployment environment."
+            ),
+        ),
+    ] = None,
+    update_github_variables: Annotated[
+        bool,
+        typer.Option(
+            "--update-github-variables",
+            help=(
+                "Replace differing GitHub variable values. Requires "
+                "--set-github-variables."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Discover and draft secretless repository onboarding."""
-    request = OnboardingRequest(
-        repository_root=Path.cwd(),
-        environment_name=environment,
-        target_name=target,
-        project_endpoint=project_endpoint,
-        project_resource_id=project_resource_id,
-        tenant_id=tenant_id,
-        client_id=client_id,
-        subscription_id=subscription_id,
-        product_install=product_install,
-    )
+    try:
+        request = OnboardingRequest(
+            repository_root=Path.cwd(),
+            environment_name=environment,
+            target_name=target,
+            project_endpoint=project_endpoint,
+            project_resource_id=project_resource_id,
+            tenant_id=tenant_id,
+            client_id=client_id,
+            subscription_id=subscription_id,
+            product_install=product_install,
+            set_github_variables=set_github_variables,
+            mirror_actions_environment=mirror_actions_environment,
+            update_github_variables=update_github_variables,
+        )
+    except ValueError as error:
+        typer.echo(f"Onboarding input error: {redact(str(error))}", err=True)
+        raise typer.Exit(2) from None
     result = run_onboarding(request, build_onboarding_dependencies())
     typer.echo(_render_onboarding(result))
     raise typer.Exit(result.exit_code)

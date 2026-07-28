@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 
 from foundry_opt.campaign.models import PatchArtifact
@@ -164,6 +165,84 @@ class CampaignGit:
         worktree = CampaignWorktree(candidate_id, path, branch, base_commit)
         self._worktrees[path.resolve()] = worktree
         return worktree
+
+    def open_worktree(
+        self,
+        repository_root: Path,
+        campaign_id: str,
+        candidate_id: str,
+        base_commit: str,
+    ) -> CampaignWorktree:
+        root = _repository_root(repository_root)
+        _identifier(campaign_id, "campaign_id")
+        _identifier(candidate_id, "candidate_id")
+        _commit(base_commit)
+        worktree_root = contained_worktree_root(root, campaign_id)
+        path = worktree_root / candidate_id
+        resolved = path.resolve()
+        existing = self._worktrees.get(resolved)
+        if existing is not None:
+            return existing
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError("campaign worktree does not exist")
+        branch = f"foundry-opt/{campaign_id}/{candidate_id}"
+        registered_paths: set[Path] = set()
+        for line in self._git(root, "worktree", "list", "--porcelain").split(
+            b"\n"
+        ):
+            if line.startswith(b"worktree "):
+                raw = line[len(b"worktree "):].decode("utf-8", "replace")
+                try:
+                    registered_paths.add(Path(raw).expanduser().resolve())
+                except OSError:
+                    continue
+        if resolved not in registered_paths:
+            raise ValueError("campaign worktree is not registered with Git")
+        worktree = CampaignWorktree(candidate_id, path, branch, base_commit)
+        self._worktrees[resolved] = worktree
+        return worktree
+
+    def reconcile_worktree(
+        self,
+        repository_root: Path,
+        campaign_id: str,
+        candidate_id: str,
+        base_commit: str,
+    ) -> CampaignWorktree:
+        """Discard any orphan worktree/branch, then recreate a clean worktree.
+
+        Used to recover from a crash between ``create_worktree`` and the
+        durable ``awaiting_idea`` reservation: the partially created worktree
+        (registered branch + directory) is force-removed before a fresh
+        worktree is created at the exact base commit.
+        """
+        root = _repository_root(repository_root)
+        _identifier(campaign_id, "campaign_id")
+        _identifier(candidate_id, "candidate_id")
+        _commit(base_commit)
+        worktree_root = contained_worktree_root(root, campaign_id)
+        path = worktree_root / candidate_id
+        branch = f"foundry-opt/{campaign_id}/{candidate_id}"
+        if os.path.lexists(path):
+            # Only ever operate inside the managed worktree area.
+            require_managed_worktree(root, path)
+            subprocess.run(
+                ("git", "worktree", "remove", "--force", str(path)),
+                cwd=root,
+                check=False,
+                capture_output=True,
+            )
+            if os.path.lexists(path):
+                _remove_managed_tree(path)
+        subprocess.run(
+            ("git", "branch", "-D", branch),
+            cwd=root,
+            check=False,
+            capture_output=True,
+        )
+        self._git(root, "worktree", "prune")
+        self._worktrees.pop(path.resolve(), None)
+        return self.create_worktree(root, campaign_id, candidate_id, base_commit)
 
     def changed_paths(
         self,
@@ -356,6 +435,16 @@ def _repository_root(path: Path) -> Path:
 def _identifier(value: str, field: str) -> None:
     if not _IDENTIFIER.fullmatch(value):
         raise ValueError(f"{field} is invalid")
+
+
+def _remove_managed_tree(path: Path) -> None:
+    """Force-remove a managed worktree directory, rejecting symlinks."""
+    if path.is_symlink():
+        raise ValueError("refusing to remove a symlinked worktree path")
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def _commit(value: str) -> None:

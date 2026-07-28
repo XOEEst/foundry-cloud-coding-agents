@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 from math import isfinite
 from pathlib import Path
@@ -13,7 +14,15 @@ from foundry_opt.evaluation import (
     Outcome,
     select_eligible_candidates,
 )
-from foundry_opt.evidence.models import EvidenceManifest, EvidenceRequest
+from foundry_opt.evidence.models import (
+    EvaluationAssetReference,
+    EvidenceManifest,
+    EvidenceRequest,
+)
+from foundry_opt.security import reject_secret_content
+
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class SensitiveEvidenceError(ValueError):
@@ -37,7 +46,16 @@ def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
     output_path = request.output_path.absolute()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _reject_symlink_components(output_path)
+    digest = hashlib.sha256(serialized).hexdigest()
+    manifest = _evidence_manifest(request, output_path, serialized, digest)
     if output_path.exists():
+        # Idempotent re-write: an identical deterministic serialization (for
+        # example on a publication retry after a crash between the evidence
+        # write and publication) reuses the existing artifact. Different bytes
+        # are a genuine conflict and must never be silently overwritten.
+        existing = output_path.read_bytes()
+        if existing == serialized:
+            return manifest
         raise FileExistsError(output_path)
     temporary_path = output_path.with_name(
         f".{output_path.name}.{secrets.token_hex(12)}.writing"
@@ -55,6 +73,15 @@ def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
             temporary_path.unlink()
         except FileNotFoundError:
             pass
+    return manifest
+
+
+def _evidence_manifest(
+    request: EvidenceRequest,
+    output_path: Path,
+    serialized: bytes,
+    digest: str,
+) -> EvidenceManifest:
     runs = tuple(
         run
         for result in (request.baseline, *request.candidates)
@@ -62,10 +89,12 @@ def write_redacted_evidence(request: EvidenceRequest) -> EvidenceManifest:
     )
     return EvidenceManifest(
         path=output_path,
-        sha256=hashlib.sha256(serialized).hexdigest(),
+        sha256=digest,
         byte_count=len(serialized),
         evaluation_ids=_unique(run.evaluation_id for run in runs),
         run_ids=_unique(run.run_id for run in runs),
+        goal_sha256=_goal_sha256(request.goal),
+        spec_sha256=request.spec_sha256,
     )
 
 
@@ -76,6 +105,9 @@ def _build_document(request: EvidenceRequest) -> dict[str, object]:
         "schema_version": 1,
         "campaign_id": request.campaign_id,
         "source_hash": request.source_hash,
+        "goal_sha256": _goal_sha256(request.goal),
+        "spec_sha256": request.spec_sha256,
+        "assets": [_asset_document(asset) for asset in request.assets],
         "baseline": _result_document(request.baseline),
         "candidates": [
             {
@@ -375,6 +407,10 @@ def _is_finite_number(value: object) -> bool:
 def _validate_evidence_identifiers(request: EvidenceRequest) -> None:
     _require_identifier(request.campaign_id, "campaign_id")
     _require_identifier(request.source_hash, "source_hash")
+    _validate_goal(request.goal)
+    if not _SHA256.fullmatch(request.spec_sha256):
+        raise ValueError("spec_sha256 must be a SHA-256 digest")
+    _validate_assets(request.assets)
     for subject_id, patch_hash in (request.patch_hashes or {}).items():
         _require_identifier(subject_id, "patch subject_id")
         _require_identifier(patch_hash, "patch_hash")
@@ -512,6 +548,47 @@ def _require_identifier(value: object, field: str) -> str:
     if not isinstance(value, str) or not _safe_identifier(value):
         raise ValueError(f"{field} must be a safe bounded identifier.")
     return value
+
+
+def _validate_goal(goal: object) -> None:
+    if not isinstance(goal, str) or not 20 <= len(goal) <= 4000:
+        raise ValueError(
+            "Evidence goal must be a string between 20 and 4000 characters."
+        )
+    reject_secret_content(goal)
+
+
+def _validate_assets(assets: tuple[EvaluationAssetReference, ...]) -> None:
+    if not isinstance(assets, tuple) or not all(
+        isinstance(asset, EvaluationAssetReference) for asset in assets
+    ):
+        raise ValueError(
+            "Evidence assets must be a tuple of asset references."
+        )
+    asset_ids = tuple(asset.asset_id for asset in assets)
+    if len(asset_ids) != len(set(asset_ids)):
+        raise ValueError(
+            "Evidence asset references must have unique asset IDs."
+        )
+
+
+def _goal_sha256(goal: str) -> str:
+    return hashlib.sha256(goal.encode("utf-8")).hexdigest()
+
+
+def _asset_document(asset: EvaluationAssetReference) -> dict[str, object]:
+    return {
+        "asset_id": asset.asset_id,
+        "kind": asset.kind,
+        "source": asset.source,
+        "role": asset.role,
+        "name": asset.name,
+        "version": asset.version,
+        "remote_id": asset.remote_id,
+        "content_sha256": asset.content_sha256,
+        "approval_gate": asset.approval_gate,
+        "metrics": list(asset.metrics),
+    }
 
 
 def _reject_symlink_components(path: Path) -> None:

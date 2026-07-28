@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import re
 
 import yaml
 
 from foundry_opt.config.models import OptimizerConfig
+from foundry_opt.onboarding.bundle import generate_repository_agent_bundle
 from foundry_opt.onboarding.models import (
     DeploymentWorkflowDiscovery,
     EvaluatorDiscovery,
@@ -155,7 +155,6 @@ on:
 jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
-    environment: {json.dumps(request.environment_name)}
     permissions:
       contents: read
       id-token: write
@@ -165,9 +164,13 @@ jobs:
       - name: Export non-secret Azure OIDC identifiers
         shell: bash
         run: |
-          echo "AZURE_TENANT_ID=${{{{ vars.AZURE_TENANT_ID }}}}" >> "$GITHUB_ENV"
-          echo "AZURE_CLIENT_ID=${{{{ vars.AZURE_CLIENT_ID }}}}" >> "$GITHUB_ENV"
-          echo "AZURE_SUBSCRIPTION_ID=${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}" >> "$GITHUB_ENV"
+          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_SUBSCRIPTION_ID; do
+            if [ -z "${{!name:-}}" ]; then
+              echo "Missing GitHub Agents variable: $name" >&2
+              exit 1
+            fi
+            printf '%s=%s\\n' "$name" "${{!name}}" >> "$GITHUB_ENV"
+          done
       - name: Sign in to Azure with repository-ID OIDC
         uses: {AZURE_LOGIN_ACTION} # v3.0.0
         with:
@@ -184,29 +187,17 @@ jobs:
         run: uv tool install {shell_quote(request.product_install)}
 """
 
-    skill_text = f"""---
-name: foundry-agent-optimizer
-description: Safely prepare and run Foundry agent optimization campaigns.
----
-
-# Foundry Agent Optimizer
-
-- Run `foundry-opt preflight --target {request.target_name}` before a campaign.
-- Use environment `{request.environment_name}` and target `{request.target_name}`.
-- Keep Azure authentication OIDC-only. Never request or store client secrets,
-  certificates, tokens, connection strings, prompts, dataset rows, or traces.
-- The verified immutable repository-ID OIDC subject is `{oidc_subject}`.
-- Optimize only configured paths and deployed model choices. Never deploy models,
-  broaden permissions, use ACR, or change production routing.
-- Draft creation must return a real `draft-*` version. Treat unavailable source-bundle
-  support or any published version as a blocker, never as success.
-- Commit only redacted evidence and exact patch artifacts for developer review.
-"""
-    return {
+    contents = {
         Path(".github/foundry-optimizer.yaml"): config_text,
         Path(".github/workflows/copilot-setup-steps.yml"): workflow_text,
-        Path(".github/skills/foundry-agent-optimizer/SKILL.md"): skill_text,
     }
+    contents.update(
+        generate_repository_agent_bundle(
+            request,
+            oidc_subject=oidc_subject,
+        )
+    )
+    return contents
 
 
 def validate_generation_inputs(

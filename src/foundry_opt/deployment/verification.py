@@ -8,13 +8,16 @@ from statistics import median
 import subprocess
 import uuid
 
+from foundry_opt.deployment.errors import DeploymentLineageMismatchError
 from foundry_opt.deployment.models import (
     DeploymentCheck,
     DeploymentTrigger,
     DeploymentVerification,
     DeploymentVerificationRequest,
     DeploymentVerificationStatus,
+    OptimizationDeploymentLineage,
     WorkflowRunStatus,
+    optimization_deployment_lineage_sha256,
 )
 from foundry_opt.evaluation import (
     AgentVersionRef,
@@ -42,6 +45,27 @@ from foundry_opt.packaging import BundleRequest, build_source_bundle
 
 
 _SUCCESS_STATUSES = {"active"}
+
+
+def verify_optimization_deployment_lineage(
+    actual: OptimizationDeploymentLineage | None,
+    expected: OptimizationDeploymentLineage,
+) -> None:
+    """Raise a stable typed error if lineage provenance does not match.
+
+    ``actual`` is the lineage recorded on the published deployment
+    (``DeploymentRecord.lineage``); ``expected`` is the lineage the
+    verifier requires (``DeploymentVerificationRequest.expected_lineage``).
+    Both must be exact matches for every issue, spec, campaign, candidate,
+    draft, hash, and commit field.
+    """
+
+    if (
+        not isinstance(expected, OptimizationDeploymentLineage)
+        or not isinstance(actual, OptimizationDeploymentLineage)
+        or actual != expected
+    ):
+        raise DeploymentLineageMismatchError()
 
 
 def verify_deployed_selection(
@@ -106,6 +130,7 @@ def verify_deployed_selection(
         else None
     )
     reproduction = _reproduce_selection(request)
+    lineage_ok = _lineage_provenance_matches(request)
     checks = (
         DeploymentCheck(
             "patch_sha256",
@@ -240,6 +265,10 @@ def verify_deployed_selection(
             runtime is not None
             and runtime.portal_url == request.expected_portal_url
             and request.record.portal_url == request.expected_portal_url,
+        ),
+        DeploymentCheck(
+            "lineage_provenance",
+            lineage_ok,
         ),
     )
     verified = all(check.passed for check in checks)
@@ -674,6 +703,21 @@ def _verify_serialized_aggregates(
             raise ValueError
 
 
+def _lineage_provenance_matches(
+    request: DeploymentVerificationRequest,
+) -> bool:
+    if request.expected_lineage is None:
+        return True
+    try:
+        verify_optimization_deployment_lineage(
+            request.record.lineage,
+            request.expected_lineage,
+        )
+    except DeploymentLineageMismatchError:
+        return False
+    return True
+
+
 def _record_metadata_matches(
     request: DeploymentVerificationRequest,
 ) -> bool:
@@ -687,6 +731,10 @@ def _record_metadata_matches(
         "foundry-opt-tree-hash": request.expected_tree_hash,
         "foundry-opt-evidence-sha256": request.expected_evidence_sha256,
     }
+    if request.expected_lineage is not None:
+        expected["foundry-opt-lineage-sha256"] = (
+            optimization_deployment_lineage_sha256(request.expected_lineage)
+        )
     return all(
         request.record.metadata.get(key) == value
         for key, value in expected.items()

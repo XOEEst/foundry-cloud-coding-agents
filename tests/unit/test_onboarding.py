@@ -152,6 +152,11 @@ class FailingPublisher:
         raise RuntimeError("push rejected")
 
 
+class FailingVariables:
+    def configure(self, request, discovery):
+        raise RuntimeError("variable API unavailable")
+
+
 class TestChangeWriter:
     def prevalidate(self, repository_root, contents):
         return tuple(
@@ -215,11 +220,21 @@ def test_run_onboarding_generates_secretless_draft_change_set(
         commit_sha="abc123",
     )
     assert result.draft_pull_request.title == "Configure Foundry optimizer onboarding"
-    assert {change.path.as_posix() for change in result.changes} == {
+    generated_paths = {
+        change.path.as_posix() for change in result.changes
+    }
+    assert {
         ".github/foundry-optimizer.yaml",
         ".github/workflows/copilot-setup-steps.yml",
         ".github/skills/foundry-agent-optimizer/SKILL.md",
-    }
+        ".github/ISSUE_TEMPLATE/foundry-optimization.yml",
+        ".github/agents/foundry-optimization-planner.agent.md",
+        ".github/agents/foundry-optimization-runner.agent.md",
+        ".github/agents/foundry-candidate-applier.agent.md",
+        ".github/workflows/foundry-optimization-control.yml",
+        ".github/workflows/foundry-exact-candidate-check.yml",
+        ".github/workflows/foundry-post-deployment-check.yml",
+    } <= generated_paths
     assert probe.deleted == [
         ("support-agent", "draft-onboarding-probe")
     ]
@@ -235,15 +250,15 @@ def test_run_onboarding_generates_secretless_draft_change_set(
         if change.path.as_posix()
         == ".github/workflows/copilot-setup-steps.yml"
     )
-    assert 'runs-on: ubuntu-latest\n    environment: "acceptance"' in workflow
+    assert "runs-on: ubuntu-latest" in workflow
+    assert "environment:" not in workflow
     assert "python-version: '3.12'" in generated
-    assert "AZURE_TENANT_ID=${{ vars.AZURE_TENANT_ID }}" in generated
-    assert "AZURE_CLIENT_ID=${{ vars.AZURE_CLIENT_ID }}" in generated
+    assert "Missing GitHub Agents variable: $name" in generated
     assert (
-        "AZURE_SUBSCRIPTION_ID=${{ vars.AZURE_SUBSCRIPTION_ID }}"
-        in generated
+        "for name in AZURE_TENANT_ID AZURE_CLIENT_ID "
+        "AZURE_SUBSCRIPTION_ID" in generated
     )
-    assert generated.count('>> "$GITHUB_ENV"') == 3
+    assert 'printf \'%s=%s\\n\' "$name" "${!name}" >> "$GITHUB_ENV"' in generated
     assert "client-id: ${{ env.AZURE_CLIENT_ID }}" in generated
     assert "tenant-id: ${{ env.AZURE_TENANT_ID }}" in generated
     assert (
@@ -276,6 +291,37 @@ def test_run_onboarding_generates_secretless_draft_change_set(
     )
     loaded = load_config(tmp_path / ".github/foundry-optimizer.yaml")
     assert loaded.default_environment == "acceptance"
+
+
+def test_run_onboarding_reports_partial_after_variable_failure(
+    tmp_path: Path,
+) -> None:
+    request = OnboardingRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "set_github_variables": True,
+        }
+    )
+
+    result = run_onboarding(
+        request,
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+            publisher=FakePublisher(),
+            change_writer=TestChangeWriter(),
+            variables=FailingVariables(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.PARTIAL
+    assert result.published_pull_request is not None
+    assert result.published_pull_request.url.endswith("/pull/42")
+    assert "GitHub variable configuration failed" in result.blockers[0]
+    assert result.residual_state == (
+        "Draft onboarding PR: https://github.com/octo-org/agents/pull/42",
+    )
 
 
 def test_run_onboarding_preserves_existing_files_and_reports_conflicts(

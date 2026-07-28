@@ -15,6 +15,8 @@ from pydantic import (
     model_validator,
 )
 
+from foundry_opt.security import reject_secret_content
+
 
 def _repository_path(value: Any) -> PurePosixPath:
     if not isinstance(value, (str, PurePosixPath)):
@@ -107,6 +109,54 @@ class IssueOverride(StrEnum):
     CANDIDATE_CUTOFF_MINUTES = "candidate_cutoff_minutes"
     MAX_CHANGED_CANDIDATES = "max_changed_candidates"
     TRANSIENT_RETRIES = "transient_retries"
+
+
+class AutomationPolicy(ConfigModel):
+    allowed_dataset_sources: set[str] = Field(
+        default_factory=lambda: {"foundry", "repository"},
+        min_length=1,
+    )
+    allowed_evaluator_sources: set[str] = Field(
+        default_factory=lambda: {"foundry", "repository", "builtin"},
+        min_length=1,
+    )
+    synthetic_max_rows: int = Field(default=100, ge=1, le=1000)
+    trace_requires_human_review: Literal[True] = True
+    allow_spec_auto_approval: bool = False
+    allow_candidate_auto_selection: bool = False
+    allow_merge: bool = False
+    allow_deployment: bool = False
+    merge_actor: str | None = None
+    required_checks: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_automation_order(self) -> AutomationPolicy:
+        for source in (
+            *self.allowed_dataset_sources,
+            *self.allowed_evaluator_sources,
+        ):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", source):
+                raise ValueError("automation asset sources must be identifiers")
+        if self.allow_merge and not self.allow_candidate_auto_selection:
+            raise ValueError("merge requires candidate auto selection")
+        if self.allow_merge and not self.merge_actor:
+            raise ValueError("merge_actor is required when merge is enabled")
+        if self.allow_merge and not self.required_checks:
+            raise ValueError(
+                "required_checks are required when merge is enabled"
+            )
+        if self.allow_deployment and not self.allow_merge:
+            raise ValueError("automated deployment requires merge")
+        if self.merge_actor is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            self.merge_actor,
+        ):
+            raise ValueError("merge_actor must be an identifier")
+        if len(self.required_checks) != len(set(self.required_checks)):
+            raise ValueError("required_checks must be unique")
+        if any(not check.strip() for check in self.required_checks):
+            raise ValueError("required_checks must not contain empty values")
+        return self
 
 
 class DeploymentWorkflow(ConfigModel):
@@ -207,6 +257,28 @@ class CampaignOverrides(ConfigModel):
         return self
 
 
+class AgentRuntime(ConfigModel):
+    """The hosted-agent runtime contract for a campaign draft.
+
+    A campaign candidate is a source-only mutation of the *same* hosted agent,
+    so by default every field is ``None`` — meaning *inherit the published
+    baseline version's contract* rather than a guessed value that would
+    silently overwrite it (e.g. forcing ``python_3_12`` onto a ``python_3_13``
+    baseline). A target overrides an individual field only by configuring it
+    explicitly; the production draft creator forwards these inherit-or-override
+    values into the ``DraftRequest``, and the draft gateway leaves the
+    baseline's runtime/dependency and hosted CPU/memory/protocol untouched for
+    every field left as ``None``.
+    """
+
+    runtime: str | None = Field(default=None, min_length=1)
+    dependency_resolution: Literal["remote_build", "bundled"] | None = None
+    cpu: str | None = Field(default=None, min_length=1)
+    memory: str | None = Field(default=None, min_length=1)
+    protocol: str | None = Field(default=None, min_length=1)
+    protocol_version: str | None = Field(default=None, min_length=1)
+
+
 class AgentTarget(ConfigModel):
     environment: str = Field(min_length=1)
     source_paths: list[RepositoryPath] = Field(min_length=1)
@@ -220,6 +292,7 @@ class AgentTarget(ConfigModel):
     metrics: dict[str, MetricPolicy] = Field(min_length=1)
     allowed_mutations: set[MutationClass] = Field(min_length=1)
     restricted_opt_ins: RestrictedOptIns = Field(default_factory=RestrictedOptIns)
+    runtime: AgentRuntime = Field(default_factory=AgentRuntime)
     campaign_overrides: CampaignOverrides | None = None
 
     @model_validator(mode="after")
@@ -266,82 +339,14 @@ class OptimizerConfig(ConfigModel):
     environments: dict[str, EnvironmentProfile] = Field(min_length=1)
     targets: dict[str, AgentTarget] = Field(min_length=1)
     campaign: CampaignDefaults
+    automation_policy: AutomationPolicy = Field(
+        default_factory=AutomationPolicy
+    )
 
     @model_validator(mode="before")
     @classmethod
     def reject_secrets(cls, value: Any) -> Any:
-        secret_keys = {
-            "access_key",
-            "api_key",
-            "client_certificate",
-            "client_secret",
-            "connection_string",
-            "credential",
-            "password",
-            "private_key",
-            "secret",
-            "secret_value",
-            "shared_key",
-            "signing_key",
-            "token",
-        }
-        plural_secret_keys = {
-            "access_keys",
-            "access_tokens",
-            "api_keys",
-            "client_certificates",
-            "client_secrets",
-            "connection_strings",
-            "credentials",
-            "passwords",
-            "private_keys",
-            "secrets",
-            "shared_keys",
-            "signing_keys",
-        }
-        secret_value_markers = (
-            "accountkey=",
-            "github_pat_",
-            "ghp_",
-            "-----begin private key-----",
-        )
-
-        def visit(node: Any, path: tuple[str | int, ...] = ()) -> None:
-            if isinstance(node, dict):
-                for key, child in node.items():
-                    snake_key = re.sub(
-                        r"([a-z0-9])([A-Z])",
-                        r"\1_\2",
-                        str(key).replace("-", "_"),
-                    )
-                    normalized = snake_key.casefold()
-                    has_secret_name = (
-                        normalized in secret_keys
-                        or normalized in plural_secret_keys
-                        or any(
-                            normalized.endswith(f"_{suffix}")
-                            for suffix in secret_keys | plural_secret_keys
-                        )
-                    )
-                    if has_secret_name:
-                        location = ".".join(map(str, (*path, key)))
-                        raise ValueError(
-                            f"configuration must not contain secrets ({location})"
-                        )
-                    visit(child, (*path, key))
-            elif isinstance(node, list):
-                for index, child in enumerate(node):
-                    visit(child, (*path, index))
-            elif isinstance(node, str):
-                lowered = node.casefold()
-                if any(marker in lowered for marker in secret_value_markers):
-                    location = ".".join(map(str, path))
-                    raise ValueError(
-                        f"configuration must not contain secrets ({location})"
-                    )
-
-        visit(value)
-        return value
+        return reject_secret_content(value)
 
     @model_validator(mode="after")
     def validate_references(self) -> OptimizerConfig:

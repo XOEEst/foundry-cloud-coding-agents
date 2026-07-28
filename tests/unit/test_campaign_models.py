@@ -8,6 +8,33 @@ from foundry_opt.campaign.models import (
     CandidateArtifact,
     PatchArtifact,
 )
+from foundry_opt.evidence import EvaluationAssetReference
+
+
+GOAL_SHA256 = "1" * 64
+SPEC_SHA256 = "2" * 64
+ASSETS = (
+    EvaluationAssetReference(
+        asset_id="dataset-dev",
+        kind="dataset",
+        source="repository",
+        role="development",
+    ),
+    EvaluationAssetReference(
+        asset_id="dataset-val",
+        kind="dataset",
+        source="repository",
+        role="validation",
+    ),
+    EvaluationAssetReference(
+        asset_id="evaluator-quality",
+        kind="evaluator",
+        source="builtin",
+        name="quality",
+        version="1",
+        metrics=("quality",),
+    ),
+)
 
 
 def _patch(candidate_id: str = "candidate-1") -> PatchArtifact:
@@ -73,9 +100,15 @@ def test_campaign_report_binds_pareto_ids_to_unique_candidates() -> None:
         baseline_draft_id="draft-baseline",
         candidates=(candidate,),
         pareto_candidate_ids=("candidate-1",),
+        goal_sha256=GOAL_SHA256,
+        spec_sha256=SPEC_SHA256,
+        assets=ASSETS,
     )
 
     assert report.pareto_candidate_ids == ("candidate-1",)
+    assert report.goal_sha256 == GOAL_SHA256
+    assert report.spec_sha256 == SPEC_SHA256
+    assert report.assets == ASSETS
 
     with pytest.raises(ValueError):
         CampaignReport(
@@ -85,4 +118,33 @@ def test_campaign_report_binds_pareto_ids_to_unique_candidates() -> None:
             baseline_draft_id="draft-baseline",
             candidates=(candidate,),
             pareto_candidate_ids=("missing",),
+            goal_sha256=GOAL_SHA256,
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
+        )
+
+    with pytest.raises(ValueError):
+        CampaignReport(
+            campaign_id="campaign-1",
+            target="acceptance-agent",
+            base_commit="b" * 40,
+            baseline_draft_id="draft-baseline",
+            candidates=(candidate,),
+            pareto_candidate_ids=("candidate-1",),
+            goal_sha256="not-a-hash",
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
+        )
+
+    with pytest.raises(ValueError):
+        CampaignReport(
+            campaign_id="campaign-1",
+            target="acceptance-agent",
+            base_commit="b" * 40,
+            baseline_draft_id="draft-baseline",
+            candidates=(candidate,),
+            pareto_candidate_ids=("candidate-1",),
+            goal_sha256=GOAL_SHA256,
+            spec_sha256=SPEC_SHA256,
+            assets=(ASSETS[0], ASSETS[0]),
         )

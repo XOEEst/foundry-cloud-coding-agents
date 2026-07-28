@@ -20,6 +20,8 @@ from foundry_opt.github_workflow.models import (
     CandidateApplicationResult,
     CandidateApplicationStatus,
     CandidateApplicationRequest,
+    CandidateMergeMode,
+    CandidatePullRequestPolicy,
     CandidateIssuePublication,
     GitHubCapabilities,
     GitHubPermissionReport,
@@ -32,6 +34,13 @@ from foundry_opt.github_workflow.models import (
 )
 from foundry_opt.github_workflow.candidate import verify_and_apply_candidate
 from foundry_opt.github_workflow.publication import publish_campaign
+from foundry_opt.github_workflow.reconcile import (
+    CandidateReconcileEntry,
+    CandidateReconcileRequest,
+    CandidateReconcileResult,
+    CandidateReconcileStatus,
+    reconcile_candidates,
+)
 
 __all__ = [
     "AppliedPatch",
@@ -46,7 +55,13 @@ __all__ = [
     "CandidateApplicationResult",
     "CandidateApplicationStatus",
     "CandidateIssuePublication",
+    "CandidateMergeMode",
+    "CandidatePullRequestPolicy",
     "CandidatePublicationError",
+    "CandidateReconcileEntry",
+    "CandidateReconcileRequest",
+    "CandidateReconcileResult",
+    "CandidateReconcileStatus",
     "ExactPatchRequest",
     "GitHubCapabilities",
     "GitHubPermissionDeniedError",
@@ -61,5 +76,6 @@ __all__ = [
     "RepositoryState",
     "WorkflowFailure",
     "publish_campaign",
+    "reconcile_candidates",
     "verify_and_apply_candidate",
 ]

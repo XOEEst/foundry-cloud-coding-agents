@@ -4,6 +4,8 @@ import re
 from types import MappingProxyType
 from typing import Mapping
 
+from foundry_opt.evidence import EvaluationAssetReference
+
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -118,6 +120,9 @@ class CampaignReport:
     baseline_draft_id: str
     candidates: tuple[CandidateArtifact, ...]
     pareto_candidate_ids: tuple[str, ...]
+    goal_sha256: str
+    spec_sha256: str
+    assets: tuple[EvaluationAssetReference, ...]
 
     def __post_init__(self) -> None:
         _identifier(self.campaign_id, "campaign_id")
@@ -137,3 +142,16 @@ class CampaignReport:
             raise ValueError("pareto candidate IDs must be unique")
         if not set(self.pareto_candidate_ids).issubset(candidate_ids):
             raise ValueError("pareto candidate IDs must reference candidates")
+        if not _SHA256.fullmatch(self.goal_sha256):
+            raise ValueError("goal_sha256 is invalid")
+        if not _SHA256.fullmatch(self.spec_sha256):
+            raise ValueError("spec_sha256 is invalid")
+        if not isinstance(self.assets, (tuple, list)) or not all(
+            isinstance(asset, EvaluationAssetReference) for asset in self.assets
+        ):
+            raise ValueError(
+                "assets must be a tuple of EvaluationAssetReference"
+            )
+        asset_ids = tuple(asset.asset_id for asset in self.assets)
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError("asset IDs must be unique")

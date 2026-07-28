@@ -19,6 +19,7 @@ from foundry_opt.evaluation import (
     select_eligible_candidates,
 )
 from foundry_opt.evidence import (
+    EvaluationAssetReference,
     EvidenceRequest,
     SensitiveEvidenceError,
     TelemetryEvidence,
@@ -26,6 +27,35 @@ from foundry_opt.evidence import (
 )
 
 from test_evaluation_selection import POLICY, _result
+
+
+GOAL = (
+    "Improve response quality for the acceptance agent while preserving "
+    "safety guardrails across every candidate."
+)
+SPEC_SHA256 = "9" * 64
+ASSETS = (
+    EvaluationAssetReference(
+        asset_id="dataset-dev",
+        kind="dataset",
+        source="repository",
+        role="development",
+    ),
+    EvaluationAssetReference(
+        asset_id="dataset-val",
+        kind="dataset",
+        source="repository",
+        role="validation",
+    ),
+    EvaluationAssetReference(
+        asset_id="evaluator-quality",
+        kind="evaluator",
+        source="builtin",
+        name="quality",
+        version="1",
+        metrics=("quality",),
+    ),
+)
 
 
 def test_write_redacted_evidence_writes_allowlisted_compact_manifest(
@@ -61,6 +91,9 @@ def test_write_redacted_evidence_writes_allowlisted_compact_manifest(
             pareto=pareto,
             metric_policies=POLICY,
             source_hash="sha256:source",
+            goal=GOAL,
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
             patch_hashes={"candidate": "sha256:patch"},
         )
     )
@@ -107,6 +140,9 @@ def test_evidence_writer_strips_query_and_fragment_from_portal_links(
             ),
             metric_policies=POLICY,
             source_hash="sha256:source",
+            goal=GOAL,
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
         )
     )
 
@@ -138,6 +174,9 @@ def test_evidence_writer_rejects_untrusted_portal_host_and_path(
             pareto=select_eligible_candidates(baseline, (candidate,), POLICY),
             metric_policies=POLICY,
             source_hash="sha256:source",
+            goal=GOAL,
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
         )
     )
 
@@ -166,6 +205,9 @@ def test_evidence_writer_rejects_noncanonical_portal_path(
             pareto=select_eligible_candidates(baseline, (), POLICY),
             metric_policies=POLICY,
             source_hash="sha256:source",
+            goal=GOAL,
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
         )
     )
 
@@ -202,6 +244,9 @@ def test_evidence_writer_omits_non_finite_raw_float_scores(
             pareto=select_eligible_candidates(baseline, (candidate,), POLICY),
             metric_policies=POLICY,
             source_hash="sha256:source",
+            goal=GOAL,
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
         )
     )
 
@@ -264,6 +309,9 @@ def test_evidence_writer_never_persists_provider_controlled_text(
             pareto=select_eligible_candidates(baseline, (candidate,), POLICY),
             metric_policies=POLICY,
             source_hash="sha256:source",
+            goal=GOAL,
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
         )
     )
 
@@ -326,6 +374,9 @@ def test_evidence_writer_rejects_sensitive_values_in_every_string_field(
                 pareto=select_eligible_candidates(baseline, (), POLICY),
                 metric_policies=POLICY,
                 source_hash=source_hash,
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
                 telemetry=(
                     TelemetryEvidence(
                         response_id=telemetry_response_id,
@@ -366,6 +417,9 @@ def test_evidence_writer_rejects_telemetry_for_unserialized_response(
                 pareto=select_eligible_candidates(baseline, (), POLICY),
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
                 telemetry=(
                     TelemetryEvidence(
                         response_id="response-production",
@@ -430,6 +484,9 @@ def test_evidence_writer_revalidates_telemetry_model_boundary(
                 pareto=select_eligible_candidates(baseline, (), POLICY),
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
                 telemetry=(telemetry,),
             )
         )
@@ -464,6 +521,9 @@ def test_evidence_writer_rejects_unsafe_result_identifiers(
                 pareto=select_eligible_candidates(baseline, (), POLICY),
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
             )
         )
 
@@ -514,6 +574,9 @@ def test_evidence_writer_rejects_unsafe_case_and_trace_identifiers(
                 ),
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
             )
         )
 
@@ -560,6 +623,9 @@ def test_evidence_writer_requires_pareto_exactly_bound_to_candidates(
                 pareto=pareto_factory(valid),
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
             )
         )
 
@@ -587,6 +653,9 @@ def test_evidence_writer_recomputes_and_rejects_fabricated_pareto(
                 pareto=fabricated,
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
             )
         )
 
@@ -608,6 +677,9 @@ def test_evidence_writer_rejects_duplicate_candidate_subject_ids(
                 pareto=pareto,
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
             )
         )
 
@@ -629,10 +701,41 @@ def test_evidence_writer_does_not_overwrite_existing_destination(
                 pareto=select_eligible_candidates(baseline, (), POLICY),
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
             )
         )
 
     assert output.read_text(encoding="utf-8") == "external-content"
+
+
+def test_evidence_writer_reuses_byte_identical_existing_manifest(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "evidence.json"
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    request = EvidenceRequest(
+        output_path=output,
+        campaign_id="campaign-1",
+        baseline=baseline,
+        candidates=(),
+        pareto=select_eligible_candidates(baseline, (), POLICY),
+        metric_policies=POLICY,
+        source_hash="sha256:source",
+        goal=GOAL,
+        spec_sha256=SPEC_SHA256,
+        assets=ASSETS,
+    )
+
+    first = write_redacted_evidence(request)
+    original_bytes = output.read_bytes()
+    # A deterministic re-write (for example a publication retry) reuses the
+    # existing artifact instead of raising FileExistsError.
+    second = write_redacted_evidence(request)
+
+    assert first == second
+    assert output.read_bytes() == original_bytes
 
 
 def test_evidence_writer_rejects_symlink_destination(tmp_path: Path) -> None:
@@ -655,6 +758,9 @@ def test_evidence_writer_rejects_symlink_destination(tmp_path: Path) -> None:
                 pareto=select_eligible_candidates(baseline, (), POLICY),
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
             )
         )
 
@@ -700,5 +806,8 @@ def test_evidence_writer_rejects_foreign_attempt_run_lineage(
                 pareto=select_eligible_candidates(baseline, (), POLICY),
                 metric_policies=POLICY,
                 source_hash="sha256:source",
+                goal=GOAL,
+                spec_sha256=SPEC_SHA256,
+                assets=ASSETS,
             )
         )

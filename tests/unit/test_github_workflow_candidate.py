@@ -12,6 +12,8 @@ from foundry_opt.github_workflow import (
     ArtifactInspection,
     CandidateApplicationRequest,
     CandidateApplicationStatus,
+    CandidateMergeMode,
+    CandidatePullRequestPolicy,
     CandidatePublicationError,
     ExactPatchRequest,
     GitHubCapabilities,
@@ -266,6 +268,41 @@ def test_exact_candidate_patch_creates_one_branch_commit_and_pr() -> None:
     assert gateway.comments == [
         (101, "Exact candidate patch published as #55.")
     ]
+    assert "Automation must not merge or deploy it." in body
+
+
+def test_autopilot_candidate_pr_names_policy_actor_and_checks() -> None:
+    request, artifacts = _inputs()
+    request = CandidateApplicationRequest(
+        **{
+            **request.__dict__,
+            "decision_policy": CandidatePullRequestPolicy(
+                mode=CandidateMergeMode.AUTOPILOT,
+                spec_sha256="f" * 64,
+                merge_actor="foundry-opt-merge-app",
+                required_checks=(
+                    "foundry-opt/spec",
+                    "foundry-opt/exact-patch",
+                ),
+                deployment_allowed=True,
+            ),
+        }
+    )
+    gateway = FakeCandidateGateway()
+
+    verify_and_apply_candidate(
+        request,
+        gateway,
+        FakePatchApplier(artifacts),
+    )
+
+    body = gateway.created_prs[0][2]
+    assert "Autopilot eligible" in body
+    assert "foundry-opt-merge-app" in body
+    assert "foundry-opt/spec" in body
+    assert "foundry-opt/exact-patch" in body
+    assert "Spec SHA-256: `" + "f" * 64 + "`" in body
+    assert "only through `foundry-opt optimize reconcile`" in body
 
 
 @pytest.mark.parametrize(

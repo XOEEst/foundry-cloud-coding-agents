@@ -186,6 +186,7 @@ class FakeCommands:
         cwd: Path | None = None,
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
+        input_bytes: bytes | None = None,
     ) -> CommandResult:
         command = tuple(arguments)
         self.invocations.append(command)

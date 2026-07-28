@@ -95,6 +95,7 @@ def _run_campaign(
 ) -> CampaignReport:
     root = request.repository_root.expanduser().resolve()
     pinned = dependencies.repository.pin_default_branch(root)
+    goal_sha256 = hashlib.sha256(request.goal.encode("utf-8")).hexdigest()
     lock = dependencies.repository.acquire_lock(
         repository_root=root,
         target=request.target,
@@ -112,7 +113,10 @@ def _run_campaign(
 
     state = dependencies.state.load(root, request.campaign_id)
     if state is not None and (
-        state.target != request.target or state.base_commit != pinned.commit
+        state.target != request.target
+        or state.base_commit != pinned.commit
+        or state.goal_sha256 != goal_sha256
+        or state.spec_sha256 != request.spec_sha256
     ):
         state = replace(
             state,
@@ -144,6 +148,9 @@ def _run_campaign(
         status="active",
         started_at=started,
         updated_at=started,
+        goal_sha256=goal_sha256,
+        spec_sha256=request.spec_sha256,
+        assets=request.assets,
     )
     dependencies.state.save(root, state)
     baseline_worktree = None
@@ -251,6 +258,8 @@ def _run_campaign(
                 restricted_opt_ins=request.restricted_opt_ins,
                 baseline_metrics=state.baseline_metrics,
                 history=tuple(feedback),
+                goal=request.goal,
+                spec_sha256=request.spec_sha256,
             )
             generation_started = dependencies.clock.now()
             try:
@@ -693,6 +702,9 @@ def _run_campaign(
             pareto=development_pareto,
             metric_policies=request.evaluation_policy,
             source_hash=baseline_bundle.sha256,
+            goal=request.goal,
+            spec_sha256=request.spec_sha256,
+            assets=request.assets,
             patch_hashes={
                 candidate.artifact.candidate_id: candidate.artifact.patch.sha256
                 for candidate in state.candidates
@@ -797,6 +809,9 @@ def _run_campaign(
                 pareto=validation_pareto,
                 metric_policies=request.evaluation_policy,
                 source_hash=baseline_bundle.sha256,
+                goal=request.goal,
+                spec_sha256=request.spec_sha256,
+                assets=request.assets,
                 patch_hashes={
                     candidate.artifact.candidate_id:
                     candidate.artifact.patch.sha256
@@ -1060,4 +1075,7 @@ def _report_from_state(state: CampaignState) -> CampaignReport:
             if candidate.artifact is not None
         ),
         pareto_candidate_ids=state.pareto_candidate_ids,
+        goal_sha256=state.goal_sha256,
+        spec_sha256=state.spec_sha256,
+        assets=state.assets,
     )

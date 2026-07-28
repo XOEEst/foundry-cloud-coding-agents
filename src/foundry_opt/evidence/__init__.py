@@ -1,4 +1,5 @@
 from foundry_opt.evidence.models import (
+    EvaluationAssetReference,
     EvidenceManifest,
     EvidenceRequest,
     TelemetryEvidence,
@@ -9,6 +10,7 @@ from foundry_opt.evidence.writer import (
 )
 
 __all__ = [
+    "EvaluationAssetReference",
     "EvidenceManifest",
     "EvidenceRequest",
     "SensitiveEvidenceError",

@@ -70,6 +70,14 @@ class DraftHashMismatchError(DraftError):
         super().__init__("Foundry returned a different source ZIP SHA-256.")
 
 
+class DraftConflictError(DraftError):
+    def __init__(self) -> None:
+        super().__init__(
+            "An existing draft shares this idempotency key but a different "
+            "source bundle."
+        )
+
+
 class CredentialProvider(Protocol):
     def create(self) -> Any: ...
 
@@ -116,6 +124,15 @@ class DraftGateway:
                 ),
             )
             _verify_published_baseline(baseline, request.base_version)
+
+            # Crash-safe idempotency: before creating a new draft, reuse an
+            # existing draft that already carries this idempotency key (and the
+            # identical source bundle), so a POST that succeeded before its
+            # record was persisted is never duplicated.
+            if request.idempotency_key is not None:
+                existing = _find_matching_draft(client, request)
+                if existing is not None:
+                    return existing
 
             metadata = _draft_metadata(request, baseline)
             metadata_json = json.dumps(
@@ -218,13 +235,16 @@ def _draft_metadata(
         raise DraftResponseError()
     configuration = deepcopy(configuration)
     configuration.pop("content_hash", None)
-    configuration.update(
-        {
-            "runtime": request.runtime,
-            "entry_point": list(request.entry_point),
-            "dependency_resolution": request.dependency_resolution,
-        }
-    )
+    # The candidate is a source-only mutation of the same hosted agent, so the
+    # published baseline's runtime/dependency contract is inherited unless the
+    # caller explicitly configured an override. ``entry_point`` always reflects
+    # the new source bundle; the hosted CPU/memory/protocol stay inherited
+    # (they are never part of ``code_configuration``).
+    configuration["entry_point"] = list(request.entry_point)
+    if request.runtime is not None:
+        configuration["runtime"] = request.runtime
+    if request.dependency_resolution is not None:
+        configuration["dependency_resolution"] = request.dependency_resolution
     definition["code_configuration"] = configuration
 
     baseline_metadata = baseline.get("metadata")
@@ -236,6 +256,9 @@ def _draft_metadata(
         "foundry-opt-base-version": str(request.base_version),
         "foundry-opt-source-sha256": request.bundle.sha256,
     }
+    if request.idempotency_key is not None:
+        provenance["foundry-opt-idempotency-key"] = request.idempotency_key
+        provenance["foundry-opt-subject"] = request.subject or ""
     caller_metadata = dict(request.metadata)
     if any(key in caller_metadata for key in provenance):
         raise DraftResponseError()
@@ -250,7 +273,7 @@ def _draft_metadata(
     metadata = {
         **provenance,
         **caller_metadata,
-        **dict(list(inherited_metadata.items())[:inherited_slots]),
+        **dict(list(inherited_metadata.items())[:max(0, inherited_slots)]),
     }
 
     payload: dict[str, Any] = {
@@ -278,6 +301,79 @@ def _verify_published_baseline(
         or payload.get("draft") is not False
     ):
         raise DraftResponseError()
+
+
+_MAX_VERSION_PAGES = 100
+
+
+def _find_matching_draft(
+    client: Any,
+    request: DraftRequest,
+) -> DraftRecord | None:
+    """Return an existing draft that matches the idempotency key, or ``None``.
+
+    Lists the agent's versions and reuses a draft whose provenance metadata
+    records the same idempotency key. A matching key with a *different* source
+    bundle hash is a genuine conflict and is rejected.
+    """
+    url: str | None = _versions_url(
+        request.project_endpoint, request.agent_name
+    )
+    pages = 0
+    while url is not None and pages < _MAX_VERSION_PAGES:
+        payload = _send_json(
+            client,
+            HttpRequest(
+                "GET",
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "Foundry-Features": _PREVIEW_HEADER,
+                },
+            ),
+        )
+        items = payload.get("value")
+        if not isinstance(items, list):
+            raise DraftResponseError()
+        for item in items:
+            record = _matching_draft_record(item, request)
+            if record is not None:
+                return record
+        next_link = payload.get("nextLink")
+        url = next_link if isinstance(next_link, str) and next_link else None
+        pages += 1
+    return None
+
+
+def _matching_draft_record(
+    item: Any,
+    request: DraftRequest,
+) -> DraftRecord | None:
+    if not isinstance(item, dict) or item.get("draft") is not True:
+        return None
+    metadata = item.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("foundry-opt-idempotency-key") != request.idempotency_key:
+        return None
+    version = item.get("version")
+    if not isinstance(version, str) or not _DRAFT_VERSION.fullmatch(version):
+        raise DraftResponseError()
+    source_sha = metadata.get("foundry-opt-source-sha256")
+    if not isinstance(source_sha, str) or (
+        source_sha.casefold() != request.bundle.sha256.casefold()
+    ):
+        raise DraftConflictError()
+    status = item.get("status")
+    return DraftRecord(
+        agent_name=request.agent_name,
+        version_id=version,
+        base_version=request.base_version,
+        sha256=request.bundle.sha256,
+        status=status if isinstance(status, str) else None,
+        probe=request.probe,
+        project_endpoint=request.project_endpoint,
+    )
 
 
 def _parse_draft_response(

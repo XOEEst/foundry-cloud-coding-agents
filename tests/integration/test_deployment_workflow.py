@@ -10,14 +10,18 @@ import pytest
 
 from foundry_opt.deployment import (
     DeployedRuntime,
+    DeploymentLineageMismatchError,
     DeploymentRecord,
     DeploymentTrigger,
     DeploymentVerificationRequest,
     DeploymentVerificationStatus,
     DeploymentWorkflow,
     DeploymentWorkflowRun,
+    OptimizationDeploymentLineage,
     WorkflowRunStatus,
+    optimization_deployment_lineage_sha256,
     verify_deployed_selection,
+    verify_optimization_deployment_lineage,
 )
 from foundry_opt.evaluation import (
     AgentVersionRef,
@@ -347,6 +351,52 @@ def _request(tmp_path: Path) -> DeploymentVerificationRequest:
             portal_url=PORTAL_URL,
         ),
     )
+
+
+def _request_with_lineage(
+    tmp_path: Path,
+    *,
+    record_overrides: dict[str, object] | None = None,
+    expected_overrides: dict[str, object] | None = None,
+) -> DeploymentVerificationRequest:
+    """Layer an OptimizationDeploymentLineage onto ``_request``'s fixture.
+
+    ``record_overrides``/``expected_overrides`` deliberately only support
+    fields that are *not* cross-checked elsewhere at construction time
+    (for example ``parent_issue_number``), so callers can build a
+    self-consistent record/expected-request pair that nonetheless disagree
+    on issue/spec/campaign-PR provenance -- the exact scenario the
+    lineage contract exists to catch.
+    """
+
+    request = _request(tmp_path)
+    base_lineage = OptimizationDeploymentLineage(
+        parent_issue_number=42,
+        spec_sha256="b" * 64,
+        campaign_id=request.expected_campaign_id,
+        campaign_pull_request_number=10,
+        candidate_issue_number=11,
+        candidate_pull_request_number=12,
+        candidate_id=request.candidate_id,
+        selected_draft_id="draft-candidate-1",
+        patch_sha256=request.expected_patch_sha256,
+        evidence_sha256=request.expected_evidence_sha256,
+        selected_tree_sha=request.expected_tree_hash,
+        selected_merge_commit=request.expected_commit,
+    )
+    record_lineage = replace(base_lineage, **(record_overrides or {}))
+    expected_lineage = replace(base_lineage, **(expected_overrides or {}))
+    record = replace(
+        request.record,
+        lineage=record_lineage,
+        metadata={
+            **request.record.metadata,
+            "foundry-opt-lineage-sha256": (
+                optimization_deployment_lineage_sha256(record_lineage)
+            ),
+        },
+    )
+    return replace(request, record=record, expected_lineage=expected_lineage)
 
 
 def test_verify_deployed_selection_reproduces_exact_tree_and_bundle(
@@ -884,3 +934,84 @@ def test_verify_deployed_selection_does_not_fallback_on_failed_run(
         verification.status
         is DeploymentVerificationStatus.WORKFLOW_FAILED
     )
+
+
+def test_verify_deployed_selection_matches_optimization_lineage(
+    tmp_path: Path,
+) -> None:
+    request = _request_with_lineage(tmp_path)
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is True, verification.failed_checks
+    assert verification.status is DeploymentVerificationStatus.VERIFIED
+    assert all(check.passed for check in verification.checks)
+    assert request.record.lineage == request.expected_lineage
+    verify_optimization_deployment_lineage(
+        request.record.lineage, request.expected_lineage
+    )
+
+
+def test_verify_deployed_selection_reports_lineage_provenance_mismatch(
+    tmp_path: Path,
+) -> None:
+    # Record and expectation are otherwise byte-for-byte identical (same
+    # patch/tree/evidence hashes and merge commit); only the parent issue
+    # number that produced the campaign differs. Hash equality alone would
+    # not catch this, which is exactly what the lineage contract exists for.
+    request = _request_with_lineage(
+        tmp_path,
+        record_overrides={"parent_issue_number": 42},
+        expected_overrides={"parent_issue_number": 999},
+    )
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is False
+    assert verification.status is DeploymentVerificationStatus.MISMATCH
+    assert "lineage_provenance" in verification.failed_checks
+    with pytest.raises(DeploymentLineageMismatchError):
+        verify_optimization_deployment_lineage(
+            request.record.lineage, request.expected_lineage
+        )
+
+
+def test_verify_deployed_selection_reports_stale_lineage_evidence_digest(
+    tmp_path: Path,
+) -> None:
+    # The lineage object itself matches, but the metadata-embedded lineage
+    # digest ("deployment evidence") was not updated -- this must still be
+    # caught, since the lineage sha is what is actually retained as
+    # tamper-evident deployment evidence.
+    request = _request_with_lineage(tmp_path)
+    stale_record = replace(
+        request.record,
+        metadata={
+            **request.record.metadata,
+            "foundry-opt-lineage-sha256": "0" * 64,
+        },
+    )
+    request = replace(request, record=stale_record)
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is False
+    assert "service_provenance_record" in verification.failed_checks
+    # The lineage objects still match exactly.
+    assert request.record.lineage == request.expected_lineage
+    assert "lineage_provenance" not in verification.failed_checks
+
+
+def test_verify_deployed_selection_without_lineage_is_unaffected(
+    tmp_path: Path,
+) -> None:
+    # Backward compatibility: requests that never opt into lineage keep
+    # behaving exactly as before, with the check trivially passing.
+    request = _request(tmp_path)
+    assert request.expected_lineage is None
+    assert request.record.lineage is None
+
+    verification = verify_deployed_selection(request)
+
+    assert verification.verified is True, verification.failed_checks
+    assert all(check.passed for check in verification.checks)

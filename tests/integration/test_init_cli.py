@@ -102,6 +102,23 @@ class Publisher:
         )
 
 
+class Variables:
+    def configure(self, request, discovery):
+        from foundry_opt.onboarding import (
+            GitHubVariableChange,
+            GitHubVariableChangeStatus,
+            GitHubVariableScope,
+        )
+
+        return (
+            GitHubVariableChange(
+                name="AZURE_TENANT_ID",
+                scope=GitHubVariableScope.AGENTS,
+                status=GitHubVariableChangeStatus.CREATED,
+            ),
+        )
+
+
 class TestChangeWriter:
     def prevalidate(self, repository_root, contents):
         return tuple(
@@ -169,6 +186,37 @@ def test_init_cli_returns_zero_and_describes_draft_pr(
     assert ".github/foundry-optimizer.yaml" in result.stdout
 
 
+def test_init_cli_can_create_agents_variables(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "build_onboarding_dependencies",
+        lambda: OnboardingDependencies(
+            Discovery(),
+            Oidc(),
+            Probe(),
+            publisher=Publisher(),
+            change_writer=TestChangeWriter(),
+            variables=Variables(),
+        ),
+    )
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        cli.app,
+        [*_arguments(), "--set-github-variables"],
+    )
+
+    assert result.exit_code == 0
+    assert (
+        "GitHub variable: [created] agents/AZURE_TENANT_ID"
+        in result.stdout
+    )
+    assert "tenant" not in result.stdout
+
+
 def test_init_cli_returns_one_when_draft_probe_is_unavailable(
     monkeypatch,
     tmp_path: Path,
@@ -199,3 +247,13 @@ def test_init_cli_does_not_offer_secret_or_certificate_onboarding() -> None:
     assert result.exit_code == 0
     assert "--client-secret" not in result.stdout
     assert "--certificate" not in result.stdout
+
+
+def test_init_cli_requires_set_flag_for_variable_updates() -> None:
+    result = CliRunner().invoke(
+        cli.app,
+        [*_arguments(), "--update-github-variables"],
+    )
+
+    assert result.exit_code == 2
+    assert "require set_github_variables" in result.stderr

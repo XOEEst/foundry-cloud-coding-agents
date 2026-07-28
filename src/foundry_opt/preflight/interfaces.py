@@ -26,6 +26,7 @@ class CommandRunner(Protocol):
         cwd: Path | None = None,
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
+        input_bytes: bytes | None = None,
     ) -> CommandResult: ...
 
 

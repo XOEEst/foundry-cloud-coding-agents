@@ -16,15 +16,21 @@ from foundry_opt.evaluation import (
     EvaluationResult,
     EvaluationSubject,
 )
-from foundry_opt.evidence import EvidenceManifest, EvidenceRequest
+from foundry_opt.evidence import (
+    EvaluationAssetReference,
+    EvidenceManifest,
+    EvidenceRequest,
+)
 from foundry_opt.packaging import (
     BundleArtifact,
     ValidationReport,
 )
+from foundry_opt.security import reject_secret_content
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _identifier(value: str, field_name: str) -> None:
@@ -75,6 +81,9 @@ class CampaignRequest:
     edit_paths: tuple[Path, ...]
     allowed_mutations: frozenset[str]
     evaluation_policy: EvaluationPolicy
+    goal: str
+    spec_sha256: str
+    assets: tuple[EvaluationAssetReference, ...]
     restricted_opt_ins: Mapping[str, bool] = field(default_factory=dict)
     evidence_root: Path = Path(".foundry-optimizer/campaigns")
     stale_after: timedelta = timedelta(hours=2)
@@ -88,6 +97,23 @@ class CampaignRequest:
             raise ValueError("allowed_mutations must not be empty")
         if self.stale_after < timedelta(hours=2):
             raise ValueError("stale_after must be at least two hours")
+        if not isinstance(self.goal, str) or not 20 <= len(self.goal) <= 4000:
+            raise ValueError("goal must be between 20 and 4000 characters")
+        reject_secret_content(self.goal)
+        if not _SHA256.fullmatch(self.spec_sha256):
+            raise ValueError("spec_sha256 is invalid")
+        if not self.assets:
+            raise ValueError("assets must not be empty")
+        if not isinstance(self.assets, (tuple, list)) or not all(
+            isinstance(asset, EvaluationAssetReference) for asset in self.assets
+        ):
+            raise ValueError(
+                "assets must be a tuple of EvaluationAssetReference"
+            )
+        asset_ids = tuple(asset.asset_id for asset in self.assets)
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError("asset IDs must be unique")
+        object.__setattr__(self, "assets", tuple(self.assets))
         object.__setattr__(
             self,
             "edit_paths",
@@ -171,6 +197,15 @@ class CandidateContext:
     restricted_opt_ins: Mapping[str, bool]
     baseline_metrics: Mapping[str, float]
     history: tuple[CandidateFeedback, ...]
+    goal: str
+    spec_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.goal, str) or not 20 <= len(self.goal) <= 4000:
+            raise ValueError("goal must be between 20 and 4000 characters")
+        reject_secret_content(self.goal)
+        if not _SHA256.fullmatch(self.spec_sha256):
+            raise ValueError("spec_sha256 is invalid")
 
 
 @dataclass(frozen=True)
@@ -239,6 +274,22 @@ class CampaignRepository(Protocol):
     ) -> None: ...
 
     def create_worktree(
+        self,
+        repository_root: Path,
+        campaign_id: str,
+        candidate_id: str,
+        base_commit: str,
+    ) -> CampaignWorktree: ...
+
+    def open_worktree(
+        self,
+        repository_root: Path,
+        campaign_id: str,
+        candidate_id: str,
+        base_commit: str,
+    ) -> CampaignWorktree: ...
+
+    def reconcile_worktree(
         self,
         repository_root: Path,
         campaign_id: str,

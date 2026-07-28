@@ -32,6 +32,7 @@ from foundry_opt.deployment.errors import (
     DeploymentError,
     DeploymentHashMismatchError,
     DeploymentIdentityError,
+    DeploymentLineageMismatchError,
     DeploymentResponseError,
     DeploymentStatusError,
 )
@@ -39,20 +40,34 @@ from foundry_opt.deployment.models import (
     DEPLOYMENT_OIDC_CLIENT_ID,
     DeploymentRecord,
     DeploymentRequest,
+    OptimizationDeploymentLineage,
+    optimization_deployment_lineage_sha256,
 )
 from foundry_opt.drafts.models import project_endpoint_components
 
 
 _API_VERSION = "v1"
 _MAX_ZIP_BYTES = 250 * 1024 * 1024
-_PROVENANCE_KEYS = (
-    "foundry-opt-base-version",
-    "foundry-opt-baseline-source-sha256",
-    "foundry-opt-source-sha256",
-    "foundry-opt-patch-sha256",
-    "foundry-opt-tree-hash",
-    "foundry-opt-evidence-sha256",
-)
+_LINEAGE_PROVENANCE_KEY = "foundry-opt-lineage-sha256"
+
+
+def _provenance_keys() -> tuple[str, ...]:
+    """Deployment metadata keys reserved for foundry-opt provenance.
+
+    The lineage key is always reserved so a non-optimization deployment
+    cannot inherit or forge a stale lineage claim.
+    """
+    return (
+        "foundry-opt-base-version",
+        "foundry-opt-baseline-source-sha256",
+        "foundry-opt-source-sha256",
+        "foundry-opt-patch-sha256",
+        "foundry-opt-tree-hash",
+        "foundry-opt-evidence-sha256",
+        _LINEAGE_PROVENANCE_KEY,
+    )
+
+
 _SUCCESS_STATUSES = {"active"}
 _PENDING_STATUSES = {
     "creating",
@@ -216,8 +231,7 @@ class DeploymentGateway:
             )
             record = _parse_published_readback(
                 payload,
-                request.project_endpoint,
-                request.agent_name,
+                request,
                 version,
             )
             status = record.status or ""
@@ -273,18 +287,23 @@ def _deployment_metadata(
         raise DeploymentResponseError()
     provenance = _provenance_metadata(request)
     caller_metadata = dict(request.metadata)
-    if set(_PROVENANCE_KEYS) & caller_metadata.keys():
+    if set(_provenance_keys()) & caller_metadata.keys():
         raise DeploymentResponseError()
     inherited = {
         key: value
         for key, value in sorted(deepcopy(baseline_metadata).items())
-        if key not in provenance and key not in caller_metadata
+        if (
+            key not in _provenance_keys()
+            and key not in caller_metadata
+        )
     }
     inherited_slots = 16 - len(provenance) - len(caller_metadata)
+    if inherited_slots < 0:
+        raise DeploymentResponseError()
     metadata = {
         **provenance,
         **caller_metadata,
-        **dict(list(inherited.items())[:inherited_slots]),
+        **dict(list(inherited.items())[:max(0, inherited_slots)]),
     }
     payload: dict[str, Any] = {
         "definition": definition,
@@ -303,7 +322,7 @@ def _deployment_metadata(
 
 
 def _provenance_metadata(request: DeploymentRequest) -> dict[str, str]:
-    return {
+    provenance = {
         "foundry-opt-base-version": str(request.base_version),
         "foundry-opt-baseline-source-sha256": (
             request.expected_baseline_source_sha256
@@ -313,6 +332,11 @@ def _provenance_metadata(request: DeploymentRequest) -> dict[str, str]:
         "foundry-opt-tree-hash": request.tree_hash,
         "foundry-opt-evidence-sha256": request.evidence_sha256,
     }
+    if request.lineage is not None:
+        provenance[_LINEAGE_PROVENANCE_KEY] = (
+            optimization_deployment_lineage_sha256(request.lineage)
+        )
+    return provenance
 
 
 def _verify_published_baseline(
@@ -362,10 +386,11 @@ def _parse_created_version(
 
 def _parse_published_readback(
     payload: dict[str, Any],
-    project_endpoint: str,
-    agent_name: str,
+    request: DeploymentRequest,
     expected_version: int,
 ) -> DeploymentRecord:
+    project_endpoint = request.project_endpoint
+    agent_name = request.agent_name
     raw_version = payload.get("version")
     if isinstance(raw_version, bool):
         raise DeploymentResponseError()
@@ -408,6 +433,19 @@ def _parse_published_readback(
         )
     ):
         raise DeploymentResponseError()
+    # The metadata only ever carries a one-way digest of the lineage, never
+    # the lineage fields themselves, so it cannot be used to reconstruct an
+    # ``OptimizationDeploymentLineage``. Once the digest is confirmed to
+    # match, the record is bound to the exact lineage object the caller
+    # supplied on the request (not a value rebuilt from the readback).
+    lineage: OptimizationDeploymentLineage | None = None
+    if request.lineage is not None:
+        expected_digest = optimization_deployment_lineage_sha256(
+            request.lineage
+        )
+        if metadata.get(_LINEAGE_PROVENANCE_KEY) != expected_digest:
+            raise DeploymentLineageMismatchError()
+        lineage = request.lineage
     try:
         return DeploymentRecord(
             project_endpoint=project_endpoint,
@@ -421,6 +459,7 @@ def _parse_published_readback(
             patch_sha256=metadata["foundry-opt-patch-sha256"],
             tree_hash=metadata["foundry-opt-tree-hash"],
             evidence_sha256=metadata["foundry-opt-evidence-sha256"],
+            lineage=lineage,
             status=status,
             portal_url=_safe_portal_url(
                 payload.get("portal_url")
@@ -457,6 +496,8 @@ def _verify_readback_matches_request(
         )
     ):
         raise DeploymentResponseError()
+    if request.lineage is not None and record.lineage != request.lineage:
+        raise DeploymentLineageMismatchError()
 
 
 def _verify_effective_payload(

@@ -32,22 +32,32 @@ class DraftRequest:
     agent_name: str
     base_version: int
     bundle: BundleArtifact
-    runtime: str
     entry_point: tuple[str, ...]
-    dependency_resolution: str
-    cpu: str
-    memory: str
-    protocol: str
-    protocol_version: str
+    runtime: str | None = None
+    dependency_resolution: str | None = None
+    cpu: str | None = None
+    memory: str | None = None
+    protocol: str | None = None
+    protocol_version: str | None = None
     environment_variables: Mapping[str, str] = field(default_factory=dict)
     description: str | None = None
     metadata: Mapping[str, str] = field(default_factory=dict)
+    idempotency_key: str | None = None
+    subject: str | None = None
     probe: bool = False
 
     def __post_init__(self) -> None:
         project_endpoint_components(self.project_endpoint)
         if not _AGENT_NAME.fullmatch(self.agent_name):
             raise ValueError("agent_name is invalid")
+        if self.idempotency_key is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.idempotency_key
+        ):
+            raise ValueError("idempotency_key must be a bounded token")
+        if self.subject is not None and not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.subject
+        ):
+            raise ValueError("subject must be a bounded identifier")
         if (
             not isinstance(self.base_version, int)
             or isinstance(self.base_version, bool)
@@ -56,12 +66,29 @@ class DraftRequest:
             raise ValueError("base_version must be a positive published version")
         if not self.entry_point or any(not part for part in self.entry_point):
             raise ValueError("entry_point must not be empty")
-        if self.dependency_resolution not in {"remote_build", "bundled"}:
+        # ``runtime``/``dependency_resolution`` (and the hosted
+        # ``cpu``/``memory``/``protocol``/``protocol_version``) are optional:
+        # ``None`` means *inherit the published baseline* rather than a guessed
+        # value that would silently overwrite it. When a field is explicitly
+        # configured it must be a valid, non-empty value.
+        if (
+            self.dependency_resolution is not None
+            and self.dependency_resolution not in {"remote_build", "bundled"}
+        ):
             raise ValueError("dependency_resolution is invalid")
-        if not self.runtime or not self.cpu or not self.memory:
-            raise ValueError("runtime, cpu, and memory are required")
-        if not self.protocol or not self.protocol_version:
-            raise ValueError("protocol and protocol_version are required")
+        for value, name in (
+            (self.runtime, "runtime"),
+            (self.cpu, "cpu"),
+            (self.memory, "memory"),
+            (self.protocol, "protocol"),
+            (self.protocol_version, "protocol_version"),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(
+                    f"{name} must be a non-empty string when configured"
+                )
 
         environment = dict(self.environment_variables)
         for name, value in environment.items():
@@ -85,6 +112,8 @@ class DraftRequest:
         if {
             "foundry-opt-base-version",
             "foundry-opt-source-sha256",
+            "foundry-opt-idempotency-key",
+            "foundry-opt-subject",
         } & metadata.keys():
             raise ValueError("foundry-opt provenance metadata is reserved")
         if any(not isinstance(key, str) or not isinstance(value, str)

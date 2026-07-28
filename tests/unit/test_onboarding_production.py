@@ -93,6 +93,17 @@ def test_draft_probe_factory_adapts_milestone_three_gateway(
         "src/support_agent/main.py",
     )
     assert gateway.created[0].bundle is bundle
+    # The probe omits runtime/dependency/CPU/memory/protocol so the draft
+    # inherits the published baseline rather than guessing values.
+    for field in (
+        "runtime",
+        "dependency_resolution",
+        "cpu",
+        "memory",
+        "protocol",
+        "protocol_version",
+    ):
+        assert not hasattr(gateway.created[0], field)
     assert bundle_requests[0].include == ("src/support_agent/**",)
     assert gateway.deleted == gateway.records
 

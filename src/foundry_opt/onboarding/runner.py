@@ -12,6 +12,7 @@ from foundry_opt.onboarding.interfaces import (
     DiscoveryGateway,
     DraftProbe,
     ChangeSetWriter,
+    GitHubVariableConfigurer,
     OnboardingPublisher,
     OidcVerifier,
 )
@@ -22,6 +23,9 @@ from foundry_opt.onboarding.models import (
     OnboardingRequest,
     OnboardingResult,
     OnboardingStatus,
+)
+from foundry_opt.onboarding.variables import (
+    UnavailableGitHubVariableConfigurer,
 )
 from foundry_opt.preflight.redaction import redact
 from foundry_opt.onboarding.repository import (
@@ -44,6 +48,9 @@ class OnboardingDependencies:
     )
     change_writer: ChangeSetWriter = field(
         default_factory=SafeChangeSetWriter
+    )
+    variables: GitHubVariableConfigurer = field(
+        default_factory=UnavailableGitHubVariableConfigurer
     )
 
 
@@ -277,6 +284,30 @@ def run_onboarding(
             draft_probe=probe,
             changes=changes,
         )
+    variable_changes = ()
+    if request.set_github_variables:
+        try:
+            variable_changes = dependencies.variables.configure(
+                request,
+                discovery,
+            )
+        except RuntimeError as error:
+            return OnboardingResult(
+                status=OnboardingStatus.PARTIAL,
+                changes=changes,
+                draft_pull_request=draft_pr,
+                discovery=discovery,
+                oidc=oidc,
+                draft_probe=probe,
+                published_pull_request=publication,
+                blockers=(
+                    "GitHub variable configuration failed: "
+                    f"{_safe_error(error)}",
+                ),
+                residual_state=(
+                    f"Draft onboarding PR: {publication.url}",
+                ),
+            )
     return OnboardingResult(
         status=OnboardingStatus.READY,
         changes=changes,
@@ -285,9 +316,19 @@ def run_onboarding(
         oidc=oidc,
         draft_probe=probe,
         published_pull_request=publication,
+        variable_changes=variable_changes,
         guidance=(
-            "Create non-secret GitHub Actions variables AZURE_TENANT_ID, "
-            "AZURE_CLIENT_ID, and AZURE_SUBSCRIPTION_ID.",
+            *(
+                (
+                    "Repository-level GitHub Agents variables were configured.",
+                )
+                if request.set_github_variables
+                else (
+                    "Create non-secret GitHub Agents variables "
+                    "AZURE_TENANT_ID, AZURE_CLIENT_ID, and "
+                    "AZURE_SUBSCRIPTION_ID.",
+                )
+            ),
             "Azure OIDC does not require GitHub Agents or Actions secrets.",
             f"Draft onboarding pull request created: {publication.url}",
         ),

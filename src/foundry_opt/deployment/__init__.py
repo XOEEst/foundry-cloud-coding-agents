@@ -7,6 +7,7 @@ from foundry_opt.deployment.errors import (
     DeploymentError,
     DeploymentHashMismatchError,
     DeploymentIdentityError,
+    DeploymentLineageMismatchError,
     DeploymentResponseError,
     DeploymentStatusError,
 )
@@ -26,9 +27,15 @@ from foundry_opt.deployment.models import (
     DeploymentWorkflowModel,
     DeploymentWorkflowRun,
     DeploymentWorkflowScaffold,
+    OptimizationDeploymentLineage,
     WorkflowRunStatus,
+    optimization_deployment_lineage_document,
+    optimization_deployment_lineage_sha256,
 )
-from foundry_opt.deployment.verification import verify_deployed_selection
+from foundry_opt.deployment.verification import (
+    verify_deployed_selection,
+    verify_optimization_deployment_lineage,
+)
 from foundry_opt.deployment.workflow import detect_deployment_workflow
 
 __all__ = [
@@ -45,6 +52,7 @@ __all__ = [
     "DeploymentGateway",
     "DeploymentHashMismatchError",
     "DeploymentIdentityError",
+    "DeploymentLineageMismatchError",
     "DeploymentRecord",
     "DeploymentRequest",
     "DeploymentResponseError",
@@ -57,7 +65,11 @@ __all__ = [
     "DeploymentWorkflowModel",
     "DeploymentWorkflowRun",
     "DeploymentWorkflowScaffold",
+    "OptimizationDeploymentLineage",
     "WorkflowRunStatus",
     "detect_deployment_workflow",
+    "optimization_deployment_lineage_document",
+    "optimization_deployment_lineage_sha256",
     "verify_deployed_selection",
+    "verify_optimization_deployment_lineage",
 ]

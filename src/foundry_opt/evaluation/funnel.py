@@ -25,13 +25,24 @@ EvaluationRunner = Callable[
 ]
 
 
+def evaluate_with_repeat(
+    subject: EvaluationSubject,
+    split: DatasetSplit,
+    policy: EvaluationPolicy,
+    evaluate: EvaluationRunner,
+) -> EvaluationResult:
+    """Evaluate one subject and combine its bounded repeat when requested."""
+
+    return _evaluate_with_repeat(subject, split, policy, evaluate)
+
+
 def run_evaluation_funnel(
     request: EvaluationFunnelRequest,
     evaluate: EvaluationRunner,
 ) -> FunnelResult:
     development_subjects = (request.baseline, *request.candidates)
     development_results = {
-        subject.subject_id: _evaluate_with_repeat(
+        subject.subject_id: evaluate_with_repeat(
             subject,
             DatasetSplit.DEVELOPMENT,
             request.policy,
@@ -58,7 +69,7 @@ def run_evaluation_funnel(
         ),
     )
     validation_results = {
-        subject.subject_id: _evaluate_with_repeat(
+        subject.subject_id: evaluate_with_repeat(
             subject,
             DatasetSplit.VALIDATION,
             request.policy,

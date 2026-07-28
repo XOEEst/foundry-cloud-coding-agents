@@ -1,5 +1,6 @@
 from pathlib import Path
 import subprocess
+import sys
 from collections.abc import Sequence
 from typing import Callable
 
@@ -133,6 +134,31 @@ def test_command_runner_maps_a_nonzero_exit(
     assert error.value.exit_code == 7
     assert error.value.stdout == "output"
     assert error.value.stderr == "diagnostic"
+
+
+def test_command_runner_preserves_binary_stdin_newlines() -> None:
+    result = SubprocessCommandRunner().run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.buffer.write(sys.stdin.buffer.read())"
+            ),
+        ],
+        input_bytes=b"a\nb\n",
+    )
+
+    assert result.stdout == "a\nb\n"
+
+
+def test_command_runner_rejects_text_and_binary_stdin_together() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SubprocessCommandRunner().run(
+            [sys.executable, "-c", "pass"],
+            input_text="text",
+            input_bytes=b"bytes",
+        )
 
 
 @pytest.mark.parametrize(

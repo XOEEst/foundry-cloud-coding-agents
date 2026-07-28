@@ -51,6 +51,8 @@ class GitHubCapabilities(IntFlag):
     CONTENTS_WRITE = 2
     ISSUES_WRITE = 4
     PULL_REQUESTS_WRITE = 8
+    MERGE = 16
+    DEPLOY_DISPATCH = 32
 
     ISSUES = ISSUES_WRITE
     LABELS = ISSUES_WRITE
@@ -61,6 +63,55 @@ class GitHubCapabilities(IntFlag):
         METADATA_READ | CONTENTS_WRITE | ISSUES_WRITE | PULL_REQUESTS_WRITE
     )
     CANDIDATE_PUBLICATION = CAMPAIGN_PUBLICATION
+
+
+class CandidateMergeMode(StrEnum):
+    HUMAN = "human"
+    AUTOPILOT = "autopilot"
+
+
+@dataclass(frozen=True)
+class CandidatePullRequestPolicy:
+    mode: CandidateMergeMode = CandidateMergeMode.HUMAN
+    spec_sha256: str | None = None
+    merge_actor: str | None = None
+    required_checks: tuple[str, ...] = ()
+    deployment_allowed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode is CandidateMergeMode.AUTOPILOT:
+            if (
+                self.spec_sha256 is None
+                or not _SHA256.fullmatch(self.spec_sha256)
+            ):
+                raise ValueError(
+                    "autopilot candidate policy requires spec_sha256"
+                )
+            if (
+                self.merge_actor is None
+                or not re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+                    self.merge_actor,
+                )
+            ):
+                raise ValueError(
+                    "autopilot candidate policy requires merge_actor"
+                )
+            if not self.required_checks:
+                raise ValueError(
+                    "autopilot candidate policy requires checks"
+                )
+        if len(self.required_checks) != len(set(self.required_checks)):
+            raise ValueError("candidate policy checks must be unique")
+        if any(not check.strip() for check in self.required_checks):
+            raise ValueError("candidate policy checks must not be empty")
+        if (
+            self.mode is CandidateMergeMode.HUMAN
+            and self.deployment_allowed
+        ):
+            raise ValueError(
+                "automated deployment requires an autopilot candidate policy"
+            )
 
 
 @dataclass(frozen=True)
@@ -396,6 +447,9 @@ class CandidateApplicationRequest:
     expected_pull_request_head_commit: str | None = None
     close_rejected: bool = False
     rejected_pull_request_number: int | None = None
+    decision_policy: CandidatePullRequestPolicy = field(
+        default_factory=CandidatePullRequestPolicy
+    )
 
     def __post_init__(self) -> None:
         if not all(
@@ -435,6 +489,13 @@ class CandidateApplicationRequest:
             and self.rejected_pull_request_number < 1
         ):
             raise ValueError("rejected_pull_request_number must be positive")
+        if not isinstance(
+            self.decision_policy,
+            CandidatePullRequestPolicy,
+        ):
+            raise ValueError(
+                "decision_policy must be a CandidatePullRequestPolicy"
+            )
 
 
 def _github_reference_url(url: str, kind: str, number: int) -> None:

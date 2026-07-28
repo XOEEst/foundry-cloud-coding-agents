@@ -79,11 +79,70 @@ def _minimal_document() -> dict:
             "allowed_issue_overrides": ["deadline_minutes"],
             "allowed_mutations": ["system_instructions"],
         },
+        "automation_policy": {
+            "allowed_dataset_sources": [
+                "foundry",
+                "repository",
+                "synthetic",
+            ],
+            "allowed_evaluator_sources": [
+                "foundry",
+                "repository",
+                "builtin",
+                "custom",
+            ],
+            "synthetic_max_rows": 100,
+            "trace_requires_human_review": True,
+            "allow_spec_auto_approval": False,
+            "allow_candidate_auto_selection": False,
+            "allow_merge": False,
+            "allow_deployment": False,
+            "required_checks": ["foundry-opt/exact-patch"],
+        },
     }
 
 
 def _write_document(tmp_path: Path, document: dict) -> Path:
     return _write_config(tmp_path, yaml.safe_dump(document, sort_keys=False))
+
+
+def test_agent_runtime_defaults_to_inherit_and_allows_explicit_override(
+    tmp_path: Path,
+) -> None:
+    inherit_dir = tmp_path / "inherit"
+    inherit_dir.mkdir()
+    override_dir = tmp_path / "override"
+    override_dir.mkdir()
+
+    # A target with no runtime block inherits the published baseline: every
+    # runtime field is None rather than a guessed value.
+    inherit = load_config(_write_document(inherit_dir, _minimal_document()))
+    runtime = inherit.targets["support_agent"].runtime
+    assert runtime.runtime is None
+    assert runtime.dependency_resolution is None
+    assert runtime.cpu is None
+    assert runtime.memory is None
+    assert runtime.protocol is None
+    assert runtime.protocol_version is None
+
+    # An explicit runtime block overrides only the configured fields.
+    document = _minimal_document()
+    document["targets"]["support_agent"]["runtime"] = {
+        "runtime": "python_3_13",
+        "dependency_resolution": "bundled",
+        "cpu": "0.5",
+        "memory": "1Gi",
+        "protocol": "responses",
+        "protocol_version": "2.0",
+    }
+    override = load_config(_write_document(override_dir, document))
+    runtime = override.targets["support_agent"].runtime
+    assert runtime.runtime == "python_3_13"
+    assert runtime.dependency_resolution == "bundled"
+    assert runtime.cpu == "0.5"
+    assert runtime.memory == "1Gi"
+    assert runtime.protocol == "responses"
+    assert runtime.protocol_version == "2.0"
 
 
 def test_load_config_preserves_the_complete_configuration_contract(
@@ -198,6 +257,25 @@ def test_load_config_preserves_the_complete_configuration_contract(
             - model
             - skills
             - tool_descriptions
+        automation_policy:
+          allowed_dataset_sources:
+            - foundry
+            - repository
+            - synthetic
+          allowed_evaluator_sources:
+            - foundry
+            - repository
+            - builtin
+            - custom
+          synthetic_max_rows: 80
+          trace_requires_human_review: true
+          allow_spec_auto_approval: true
+          allow_candidate_auto_selection: false
+          allow_merge: false
+          allow_deployment: false
+          required_checks:
+            - foundry-opt/spec
+            - foundry-opt/exact-patch
         future_root_option:
           enabled: true
         """,
@@ -300,7 +378,50 @@ def test_load_config_preserves_the_complete_configuration_contract(
         "skills",
         "tool_descriptions",
     }
+    assert config.automation_policy.allowed_dataset_sources == {
+        "foundry",
+        "repository",
+        "synthetic",
+    }
+    assert config.automation_policy.allowed_evaluator_sources == {
+        "foundry",
+        "repository",
+        "builtin",
+        "custom",
+    }
+    assert config.automation_policy.synthetic_max_rows == 80
+    assert config.automation_policy.trace_requires_human_review is True
+    assert config.automation_policy.allow_spec_auto_approval is True
+    assert config.automation_policy.allow_candidate_auto_selection is False
+    assert config.automation_policy.allow_merge is False
+    assert config.automation_policy.allow_deployment is False
+    assert config.automation_policy.required_checks == (
+        "foundry-opt/spec",
+        "foundry-opt/exact-patch",
+    )
     assert config.model_extra == {"future_root_option": {"enabled": True}}
+
+
+def test_load_config_supplies_safe_automation_defaults(tmp_path: Path) -> None:
+    document = _minimal_document()
+    document.pop("automation_policy")
+
+    config = load_config(_write_document(tmp_path, document))
+
+    assert config.automation_policy.allowed_dataset_sources == {
+        "foundry",
+        "repository",
+    }
+    assert config.automation_policy.allowed_evaluator_sources == {
+        "foundry",
+        "repository",
+        "builtin",
+    }
+    assert config.automation_policy.trace_requires_human_review is True
+    assert config.automation_policy.allow_spec_auto_approval is False
+    assert config.automation_policy.allow_candidate_auto_selection is False
+    assert config.automation_policy.allow_merge is False
+    assert config.automation_policy.allow_deployment is False
 
 
 def test_load_config_reports_path_specific_validation_errors(tmp_path: Path) -> None:

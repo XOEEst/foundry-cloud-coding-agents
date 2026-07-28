@@ -134,7 +134,7 @@ class GitChangeSetWriter:
                 blob = self._run(
                     ("git", "hash-object", "-w", "--stdin"),
                     repository_root,
-                    input_text=contents[path],
+                    input_bytes=contents[path].encode("utf-8"),
                 ).strip()
                 self._run(
                     (
@@ -312,6 +312,7 @@ class GitChangeSetWriter:
         *,
         environment: Mapping[str, str] | None = None,
         input_text: str | None = None,
+        input_bytes: bytes | None = None,
     ) -> str:
         try:
             return self._commands.run(
@@ -319,6 +320,7 @@ class GitChangeSetWriter:
                 cwd=repository_root,
                 environment=environment,
                 input_text=input_text,
+                input_bytes=input_bytes,
             ).stdout
         except CommandError as error:
             operation = arguments[1] if len(arguments) > 1 else "command"

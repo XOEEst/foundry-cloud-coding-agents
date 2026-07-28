@@ -19,10 +19,12 @@ from foundry_opt.adapters.deployment import (
     DeploymentGateway,
     DeploymentHashMismatchError,
     DeploymentIdentityError,
+    DeploymentLineageMismatchError,
     DeploymentResponseError,
     DeploymentStatusError,
 )
-from foundry_opt.deployment import DeploymentRequest
+from foundry_opt.deployment import DeploymentRequest, OptimizationDeploymentLineage
+from foundry_opt.deployment.models import optimization_deployment_lineage_sha256
 from foundry_opt.packaging import BundleRequest, build_source_bundle
 
 
@@ -107,6 +109,27 @@ def _request(tmp_path: Path) -> DeploymentRequest:
     )
 
 
+def _lineage() -> OptimizationDeploymentLineage:
+    return OptimizationDeploymentLineage(
+        parent_issue_number=42,
+        spec_sha256="1" * 64,
+        campaign_id="campaign-1",
+        campaign_pull_request_number=101,
+        candidate_issue_number=55,
+        candidate_pull_request_number=102,
+        candidate_id="candidate-1",
+        selected_draft_id="draft-1",
+        patch_sha256=SHA,
+        evidence_sha256=EVIDENCE,
+        selected_tree_sha=TREE,
+        selected_merge_commit="e" * 40,
+    )
+
+
+def _request_with_lineage(tmp_path: Path) -> DeploymentRequest:
+    return replace(_request(tmp_path), lineage=_lineage())
+
+
 def _baseline(
     version: int = 7,
     *,
@@ -189,6 +212,10 @@ def _readback(
         "foundry-opt-tree-hash": request.tree_hash,
         "foundry-opt-evidence-sha256": request.evidence_sha256,
     }
+    if request.lineage is not None:
+        provenance["foundry-opt-lineage-sha256"] = (
+            optimization_deployment_lineage_sha256(request.lineage)
+        )
     persisted_metadata = {
         **provenance,
         **dict(request.metadata),
@@ -804,3 +831,145 @@ def test_deployment_request_rejects_noncanonical_endpoint_before_auth(
             tree_hash=TREE,
             evidence_sha256=EVIDENCE,
         )
+
+
+def test_publish_includes_lineage_digest_in_published_and_readback_metadata(
+    tmp_path: Path,
+) -> None:
+    request = _request_with_lineage(tmp_path)
+    expected_digest = optimization_deployment_lineage_sha256(request.lineage)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, status="creating"),
+            _readback(request),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.publish(request)
+
+    _, publish_call, _, _ = client.requests
+    published_metadata = json.loads(
+        _multipart_part(publish_call, "metadata")
+    )["metadata"]
+    assert published_metadata["foundry-opt-lineage-sha256"] == expected_digest
+    assert record.metadata["foundry-opt-lineage-sha256"] == expected_digest
+
+
+def test_publish_returns_record_retaining_exact_request_lineage(
+    tmp_path: Path,
+) -> None:
+    request = _request_with_lineage(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, status="creating"),
+            _readback(request),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.publish(request)
+
+    assert record.lineage == request.lineage
+    # The lineage is never reconstructed from the metadata digest: it must
+    # be the exact object carried on the originating request.
+    assert record.lineage is request.lineage
+
+
+def test_publish_rejects_missing_lineage_digest_in_readback(
+    tmp_path: Path,
+) -> None:
+    request = _request_with_lineage(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(
+                request,
+                mutate=lambda payload: payload["metadata"].pop(
+                    "foundry-opt-lineage-sha256"
+                ),
+            ),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DeploymentLineageMismatchError):
+        gateway.publish(request)
+
+
+def test_publish_rejects_wrong_lineage_digest_in_readback(
+    tmp_path: Path,
+) -> None:
+    request = _request_with_lineage(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(
+                request,
+                mutate=lambda payload: payload["metadata"].update(
+                    {"foundry-opt-lineage-sha256": "0" * 64}
+                ),
+            ),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DeploymentLineageMismatchError):
+        gateway.publish(request)
+
+
+def test_publish_without_lineage_leaves_record_lineage_none(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, status="creating"),
+            _readback(request),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.publish(request)
+
+    assert record.lineage is None
+    assert "foundry-opt-lineage-sha256" not in record.metadata
+    assert "foundry-opt-lineage-sha256" not in json.loads(
+        _multipart_part(client.requests[1], "metadata")
+    )["metadata"]
+
+
+def test_publish_without_lineage_strips_stale_baseline_lineage(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    baseline = _baseline()
+    baseline._payload["metadata"]["foundry-opt-lineage-sha256"] = (
+        "stale-prior-version-digest"
+    )
+    client = FakeClient(
+        [
+            baseline,
+            _published(request.bundle.sha256),
+            _readback(request, status="creating"),
+            _readback(request),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.publish(request)
+    published_metadata = json.loads(
+        _multipart_part(client.requests[1], "metadata")
+    )["metadata"]
+
+    assert record.lineage is None
+    assert "foundry-opt-lineage-sha256" not in published_metadata
+    assert "foundry-opt-lineage-sha256" not in record.metadata

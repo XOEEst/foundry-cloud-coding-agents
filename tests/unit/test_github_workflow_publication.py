@@ -12,6 +12,7 @@ from foundry_opt.campaign import (
     CandidateArtifact,
     PatchArtifact,
 )
+from foundry_opt.evidence import EvaluationAssetReference
 from foundry_opt.github_workflow import (
     ArtifactReference,
     CampaignPublicationError,
@@ -38,6 +39,16 @@ _MANIFEST_PATH = Path(
     ".foundry-optimizer/campaigns/c1/manifest.json"
 )
 _PATCH_BYTES = b"diff --git a/agent.py b/agent.py\n"
+_GOAL_SHA256 = "1" * 64
+_SPEC_SHA256 = "2" * 64
+_ASSETS = (
+    EvaluationAssetReference(
+        asset_id="dataset-dev",
+        kind="dataset",
+        source="repository",
+        role="development",
+    ),
+)
 _PROVENANCE = RedactionProvenance(
     generator="foundry-opt.evidence",
     schema_version=1,
@@ -100,6 +111,22 @@ _EVIDENCE_BYTES = json.dumps(
         "schema_version": 1,
         "campaign_id": "campaign-1",
         "source_hash": "source-1",
+        "goal_sha256": _GOAL_SHA256,
+        "spec_sha256": _SPEC_SHA256,
+        "assets": [
+            {
+                "asset_id": "dataset-dev",
+                "kind": "dataset",
+                "source": "repository",
+                "role": "development",
+                "name": None,
+                "version": None,
+                "remote_id": None,
+                "content_sha256": None,
+                "approval_gate": "policy",
+                "metrics": [],
+            }
+        ],
         "baseline": _BASELINE_RESULT,
         "candidates": [_CANDIDATE_RESULT],
         "pareto": {
@@ -380,6 +407,9 @@ def _report() -> CampaignReport:
         baseline_draft_id="draft-baseline",
         candidates=(candidate,),
         pareto_candidate_ids=("candidate-1",),
+        goal_sha256=_GOAL_SHA256,
+        spec_sha256=_SPEC_SHA256,
+        assets=_ASSETS,
     )
 
 
@@ -636,6 +666,9 @@ def test_publication_rejects_ineligible_pareto_candidate() -> None:
         baseline_draft_id="draft-baseline",
         candidates=(ineligible,),
         pareto_candidate_ids=("candidate-1",),
+        goal_sha256=_GOAL_SHA256,
+        spec_sha256=_SPEC_SHA256,
+        assets=_ASSETS,
     )
     request = _request()
 
@@ -935,6 +968,30 @@ def test_publication_rejects_evidence_not_bound_to_exact_patch() -> None:
     request = CampaignPublicationRequest(
         **{
             **request.__dict__,
+            "evidence_sha256": {
+                "candidate-1": hashlib.sha256(bad_evidence).hexdigest()
+            },
+        }
+    )
+    gateway = FakeGateway(
+        artifact_contents={
+            _PATCH_PATH: _PATCH_BYTES,
+            _EVIDENCE_PATH: bad_evidence,
+            _MANIFEST_PATH: _MANIFEST_BYTES,
+        }
+    )
+
+    with pytest.raises(CampaignPublicationError, match="provenance"):
+        publish_campaign(request, gateway)
+
+
+def test_publication_rejects_evidence_with_wrong_spec_identity() -> None:
+    document = json.loads(_EVIDENCE_BYTES)
+    document["spec_sha256"] = "9" * 64
+    bad_evidence = json.dumps(document, sort_keys=True).encode()
+    request = CampaignPublicationRequest(
+        **{
+            **_request().__dict__,
             "evidence_sha256": {
                 "candidate-1": hashlib.sha256(bad_evidence).hexdigest()
             },

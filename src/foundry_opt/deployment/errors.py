@@ -57,3 +57,12 @@ class DeploymentStatusError(DeploymentError):
 class DeploymentHashMismatchError(DeploymentError):
     def __init__(self) -> None:
         super().__init__("Deployment source or lineage hash verification failed.")
+
+
+class DeploymentLineageMismatchError(DeploymentError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Deployment optimization lineage does not match the expected "
+            "issue, spec, campaign, candidate, or selected commit "
+            "provenance."
+        )

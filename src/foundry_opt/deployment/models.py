@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import hashlib
+import json
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from types import MappingProxyType
@@ -83,6 +85,117 @@ def _safe_url(value: str, hosts: set[str], field_name: str) -> None:
         raise ValueError(f"{field_name} is invalid")
 
 
+def _positive_int(value: object, field_name: str) -> None:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 1
+    ):
+        raise ValueError(f"{field_name} must be a positive integer")
+
+
+@dataclass(frozen=True)
+class OptimizationDeploymentLineage:
+    """Exact optimization provenance carried through a deployment.
+
+    Ties a published or verified Foundry deployment back to the GitHub
+    issue and pull requests, campaign, candidate, and selected draft that
+    produced it, plus the exact hashes/commits the deployment must match.
+    """
+
+    parent_issue_number: int
+    spec_sha256: str
+    campaign_id: str
+    campaign_pull_request_number: int
+    candidate_issue_number: int
+    candidate_pull_request_number: int
+    candidate_id: str
+    selected_draft_id: str
+    patch_sha256: str
+    evidence_sha256: str
+    selected_tree_sha: str
+    selected_merge_commit: str
+
+    def __post_init__(self) -> None:
+        _positive_int(self.parent_issue_number, "parent_issue_number")
+        _positive_int(
+            self.campaign_pull_request_number,
+            "campaign_pull_request_number",
+        )
+        _positive_int(
+            self.candidate_issue_number,
+            "candidate_issue_number",
+        )
+        _positive_int(
+            self.candidate_pull_request_number,
+            "candidate_pull_request_number",
+        )
+        _sha256(self.spec_sha256, "spec_sha256")
+        _sha256(self.patch_sha256, "patch_sha256")
+        _sha256(self.evidence_sha256, "evidence_sha256")
+        _identifier(self.campaign_id, "campaign_id")
+        _identifier(self.candidate_id, "candidate_id")
+        _identifier(self.selected_draft_id, "selected_draft_id")
+        _tree_hash(self.selected_tree_sha, "selected_tree_sha")
+        if not _COMMIT.fullmatch(self.selected_merge_commit):
+            raise ValueError("selected_merge_commit is invalid")
+
+
+def optimization_deployment_lineage_document(
+    lineage: OptimizationDeploymentLineage,
+) -> Mapping[str, str]:
+    """Canonical, string-only serialization of a deployment lineage.
+
+    Contains only identifiers, hashes, and numbers (as decimal strings) so
+    it never carries raw prompts, responses, or dataset rows.
+    """
+
+    if not isinstance(lineage, OptimizationDeploymentLineage):
+        raise ValueError("lineage must be an OptimizationDeploymentLineage")
+    return MappingProxyType(
+        {
+            "parent_issue_number": str(lineage.parent_issue_number),
+            "spec_sha256": lineage.spec_sha256,
+            "campaign_id": lineage.campaign_id,
+            "campaign_pull_request_number": str(
+                lineage.campaign_pull_request_number
+            ),
+            "candidate_issue_number": str(lineage.candidate_issue_number),
+            "candidate_pull_request_number": str(
+                lineage.candidate_pull_request_number
+            ),
+            "candidate_id": lineage.candidate_id,
+            "selected_draft_id": lineage.selected_draft_id,
+            "patch_sha256": lineage.patch_sha256,
+            "evidence_sha256": lineage.evidence_sha256,
+            "selected_tree_sha": lineage.selected_tree_sha,
+            "selected_merge_commit": lineage.selected_merge_commit,
+        }
+    )
+
+
+def optimization_deployment_lineage_sha256(
+    lineage: OptimizationDeploymentLineage,
+) -> str:
+    """SHA-256 of the canonical lineage document.
+
+    This is the hash embedded as deployment evidence (the reserved
+    ``foundry-opt-lineage-sha256`` metadata entry) so any change to the
+    lineage's issue, spec, campaign, candidate, or selected commit
+    provenance is detectable on verification.
+    """
+
+    payload = json.dumps(
+        dict(optimization_deployment_lineage_document(lineage)),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+_LINEAGE_SHA256_METADATA_KEY = "foundry-opt-lineage-sha256"
+
+
 @dataclass(frozen=True)
 class DeploymentRequest:
     project_endpoint: str
@@ -96,6 +209,7 @@ class DeploymentRequest:
     patch_sha256: str
     tree_hash: str
     evidence_sha256: str
+    lineage: OptimizationDeploymentLineage | None = None
     description: str | None = None
     metadata: Mapping[str, str] = field(default_factory=dict)
 
@@ -124,11 +238,35 @@ class DeploymentRequest:
         _sha256(self.patch_sha256, "patch_sha256")
         _tree_hash(self.tree_hash, "tree_hash")
         _sha256(self.evidence_sha256, "evidence_sha256")
+        reserved_keys = {
+            "foundry-opt-base-version",
+            "foundry-opt-baseline-source-sha256",
+            "foundry-opt-source-sha256",
+            "foundry-opt-patch-sha256",
+            "foundry-opt-tree-hash",
+            "foundry-opt-evidence-sha256",
+            _LINEAGE_SHA256_METADATA_KEY,
+        }
+        if self.lineage is not None:
+            if not isinstance(self.lineage, OptimizationDeploymentLineage):
+                raise ValueError(
+                    "lineage must be an OptimizationDeploymentLineage"
+                )
+            if (
+                self.lineage.patch_sha256 != self.patch_sha256
+                or self.lineage.selected_tree_sha != self.tree_hash
+                or self.lineage.evidence_sha256 != self.evidence_sha256
+            ):
+                raise ValueError(
+                    "lineage patch/tree/evidence hashes must match the "
+                    "deployment request"
+                )
         metadata = dict(self.metadata)
-        if len(metadata) > 10:
+        maximum_caller_entries = 9 if self.lineage is not None else 10
+        if len(metadata) > maximum_caller_entries:
             raise ValueError(
-                "metadata permits at most 10 caller entries; six entries "
-                "are reserved for deployment provenance"
+                "metadata exceeds the caller entry budget after reserved "
+                "deployment provenance"
             )
         for key, value in metadata.items():
             if not isinstance(key, str) or not isinstance(value, str):
@@ -138,14 +276,7 @@ class DeploymentRequest:
                 raise ValueError("metadata must not contain credentials")
             if _looks_sensitive(value):
                 raise ValueError("metadata must not contain credentials")
-        if {
-            "foundry-opt-base-version",
-            "foundry-opt-baseline-source-sha256",
-            "foundry-opt-source-sha256",
-            "foundry-opt-patch-sha256",
-            "foundry-opt-tree-hash",
-            "foundry-opt-evidence-sha256",
-        } & metadata.keys():
+        if reserved_keys & metadata.keys():
             raise ValueError("foundry-opt deployment provenance is reserved")
         if self.description is not None and _looks_sensitive(self.description):
             raise ValueError("description must not contain credentials")
@@ -163,6 +294,7 @@ class DeploymentRecord:
     patch_sha256: str
     tree_hash: str
     evidence_sha256: str
+    lineage: OptimizationDeploymentLineage | None = None
     status: str | None = None
     portal_url: str | None = None
     runtime: str = ""
@@ -190,6 +322,20 @@ class DeploymentRecord:
         _sha256(self.patch_sha256, "patch_sha256")
         _tree_hash(self.tree_hash, "tree_hash")
         _sha256(self.evidence_sha256, "evidence_sha256")
+        if self.lineage is not None:
+            if not isinstance(self.lineage, OptimizationDeploymentLineage):
+                raise ValueError(
+                    "lineage must be an OptimizationDeploymentLineage"
+                )
+            if (
+                self.lineage.patch_sha256 != self.patch_sha256
+                or self.lineage.selected_tree_sha != self.tree_hash
+                or self.lineage.evidence_sha256 != self.evidence_sha256
+            ):
+                raise ValueError(
+                    "lineage patch/tree/evidence hashes must match the "
+                    "deployment record"
+                )
         if not self.runtime:
             raise ValueError("deployment runtime is required")
         if not self.entry_point or any(not part for part in self.entry_point):
@@ -352,6 +498,7 @@ class DeploymentVerificationRequest:
     bundle_exclude: tuple[str, ...] = ()
     bundle_dependency_resolution: str = "remote_build"
     bundle_evidence_paths: tuple[Path, ...] = ()
+    expected_lineage: OptimizationDeploymentLineage | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.candidate_id, "candidate_id")
@@ -475,6 +622,34 @@ class DeploymentVerificationRequest:
                 for path in self.bundle_evidence_paths
             ),
         )
+        if self.expected_lineage is not None:
+            if not isinstance(
+                self.expected_lineage, OptimizationDeploymentLineage
+            ):
+                raise ValueError(
+                    "expected_lineage must be an "
+                    "OptimizationDeploymentLineage"
+                )
+            candidate_agent = candidate_agents[self.candidate_id]
+            if (
+                self.expected_lineage.candidate_id != self.candidate_id
+                or self.expected_lineage.campaign_id
+                != self.expected_campaign_id
+                or self.expected_lineage.patch_sha256
+                != self.expected_patch_sha256
+                or self.expected_lineage.selected_tree_sha
+                != self.expected_tree_hash
+                or self.expected_lineage.evidence_sha256
+                != self.expected_evidence_sha256
+                or self.expected_lineage.selected_merge_commit
+                != self.expected_commit
+                or self.expected_lineage.selected_draft_id
+                != candidate_agent.draft_id
+            ):
+                raise ValueError(
+                    "expected_lineage does not match the deployment "
+                    "verification request's expected provenance"
+                )
 
 
 class DeploymentVerificationStatus(StrEnum):

@@ -22,6 +22,10 @@ from foundry_opt.onboarding.repository import (
     GhOnboardingPublisher,
     GitChangeSetWriter,
 )
+from foundry_opt.onboarding.variables import (
+    GitHubApiVariableGateway,
+    GitHubVariableConfigurator,
+)
 from foundry_opt.onboarding.runner import OnboardingDependencies
 
 
@@ -99,13 +103,7 @@ class SourceBundleDraftProbe:
                 agent_name=agent.name,
                 base_version=max(published),
                 bundle=artifact,
-                runtime="python_3_12",
                 entry_point=("python", source.entry_point.as_posix()),
-                dependency_resolution="remote_build",
-                cpu="1",
-                memory="2Gi",
-                protocol="responses",
-                protocol_version="1.0.0",
                 probe=True,
             )
             record = gateway.create_draft(draft_request)
@@ -205,6 +203,9 @@ def build_production_onboarding_dependencies(
         draft_probe=draft_probe_factory(),
         publisher=GhOnboardingPublisher(commands),
         change_writer=GitChangeSetWriter(commands),
+        variables=GitHubVariableConfigurator(
+            GitHubApiVariableGateway(commands)
+        ),
     )
 
 

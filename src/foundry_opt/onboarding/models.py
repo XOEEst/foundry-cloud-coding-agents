@@ -18,6 +18,17 @@ class ChangeStatus(StrEnum):
     CONFLICT = "conflict"
 
 
+class GitHubVariableScope(StrEnum):
+    AGENTS = "agents"
+    ACTIONS_ENVIRONMENT = "actions_environment"
+
+
+class GitHubVariableChangeStatus(StrEnum):
+    CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+
+
 @dataclass(frozen=True)
 class PythonAgentCandidate:
     name: str
@@ -118,6 +129,30 @@ class OnboardingRequest:
     client_id: str
     subscription_id: str
     product_install: str
+    set_github_variables: bool = False
+    mirror_actions_environment: str | None = None
+    update_github_variables: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.mirror_actions_environment is not None
+            or self.update_github_variables
+        ) and not self.set_github_variables:
+            raise ValueError(
+                "GitHub variable mirror/update options require "
+                "set_github_variables"
+            )
+        if self.mirror_actions_environment is not None:
+            environment = self.mirror_actions_environment
+            if (
+                not environment.strip()
+                or any(ord(character) < 32 for character in environment)
+                or "/" in environment
+                or "\\" in environment
+            ):
+                raise ValueError(
+                    "mirror_actions_environment is not a safe environment name"
+                )
 
 
 @dataclass(frozen=True)
@@ -144,6 +179,15 @@ class DraftPullRequestPublication:
 
 
 @dataclass(frozen=True)
+class GitHubVariableChange:
+    name: str
+    scope: GitHubVariableScope
+    status: GitHubVariableChangeStatus
+    environment: str | None = None
+    value: None = None
+
+
+@dataclass(frozen=True)
 class OnboardingResult:
     status: OnboardingStatus
     changes: tuple[OnboardingChange, ...]
@@ -152,6 +196,7 @@ class OnboardingResult:
     oidc: OidcTrustResult | None = None
     draft_probe: DraftProbeResult | None = None
     published_pull_request: DraftPullRequestPublication | None = None
+    variable_changes: tuple[GitHubVariableChange, ...] = ()
     blockers: tuple[str, ...] = ()
     residual_state: tuple[str, ...] = ()
     guidance: tuple[str, ...] = field(default_factory=tuple)

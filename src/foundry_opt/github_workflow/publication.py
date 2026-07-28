@@ -568,6 +568,9 @@ def _verify_campaign_commit(
             candidate_id,
             candidate.patch.sha256,
             request.sensitive_values,
+            expected_goal_sha256=request.report.goal_sha256,
+            expected_spec_sha256=request.report.spec_sha256,
+            expected_assets=request.report.assets,
         )
 
 
@@ -626,12 +629,41 @@ def _verify_redacted_evidence(
     candidate_id: str,
     patch_sha256: str,
     sensitive_values: tuple[str, ...],
+    *,
+    expected_goal_sha256: str | None = None,
+    expected_spec_sha256: str | None = None,
+    expected_assets: tuple[object, ...] = (),
 ) -> None:
     try:
         document = json.loads(content)
         _validate_evidence_document(document)
         candidates = document["candidates"]
         pareto = document["pareto"]
+        if (
+            expected_goal_sha256 is not None
+            and document.get("goal_sha256") != expected_goal_sha256
+        ) or (
+            expected_spec_sha256 is not None
+            and document.get("spec_sha256") != expected_spec_sha256
+        ):
+            raise ValueError
+        if expected_assets:
+            actual_assets = document.get("assets")
+            if not isinstance(actual_assets, list):
+                raise ValueError
+            expected_documents = sorted(
+                (_asset_document(asset) for asset in expected_assets),
+                key=lambda item: str(item["asset_id"]),
+            )
+            if sorted(
+                actual_assets,
+                key=lambda item: (
+                    str(item.get("asset_id"))
+                    if isinstance(item, dict)
+                    else ""
+                ),
+            ) != expected_documents:
+                raise ValueError
         if (
             document.get("schema_version") != 1
             or document.get("campaign_id") != campaign_id
@@ -693,12 +725,29 @@ def _validate_evidence_document(value: object) -> None:
             "candidates",
             "pareto",
         },
-        optional={"generated_at", "telemetry"},
+        optional={
+            "goal_sha256",
+            "spec_sha256",
+            "assets",
+            "generated_at",
+            "telemetry",
+        },
     )
     if document["schema_version"] != 1:
         raise ValueError
     _metadata_string(document["campaign_id"])
     _metadata_string(document["source_hash"])
+    if "goal_sha256" in document:
+        _sha256(document["goal_sha256"])
+    if "spec_sha256" in document:
+        _sha256(document["spec_sha256"])
+    if "assets" in document:
+        assets = document["assets"]
+        if not isinstance(assets, list):
+            raise ValueError
+        asset_ids = tuple(_validate_asset(asset) for asset in assets)
+        if len(asset_ids) != len(set(asset_ids)):
+            raise ValueError
     if "generated_at" in document:
         _nullable_metadata_string(document["generated_at"])
     _validate_result(document["baseline"], candidate=False)
@@ -714,6 +763,61 @@ def _validate_evidence_document(value: object) -> None:
             raise ValueError
         for item in telemetry:
             _validate_telemetry(item)
+
+
+def _asset_document(asset: object) -> dict[str, object]:
+    return {
+        "asset_id": getattr(asset, "asset_id"),
+        "kind": getattr(asset, "kind"),
+        "source": getattr(asset, "source"),
+        "role": getattr(asset, "role"),
+        "name": getattr(asset, "name"),
+        "version": getattr(asset, "version"),
+        "remote_id": getattr(asset, "remote_id"),
+        "content_sha256": getattr(asset, "content_sha256"),
+        "approval_gate": getattr(asset, "approval_gate"),
+        "metrics": list(getattr(asset, "metrics", ())),
+    }
+
+
+def _validate_asset(value: object) -> str:
+    asset = _strict_object(
+        value,
+        required={
+            "asset_id",
+            "kind",
+            "source",
+            "role",
+            "name",
+            "version",
+            "remote_id",
+            "content_sha256",
+            "approval_gate",
+            "metrics",
+        },
+    )
+    asset_id = _metadata_string(asset["asset_id"])
+    if asset["kind"] not in {"dataset", "evaluator"}:
+        raise ValueError
+    _metadata_string(asset["source"])
+    _nullable_metadata_string(asset["role"])
+    _nullable_metadata_string(asset["name"])
+    _nullable_metadata_string(asset["version"])
+    _nullable_metadata_string(asset["remote_id"])
+    if asset["content_sha256"] is not None:
+        _sha256(asset["content_sha256"])
+    if asset["approval_gate"] not in {"policy", "human"}:
+        raise ValueError
+    metrics = asset["metrics"]
+    if not isinstance(metrics, list):
+        raise ValueError
+    for metric in metrics:
+        _metadata_string(metric)
+    if asset["kind"] == "dataset" and metrics:
+        raise ValueError
+    if asset["kind"] == "evaluator" and not metrics:
+        raise ValueError
+    return asset_id
 
 
 def _validate_result(value: object, *, candidate: bool) -> None:
