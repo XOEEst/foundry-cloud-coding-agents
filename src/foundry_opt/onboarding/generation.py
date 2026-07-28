@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 
@@ -155,6 +156,7 @@ on:
 jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
+    environment: {json.dumps(request.environment_name)}
     permissions:
       contents: read
       id-token: write
@@ -162,14 +164,20 @@ jobs:
       - name: Checkout repository
         uses: {CHECKOUT_ACTION} # v7.0.1
       - name: Export non-secret Azure OIDC identifiers
+        env:
+          ACTIONS_AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
+          ACTIONS_AZURE_CLIENT_ID: ${{{{ vars.AZURE_CLIENT_ID }}}}
+          ACTIONS_AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
         shell: bash
         run: |
           for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_SUBSCRIPTION_ID; do
-            if [ -z "${{!name:-}}" ]; then
-              echo "Missing GitHub Agents variable: $name" >&2
+            fallback="ACTIONS_${{name}}"
+            value="${{!name:-${{!fallback:-}}}}"
+            if [ -z "$value" ]; then
+              echo "Missing GitHub Agents or Actions variable: $name" >&2
               exit 1
             fi
-            printf '%s=%s\\n' "$name" "${{!name}}" >> "$GITHUB_ENV"
+            printf '%s=%s\\n' "$name" "$value" >> "$GITHUB_ENV"
           done
       - name: Sign in to Azure with repository-ID OIDC
         uses: {AZURE_LOGIN_ACTION} # v3.0.0

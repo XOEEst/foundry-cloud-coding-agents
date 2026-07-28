@@ -370,7 +370,9 @@ permissions:
 
 jobs:
   exact-candidate:
-    if: startsWith(github.event.pull_request.head.ref, 'foundry-opt/')
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'foundry-opt/') &&
+      contains(github.event.pull_request.body, '<!-- foundry-opt:candidate-pr:')
     runs-on: ubuntu-latest
     steps:
       - uses: {_CHECKOUT_ACTION} # v7.0.1

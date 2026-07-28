@@ -164,6 +164,7 @@ def test_candidate_check_never_sources_pr_controlled_shell_content() -> None:
         in workflow
     )
     assert "steps.metadata.outputs.candidate" in workflow
+    assert "contains(github.event.pull_request.body" in workflow
 
 
 def test_dispatch_inputs_are_passed_through_environment_variables() -> None:

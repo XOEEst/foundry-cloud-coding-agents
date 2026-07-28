@@ -251,14 +251,15 @@ def test_run_onboarding_generates_secretless_draft_change_set(
         == ".github/workflows/copilot-setup-steps.yml"
     )
     assert "runs-on: ubuntu-latest" in workflow
-    assert "environment:" not in workflow
+    assert 'environment: "acceptance"' in workflow
     assert "python-version: '3.12'" in generated
-    assert "Missing GitHub Agents variable: $name" in generated
+    assert "Missing GitHub Agents or Actions variable: $name" in generated
     assert (
         "for name in AZURE_TENANT_ID AZURE_CLIENT_ID "
         "AZURE_SUBSCRIPTION_ID" in generated
     )
-    assert 'printf \'%s=%s\\n\' "$name" "${!name}" >> "$GITHUB_ENV"' in generated
+    assert 'printf \'%s=%s\\n\' "$name" "$value" >> "$GITHUB_ENV"' in generated
+    assert "ACTIONS_AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}" in generated
     assert "client-id: ${{ env.AZURE_CLIENT_ID }}" in generated
     assert "tenant-id: ${{ env.AZURE_TENANT_ID }}" in generated
     assert (
