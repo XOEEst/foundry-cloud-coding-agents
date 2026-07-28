@@ -453,15 +453,16 @@ def test_multiple_evaluators_compose_single_definition() -> None:
 
     payload = transport.created_definitions[0]
     criteria = payload["configuration"]["testing_criteria"]
-    # One criterion per metric: criterion name == metric name, and
-    # evaluator_name is the remote identity of the producing evaluator.
+    # One criterion per metric: criterion name == metric name, while
+    # evaluator_name is the evaluator catalog name. Exact remote identity
+    # remains in evaluator_reference for lineage.
     mapping = {
         criterion["name"]: criterion["evaluator_name"]
         for criterion in criteria
     }
     assert mapping == {
-        "quality": "builtin:quality:1",
-        "safety": "builtin:safety:2",
+        "quality": "quality",
+        "safety": "safety",
     }
     normalization = payload["configuration"]["normalization"]
     assert set(normalization) == {"quality", "safety"}
@@ -1024,7 +1025,7 @@ def test_real_transport_round_trip_with_fake_openai_client() -> None:
     assert len(evals.create_calls) == 1
     criteria = evals.create_calls[0]["testing_criteria"]
     assert [c["name"] for c in criteria] == ["quality"]
-    assert criteria[0]["evaluator_name"] == "builtin:quality:1"
+    assert criteria[0]["evaluator_name"] == "quality"
     # The batch run pins the exact split dataset remote id and draft agent.
     data_source = evals.runs.create_calls[0]["data_source"]
     assert "foundry-dataset-dev/versions/1" in data_source["source"]["id"]

@@ -601,7 +601,16 @@ class EvaluationAssetRegistrationGateway(Protocol):
 
 
 def deterministic_asset_name(provenance: AssetProvenance) -> str:
-    return f"{provenance.kind.value}-{provenance.asset_id}"
+    base = f"{provenance.kind.value}-{provenance.asset_id}"
+    if provenance.kind is AssetKind.EVALUATOR:
+        if provenance.content_sha256 is None:
+            raise ValueError(
+                "prepared evaluators require a content hash before "
+                "registration"
+            )
+        suffix = provenance.content_sha256[:12]
+        return f"{base[:114]}-{suffix}"
+    return base
 
 
 def deterministic_asset_version(provenance: AssetProvenance) -> str:
@@ -661,5 +670,9 @@ def materialize_prepared_asset(
         raise AssetIdentityMismatchError(provenance.asset_id)
 
     return provenance.model_copy(
-        update={"remote_id": identity.remote_id, "version": identity.version}
+        update={
+            "name": identity.name,
+            "remote_id": identity.remote_id,
+            "version": identity.version,
+        }
     )

@@ -669,6 +669,17 @@ def _versions_list(*items: dict[str, Any]) -> FakeResponse:
     return FakeResponse(200, {"value": list(items)})
 
 
+def _current_versions_list(*items: dict[str, Any]) -> FakeResponse:
+    return FakeResponse(
+        200,
+        {
+            "data": list(items),
+            "has_more": False,
+            "object": "list",
+        },
+    )
+
+
 def _existing_draft_version(
     source_sha256: str,
     *,
@@ -706,6 +717,22 @@ def test_create_draft_reuses_existing_draft_for_idempotency_key(
     # No POST was issued: only the baseline GET and the versions LIST.
     methods = [call.method for call in client.requests]
     assert methods == ["GET", "GET"]
+
+
+def test_create_draft_accepts_current_versions_list_shape(
+    tmp_path: Path,
+) -> None:
+    request = _idempotent_request(tmp_path)
+    existing = _existing_draft_version(request.bundle.sha256)
+    client = FakeProjectClient(
+        [_baseline(), _current_versions_list(existing)]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.create_draft(request)
+
+    assert record.version_id == "draft-candidate-1"
+    assert [call.method for call in client.requests] == ["GET", "GET"]
 
 
 def test_create_draft_posts_when_no_matching_draft_exists(

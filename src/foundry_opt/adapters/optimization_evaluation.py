@@ -425,13 +425,14 @@ class _EvaluationPlan:
     def definition_configuration(self) -> dict[str, object]:
         # One testing criterion per approved metric: the criterion name is the
         # metric name (so provider results map straight onto the metric
-        # policy), and evaluator_name is the remote identity of the single
-        # evaluator that produces that metric.
+        # policy), and evaluator_name is the catalog name of the single
+        # evaluator that produces that metric. Its exact remote identity stays
+        # in evaluator_reference for immutable lineage.
         testing_criteria = [
             {
                 "type": _EVALUATOR_TYPE,
                 "name": metric,
-                "evaluator_name": evaluator.remote_id,
+                "evaluator_name": _evaluator_catalog_name(evaluator),
                 "evaluator_reference": {
                     "asset_id": evaluator.asset_id,
                     "source": evaluator.source,
@@ -597,6 +598,14 @@ def _map_metrics_to_evaluators(
     return tuple(
         (metric, producers[metric][0]) for metric in sorted(metric_names)
     )
+
+
+def _evaluator_catalog_name(evaluator: _FoundryAsset) -> str:
+    if not evaluator.name:
+        raise OptimizationEvaluationError(
+            f"approved evaluator {evaluator.asset_id!r} has no catalog name"
+        )
+    return evaluator.name
 
 
 def _validate_assets_match_spec(

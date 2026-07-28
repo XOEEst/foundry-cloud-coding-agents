@@ -333,6 +333,8 @@ def _find_matching_draft(
             ),
         )
         items = payload.get("value")
+        if items is None:
+            items = payload.get("data")
         if not isinstance(items, list):
             raise DraftResponseError()
         for item in items:

@@ -689,6 +689,7 @@ def test_materialize_registers_prepared_asset_with_deterministic_identity(
     expected_version = prepared.provenance.content_sha256[:16]
     assert gateway.calls == [(AssetKind.DATASET, expected_name, expected_version)]
     assert provenance.remote_id == f"remote-{expected_name}-{expected_version}"
+    assert provenance.name == expected_name
     assert provenance.content_sha256 == prepared.provenance.content_sha256
 
 
@@ -746,7 +747,10 @@ def test_materialize_preserves_evaluator_metrics_through_version_overwrite(
     prepared = provider.prepare(request, _context(tmp_path))
     assert prepared.provenance.metrics == ("quality", "safety")
 
-    expected_name = f"evaluator-{prepared.provenance.asset_id}"
+    expected_name = (
+        f"evaluator-{prepared.provenance.asset_id}-"
+        f"{prepared.provenance.content_sha256[:12]}"
+    )
     expected_requested_version = prepared.provenance.content_sha256[:16]
     actual_identity = AssetIdentity(
         remote_id="remote-evaluator-actual",
