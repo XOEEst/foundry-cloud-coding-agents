@@ -430,9 +430,6 @@ class EvaluationAssetRegistrationGateway:
                         existing, name, version, content_sha256
                     )
 
-                staging_name, staging_version = _staging_dataset_identity(
-                    name, content_sha256
-                )
                 try:
                     with tempfile.TemporaryDirectory() as scratch_dir:
                         scratch_path = Path(scratch_dir) / (
@@ -440,8 +437,8 @@ class EvaluationAssetRegistrationGateway:
                         )
                         scratch_path.write_bytes(data)
                         uploaded = client.datasets.upload_file(
-                            name=staging_name,
-                            version=staging_version,
+                            name=name,
+                            version=version,
                             file_path=str(scratch_path),
                         )
                     tagged = client.datasets.create_or_update(
@@ -455,10 +452,9 @@ class EvaluationAssetRegistrationGateway:
                     return _verify_registered_dataset(
                         tagged, name, version, content_sha256
                     )
-                finally:
-                    _delete_staging_dataset_quietly(
-                        client, staging_name, staging_version
-                    )
+                except Exception:
+                    _delete_dataset_quietly(client, name, version)
+                    raise
             except FoundryAssetGatewayError:
                 raise
             except Exception as error:
@@ -497,6 +493,10 @@ class EvaluationAssetRegistrationGateway:
                         categories=metadata["categories"],
                         definition=definition,
                         display_name=metadata.get("display_name"),
+                        metadata={
+                            _CONTENT_HASH_TAG: content_sha256,
+                            _ASSET_VERSION_TAG: version,
+                        },
                         supported_evaluation_levels=metadata.get(
                             "supported_evaluation_levels"
                         ),
@@ -551,33 +551,10 @@ def _try_get_dataset(client: Any, name: str, version: str) -> Any | None:
         raise
 
 
-_STAGING_DATASET_SUFFIX = "-foundry-opt-staging"
-
-
-def _staging_dataset_identity(name: str, content_sha256: str) -> tuple[str, str]:
-    """A disposable name/version used only to obtain an uploaded ``data_uri``.
-
-    Uploading directly to the final, caller-visible deterministic
-    ``(name, version)`` and then issuing a second call to add tags would
-    risk *poisoning* that identity: if the file upload succeeds but the
-    follow-up tagging call fails (or races with a concurrent registration),
-    the target name/version is left registered with untagged or
-    partially-tagged content that can never be safely overwritten again.
-    Instead, the file is uploaded to a disposable staging identity —
-    deterministically derived from the content hash, so repeated attempts
-    with identical content reuse the same staging blob rather than
-    accumulating garbage — and its resulting ``data_uri`` is used to create
-    the *final* dataset version in a single, already-tagged call. The
-    staging dataset is then best-effort deleted.
-    """
-
-    return f"{name}{_STAGING_DATASET_SUFFIX}", content_sha256[:32]
-
-
-def _delete_staging_dataset_quietly(client: Any, name: str, version: str) -> None:
+def _delete_dataset_quietly(client: Any, name: str, version: str) -> None:
     try:
         client.datasets.delete(name, version)
-    except Exception:  # noqa: BLE001 - best-effort cleanup must never mask the real result
+    except Exception:  # noqa: BLE001 - cleanup must not mask the real error
         pass
 
 
@@ -650,8 +627,8 @@ def _find_existing_evaluator_version(
         raise
 
     for candidate in candidates:
-        tags = getattr(candidate, "tags", None) or {}
-        if tags.get(_ASSET_VERSION_TAG) != version:
+        identity_metadata = _evaluator_identity_metadata(candidate)
+        if identity_metadata.get(_ASSET_VERSION_TAG) != version:
             continue
         service_version = getattr(candidate, "version", None)
         if (
@@ -662,7 +639,7 @@ def _find_existing_evaluator_version(
             raise FoundryAssetIdentityMismatchError(
                 AssetKind.EVALUATOR, name, version
             )
-        if tags.get(_CONTENT_HASH_TAG) != content_sha256:
+        if identity_metadata.get(_CONTENT_HASH_TAG) != content_sha256:
             raise FoundryAssetRegistrationConflictError(
                 AssetKind.EVALUATOR, name, version
             )
@@ -699,14 +676,14 @@ def _verify_registered_evaluator(
     compares against the prepared asset's deterministic version.
     """
 
-    tags = getattr(record, "tags", None) or {}
+    identity_metadata = _evaluator_identity_metadata(record)
     service_version = getattr(record, "version", None)
     if (
         getattr(record, "name", None) != name
         or not getattr(record, "id", None)
         or not service_version
-        or tags.get(_ASSET_VERSION_TAG) != version
-        or tags.get(_CONTENT_HASH_TAG) != content_sha256
+        or identity_metadata.get(_ASSET_VERSION_TAG) != version
+        or identity_metadata.get(_CONTENT_HASH_TAG) != content_sha256
     ):
         raise FoundryAssetIdentityMismatchError(AssetKind.EVALUATOR, name, version)
     return AssetIdentity(
@@ -716,6 +693,12 @@ def _verify_registered_evaluator(
         requested_version=version,
         content_sha256=content_sha256,
     )
+
+
+def _evaluator_identity_metadata(record: Any) -> dict[str, Any]:
+    tags = getattr(record, "tags", None) or {}
+    metadata = getattr(record, "metadata", None) or {}
+    return {**tags, **metadata}
 
 
 

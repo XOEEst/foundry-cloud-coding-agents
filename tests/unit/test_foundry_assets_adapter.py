@@ -180,7 +180,8 @@ class FakeBetaEvaluatorsOperations:
             id=f"evaluator-id-{name}",
             name=name,
             version="1",
-            tags=dict(evaluator_version.tags or {}),
+            tags={},
+            metadata=dict(evaluator_version.metadata or {}),
         )
 
 
@@ -480,13 +481,12 @@ def test_register_dataset_uploads_and_tags_new_dataset() -> None:
     )
     assert client.datasets.get_calls == [("dataset-dev", "v1")]
 
-    # The upload targets a disposable staging identity, never the final
-    # deterministic (name, version) directly, so a failed follow-up create
-    # can never leave the real target partially tagged.
+    # The SDK upload helper must target the final identity because Foundry
+    # rejects re-registering a blob that is already owned by a staging asset.
     assert len(client.datasets.upload_calls) == 1
     uploaded_name, uploaded_version, uploaded_content = client.datasets.upload_calls[0]
-    assert uploaded_name == "dataset-dev-foundry-opt-staging"
-    assert uploaded_version == content_sha256[:32]
+    assert uploaded_name == "dataset-dev"
+    assert uploaded_version == "v1"
     ((_, expected_bytes),) = _DATASET_CONTENT.items()
     assert uploaded_content == expected_bytes
 
@@ -497,17 +497,12 @@ def test_register_dataset_uploads_and_tags_new_dataset() -> None:
     assert (created_name, created_version) == ("dataset-dev", "v1")
     assert dataset_version.tags == {"foundry_opt_content_sha256": content_sha256}
 
-    # The staging dataset is best-effort cleaned up afterwards.
-    assert client.datasets.delete_calls == [
-        ("dataset-dev-foundry-opt-staging", content_sha256[:32])
-    ]
+    assert client.datasets.delete_calls == []
     assert client.closed is True
 
 
-def test_register_dataset_cleans_up_staging_when_final_create_fails() -> None:
-    """If the final create_or_update fails after a successful staging upload,
-    the staging dataset must still be deleted and the error translated;
-    nothing should be left registered under the final target."""
+def test_register_dataset_cleans_up_target_when_tagging_fails() -> None:
+    """A failed tagging call removes the newly uploaded target before retry."""
 
     content_sha256 = _dataset_content_hash()
     client = FakeProjectClient(
@@ -528,18 +523,16 @@ def test_register_dataset_cleans_up_staging_when_final_create_fails() -> None:
 
     assert len(client.datasets.upload_calls) == 1
     uploaded_name, uploaded_version, _ = client.datasets.upload_calls[0]
-    assert uploaded_name == "dataset-dev-foundry-opt-staging"
-    assert uploaded_version == content_sha256[:32]
+    assert uploaded_name == "dataset-dev"
+    assert uploaded_version == "v1"
     assert len(client.datasets.create_calls) == 1
-    assert client.datasets.delete_calls == [
-        ("dataset-dev-foundry-opt-staging", content_sha256[:32])
-    ]
+    assert client.datasets.delete_calls == [("dataset-dev", "v1")]
     assert client.closed is True
 
 
 def test_register_dataset_retries_successfully_after_transient_create_failure() -> None:
     """A second registration attempt with identical content succeeds once the
-    transient failure is gone, reusing the same deterministic staging blob."""
+    transient failure is gone after the partial target is removed."""
 
     content_sha256 = _dataset_content_hash()
     failing_client = FakeProjectClient(
@@ -556,9 +549,7 @@ def test_register_dataset_retries_successfully_after_transient_create_failure() 
             version="v1",
             content=_DATASET_CONTENT,
         )
-    assert failing_client.datasets.delete_calls == [
-        ("dataset-dev-foundry-opt-staging", content_sha256[:32])
-    ]
+    assert failing_client.datasets.delete_calls == [("dataset-dev", "v1")]
 
     retry_client = FakeProjectClient(datasets=FakeDatasetsOperations(existing=None))
     identity = EvaluationAssetRegistrationGateway(
@@ -575,8 +566,8 @@ def test_register_dataset_retries_successfully_after_transient_create_failure() 
     assert identity.remote_id == "dataset-id-dataset-dev-v1"
     assert identity.content_sha256 == content_sha256
     uploaded_name, uploaded_version, _ = retry_client.datasets.upload_calls[0]
-    assert uploaded_name == "dataset-dev-foundry-opt-staging"
-    assert uploaded_version == content_sha256[:32]
+    assert uploaded_name == "dataset-dev"
+    assert uploaded_version == "v1"
 
 
 def test_register_dataset_is_idempotent_for_identical_content() -> None:
@@ -819,6 +810,8 @@ def test_register_evaluator_creates_prompt_based_definition() -> None:
     assert evaluator_version.definition.prompt_text == _PROMPT_SPEC["prompt_text"]
     assert evaluator_version.tags["foundry_opt_asset_version"] == "v1"
     assert "foundry_opt_content_sha256" in evaluator_version.tags
+    assert evaluator_version.metadata["foundry_opt_asset_version"] == "v1"
+    assert "foundry_opt_content_sha256" in evaluator_version.metadata
     assert client.closed is True
 
 
