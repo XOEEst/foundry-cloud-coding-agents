@@ -908,6 +908,15 @@ def _compile_rubric_prompt_text(
             f"- {dimension['name']} (weight {dimension['weight']}): "
             f"{dimension['criteria']}"
         )
+    lines.extend(
+        (
+            "Output Format (JSON):",
+            "{",
+            '  "result": <number from 0.0 to 1.0>,',
+            '  "reason": "<brief explanation>"',
+            "}",
+        )
+    )
     return "\n".join(lines)
 
 

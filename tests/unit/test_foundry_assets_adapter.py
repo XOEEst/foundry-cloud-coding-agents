@@ -1207,6 +1207,8 @@ def test_register_evaluator_compiles_repo_rubric_kind_shape() -> None:
     prompt_text = definition.prompt_text
     assert "{{query}}" in prompt_text
     assert "{{response}}" in prompt_text
+    assert '"result": <number from 0.0 to 1.0>' in prompt_text
+    assert '"reason": "<brief explanation>"' in prompt_text
     for dimension in _REPO_RUBRIC_EVALUATOR_SPEC["dimensions"]:
         assert dimension["name"] in prompt_text
         assert dimension["criteria"] in prompt_text
