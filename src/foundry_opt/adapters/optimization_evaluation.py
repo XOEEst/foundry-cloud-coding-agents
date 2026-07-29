@@ -91,7 +91,7 @@ __all__ = [
 
 _EVALUATOR_TYPE = "azure_ai_evaluator"
 _SCHEMA_VERSION = "1"
-_FINGERPRINT_SCHEME = "opt-eval-1"
+_FINGERPRINT_SCHEME = "opt-eval-2"
 
 
 EvaluationRunner = Callable[
@@ -472,7 +472,15 @@ class _EvaluationPlan:
                 }
             testing_criteria.append(criterion)
         normalization = {
-            metric: {"type": "pass_fail"}
+            metric: (
+                {"type": "pass_fail"}
+                if self.policy.metric(metric).hard_guardrail
+                else {
+                    "type": "min_max",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                }
+            )
             for metric, _ in self.metric_evaluators
         }
         return {

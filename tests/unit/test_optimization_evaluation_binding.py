@@ -489,7 +489,26 @@ def test_multiple_evaluators_compose_single_definition() -> None:
         "safety": "safety",
     }
     normalization = payload["configuration"]["normalization"]
-    assert set(normalization) == {"quality", "safety"}
+    assert normalization == {
+        "quality": {"type": "min_max", "minimum": 0.0, "maximum": 1.0},
+        "safety": {"type": "min_max", "minimum": 0.0, "maximum": 1.0},
+    }
+
+
+def test_hard_guardrail_uses_pass_fail_normalization() -> None:
+    guardrail = _metric(threshold=1.0)
+    guardrail["hard_guardrail"] = True
+    spec = _spec(metrics={"quality": guardrail})
+    transport = FakeTransport()
+    binder, _client, _provider = _binder(transport)
+
+    binder(spec, _assets(spec))(
+        _subject(), DatasetSplit.DEVELOPMENT, 1
+    )
+
+    assert transport.created_definitions[0]["configuration"][
+        "normalization"
+    ] == {"quality": {"type": "pass_fail"}}
 
 
 # ---------------------------------------------------------------------------
