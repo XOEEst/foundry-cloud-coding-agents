@@ -1201,10 +1201,15 @@ def _case_identity_digest(
     item_id: str,
     response_ids: list[str],
 ) -> str:
+    del item_id, response_ids
+    stable_datasource = {
+        key: value
+        for key, value in datasource.items()
+        if key not in {"response_id", "response_ids"}
+        and not key.startswith("sample.")
+    }
     identity = {
-        "datasource_item": _json_value(datasource),
-        "provider_output_item_id": item_id,
-        "response_ids": response_ids,
+        "datasource_item": _json_value(stable_datasource),
     }
     encoded = json.dumps(
         identity,

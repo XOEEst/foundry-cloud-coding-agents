@@ -20,6 +20,7 @@ from foundry_opt.adapters.foundry_evaluation import (
     EvaluationRateLimitError,
     EvaluationServiceError,
     FoundryEvaluationTransport,
+    _case_identity_digest,
     _provider_error,
     _optional_string,
     _usage,
@@ -55,6 +56,31 @@ def test_missing_cached_token_count_defaults_to_zero() -> None:
 
 def test_empty_optional_provider_string_is_absent() -> None:
     assert _optional_string("") is None
+
+
+def test_case_identity_excludes_generated_output_lineage() -> None:
+    first = _case_identity_digest(
+        {
+            "case_id": "case-1",
+            "query": "hello",
+            "sample.output_text": "first response",
+            "response_id": "response-1",
+        },
+        item_id="item-1",
+        response_ids=["response-1"],
+    )
+    second = _case_identity_digest(
+        {
+            "case_id": "case-1",
+            "query": "hello",
+            "sample.output_text": "second response",
+            "response_id": "response-2",
+        },
+        item_id="item-2",
+        response_ids=["response-2"],
+    )
+
+    assert first == second
 
 
 @dataclass
@@ -1185,11 +1211,7 @@ def test_query_only_output_derives_stable_case_identity() -> None:
         page_size=10,
     )
 
-    identity = {
-        "datasource_item": datasource_item,
-        "provider_output_item_id": "output-query-only",
-        "response_ids": ["resp-query-only"],
-    }
+    identity = {"datasource_item": {"query": datasource_item["query"]}}
     digest = hashlib.sha256(
         json.dumps(
             identity,
