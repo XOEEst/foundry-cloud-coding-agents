@@ -6,6 +6,7 @@ from foundry_opt.evaluation.models import (
     EvaluationResult,
     EvaluationStatus,
     MetricAggregate,
+    MetricDirection,
     MetricPolicy,
     Outcome,
     ParetoResult,
@@ -267,6 +268,29 @@ def _materially_improves(
             candidate_value.median,
         )
         if improvement > 0 and improvement >= metric.materiality:
+            return True
+        if metric.hard_guardrail:
+            continue
+        baseline_worst = (
+            baseline_value.minimum
+            if metric.direction is MetricDirection.MAXIMIZE
+            else baseline_value.maximum
+        )
+        candidate_worst = (
+            candidate_value.minimum
+            if metric.direction is MetricDirection.MAXIMIZE
+            else candidate_value.maximum
+        )
+        if baseline_worst is None or candidate_worst is None:
+            continue
+        worst_case_improvement = metric.improvement(
+            baseline_worst,
+            candidate_worst,
+        )
+        if (
+            worst_case_improvement > 0
+            and worst_case_improvement >= metric.materiality
+        ):
             return True
     return False
 

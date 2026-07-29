@@ -359,6 +359,22 @@ class CampaignGit:
             capture_output=True,
         )
         if result.returncode != 0 and path.exists():
+            listed = subprocess.run(
+                ("git", "worktree", "list", "--porcelain"),
+                cwd=root,
+                check=False,
+                capture_output=True,
+            )
+            registered = {
+                Path(line.removeprefix(b"worktree ").decode("utf-8"))
+                .expanduser()
+                .resolve()
+                for line in listed.stdout.splitlines()
+                if line.startswith(b"worktree ")
+            }
+            if path not in registered:
+                shutil.rmtree(path)
+        if result.returncode != 0 and path.exists():
             raise RuntimeError(
                 result.stderr.decode("utf-8", errors="replace").strip()
             )

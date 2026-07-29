@@ -504,12 +504,12 @@ def _validate_result_identifiers(result: EvaluationResult) -> None:
         (run.agent.agent_id, "agent_id"),
         (run.agent.draft_id, "draft_id"),
         (run.agent.version, "agent_version"),
-        (run.dataset.dataset_id, "dataset_id"),
         (run.dataset.version, "dataset_version"),
         (run.evaluator.definition_id, "evaluator_definition_id"),
         (run.evaluator.version, "evaluator_version"),
     ):
         _require_identifier(value, field)
+    _require_resource_identifier(run.dataset.dataset_id, "dataset_id")
     for attempt in result.all_runs:
         if (
             attempt.subject_id != run.subject_id
@@ -547,6 +547,26 @@ def _validate_result_identifiers(result: EvaluationResult) -> None:
 def _require_identifier(value: object, field: str) -> str:
     if not isinstance(value, str) or not _safe_identifier(value):
         raise ValueError(f"{field} must be a safe bounded identifier.")
+    return value
+
+
+def _require_resource_identifier(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a safe bounded identifier.")
+    if not value.startswith("azureai://"):
+        return _require_identifier(value, field)
+    parsed = urlsplit(value)
+    if (
+        len(value) > 2048
+        or parsed.scheme != "azureai"
+        or parsed.netloc != "accounts"
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+        or any(part in {".", ".."} for part in parsed.path.split("/"))
+        or not value.isascii()
+    ):
+        raise ValueError(f"{field} must be a safe Foundry resource identifier.")
     return value
 
 

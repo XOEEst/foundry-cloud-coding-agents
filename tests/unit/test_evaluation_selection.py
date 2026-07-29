@@ -233,6 +233,41 @@ def test_zero_materiality_still_requires_strict_positive_improvement() -> None:
     assert "material improvement" in result.decision_for("unchanged").reason
 
 
+def test_worst_case_objective_improvement_is_material() -> None:
+    baseline = _result("baseline", quality=0.90, latency=1.5)
+    candidate = _result("candidate", quality=0.90, latency=1.5)
+    baseline = replace(
+        baseline,
+        metrics={
+            **baseline.metrics,
+            "quality": replace(
+                baseline.metrics["quality"],
+                minimum=0.40,
+                spread=0.50,
+            ),
+        },
+    )
+    candidate = replace(
+        candidate,
+        metrics={
+            **candidate.metrics,
+            "quality": replace(
+                candidate.metrics["quality"],
+                minimum=0.80,
+                spread=0.10,
+            ),
+        },
+    )
+
+    result = select_eligible_candidates(
+        baseline,
+        (candidate,),
+        POLICY,
+    )
+
+    assert result.eligible_ids == ("candidate",)
+
+
 def test_incomplete_baseline_rejects_all_candidates() -> None:
     baseline = replace(
         _result("baseline", quality=0.70, latency=1.5),

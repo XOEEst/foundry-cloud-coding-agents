@@ -398,7 +398,7 @@ class _EvaluationPlan:
         metric_fingerprint = tuple(
             {
                 "name": name,
-                **spec.metrics[name].model_dump(mode="json"),
+                **_metric_policy_fingerprint(spec.metrics[name]),
             }
             for name in sorted(spec.metrics)
         )
@@ -641,6 +641,16 @@ def _evaluator_catalog_name(evaluator: _FoundryAsset) -> str:
             f"approved evaluator {evaluator.asset_id!r} has no catalog name"
         )
     return evaluator.name
+
+
+def _metric_policy_fingerprint(policy: Any) -> dict[str, object]:
+    document = policy.model_dump(mode="json")
+    repeat = document.get("repeat")
+    if isinstance(repeat, dict) and isinstance(
+        repeat.get("conditions"), list
+    ):
+        repeat["conditions"] = sorted(repeat["conditions"])
+    return document
 
 
 def _validate_assets_match_spec(

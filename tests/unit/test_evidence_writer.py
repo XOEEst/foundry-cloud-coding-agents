@@ -118,6 +118,50 @@ def test_write_redacted_evidence_writes_allowlisted_compact_manifest(
     )
 
 
+def test_evidence_accepts_foundry_dataset_resource_ids(
+    tmp_path: Path,
+) -> None:
+    dataset_id = (
+        "azureai://accounts/account/projects/project/data/"
+        "dataset/versions/1"
+    )
+    baseline = _result("baseline", quality=0.70, latency=1.5)
+    candidate = _result("candidate", quality=0.80, latency=1.4)
+    baseline = replace(
+        baseline,
+        run=replace(
+            baseline.run,
+            dataset=replace(baseline.run.dataset, dataset_id=dataset_id),
+        ),
+    )
+    candidate = replace(
+        candidate,
+        run=replace(
+            candidate.run,
+            dataset=replace(candidate.run.dataset, dataset_id=dataset_id),
+        ),
+    )
+    pareto = select_eligible_candidates(baseline, (candidate,), POLICY)
+
+    manifest = write_redacted_evidence(
+        EvidenceRequest(
+            output_path=tmp_path / "evidence.json",
+            campaign_id="campaign-1",
+            baseline=baseline,
+            candidates=(candidate,),
+            pareto=pareto,
+            metric_policies=POLICY,
+            source_hash="sha256:source",
+            goal=GOAL,
+            spec_sha256=SPEC_SHA256,
+            assets=ASSETS,
+            patch_hashes={"candidate": "sha256:patch"},
+        )
+    )
+
+    assert manifest.run_ids == ("run-baseline", "run-candidate")
+
+
 def test_evidence_writer_strips_query_and_fragment_from_portal_links(
     tmp_path: Path,
 ) -> None:

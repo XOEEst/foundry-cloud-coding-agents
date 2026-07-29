@@ -1202,10 +1202,21 @@ def _case_identity_digest(
     response_ids: list[str],
 ) -> str:
     del item_id, response_ids
+    generated_keys = {
+        "agent_id",
+        "agent_name",
+        "agent_version",
+        "conversation_id",
+        "previous_response_id",
+        "response_id",
+        "response_ids",
+        "span_id",
+        "trace_id",
+    }
     stable_datasource = {
         key: value
         for key, value in datasource.items()
-        if key not in {"response_id", "response_ids"}
+        if key not in generated_keys
         and not key.startswith("sample.")
     }
     identity = {

@@ -597,7 +597,7 @@ class GhCampaignGateway:
                 "--repo",
                 self._repository_name(),
                 "--state",
-                "all",
+                "open",
                 "--head",
                 head_branch,
                 "--json",

@@ -20,6 +20,7 @@ from foundry_opt.adapters.foundry_evaluation import EvaluationServiceError
 from foundry_opt.adapters.optimization_evaluation import (
     OptimizationEvaluationBinder,
     OptimizationEvaluationError,
+    _EvaluationPlan,
 )
 from foundry_opt.evaluation import (
     AgentVersionRef,
@@ -377,6 +378,20 @@ def test_custom_evaluators_receive_model_and_threshold_parameters() -> None:
         "threshold": 0.8,
         "pass_threshold": 0.8,
     }
+
+
+def test_metric_fingerprint_sorts_repeat_conditions() -> None:
+    metric = _metric()
+    metric["repeat"] = {
+        "max_repeats": 1,
+        "conditions": ["partial", "borderline", "noisy"],
+    }
+    spec = _spec(metrics={"quality": metric})
+
+    plan = _EvaluationPlan.build(spec, _assets(spec))
+
+    repeat = plan.metric_fingerprint[0]["repeat"]
+    assert repeat["conditions"] == ["borderline", "noisy", "partial"]
 
 
 # ---------------------------------------------------------------------------
