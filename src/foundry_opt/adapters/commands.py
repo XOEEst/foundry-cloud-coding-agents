@@ -61,6 +61,8 @@ class SubprocessCommandRunner:
         }
         if input_bytes is None:
             options["text"] = True
+            options["encoding"] = "utf-8"
+            options["errors"] = "replace"
         if environment is not None:
             options["env"] = {**os.environ, **environment}
         if input_text is not None:

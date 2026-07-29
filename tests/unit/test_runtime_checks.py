@@ -49,6 +49,18 @@ class FakeCommandRunner:
         return response
 
 
+def test_subprocess_runner_decodes_utf8_output() -> None:
+    result = SubprocessCommandRunner().run(
+        (
+            sys.executable,
+            "-c",
+            "import sys;sys.stdout.buffer.write('✅ ready\\n'.encode())",
+        )
+    )
+
+    assert result.stdout == "\u2705 ready\n"
+
+
 class FakeGitHubMetadataGateway:
     def __init__(self, metadata: GitHubRepositoryMetadata) -> None:
         self._metadata = metadata
@@ -98,6 +110,8 @@ def test_command_runner_passes_an_argument_array_without_a_shell(
         "shell": False,
         "capture_output": True,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
         "check": False,
     }
 

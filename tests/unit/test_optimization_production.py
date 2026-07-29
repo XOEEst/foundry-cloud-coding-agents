@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+import zipfile
 
 import pytest
 import yaml
@@ -670,6 +671,35 @@ def test_default_validator_runs_target_configured_commands(
 
     assert report.passed is True
     assert commands.calls == list(expected)
+
+
+def test_default_bundle_builder_uses_target_package_rules(
+    tmp_path: Path,
+) -> None:
+    config_document = _config_dict()
+    del config_document["targets"]["billing-agent"]
+    config = OptimizerConfig.model_validate(config_document)
+    (tmp_path / "agent").mkdir()
+    (tmp_path / "agent" / "main.py").write_text(
+        "print('agent')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_agent.py").write_text(
+        "raise AssertionError\n",
+        encoding="utf-8",
+    )
+    dependencies = build_issue_optimization_dependencies(
+        config,
+        command_runner=_FakeCommands({}),
+        credential_provider=_fake_credential_provider(),
+    )
+    output = tmp_path / "candidate.zip"
+
+    dependencies.build_bundle(tmp_path, output)
+
+    with zipfile.ZipFile(output) as archive:
+        assert archive.namelist() == ["agent/main.py"]
 
 
 # ---------------------------------------------------------------------------

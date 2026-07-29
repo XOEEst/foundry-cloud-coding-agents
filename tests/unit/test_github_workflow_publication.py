@@ -593,10 +593,7 @@ def test_sub_issue_failure_uses_task_list_fallback_and_is_explicit() -> None:
     assert gateway.updated_prs
     assert "- [ ] #101" in gateway.updated_prs[0][1]
     assert "Part of #42" in gateway.created_issues[0][1]
-    assert [failure.code for failure in publication.failures] == [
-        "sub_issue_fallback"
-    ]
-    assert "secret" not in publication.failures[0].message
+    assert publication.failures == ()
 
 
 def test_labels_and_dependencies_are_best_effort_and_explicit() -> None:

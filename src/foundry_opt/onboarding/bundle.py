@@ -407,15 +407,18 @@ jobs:
               r"foundry-opt:candidate-pr:[^:]+:([^:]+):",
               body,
           )
-          issue_match = re.search(r"Candidate issue: #(\\d+)", body)
-          if candidate_match is None or issue_match is None:
+          campaign_match = re.search(
+              r"foundry-opt:candidate-pr:issue-(\\d+):",
+              body,
+          )
+          if candidate_match is None or campaign_match is None:
               raise SystemExit("candidate metadata is missing")
           candidate = candidate_match.group(1)
           if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}", candidate) is None:
               raise SystemExit("candidate identifier is invalid")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"candidate={{candidate}}\\n")
-              output.write(f"issue={{issue_match.group(1)}}\\n")
+              output.write(f"issue={{campaign_match.group(1)}}\\n")
       - name: Verify exact candidate metadata and tree
         env:
           CANDIDATE: ${{{{ steps.metadata.outputs.candidate }}}}

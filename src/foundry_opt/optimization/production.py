@@ -765,6 +765,39 @@ def _validation_request(
     )
 
 
+def _bundle_request(
+    config: OptimizerConfig,
+    repository_root: Path,
+    output_path: Path,
+) -> BundleRequest:
+    matching_targets = tuple(
+        target
+        for target in config.targets.values()
+        if (repository_root / Path(str(target.entry_point))).is_file()
+    )
+    contracts = {
+        (
+            tuple(str(pattern) for pattern in target.package.include),
+            tuple(str(pattern) for pattern in target.package.exclude),
+            target.runtime.dependency_resolution or "remote_build",
+        )
+        for target in matching_targets
+    }
+    if len(contracts) != 1:
+        raise ValueError(
+            "the candidate worktree does not resolve to one package contract"
+        )
+    include, exclude, dependency_resolution = next(iter(contracts))
+    return BundleRequest(
+        repository_root=repository_root,
+        output_path=output_path,
+        include=include,
+        exclude=exclude,
+        dependency_resolution=dependency_resolution,
+        evidence_paths=(Path(str(config.campaign.evidence_path)),),
+    )
+
+
 def build_issue_optimization_dependencies(
     config: OptimizerConfig,
     *,
@@ -840,7 +873,7 @@ def build_issue_optimization_dependencies(
             _validation_request(config, path), commands
         ),
         build_bundle=lambda root_path, output: build_source_bundle(
-            BundleRequest(repository_root=root_path, output_path=output)
+            _bundle_request(config, root_path, output)
         ),
         create_draft=_DraftCreator(config, gateway),
         bind_evaluation=_EvaluationBinder(config, binder),

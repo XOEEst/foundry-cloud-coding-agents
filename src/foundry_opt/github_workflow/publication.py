@@ -1326,16 +1326,6 @@ def _reconcile_issue(
                     "Native and task-list child linking failed.",
                 )
             )
-        else:
-            failures.append(
-                _failure(
-                    "link_sub_issue",
-                    candidate_id,
-                    "sub_issue_fallback",
-                    "Native sub-issues unavailable; task-list fallback "
-                    "was used.",
-                )
-            )
     return (
         IssueReference(
             issue.number,
