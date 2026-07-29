@@ -653,6 +653,25 @@ def test_default_factories_build_real_adapter_types() -> None:
     assert binder._evaluator_model_deployment == "gpt-5.1"
 
 
+def test_default_validator_runs_target_configured_commands(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "agent").mkdir()
+    (tmp_path / "agent" / "main.py").write_text("", encoding="utf-8")
+    expected = (("uv", "run", "pytest", "-q"),)
+    commands = _FakeCommands({command: "" for command in expected})
+    dependencies = build_issue_optimization_dependencies(
+        _config(),
+        command_runner=commands,
+        credential_provider=_fake_credential_provider(),
+    )
+
+    report = dependencies.validate(tmp_path)
+
+    assert report.passed is True
+    assert commands.calls == list(expected)
+
+
 # ---------------------------------------------------------------------------
 # Draft creator: exact request from target config + runtime contract
 # ---------------------------------------------------------------------------

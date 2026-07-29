@@ -38,6 +38,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+import shlex
 from typing import Any
 
 import yaml
@@ -734,6 +735,36 @@ def _spec_environment(
 # ---------------------------------------------------------------------------
 
 
+def _validation_request(
+    config: OptimizerConfig,
+    repository_root: Path,
+) -> ValidationRequest:
+    matching_targets = tuple(
+        target
+        for target in config.targets.values()
+        if (repository_root / Path(str(target.entry_point))).is_file()
+    )
+    if not matching_targets:
+        return ValidationRequest(repository_root=repository_root)
+    command_sets = {
+        tuple(target.validation_commands)
+        for target in matching_targets
+    }
+    if len(command_sets) != 1:
+        raise ValueError(
+            "multiple matching targets define different validation commands"
+        )
+    (configured_commands,) = command_sets
+    commands = tuple(
+        tuple(shlex.split(command, posix=True))
+        for command in configured_commands
+    )
+    return ValidationRequest(
+        repository_root=repository_root,
+        commands=commands,
+    )
+
+
 def build_issue_optimization_dependencies(
     config: OptimizerConfig,
     *,
@@ -806,7 +837,7 @@ def build_issue_optimization_dependencies(
         ),
         repository=CampaignGit(),
         validate=lambda path: run_validation(
-            ValidationRequest(repository_root=path), commands
+            _validation_request(config, path), commands
         ),
         build_bundle=lambda root_path, output: build_source_bundle(
             BundleRequest(repository_root=root_path, output_path=output)
