@@ -20,6 +20,9 @@ from foundry_opt.adapters.foundry_evaluation import (
     EvaluationRateLimitError,
     EvaluationServiceError,
     FoundryEvaluationTransport,
+    _provider_error,
+    _optional_string,
+    _usage,
 )
 from foundry_opt.evaluation import (
     AgentVersionRef,
@@ -27,6 +30,31 @@ from foundry_opt.evaluation import (
     DatasetVersionRef,
     EvaluatorDefinitionRef,
 )
+
+
+def test_empty_provider_error_envelope_is_not_an_error() -> None:
+    assert _provider_error({"code": None, "message": None}) is None
+    assert _provider_error({"code": "FAILED", "message": None}) == "FAILED"
+
+
+def test_missing_cached_token_count_defaults_to_zero() -> None:
+    assert _usage(
+        {
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "cached_tokens": None,
+            }
+        }
+    ) == {
+        "input_tokens": 10,
+        "output_tokens": 4,
+        "cached_tokens": 0,
+    }
+
+
+def test_empty_optional_provider_string_is_absent() -> None:
+    assert _optional_string("") is None
 
 
 @dataclass

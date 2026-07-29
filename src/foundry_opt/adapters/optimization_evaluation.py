@@ -213,6 +213,7 @@ class OptimizationEvaluationBinder:
         page_size: int = 100,
         max_pages: int = 1000,
         sleep: Callable[[float], None] = _default_sleep,
+        evaluator_model_deployment: str | None = None,
     ) -> None:
         if not project_endpoint or not project_endpoint.strip():
             raise ValueError("project_endpoint is required")
@@ -224,6 +225,12 @@ class OptimizationEvaluationBinder:
         self._page_size = page_size
         self._max_pages = max_pages
         self._sleep = sleep
+        if (
+            evaluator_model_deployment is not None
+            and not evaluator_model_deployment.strip()
+        ):
+            raise ValueError("evaluator_model_deployment must not be blank")
+        self._evaluator_model_deployment = evaluator_model_deployment
 
     def __call__(
         self,
@@ -290,12 +297,18 @@ class OptimizationEvaluationBinder:
         split: DatasetSplit,
         dataset: _FoundryAsset,
     ) -> EvaluationDefinition:
-        fingerprint = plan.fingerprint(split, dataset)
+        fingerprint = plan.fingerprint(
+            split,
+            dataset,
+            self._evaluator_model_deployment,
+        )
         request = EvaluationDefinitionRequest(
             name=plan.definition_name(split),
             evaluator_type=_EVALUATOR_TYPE,
             schema_version=_SCHEMA_VERSION,
-            configuration=plan.definition_configuration(),
+            configuration=plan.definition_configuration(
+                self._evaluator_model_deployment
+            ),
             fingerprint=fingerprint,
         )
         return gateway.create_or_reuse_definition(request)
@@ -422,14 +435,18 @@ class _EvaluationPlan:
             f"{self.spec_sha256[:12]}"
         )
 
-    def definition_configuration(self) -> dict[str, object]:
+    def definition_configuration(
+        self,
+        evaluator_model_deployment: str | None = None,
+    ) -> dict[str, object]:
         # One testing criterion per approved metric: the criterion name is the
         # metric name (so provider results map straight onto the metric
         # policy), and evaluator_name is the catalog name of the single
         # evaluator that produces that metric. Its exact remote identity stays
         # in evaluator_reference for immutable lineage.
-        testing_criteria = [
-            {
+        testing_criteria = []
+        for metric, evaluator in self.metric_evaluators:
+            criterion: dict[str, object] = {
                 "type": _EVALUATOR_TYPE,
                 "name": metric,
                 "evaluator_name": _evaluator_catalog_name(evaluator),
@@ -446,8 +463,14 @@ class _EvaluationPlan:
                     "response": "{{sample.output_text}}",
                 },
             }
-            for metric, evaluator in self.metric_evaluators
-        ]
+            if evaluator_model_deployment is not None:
+                threshold = self.policy.metric(metric).threshold
+                criterion["initialization_parameters"] = {
+                    "deployment_name": evaluator_model_deployment,
+                    "threshold": threshold,
+                    "pass_threshold": threshold,
+                }
+            testing_criteria.append(criterion)
         normalization = {
             metric: {"type": "pass_fail"}
             for metric, _ in self.metric_evaluators
@@ -481,7 +504,10 @@ class _EvaluationPlan:
         }
 
     def fingerprint(
-        self, split: DatasetSplit, dataset: _FoundryAsset
+        self,
+        split: DatasetSplit,
+        dataset: _FoundryAsset,
+        evaluator_model_deployment: str | None = None,
     ) -> str:
         payload = {
             "scheme": _FINGERPRINT_SCHEME,
@@ -497,6 +523,7 @@ class _EvaluationPlan:
                 evaluator.fingerprint_entry()
                 for evaluator in self.evaluators
             ],
+            "evaluator_model_deployment": evaluator_model_deployment,
         }
         digest = hashlib.sha256(
             json.dumps(

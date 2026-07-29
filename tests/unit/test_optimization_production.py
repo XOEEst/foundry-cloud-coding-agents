@@ -650,6 +650,7 @@ def test_default_factories_build_real_adapter_types() -> None:
     assert isinstance(registration, EvaluationAssetRegistrationGateway)
     binder = dependencies.bind_evaluation._binder_factory(ACCEPTANCE_ENDPOINT)
     assert isinstance(binder, OptimizationEvaluationBinder)
+    assert binder._evaluator_model_deployment == "gpt-5.1"
 
 
 # ---------------------------------------------------------------------------

@@ -678,10 +678,30 @@ def _default_registration_gateway_factory(
 
 def _default_binder_factory(
     credential_provider: AzureCredentialProvider,
+    config: OptimizerConfig,
 ) -> BinderFactory:
-    return lambda endpoint: OptimizationEvaluationBinder(
-        endpoint, credential_provider=credential_provider
-    )
+    def build(endpoint: str) -> OptimizationEvaluationBinder:
+        model_deployment = next(
+            (
+                environment.allowed_models[0]
+                for environment in config.environments.values()
+                if str(environment.project_endpoint) == endpoint
+                and environment.allowed_models
+            ),
+            None,
+        )
+        if model_deployment is None:
+            raise ValueError(
+                "the evaluation environment requires at least one allowed "
+                "model deployment"
+            )
+        return OptimizationEvaluationBinder(
+            endpoint,
+            credential_provider=credential_provider,
+            evaluator_model_deployment=model_deployment,
+        )
+
+    return build
 
 
 def _spec_environment(
@@ -748,7 +768,7 @@ def build_issue_optimization_dependencies(
         registration_gateway_factory
         or _default_registration_gateway_factory(credential)
     )
-    binder = binder_factory or _default_binder_factory(credential)
+    binder = binder_factory or _default_binder_factory(credential, config)
     gateway = draft_gateway or DraftGateway(credential)
     campaign_publisher = publisher or CampaignPublisher(commands)
 

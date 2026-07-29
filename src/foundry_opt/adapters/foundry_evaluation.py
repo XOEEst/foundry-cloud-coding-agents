@@ -1164,7 +1164,7 @@ def _usage(sample: Mapping[str, object]) -> dict[str, int]:
             "usage.completion_tokens",
         ),
         "cached_tokens": _nonnegative_integer(
-            usage.get("cached_tokens"),
+            usage.get("cached_tokens") or 0,
             "usage.cached_tokens",
         ),
     }
@@ -1413,7 +1413,17 @@ def _provider_error(value: object) -> str | None:
     if isinstance(value, str):
         return value
     mapping = _provider_mapping(value, "error")
-    return _required_string(mapping.get("message"), "provider error message")
+    message = mapping.get("message")
+    if isinstance(message, str) and message.strip():
+        return message
+    code = mapping.get("code")
+    if isinstance(code, str) and code.strip():
+        return code
+    if all(item is None or item == "" for item in mapping.values()):
+        return None
+    raise EvaluationSchemaError(
+        "provider error message must be a non-empty string"
+    )
 
 
 def _combined_error(*errors: str | None) -> str | None:
@@ -1460,7 +1470,7 @@ def _required_string(value: object, field: str) -> str:
 
 
 def _optional_string(value: object) -> str | None:
-    if value is None:
+    if value is None or value == "":
         return None
     return _required_string(value, "optional string")
 

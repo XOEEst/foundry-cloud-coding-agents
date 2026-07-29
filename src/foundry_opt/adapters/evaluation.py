@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from math import isfinite
 from time import sleep as _sleep
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from foundry_opt.evaluation import (
     AgentVersionRef,
@@ -487,7 +488,7 @@ def _parse_run(payload: Mapping[str, object]) -> EvaluationRun:
                 _identifier(agent["version"], "agent_version"),
             ),
             dataset=DatasetVersionRef(
-                _identifier(dataset["dataset_id"], "dataset_id"),
+                _resource_identifier(dataset["dataset_id"], "dataset_id"),
                 _identifier(dataset["version"], "dataset_version"),
             ),
             evaluator=EvaluatorDefinitionRef(
@@ -688,6 +689,25 @@ def _identifier(value: object, field: str) -> str:
         )
     ):
         raise ValueError(f"{field} is not a safe bounded identifier.")
+    return text
+
+
+def _resource_identifier(value: object, field: str) -> str:
+    text = _required_string(value, field)
+    if not text.startswith("azureai://"):
+        return _identifier(text, field)
+    parsed = urlsplit(text)
+    if (
+        len(text) > 2048
+        or parsed.scheme != "azureai"
+        or parsed.netloc != "accounts"
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+        or any(part in {".", ".."} for part in parsed.path.split("/"))
+        or not text.isascii()
+    ):
+        raise ValueError(f"{field} is not a safe Foundry resource identifier.")
     return text
 
 

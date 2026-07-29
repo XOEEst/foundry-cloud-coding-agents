@@ -156,6 +156,30 @@ def test_create_run_serializes_only_pinned_batch_inputs() -> None:
     ]
 
 
+def test_create_run_accepts_foundry_dataset_resource_id() -> None:
+    dataset_id = (
+        "azureai://accounts/account/projects/project/data/"
+        "dataset/versions/12"
+    )
+    transport = FakeEvaluationTransport()
+    transport.create_run = lambda payload: _run_payload(
+        "queued",
+        dataset={"dataset_id": dataset_id, "version": "12"},
+    )
+    gateway = EvaluationGateway(transport)
+
+    run = gateway.create_run(
+        BatchEvaluationRequest(
+            display_name="candidate development",
+            agent=AgentVersionRef("agent-1", "draft-9", "3"),
+            dataset=DatasetVersionRef(dataset_id, "12"),
+            evaluator=EvaluatorDefinitionRef("eval-def-1", "7"),
+        )
+    )
+
+    assert run.dataset.dataset_id == dataset_id
+
+
 def test_create_run_keeps_multi_turn_schema_inside_adapter() -> None:
     transport = FakeEvaluationTransport()
     gateway = EvaluationGateway(transport)

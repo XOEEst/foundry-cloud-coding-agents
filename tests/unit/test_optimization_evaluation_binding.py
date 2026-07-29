@@ -340,6 +340,7 @@ def _binder(
     credential_provider: FakeCredentialProvider | None = None,
     client: FakeProjectClient | None = None,
     client_factory: Any | None = None,
+    evaluator_model_deployment: str | None = None,
 ) -> tuple[OptimizationEvaluationBinder, FakeProjectClient, FakeCredentialProvider]:
     project_client = client or FakeProjectClient()
     provider = credential_provider or FakeCredentialProvider()
@@ -349,10 +350,33 @@ def _binder(
         credential_provider=provider,
         client_factory=factory,
         transport_factory=lambda project, endpoint: transport,
+        evaluator_model_deployment=evaluator_model_deployment,
         poll_policy=PollPolicy(max_attempts=3, initial_delay_seconds=0.0),
         sleep=lambda _seconds: None,
     )
     return binder, project_client, provider
+
+
+def test_custom_evaluators_receive_model_and_threshold_parameters() -> None:
+    spec = _spec()
+    transport = FakeTransport()
+    binder, _client, _provider = _binder(
+        transport,
+        evaluator_model_deployment="gpt-5-mini",
+    )
+
+    binder(spec, _assets(spec))(
+        _subject(), DatasetSplit.DEVELOPMENT, 1
+    )
+
+    (criterion,) = transport.created_definitions[0]["configuration"][
+        "testing_criteria"
+    ]
+    assert criterion["initialization_parameters"] == {
+        "deployment_name": "gpt-5-mini",
+        "threshold": 0.8,
+        "pass_threshold": 0.8,
+    }
 
 
 # ---------------------------------------------------------------------------
