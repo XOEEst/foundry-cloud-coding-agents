@@ -55,6 +55,12 @@ def generate_repository_agent_bundle(
                 ".github/agents/foundry-candidate-applier.agent.md"
             ): _applier_agent(),
             Path(
+                ".github/agents/foundry-optimization-steward.agent.md"
+            ): _steward_agent(),
+            Path(
+                ".github/workflows/foundry-optimization-issue-intake.yml"
+            ): _issue_intake_workflow(request),
+            Path(
                 ".github/workflows/foundry-optimization-control.yml"
             ): _control_workflow(request),
             Path(
@@ -302,6 +308,79 @@ candidate issue. Invoke
 Do not edit files directly, reinterpret the patch, repair conflicts, change the
 base, merge, or deploy. Stop when deterministic verification rejects the
 candidate.
+"""
+
+
+def _steward_agent() -> str:
+    return """---
+name: foundry-optimization-steward
+description: Advance one issue-driven optimization campaign from trusted events.
+target: github-copilot
+tools: ["read", "search", "edit", "execute", "github/*", "foundry-mcp/*"]
+disable-model-invocation: true
+---
+
+Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
+`REPOSITORY_CONTEXT.md`, the assigned issue, and its trusted Git-state inbox.
+
+You are the sole campaign steward. Replay unprocessed inbox events through
+`OptimizationCampaign.advance`; never reproduce domain transitions in a
+workflow or shell script. An edited or reopened issue supersedes the prior
+generation. Removing the `[Optimize] ` title prefix declassifies and cancels
+the current generation. A closed issue cancels active work.
+
+Write durable campaign state and only explicit, privacy-allowlisted outbox
+records. The workflow is transport-only and may project only
+`dashboard_projection`, `label_add`, and `label_remove` records that you
+decided. It must not classify assets, evaluate candidates, select a candidate,
+merge, or deploy. Delegate bounded work to the planner, runner, or applier only
+when the state-machine disposition requires it.
+"""
+
+
+def _issue_intake_workflow(request: OnboardingRequest) -> str:
+    install = json.dumps(request.product_install)
+    return f"""name: Foundry optimization issue intake
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed]
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: foundry-optimization-issue-intake
+  cancel-in-progress: false
+
+jobs:
+  bridge:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event.action != 'opened' ||
+      startsWith(github.event.issue.title, '[Optimize] ')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Record trusted event and recover projections
+        env:
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
+        run: >-
+          uv run --no-project --with "$OPTIMIZER_PACKAGE"
+          python -m foundry_opt.orchestration.issue_intake
 """
 
 

@@ -29,6 +29,8 @@ class CampaignPhase(StrEnum):
 class EventKind(StrEnum):
     ISSUE_CREATED = "issue_created"
     ISSUE_EDITED = "issue_edited"
+    ISSUE_DECLASSIFIED = "issue_declassified"
+    ISSUE_REOPENED = "issue_reopened"
     ISSUE_CLOSED = "issue_closed"
     SPEC_POLICY_APPROVED = "spec_policy_approved"
     SPEC_REVIEW_REQUIRED = "spec_review_required"

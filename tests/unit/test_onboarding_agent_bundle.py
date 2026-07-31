@@ -212,3 +212,70 @@ def test_control_workflow_exports_oidc_identity_to_optimizer() -> None:
     assert (
         "AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}" in control
     )
+
+
+def test_bundle_generates_transport_only_issue_intake_workflow() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    path = Path(
+        ".github/workflows/foundry-optimization-issue-intake.yml"
+    )
+
+    assert path in files
+    workflow = yaml.safe_load(files[path])
+    assert workflow[True]["issues"]["types"] == [
+        "opened",
+        "edited",
+        "reopened",
+        "closed",
+    ]
+    assert workflow[True]["schedule"]
+    assert workflow["permissions"] == {
+        "contents": "write",
+        "issues": "write",
+    }
+    assert (
+        workflow["jobs"]["bridge"]["if"]
+        == (
+            "github.event_name == 'schedule' || "
+            "github.event.action != 'opened' || "
+            "startsWith(github.event.issue.title, '[Optimize] ')"
+        )
+    )
+    text = files[path]
+    assert "github.event_path" in text
+    assert "github.event_name" in text
+    assert "github.repository_id" in text
+    assert "github.run_id" in text
+    assert "foundry_opt.orchestration.issue_intake" in text
+    assert "fetch-depth: 0" in text
+    assert "id-token: write" not in text
+    assert "pull-requests: write" not in text
+    assert "actions: write" not in text
+    assert "AZURE_" not in text
+    assert text.count("github.event.issue.title") == 1
+    assert "github.event.issue.body" not in text
+    assert "optimize spec" not in text
+    assert "optimize run" not in text
+    assert "optimize apply" not in text
+    assert "optimize reconcile" not in text
+
+
+def test_bundle_generates_copilot_steward_domain_instructions() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    steward = files[
+        Path(".github/agents/foundry-optimization-steward.agent.md")
+    ]
+
+    assert "OptimizationCampaign.advance" in steward
+    assert "Git-state inbox" in steward
+    assert "dashboard_projection" in steward
+    assert "label_add" in steward
+    assert "label_remove" in steward
+    assert "declassifies and cancels" in steward
+    assert "workflow is transport-only" in steward

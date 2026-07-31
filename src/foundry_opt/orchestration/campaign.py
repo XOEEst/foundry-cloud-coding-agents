@@ -69,11 +69,50 @@ class OptimizationCampaign:
                 processed_event_ids=(event.event_id,),
             )
 
-        if event.generation > state.generation:
+        if (
+            event.generation > state.generation
+            and event.kind not in {
+                EventKind.ISSUE_EDITED,
+                EventKind.ISSUE_REOPENED,
+            }
+        ):
             raise InvalidCampaignTransition(
                 "future-generation events require issue supersession"
             )
+        if event.kind is EventKind.ISSUE_CREATED:
+            if state.generation == event.generation == 1:
+                return self._next(state, event)
+            raise InvalidCampaignTransition(
+                "issue_created is only valid for generation 1"
+            )
+        if event.kind is EventKind.ISSUE_REOPENED:
+            if (
+                state.phase
+                not in {
+                    CampaignPhase.CANCELLED,
+                    CampaignPhase.COMPLETED,
+                    CampaignPhase.BLOCKED,
+                }
+                or event.generation != state.generation + 1
+            ):
+                raise InvalidCampaignTransition(
+                    "issue_reopened requires a closed terminal generation"
+                )
+            return CampaignState(
+                issue_number=state.issue_number,
+                generation=event.generation,
+                sequence=state.sequence + 1,
+                phase=CampaignPhase.SPECIFICATION,
+                processed_event_ids=(
+                    *state.processed_event_ids,
+                    event.event_id,
+                ),
+            )
         if event.kind is EventKind.ISSUE_EDITED:
+            if event.generation > state.generation + 1:
+                raise InvalidCampaignTransition(
+                    "issue_edited cannot skip a generation"
+                )
             if state.phase in {
                 CampaignPhase.COMPLETED,
                 CampaignPhase.BLOCKED,
@@ -84,13 +123,32 @@ class OptimizationCampaign:
                 )
             return CampaignState(
                 issue_number=state.issue_number,
-                generation=state.generation + 1,
+                generation=max(
+                    state.generation + 1,
+                    event.generation,
+                ),
                 sequence=state.sequence + 1,
                 phase=CampaignPhase.SPECIFICATION,
                 processed_event_ids=(
                     *state.processed_event_ids,
                     event.event_id,
                 ),
+            )
+        if event.kind is EventKind.ISSUE_DECLASSIFIED:
+            if event.generation != state.generation:
+                raise InvalidCampaignTransition(
+                    "issue_declassified must cancel the current generation"
+                )
+            if state.phase in {
+                CampaignPhase.COMPLETED,
+                CampaignPhase.BLOCKED,
+                CampaignPhase.CANCELLED,
+            }:
+                return self._next(state, event)
+            return self._next(
+                state,
+                event,
+                phase=CampaignPhase.CANCELLED,
             )
         if event.kind is EventKind.ISSUE_CLOSED:
             if state.phase in {

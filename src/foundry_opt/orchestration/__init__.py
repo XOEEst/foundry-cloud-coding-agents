@@ -21,16 +21,28 @@ from foundry_opt.orchestration.models import (
     CandidateRecord,
     EventKind,
 )
+from foundry_opt.orchestration.steward import (
+    CampaignInbox,
+    EmptyCampaignInbox,
+    GitCampaignInbox,
+    StewardAdvanceRequest,
+    StewardAdvanceResult,
+    StewardAdvanceService,
+    StewardAdvanceStatus,
+)
 
 __all__ = [
     "AdvanceDisposition",
     "AdvanceRequest",
     "AdvanceResult",
     "CampaignEvent",
+    "CampaignInbox",
     "CampaignPhase",
     "CampaignState",
     "CandidateRecord",
     "EventKind",
+    "EmptyCampaignInbox",
+    "GitCampaignInbox",
     "GitStateRef",
     "InvalidCampaignTransition",
     "OptimizationCampaign",
@@ -40,4 +52,8 @@ __all__ = [
     "StateRefError",
     "StateRefPrivacyError",
     "StateRefSnapshot",
+    "StewardAdvanceRequest",
+    "StewardAdvanceResult",
+    "StewardAdvanceService",
+    "StewardAdvanceStatus",
 ]

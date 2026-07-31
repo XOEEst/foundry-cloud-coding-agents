@@ -87,6 +87,17 @@ from foundry_opt.optimization.commands import (
     OptimizeCommandRequest,
     OptimizeCommandResult,
     OptimizeCommandStatus,
+    OptimizePhase,
+)
+from foundry_opt.optimization.compatibility import (
+    CompatibilityOptimizationCommandService,
+    LegacyCampaignEventProjector,
+    LegacyGenerationFence,
+    LegacyRuntimeNamespace,
+)
+from foundry_opt.orchestration.steward import (
+    GitCampaignInbox,
+    StewardAdvanceService,
 )
 from foundry_opt.optimization.models import (
     AssetKind,
@@ -103,6 +114,7 @@ from foundry_opt.optimization.runner import (
 )
 from foundry_opt.optimization.specification import (
     OptimizationSpecService,
+    provenance_file_path,
     spec_file_path,
 )
 from foundry_opt.packaging import (
@@ -886,11 +898,46 @@ def build_issue_optimization_dependencies(
     )
 
 
-class ProductionOptimizationCommandService:
-    """Loads configuration lazily and delegates to the runner."""
+class _LegacyOptimizationCommandService:
+    """Migration-only adapter around the former phase-owned runner."""
 
     def __init__(self, *, config_path: Path = _DEFAULT_CONFIG_PATH) -> None:
         self._config_path = config_path
+
+    def precheck(
+        self,
+        request: OptimizeCommandRequest,
+    ) -> OptimizeCommandResult | None:
+        config_path = request.repository_root / self._config_path
+        try:
+            load_config(config_path)
+        except (ConfigLoadError, FileNotFoundError, OSError, ValueError) as error:
+            return _configuration_error(request, error)
+        if (
+            request.phase is OptimizePhase.RUN
+            and not (
+                (
+                    request.repository_root
+                    / spec_file_path(request.issue_number)
+                ).is_file()
+                and (
+                    request.repository_root
+                    / provenance_file_path(request.issue_number)
+                ).is_file()
+            )
+        ):
+            return OptimizeCommandResult(
+                status=OptimizeCommandStatus.BLOCKED,
+                phase=request.phase,
+                summary=(
+                    "no merged optimization specification was found; run "
+                    "`optimize spec` and merge the approved specification "
+                    "first"
+                ),
+                issue_number=request.issue_number,
+                details={"code": "spec_not_prepared"},
+            )
+        return None
 
     def execute(
         self,
@@ -900,16 +947,7 @@ class ProductionOptimizationCommandService:
         try:
             config = load_config(config_path)
         except (ConfigLoadError, FileNotFoundError, OSError, ValueError) as error:
-            return OptimizeCommandResult(
-                status=OptimizeCommandStatus.BLOCKED,
-                phase=request.phase,
-                summary=(
-                    "the optimizer configuration could not be loaded: "
-                    f"{redact(str(error))}"
-                ),
-                issue_number=request.issue_number,
-                details={"code": "configuration_unavailable"},
-            )
+            return _configuration_error(request, error)
         target_environment = _spec_environment(
             config, request.repository_root, request.issue_number
         )
@@ -936,6 +974,44 @@ class ProductionOptimizationCommandService:
             )
 
 
+def _configuration_error(
+    request: OptimizeCommandRequest,
+    error: Exception,
+) -> OptimizeCommandResult:
+    return OptimizeCommandResult(
+        status=OptimizeCommandStatus.BLOCKED,
+        phase=request.phase,
+        summary=(
+            "the optimizer configuration could not be loaded: "
+            f"{redact(str(error))}"
+        ),
+        issue_number=request.issue_number,
+        details={"code": "configuration_unavailable"},
+    )
+
+
 def build_optimization_command_service() -> OptimizationCommandService:
     """Return the production issue-driven optimization command service."""
     return ProductionOptimizationCommandService()
+
+
+class ProductionOptimizationCommandService(
+    CompatibilityOptimizationCommandService
+):
+    """Compatibility facade backed by the durable steward ledger."""
+
+    def __init__(self, *, config_path: Path = _DEFAULT_CONFIG_PATH) -> None:
+        fence = LegacyGenerationFence()
+        legacy = _LegacyOptimizationCommandService(
+            config_path=config_path
+        )
+        super().__init__(
+            legacy=legacy,
+            steward=StewardAdvanceService(inbox=GitCampaignInbox()),
+            projector=LegacyCampaignEventProjector(
+                artifact_generation=fence.generation,
+            ),
+            fence=fence,
+            precheck=legacy.precheck,
+            runtime_namespace=LegacyRuntimeNamespace(),
+        )

@@ -22,6 +22,11 @@ from foundry_opt.preflight.models import PreflightRequest
 from foundry_opt.preflight.redaction import redact
 from foundry_opt.preflight.rendering import render_human, render_json
 from foundry_opt.preflight.runner import PreflightRunner
+from foundry_opt.orchestration.steward import (
+    GitCampaignInbox,
+    StewardAdvanceRequest,
+    StewardAdvanceService,
+)
 
 
 app = typer.Typer(
@@ -39,6 +44,11 @@ candidate_app = typer.Typer(
     no_args_is_help=True,
 )
 optimize_app.add_typer(candidate_app, name="candidate")
+steward_app = typer.Typer(
+    help="Advance the durable Copilot steward campaign.",
+    no_args_is_help=True,
+)
+app.add_typer(steward_app, name="steward")
 
 
 def _version_callback(value: bool) -> None:
@@ -88,6 +98,11 @@ def build_optimization_command_service() -> OptimizationCommandService:
     )
 
     return build_service()
+
+
+def build_steward_advance_service() -> StewardAdvanceService:
+    """Return the durable Copilot steward advance service."""
+    return StewardAdvanceService(inbox=GitCampaignInbox())
 
 
 def _render_onboarding(result: OnboardingResult) -> str:
@@ -155,6 +170,47 @@ def _execute_optimize(
             typer.echo(f"- {key}: {redact(str(value))}")
         if result.next_action is not None:
             typer.echo(f"Next action: {redact(result.next_action)}")
+    raise typer.Exit(result.exit_code)
+
+
+@steward_app.command("advance")
+def steward_advance(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Consume inbox events and advance one durable campaign."""
+    result = build_steward_advance_service().advance(
+        StewardAdvanceRequest(
+            repository_root=Path.cwd(),
+            issue_number=issue_number,
+        )
+    )
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Steward {result.status.value}: {redact(result.summary)}"
+        )
+        if result.code is not None:
+            typer.echo(f"- code: {result.code}")
+        if result.phase is not None:
+            typer.echo(f"- phase: {result.phase}")
+        if result.disposition is not None:
+            typer.echo(f"- disposition: {result.disposition}")
+        if result.revision is not None:
+            typer.echo(f"- revision: {result.revision}")
     raise typer.Exit(result.exit_code)
 
 

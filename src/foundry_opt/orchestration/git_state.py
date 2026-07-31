@@ -31,6 +31,8 @@ _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _EVENT_PAYLOAD_FIELDS = {
     EventKind.ISSUE_CREATED: frozenset(),
     EventKind.ISSUE_EDITED: frozenset(),
+    EventKind.ISSUE_DECLASSIFIED: frozenset(),
+    EventKind.ISSUE_REOPENED: frozenset(),
     EventKind.ISSUE_CLOSED: frozenset(),
     EventKind.SPEC_POLICY_APPROVED: frozenset({"spec_sha256"}),
     EventKind.SPEC_REVIEW_REQUIRED: frozenset({"spec_sha256"}),

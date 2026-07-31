@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+from pathlib import Path
+
+from foundry_opt.orchestration import OutboxRecord
+from foundry_opt.orchestration.projection import (
+    DashboardComment,
+    DashboardProjection,
+    GhDashboardGateway,
+)
+from foundry_opt.preflight.interfaces import CommandResult
+
+
+@dataclass
+class FakeOutbox:
+    records: tuple[OutboxRecord, ...]
+
+    def for_issue(self, issue_number: int) -> tuple[OutboxRecord, ...]:
+        return self.records
+
+
+@dataclass
+class FakeDashboardGateway:
+    comment: DashboardComment | None = None
+    labels: set[str] = field(default_factory=set)
+    created: list[str] = field(default_factory=list)
+    updated: list[tuple[int, str]] = field(default_factory=list)
+    added: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+
+    def find_dashboard(self, issue_number: int):
+        return self.comment
+
+    def create_dashboard(self, issue_number: int, body: str) -> None:
+        self.created.append(body)
+        self.comment = DashboardComment(81, body)
+
+    def update_dashboard(
+        self,
+        issue_number: int,
+        comment_id: int,
+        body: str,
+    ) -> None:
+        self.updated.append((comment_id, body))
+        self.comment = DashboardComment(comment_id, body)
+
+    def issue_labels(self, issue_number: int) -> frozenset[str]:
+        return frozenset(self.labels)
+
+    def add_label(self, issue_number: int, label: str) -> None:
+        self.added.append(label)
+        self.labels.add(label)
+
+    def remove_label(self, issue_number: int, label: str) -> None:
+        self.removed.append(label)
+        self.labels.discard(label)
+
+
+def _record(
+    record_id: str,
+    kind: str,
+    sequence: int,
+    **payload: object,
+) -> OutboxRecord:
+    return OutboxRecord(
+        record_id=record_id,
+        kind=kind,
+        generation=2,
+        sequence=sequence,
+        payload={"issue_number": 31, **payload},
+    )
+
+
+def test_dashboard_projection_uses_stable_and_idempotent_markers() -> None:
+    gateway = FakeDashboardGateway()
+    source = FakeOutbox(
+        (
+            _record(
+                "dashboard-4",
+                "dashboard_projection",
+                4,
+                phase="baseline",
+                status="running",
+                disposition="advance",
+            ),
+        )
+    )
+    projection = DashboardProjection(source, gateway)
+
+    projection.project(31)
+    projection.project(31)
+
+    assert len(gateway.created) == 1
+    assert gateway.updated == []
+    assert "<!-- foundry-opt:dashboard:issue-31 -->" in gateway.created[0]
+    assert (
+        "<!-- foundry-opt:projection:dashboard-4 -->"
+        in gateway.created[0]
+    )
+    assert "Phase: `baseline`" in gateway.created[0]
+
+
+def test_projection_applies_only_dashboard_and_label_outbox_effects() -> None:
+    gateway = FakeDashboardGateway(labels={"needs-triage", "keep"})
+    source = FakeOutbox(
+        (
+            _record(
+                "dispatch-4",
+                "continue_campaign",
+                4,
+                status="running",
+            ),
+            _record(
+                "label-add-4",
+                "label_add",
+                4,
+                label="optimization-running",
+            ),
+            _record(
+                "label-remove-4",
+                "label_remove",
+                4,
+                label="needs-triage",
+            ),
+        )
+    )
+
+    projection = DashboardProjection(source, gateway)
+    projection.project(31)
+    projection.project(31)
+
+    assert gateway.created == []
+    assert gateway.updated == []
+    assert gateway.added == ["optimization-running"]
+    assert gateway.removed == ["needs-triage"]
+    assert gateway.labels == {"optimization-running", "keep"}
+
+
+def test_new_dashboard_record_updates_the_single_dashboard_comment() -> None:
+    gateway = FakeDashboardGateway()
+    first = _record(
+        "dashboard-4",
+        "dashboard_projection",
+        4,
+        phase="baseline",
+        status="running",
+        disposition="advance",
+    )
+    source = FakeOutbox((first,))
+    projection = DashboardProjection(source, gateway)
+    projection.project(31)
+    source.records = (
+        first,
+        _record(
+            "dashboard-5",
+            "dashboard_projection",
+            5,
+            phase="awaiting_selection",
+            status="waiting",
+            disposition="wait",
+        ),
+    )
+
+    projection.project(31)
+
+    assert len(gateway.created) == 1
+    assert len(gateway.updated) == 1
+    assert "projection:dashboard-5" in gateway.updated[0][1]
+    assert "awaiting_selection" in gateway.updated[0][1]
+
+
+class FakeCommands:
+    def __init__(self, responses: dict[tuple[str, ...], str]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, object]] = []
+
+    def run(
+        self,
+        arguments,
+        *,
+        cwd: Path | None = None,
+        environment=None,
+        input_text: str | None = None,
+        input_bytes: bytes | None = None,
+    ) -> CommandResult:
+        command = tuple(arguments)
+        self.calls.append(
+            {
+                "arguments": command,
+                "input_text": input_text,
+            }
+        )
+        return CommandResult(
+            0,
+            self.responses.get(command, ""),
+            "",
+        )
+
+
+def test_github_dashboard_gateway_uses_structured_api_requests() -> None:
+    comments = (
+        "gh",
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/octo-org/optimizer/issues/31/comments",
+    )
+    issue = (
+        "gh",
+        "api",
+        "repos/octo-org/optimizer/issues/31",
+    )
+    commands = FakeCommands(
+        {
+            comments: json.dumps(
+                [[
+                    {
+                        "id": 80,
+                        "body": (
+                            "<!-- foundry-opt:dashboard:issue-31 -->\n"
+                            "spoofed"
+                        ),
+                        "user": {"login": "untrusted-user"},
+                    },
+                    {
+                        "id": 81,
+                        "body": (
+                            "<!-- foundry-opt:dashboard:issue-31 -->\nold"
+                        ),
+                        "user": {"login": "github-actions[bot]"},
+                    }
+                ]]
+            ),
+            issue: json.dumps(
+                {"labels": [{"name": "needs-triage"}]}
+            ),
+        }
+    )
+    gateway = GhDashboardGateway(
+        commands,
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.find_dashboard(31) == DashboardComment(
+        81,
+        "<!-- foundry-opt:dashboard:issue-31 -->\nold",
+    )
+    assert gateway.issue_labels(31) == frozenset({"needs-triage"})
+    gateway.update_dashboard(31, 81, "safe dashboard")
+    gateway.add_label(31, "optimization-running")
+    gateway.remove_label(31, "needs-triage")
+
+    bodies = [
+        json.loads(str(call["input_text"]))
+        for call in commands.calls
+        if call["input_text"] is not None
+    ]
+    assert {"body": "safe dashboard"} in bodies
+    assert {"labels": ["optimization-running"]} in bodies
+    assert any(
+        call["arguments"][-1]
+        == "repos/octo-org/optimizer/issues/31/labels/needs-triage"
+        for call in commands.calls
+    )

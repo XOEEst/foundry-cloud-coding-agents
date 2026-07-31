@@ -19,6 +19,7 @@ from foundry_opt.orchestration import (
     StateRefCorruptionError,
     StateRefPrivacyError,
 )
+from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 
 
 NOW = datetime(2026, 7, 31, tzinfo=UTC)
@@ -446,3 +447,23 @@ def test_state_ref_deserialization_is_strict_and_versioned(
 
     with pytest.raises(StateRefCorruptionError, match=message):
         GitStateRef().load(repository, 31)
+
+
+def test_issue_event_inbox_appends_idempotent_transport_events(
+    tmp_path: Path,
+) -> None:
+    repository, _ = _repository(tmp_path)
+    inbox = GitIssueEventInbox(repository)
+    opened = _event("github-delivery-1", EventKind.ISSUE_CREATED)
+    edited = _event(
+        "github-delivery-2",
+        EventKind.ISSUE_EDITED,
+        generation=2,
+    )
+
+    assert inbox.append(31, opened) is True
+    assert inbox.append(31, opened) is False
+    assert inbox.append(31, edited) is True
+
+    assert inbox.events(31) == (opened, edited)
+    assert inbox.issue_numbers() == (31,)

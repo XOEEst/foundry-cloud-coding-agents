@@ -193,6 +193,36 @@ def test_issue_edit_supersedes_generation_and_old_events() -> None:
     assert stale == edited
 
 
+def test_intake_generation_edit_supersedes_current_generation() -> None:
+    campaign = OptimizationCampaign()
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=2,
+        phase=CampaignPhase.CANDIDATES,
+        processed_event_ids=("event-1", "event-2"),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+    )
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(
+                _event(
+                    "event-3",
+                    EventKind.ISSUE_EDITED,
+                    generation=2,
+                ),
+            ),
+        )
+    )
+
+    assert result.state.generation == 2
+    assert result.state.phase is CampaignPhase.SPECIFICATION
+
+
 def test_duplicate_event_is_idempotent() -> None:
     campaign = OptimizationCampaign()
     state = campaign.advance(
@@ -420,3 +450,133 @@ def test_issue_closure_preserves_completed_outcome() -> None:
     assert result.state.phase is CampaignPhase.COMPLETED
     assert result.state.sequence == 2
     assert result.disposition is AdvanceDisposition.COMPLETE
+
+
+def test_reopened_cancelled_issue_supersedes_generation() -> None:
+    campaign = OptimizationCampaign()
+    cancelled = CampaignState(
+        issue_number=31,
+        generation=2,
+        sequence=4,
+        phase=CampaignPhase.CANCELLED,
+        processed_event_ids=("event-1", "event-2", "event-3", "event-4"),
+    )
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=cancelled,
+            events=(
+                _event(
+                    "event-5",
+                    EventKind.ISSUE_REOPENED,
+                    generation=3,
+                ),
+            ),
+        )
+    )
+
+    assert result.state.generation == 3
+    assert result.state.sequence == 5
+    assert result.state.phase is CampaignPhase.SPECIFICATION
+    assert result.disposition is AdvanceDisposition.ADVANCE
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    (
+        CampaignState(
+            issue_number=31,
+            generation=2,
+            sequence=4,
+            phase=CampaignPhase.BLOCKED,
+            processed_event_ids=(
+                "event-1",
+                "event-2",
+                "event-3",
+                "event-4",
+            ),
+            block_reason="no_eligible_candidates",
+        ),
+        CampaignState(
+            issue_number=31,
+            generation=2,
+            sequence=4,
+            phase=CampaignPhase.COMPLETED,
+            processed_event_ids=(
+                "event-1",
+                "event-2",
+                "event-3",
+                "event-4",
+            ),
+            spec_sha256="a" * 64,
+            baseline_evaluation_id="baseline-1",
+            candidates=(
+                {
+                    "candidate_id": "candidate-1",
+                    "eligible": True,
+                    "evidence_sha256": "b" * 64,
+                },
+            ),
+            selected_candidate_id="candidate-1",
+            merge_commit="c" * 40,
+            deployment_version=3,
+        ),
+    ),
+)
+def test_closed_terminal_campaign_can_reopen_as_new_generation(
+    terminal: CampaignState,
+) -> None:
+    result = OptimizationCampaign().advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=terminal,
+            events=(
+                _event(
+                    "event-5",
+                    EventKind.ISSUE_CLOSED,
+                    generation=2,
+                ),
+                _event(
+                    "event-6",
+                    EventKind.ISSUE_REOPENED,
+                    generation=3,
+                ),
+            ),
+        )
+    )
+
+    assert result.state.generation == 3
+    assert result.state.sequence == 6
+    assert result.state.phase is CampaignPhase.SPECIFICATION
+    assert result.state.block_reason is None
+
+
+def test_issue_declassification_cancels_active_generation() -> None:
+    state = CampaignState(
+        issue_number=31,
+        generation=2,
+        sequence=3,
+        phase=CampaignPhase.CANDIDATES,
+        processed_event_ids=("event-1", "event-2", "event-3"),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="baseline-1",
+    )
+
+    result = OptimizationCampaign().advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(
+                _event(
+                    "event-4",
+                    EventKind.ISSUE_DECLASSIFIED,
+                    generation=2,
+                ),
+            ),
+        )
+    )
+
+    assert result.state.phase is CampaignPhase.CANCELLED
+    assert result.state.generation == 2
+    assert result.disposition is AdvanceDisposition.WAIT

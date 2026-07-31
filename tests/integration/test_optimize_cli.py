@@ -12,6 +12,10 @@ from foundry_opt.optimization import (
     OptimizeCommandStatus,
     OptimizePhase,
 )
+from foundry_opt.orchestration.steward import (
+    StewardAdvanceResult,
+    StewardAdvanceStatus,
+)
 
 
 class Service:
@@ -318,3 +322,73 @@ def test_optimize_candidate_request_json_is_stable(
         "status": "awaiting_agent",
         "summary": "Candidate worktree is ready.",
     }
+
+
+class StewardService:
+    def __init__(self, result: StewardAdvanceResult) -> None:
+        self.result = result
+        self.requests = []
+
+    def advance(self, request):
+        self.requests.append(request)
+        return self.result
+
+
+def test_steward_advance_routes_issue_and_renders_json(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    service = StewardService(
+        StewardAdvanceResult(
+            status=StewardAdvanceStatus.WAITING,
+            issue_number=42,
+            summary="No new campaign events.",
+            phase="candidates",
+            disposition="wait",
+            revision="a" * 40,
+        )
+    )
+    monkeypatch.setattr(cli, "build_steward_advance_service", lambda: service)
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["steward", "advance", "--issue", "42", "--json"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "code": None,
+        "disposition": "wait",
+        "issue_number": 42,
+        "phase": "candidates",
+        "revision": "a" * 40,
+        "status": "waiting",
+        "summary": "No new campaign events.",
+    }
+    assert service.requests[0].repository_root == tmp_path
+    assert service.requests[0].issue_number == 42
+
+
+def test_steward_advance_strict_failure_returns_one(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    service = StewardService(
+        StewardAdvanceResult(
+            status=StewardAdvanceStatus.CONFLICT,
+            issue_number=42,
+            summary="The durable campaign state changed concurrently.",
+            code="state_ref_conflict",
+        )
+    )
+    monkeypatch.setattr(cli, "build_steward_advance_service", lambda: service)
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["steward", "advance", "--issue", "42"],
+    )
+
+    assert result.exit_code == 1
+    assert "state_ref_conflict" in result.stdout
