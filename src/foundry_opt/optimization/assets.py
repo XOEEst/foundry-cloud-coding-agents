@@ -370,12 +370,7 @@ class SyntheticDatasetProvider:
 
 @dataclass(frozen=True)
 class TraceEvaluationAssetProvider:
-    """Always defers trace-derived datasets to human review.
-
-    This provider never reads, commits, or registers raw trace rows: it
-    raises :class:`HumanReviewRequired` before doing anything else, so
-    trace-derived data can never be prepared under autopilot.
-    """
+    """Materialize only privacy-safe trace metadata for human review."""
 
     source_type: str = "trace"
 
@@ -385,7 +380,21 @@ class TraceEvaluationAssetProvider:
         context: EvaluationAssetContext,
     ) -> PreparedEvaluationAsset:
         _require_source(request, self.source_type)
-        raise HumanReviewRequired(request)
+        return PreparedEvaluationAsset(
+            provenance=AssetProvenance(
+                asset_id=request.asset_id,
+                kind=request.kind,
+                source=request.source,
+                role=request.role,
+                name=request.name,
+                version=request.version,
+                content_sha256=None,
+                created_by="trace-metadata-provider",
+                approval_gate=request.approval_gate,
+                metrics=request.metrics,
+            ),
+            files={},
+        )
 
 
 # ---------------------------------------------------------------------------

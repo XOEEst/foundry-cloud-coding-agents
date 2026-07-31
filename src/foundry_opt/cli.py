@@ -102,7 +102,14 @@ def build_optimization_command_service() -> OptimizationCommandService:
 
 def build_steward_advance_service() -> StewardAdvanceService:
     """Return the durable Copilot steward advance service."""
-    return StewardAdvanceService(inbox=GitCampaignInbox())
+    from foundry_opt.optimization.production import (
+        build_production_steward_spec_policy,
+    )
+
+    return StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        spec_policy=build_production_steward_spec_policy(),
+    )
 
 
 def _render_onboarding(result: OnboardingResult) -> str:

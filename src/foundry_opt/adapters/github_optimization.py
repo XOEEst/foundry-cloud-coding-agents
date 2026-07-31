@@ -38,6 +38,7 @@ from foundry_opt.github_workflow.models import (
     repository_path,
 )
 from foundry_opt.optimization.specification import (
+    PreparedSpecCommit,
     SpecBranchConflictError,
     spec_issue_marker,
 )
@@ -328,7 +329,7 @@ class GitSpecPublisher:
         base_commit: str,
         files: Mapping[Path, bytes],
         message: str,
-    ) -> str:
+    ) -> PreparedSpecCommit:
         if not files:
             raise ValueError("a spec commit requires at least one file")
         normalized = _validate_commit_paths(files)
@@ -381,7 +382,7 @@ class GitSpecPublisher:
             ).strip()
         finally:
             _remove_temporary_index(index_path)
-        return commit_sha
+        return PreparedSpecCommit(commit_sha, tree)
 
     def publish(
         self,

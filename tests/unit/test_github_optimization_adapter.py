@@ -537,14 +537,15 @@ def test_prepare_commit_uses_plumbing_and_passes_content_through_stdin(
         Path("dir/b.txt"): b"other content\n",
     }
 
-    commit_sha = publisher.prepare_commit(
+    prepared = publisher.prepare_commit(
         tmp_path,
         base_commit=base_commit,
         files=files,
         message="foundry-opt: prepare optimization spec for issue #7\n",
     )
 
-    assert commit_sha == "f" * 40
+    assert prepared.head_commit == "f" * 40
+    assert prepared.tree_sha == "e" * 40
     for call in commands.calls:
         assert isinstance(call["arguments"], tuple)
         assert all(isinstance(part, str) for part in call["arguments"])

@@ -13,7 +13,6 @@ from foundry_opt.optimization.assets import (
     DuplicateEvaluationAssetProviderError,
     EvaluationAssetProviderRegistry,
     ExistingFoundryAssetProvider,
-    HumanReviewRequired,
     MissingAssetFileError,
     RepositoryAssetProvider,
     SyntheticDatasetProvider,
@@ -362,7 +361,7 @@ def test_synthetic_provider_max_rows_must_be_positive() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_trace_provider_requires_human_review_before_touching_data(
+def test_trace_provider_returns_only_privacy_safe_review_metadata(
     tmp_path: Path,
 ) -> None:
     provider = TraceEvaluationAssetProvider()
@@ -375,10 +374,13 @@ def test_trace_provider_requires_human_review_before_touching_data(
         parameters={"lookback_hours": 24},
     )
 
-    with pytest.raises(HumanReviewRequired) as excinfo:
-        provider.prepare(request, _context(tmp_path))
+    prepared = provider.prepare(request, _context(tmp_path))
 
-    assert excinfo.value.asset_id == "production-failures"
+    assert prepared.files == {}
+    assert prepared.provenance.asset_id == "production-failures"
+    assert prepared.provenance.source == "trace"
+    assert prepared.provenance.approval_gate is ApprovalGate.HUMAN
+    assert prepared.provenance.content_sha256 is None
 
 
 # ---------------------------------------------------------------------------

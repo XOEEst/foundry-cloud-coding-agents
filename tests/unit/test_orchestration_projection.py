@@ -171,6 +171,33 @@ def test_new_dashboard_record_updates_the_single_dashboard_comment() -> None:
     assert "awaiting_selection" in gateway.updated[0][1]
 
 
+def test_dashboard_explains_specification_digest_and_classification() -> None:
+    gateway = FakeDashboardGateway()
+    source = FakeOutbox(
+        (
+            _record(
+                "dashboard-spec",
+                "dashboard_projection",
+                2,
+                phase="baseline",
+                status="advanced",
+                disposition="advance",
+                spec_sha256="d" * 64,
+                spec_classification="policy_approved",
+                reason="existing_immutable_assets",
+            ),
+        )
+    )
+
+    DashboardProjection(source, gateway).project(31)
+
+    assert "Specification digest: `" + ("d" * 64) + "`" in gateway.created[0]
+    assert "Specification classification: `policy_approved`" in (
+        gateway.created[0]
+    )
+    assert "existing_immutable_assets" in gateway.created[0]
+
+
 class FakeCommands:
     def __init__(self, responses: dict[tuple[str, ...], str]) -> None:
         self.responses = responses

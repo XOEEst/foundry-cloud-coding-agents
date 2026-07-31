@@ -12,6 +12,7 @@ from foundry_opt.orchestration.models import (
     CampaignState,
     CandidateRecord,
     EventKind,
+    SpecFileHash,
 )
 
 
@@ -172,12 +173,53 @@ class OptimizationCampaign:
                 spec_sha256=_sha(event.payload, "spec_sha256"),
             )
         if event.kind is EventKind.SPEC_REVIEW_REQUIRED:
-            self._require_phase(state, CampaignPhase.SPECIFICATION, event)
+            recovering_legacy_review = (
+                state.phase is CampaignPhase.AWAITING_SPEC_APPROVAL
+                and (
+                    state.spec_base_ref_name is None
+                    or state.spec_head_commit is None
+                    or state.spec_tree_sha is None
+                    or not state.spec_files
+                )
+            )
+            if not recovering_legacy_review:
+                self._require_phase(
+                    state,
+                    CampaignPhase.SPECIFICATION,
+                    event,
+                )
+            materialization: dict[str, Any] = {}
+            if set(event.payload) != {"spec_sha256"}:
+                materialization = {
+                    "spec_base_ref_name": _identifier(
+                        event.payload, "base_ref_name"
+                    ),
+                    "spec_head_commit": _commit(
+                        event.payload, "head_commit"
+                    ),
+                    "spec_tree_sha": _commit(
+                        event.payload, "tree_sha"
+                    ),
+                    "spec_files": _spec_files(event.payload),
+                }
+            if recovering_legacy_review:
+                if not materialization:
+                    raise InvalidCampaignTransition(
+                        "legacy spec recovery requires exact materialization"
+                    )
             return self._next(
                 state,
                 event,
-                phase=CampaignPhase.AWAITING_SPEC_APPROVAL,
+                phase=(
+                    state.phase
+                    if recovering_legacy_review
+                    else CampaignPhase.AWAITING_SPEC_APPROVAL
+                ),
+                schema_version=(
+                    2 if recovering_legacy_review else state.schema_version
+                ),
                 spec_sha256=_sha(event.payload, "spec_sha256"),
+                **materialization,
             )
         if event.kind is EventKind.SPEC_HUMAN_APPROVED:
             self._require_phase(
@@ -185,6 +227,13 @@ class OptimizationCampaign:
                 CampaignPhase.AWAITING_SPEC_APPROVAL,
                 event,
             )
+            if event.payload and (
+                _sha(event.payload, "spec_sha256")
+                != state.spec_sha256
+            ):
+                raise InvalidCampaignTransition(
+                    "human approval does not match the pinned specification"
+                )
             return self._next(
                 state,
                 event,
@@ -349,6 +398,18 @@ def _sha(payload: Any, field: str) -> str:
     if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise InvalidCampaignTransition(f"{field} must be a SHA-256 digest")
     return value
+
+
+def _spec_files(payload: Any) -> tuple[SpecFileHash, ...]:
+    value = payload.get("files")
+    if not isinstance(value, list) or not value:
+        raise InvalidCampaignTransition("files must be a non-empty list")
+    try:
+        return tuple(SpecFileHash(**item) for item in value)
+    except (TypeError, ValueError) as error:
+        raise InvalidCampaignTransition(
+            "files must contain pinned paths and hashes"
+        ) from error
 
 
 def _commit(payload: Any, field: str) -> str:

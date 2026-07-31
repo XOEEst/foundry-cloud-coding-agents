@@ -118,7 +118,15 @@ class DashboardProjection:
             "phase",
             "status",
         }
-        if set(record.payload) != expected:
+        optional = {
+            "reason",
+            "spec_classification",
+            "spec_sha256",
+        }
+        if (
+            not expected <= set(record.payload)
+            or set(record.payload) - expected - optional
+        ):
             raise ProjectionError(
                 "dashboard projection payload is invalid"
             )
@@ -367,6 +375,20 @@ def _dashboard_body(
     issue_number: int,
     record: OutboxRecord,
 ) -> str:
+    details = ""
+    if "spec_classification" in record.payload:
+        details += (
+            "- Specification classification: "
+            f"`{record.payload['spec_classification']}`\n"
+        )
+    if "spec_sha256" in record.payload:
+        details += (
+            f"- Specification digest: `{record.payload['spec_sha256']}`\n"
+        )
+    if "reason" in record.payload:
+        details += (
+            f"- Specification policy reason: `{record.payload['reason']}`\n"
+        )
     return (
         f"{dashboard_marker(issue_number)}\n"
         f"{_projection_marker(record.record_id)}\n"
@@ -376,4 +398,5 @@ def _dashboard_body(
         f"- Phase: `{record.payload['phase']}`\n"
         f"- Status: `{record.payload['status']}`\n"
         f"- Disposition: `{record.payload['disposition']}`\n"
+        f"{details}"
     )

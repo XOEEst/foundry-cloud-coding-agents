@@ -99,6 +99,14 @@ from foundry_opt.orchestration.steward import (
     GitCampaignInbox,
     StewardAdvanceService,
 )
+from foundry_opt.orchestration.git_state import GitStateRef, StateRefError
+from foundry_opt.orchestration.spec_policy import (
+    GhMergedSpecApprovalReader,
+    GitPinnedAssetReader,
+    OptimizationSpecPolicy,
+    OptimizationSpecServiceResolver,
+    RepositorySpecPolicy,
+)
 from foundry_opt.optimization.models import (
     AssetKind,
     EvaluationAssetContext,
@@ -823,6 +831,7 @@ def build_issue_optimization_dependencies(
     publisher: Any | None = None,
     target_environment: str | None = None,
     lifecycle_services: Any | None = None,
+    orchestrated: bool = True,
 ) -> IssueOptimizationDependencies:
     """Assemble the live issue-driven optimization dependencies.
 
@@ -851,6 +860,19 @@ def build_issue_optimization_dependencies(
     registry = build_specification_asset_registry(
         resolution_gateway_factory=resolution_factory
     )
+
+    def spec_generation(
+        repository_root: Path,
+        issue_number: int,
+    ) -> int:
+        snapshot = GitStateRef().load(repository_root, issue_number)
+        if snapshot is None:
+            raise StateRefError(
+                "campaign state is required for orchestrated specification "
+                "publication"
+            )
+        return snapshot.state.generation
+
     spec_service = OptimizationSpecService(
         config,
         registry=registry,
@@ -858,6 +880,7 @@ def build_issue_optimization_dependencies(
             commands, granted_capabilities=_SPEC_CAPABILITIES
         ),
         publisher=GitSpecPublisher(commands),
+        generation_provider=spec_generation if orchestrated else None,
     )
 
     registration_environment = target_environment or config.default_environment
@@ -995,6 +1018,48 @@ def build_optimization_command_service() -> OptimizationCommandService:
     return ProductionOptimizationCommandService()
 
 
+def build_production_steward_spec_policy(
+    *,
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+) -> RepositorySpecPolicy:
+    """Build the repository-aware specification policy for the steward."""
+
+    commands = SubprocessCommandRunner()
+    environment = OsEnvironmentReader()
+    credential = _default_credential_provider(environment)
+    resolution_factory = _default_resolution_gateway_factory(credential)
+    pinned_assets = GitPinnedAssetReader(commands)
+    approvals = GhMergedSpecApprovalReader(commands)
+    state = GitStateRef()
+
+    def generation(repository_root: Path, issue_number: int) -> int | None:
+        snapshot = state.load(repository_root, issue_number)
+        return snapshot.state.generation if snapshot is not None else None
+
+    def factory(repository_root: Path) -> OptimizationSpecPolicy:
+        config = load_config(repository_root / config_path)
+        service = OptimizationSpecService(
+            config,
+            registry=build_specification_asset_registry(
+                resolution_gateway_factory=resolution_factory
+            ),
+            gateway=GhOptimizationGateway(
+                commands,
+                granted_capabilities=_SPEC_CAPABILITIES,
+            ),
+            publisher=GitSpecPublisher(commands),
+            generation_provider=generation,
+        )
+        return OptimizationSpecPolicy(
+            config.automation_policy,
+            resolver=OptimizationSpecServiceResolver(service),
+            pinned_assets=pinned_assets,
+            approvals=approvals,
+        )
+
+    return RepositorySpecPolicy(factory)
+
+
 class ProductionOptimizationCommandService(
     CompatibilityOptimizationCommandService
 ):
@@ -1007,7 +1072,12 @@ class ProductionOptimizationCommandService(
         )
         super().__init__(
             legacy=legacy,
-            steward=StewardAdvanceService(inbox=GitCampaignInbox()),
+            steward=StewardAdvanceService(
+                inbox=GitCampaignInbox(),
+                spec_policy=build_production_steward_spec_policy(
+                    config_path=config_path
+                ),
+            ),
             projector=LegacyCampaignEventProjector(
                 artifact_generation=fence.generation,
             ),

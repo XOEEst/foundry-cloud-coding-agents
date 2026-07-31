@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -20,10 +20,12 @@ from foundry_opt.orchestration.models import (
     CampaignState,
     CandidateRecord,
     EventKind,
+    SpecFileHash,
 )
 
 
-_SCHEMA_VERSION = 1
+_STATE_SCHEMA_VERSION = 2
+_RECORD_SCHEMA_VERSION = 1
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -35,8 +37,23 @@ _EVENT_PAYLOAD_FIELDS = {
     EventKind.ISSUE_REOPENED: frozenset(),
     EventKind.ISSUE_CLOSED: frozenset(),
     EventKind.SPEC_POLICY_APPROVED: frozenset({"spec_sha256"}),
-    EventKind.SPEC_REVIEW_REQUIRED: frozenset({"spec_sha256"}),
-    EventKind.SPEC_HUMAN_APPROVED: frozenset(),
+    EventKind.SPEC_REVIEW_REQUIRED: frozenset(
+        {
+            "base_ref_name",
+            "files",
+            "head_commit",
+            "spec_sha256",
+            "tree_sha",
+        }
+    ),
+    EventKind.SPEC_HUMAN_APPROVED: frozenset(
+        {
+            "head_commit",
+            "merge_commit",
+            "pull_request_number",
+            "spec_sha256",
+        }
+    ),
     EventKind.BASELINE_COMPLETED: frozenset({"evaluation_id"}),
     EventKind.CANDIDATE_EVALUATED: frozenset(
         {"candidate_id", "eligible", "evidence_sha256"}
@@ -52,8 +69,11 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
     {
         "assignee",
         "branch",
+        "base_ref_name",
         "candidate_id",
         "commit_sha",
+        "files",
+        "head_commit",
         "deployment_version",
         "disposition",
         "eligible",
@@ -68,8 +88,13 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "ref",
         "retained",
         "spec_sha256",
+        "spec_classification",
+        "specialist",
         "state_sha256",
         "status",
+        "tree_sha",
+        "reason",
+        "work_kind",
     }
 )
 _HASH_FIELDS = frozenset(
@@ -84,7 +109,9 @@ _NUMBER_FIELDS = frozenset(
     {"deployment_version", "issue_number", "pull_request_number"}
 )
 _BOOLEAN_FIELDS = frozenset({"eligible", "retained"})
-_COMMIT_FIELDS = frozenset({"commit_sha", "merge_commit"})
+_COMMIT_FIELDS = frozenset(
+    {"commit_sha", "head_commit", "merge_commit", "tree_sha"}
+)
 _COMMIT_ENVIRONMENT = {
     "GIT_AUTHOR_NAME": "Foundry Optimizer Steward",
     "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
@@ -116,7 +143,7 @@ class OutboxRecord:
     generation: int
     sequence: int
     payload: Mapping[str, Any] = field(default_factory=dict)
-    schema_version: int = _SCHEMA_VERSION
+    schema_version: int = _RECORD_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
         _require_version(self.schema_version, "outbox")
@@ -226,6 +253,7 @@ class GitStateRef:
             record.record_id: _outbox_to_document(record)
             for record in all_outbox
         }
+        state = replace(state, schema_version=_STATE_SCHEMA_VERSION)
         state_document = _state_to_document(state)
         replayed = _replay(issue_number, all_inbox)
         if replayed != state:
@@ -258,7 +286,7 @@ class GitStateRef:
                 for record in outbox
             ],
             "previous_sha256": previous_hash,
-            "schema_version": _SCHEMA_VERSION,
+            "schema_version": _STATE_SCHEMA_VERSION,
             "sequence": state.sequence,
             "state_sha256": state_sha256,
         }
@@ -269,7 +297,7 @@ class GitStateRef:
         journal.append(entry)
         snapshot_document = {
             "journal_head": entry["entry_sha256"],
-            "schema_version": _SCHEMA_VERSION,
+            "schema_version": _STATE_SCHEMA_VERSION,
             "state": state_document,
         }
         files = {
@@ -492,7 +520,10 @@ def _validate_ledger(
         {"journal_head", "schema_version", "state"},
         "snapshot",
     )
-    _require_version(snapshot_document["schema_version"], "snapshot")
+    _require_state_version(
+        snapshot_document["schema_version"],
+        "snapshot",
+    )
     _sha256_text(snapshot_document["journal_head"], "journal head")
     if not journal:
         raise StateRefCorruptionError("state journal is empty")
@@ -522,7 +553,10 @@ def _validate_ledger(
             },
             "journal entry",
         )
-        _require_version(entry["schema_version"], "journal entry")
+        _require_state_version(
+            entry["schema_version"],
+            "journal entry",
+        )
         _exact_integer(entry["index"], "journal index")
         _positive_integer(entry["generation"], "journal generation")
         _nonnegative_integer(entry["sequence"], "journal sequence")
@@ -619,6 +653,10 @@ def _advance(
         raise StateRefCorruptionError(
             "the first journal entry requires an inbox event"
         )
+    replayed = replace(
+        replayed,
+        schema_version=entry["schema_version"],
+    )
     if (
         entry["generation"] != replayed.generation
         or entry["sequence"] != replayed.sequence
@@ -643,9 +681,36 @@ def _replay(
 
 
 def _state_to_document(state: CampaignState) -> dict[str, Any]:
-    if type(state.schema_version) is not int or (
-        state.schema_version != _SCHEMA_VERSION
+    if state.schema_version == 1:
+        return _state_to_document_v1(state)
+    if state.schema_version == 2:
+        return _state_to_document_v2(state)
+    raise ValueError("unsupported campaign state schema_version")
+
+
+def _state_to_document_v1(state: CampaignState) -> dict[str, Any]:
+    if any(
+        (
+            state.spec_base_ref_name,
+            state.spec_head_commit,
+            state.spec_tree_sha,
+            state.spec_files,
+        )
     ):
+        raise ValueError("v1 campaign state cannot contain spec policy fields")
+    return _state_to_document_common(state, include_spec_policy=False)
+
+
+def _state_to_document_v2(state: CampaignState) -> dict[str, Any]:
+    return _state_to_document_common(state, include_spec_policy=True)
+
+
+def _state_to_document_common(
+    state: CampaignState,
+    *,
+    include_spec_policy: bool,
+) -> dict[str, Any]:
+    if type(state.schema_version) is not int:
         raise ValueError("unsupported campaign state schema_version")
     _positive_integer(state.issue_number, "issue_number")
     _positive_integer(state.generation, "generation")
@@ -659,7 +724,7 @@ def _state_to_document(state: CampaignState) -> dict[str, Any]:
         for candidate in state.candidates
     ):
         raise ValueError("candidates must be CandidateRecord values")
-    return {
+    document = {
         "baseline_evaluation_id": state.baseline_evaluation_id,
         "block_reason": state.block_reason,
         "candidates": [
@@ -677,9 +742,32 @@ def _state_to_document(state: CampaignState) -> dict[str, Any]:
         "sequence": state.sequence,
         "spec_sha256": state.spec_sha256,
     }
+    if include_spec_policy:
+        document.update(
+            {
+                "spec_base_ref_name": state.spec_base_ref_name,
+                "spec_files": [
+                    {"path": item.path, "sha256": item.sha256}
+                    for item in state.spec_files
+                ],
+                "spec_head_commit": state.spec_head_commit,
+                "spec_tree_sha": state.spec_tree_sha,
+            }
+        )
+    return document
 
 
 def _state_from_document(document: Any) -> CampaignState:
+    if type(document) is not dict:
+        raise StateRefCorruptionError("campaign state fields are invalid")
+    version = document.get("schema_version")
+    _require_state_version(version, "campaign state")
+    if version == 1:
+        return _state_from_document_v1(document)
+    return _state_from_document_v2(document)
+
+
+def _state_from_document_v1(document: dict[str, Any]) -> CampaignState:
     keys = {
         "baseline_evaluation_id",
         "block_reason",
@@ -696,7 +784,67 @@ def _state_from_document(document: Any) -> CampaignState:
         "spec_sha256",
     }
     _exact_keys(document, keys, "campaign state")
-    _require_version(document["schema_version"], "campaign state")
+    return _state_from_document_common(
+        document,
+        spec_base_ref_name=None,
+        spec_head_commit=None,
+        spec_tree_sha=None,
+        spec_files=(),
+    )
+
+
+def _state_from_document_v2(document: dict[str, Any]) -> CampaignState:
+    keys = {
+        "baseline_evaluation_id",
+        "block_reason",
+        "candidates",
+        "deployment_version",
+        "generation",
+        "issue_number",
+        "merge_commit",
+        "phase",
+        "processed_event_ids",
+        "schema_version",
+        "selected_candidate_id",
+        "sequence",
+        "spec_base_ref_name",
+        "spec_files",
+        "spec_head_commit",
+        "spec_sha256",
+        "spec_tree_sha",
+    }
+    _exact_keys(document, keys, "campaign state")
+    _nullable_string(
+        document["spec_base_ref_name"], "spec_base_ref_name"
+    )
+    _nullable_string(document["spec_head_commit"], "spec_head_commit")
+    _nullable_string(document["spec_tree_sha"], "spec_tree_sha")
+    spec_files_document = document["spec_files"]
+    if type(spec_files_document) is not list:
+        raise StateRefCorruptionError("spec_files must be a list")
+    try:
+        spec_files = tuple(
+            SpecFileHash(**item) for item in spec_files_document
+        )
+    except (TypeError, ValueError) as error:
+        raise StateRefCorruptionError("spec_files are invalid") from error
+    return _state_from_document_common(
+        document,
+        spec_base_ref_name=document["spec_base_ref_name"],
+        spec_head_commit=document["spec_head_commit"],
+        spec_tree_sha=document["spec_tree_sha"],
+        spec_files=spec_files,
+    )
+
+
+def _state_from_document_common(
+    document: dict[str, Any],
+    *,
+    spec_base_ref_name: str | None,
+    spec_head_commit: str | None,
+    spec_tree_sha: str | None,
+    spec_files: tuple[SpecFileHash, ...],
+) -> CampaignState:
     _positive_integer(document["issue_number"], "issue_number")
     _positive_integer(document["generation"], "generation")
     _nonnegative_integer(document["sequence"], "sequence")
@@ -739,6 +887,10 @@ def _state_from_document(document: Any) -> CampaignState:
         schema_version=document["schema_version"],
         processed_event_ids=processed,
         spec_sha256=document["spec_sha256"],
+        spec_base_ref_name=spec_base_ref_name,
+        spec_head_commit=spec_head_commit,
+        spec_tree_sha=spec_tree_sha,
+        spec_files=spec_files,
         baseline_evaluation_id=document["baseline_evaluation_id"],
         candidates=candidates,
         selected_candidate_id=document["selected_candidate_id"],
@@ -753,7 +905,7 @@ def _candidate_to_document(candidate: CandidateRecord) -> dict[str, Any]:
         "candidate_id": candidate.candidate_id,
         "eligible": candidate.eligible,
         "evidence_sha256": candidate.evidence_sha256,
-        "schema_version": _SCHEMA_VERSION,
+        "schema_version": _RECORD_SCHEMA_VERSION,
     }
 
 
@@ -792,7 +944,7 @@ def _event_to_document(event: CampaignEvent) -> dict[str, Any]:
         "kind": event.kind.value,
         "occurred_at": _datetime_text(event.occurred_at),
         "payload": payload,
-        "schema_version": _SCHEMA_VERSION,
+        "schema_version": _RECORD_SCHEMA_VERSION,
     }
 
 
@@ -869,6 +1021,17 @@ def _validate_event_payload(
     payload: Mapping[str, Any],
 ) -> None:
     expected = _EVENT_PAYLOAD_FIELDS[kind]
+    if (
+        kind is EventKind.SPEC_REVIEW_REQUIRED
+        and set(payload) == {"spec_sha256"}
+    ):
+        _validate_payload_value("spec_sha256", payload["spec_sha256"])
+        return
+    if (
+        kind is EventKind.SPEC_HUMAN_APPROVED
+        and not payload
+    ):
+        return
     if set(payload) != expected:
         raise StateRefPrivacyError(
             f"{kind.value} payload violates the privacy allowlist"
@@ -888,6 +1051,20 @@ def _validate_outbox_payload(payload: Mapping[str, Any]) -> None:
 
 
 def _validate_payload_value(key: str, value: Any) -> None:
+    if key == "files":
+        if not isinstance(value, list) or not value:
+            raise StateRefPrivacyError(
+                "files must be a non-empty list of pinned hashes"
+            )
+        try:
+            files = tuple(SpecFileHash(**item) for item in value)
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError(
+                "files must contain privacy-safe paths and hashes"
+            ) from error
+        if len({item.path for item in files}) != len(files):
+            raise StateRefPrivacyError("files must contain unique paths")
+        return
     if key in _HASH_FIELDS:
         if not isinstance(value, str) or not _SHA256.fullmatch(value):
             raise StateRefPrivacyError(f"{key} must be a SHA-256 digest")
@@ -1058,7 +1235,14 @@ def _exact_keys(
 
 
 def _require_version(value: Any, description: str) -> None:
-    if type(value) is not int or value != _SCHEMA_VERSION:
+    if type(value) is not int or value != _RECORD_SCHEMA_VERSION:
+        raise StateRefCorruptionError(
+            f"unsupported {description} schema_version"
+        )
+
+
+def _require_state_version(value: Any, description: str) -> None:
+    if type(value) is not int or value not in {1, 2}:
         raise StateRefCorruptionError(
             f"unsupported {description} schema_version"
         )

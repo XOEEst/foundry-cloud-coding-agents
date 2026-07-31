@@ -22,6 +22,11 @@ from foundry_opt.orchestration.models import (
     AdvanceRequest,
     CampaignEvent,
     CampaignState,
+    EventKind,
+)
+from foundry_opt.orchestration.spec_policy import (
+    SpecPolicyDecision,
+    SpecPolicyRequest,
 )
 
 
@@ -138,6 +143,13 @@ class CampaignLedger(Protocol):
     ) -> StateRefSnapshot: ...
 
 
+class StewardSpecPolicy(Protocol):
+    def evaluate(
+        self,
+        request: SpecPolicyRequest,
+    ) -> SpecPolicyDecision | None: ...
+
+
 class StewardAdvanceService:
     """Consume campaign events and atomically advance the steward ledger."""
 
@@ -147,10 +159,12 @@ class StewardAdvanceService:
         ledger: CampaignLedger | None = None,
         inbox: CampaignInbox | None = None,
         campaign: OptimizationCampaign | None = None,
+        spec_policy: StewardSpecPolicy | None = None,
     ) -> None:
         self._ledger = ledger or GitStateRef()
         self._inbox = inbox or EmptyCampaignInbox()
         self._campaign = campaign or OptimizationCampaign()
+        self._spec_policy = spec_policy
 
     def advance(
         self,
@@ -190,64 +204,161 @@ class StewardAdvanceService:
         pending: list[CampaignEvent] = []
         seen = set(existing_ids)
         for event in consumed:
+            if (
+                self._spec_policy is not None
+                and event.kind
+                in {
+                    EventKind.SPEC_POLICY_APPROVED,
+                    EventKind.SPEC_REVIEW_REQUIRED,
+                    EventKind.SPEC_HUMAN_APPROVED,
+                }
+            ):
+                continue
             if event.event_id in seen:
                 continue
             seen.add(event.event_id)
             pending.append(event)
 
-        if not pending:
-            if snapshot is None:
+        if snapshot is None and not pending:
+            return self._failure(
+                request,
+                StewardAdvanceStatus.BLOCKED,
+                "The campaign has not received an issue-created event.",
+                "campaign_not_initialized",
+            )
+
+        state = snapshot.state if snapshot is not None else None
+        disposition = AdvanceDisposition.WAIT
+        if pending:
+            try:
+                advanced = self._campaign.advance(
+                    AdvanceRequest(
+                        issue_number=request.issue_number,
+                        state=state,
+                        events=tuple(pending),
+                    )
+                )
+            except (InvalidCampaignTransition, ValueError):
                 return self._failure(
                     request,
-                    StewardAdvanceStatus.BLOCKED,
-                    "The campaign has not received an issue-created event.",
-                    "campaign_not_initialized",
+                    StewardAdvanceStatus.FAILED,
+                    "Campaign events violate the orchestration contract.",
+                    "invalid_campaign_transition",
+                    snapshot,
                 )
+            state = advanced.state
+            disposition = advanced.disposition
+        assert state is not None
+
+        policy_decision: SpecPolicyDecision | None = None
+        if self._spec_policy is not None:
+            try:
+                policy_decision = self._spec_policy.evaluate(
+                    SpecPolicyRequest(
+                        request.repository_root,
+                        request.issue_number,
+                        state,
+                    )
+                )
+                if (
+                    policy_decision is not None
+                    and policy_decision.event is not None
+                    and policy_decision.event.event_id not in seen
+                ):
+                    policy_advanced = self._campaign.advance(
+                        AdvanceRequest(
+                            issue_number=request.issue_number,
+                            state=state,
+                            events=(policy_decision.event,),
+                        )
+                    )
+                    pending.append(policy_decision.event)
+                    seen.add(policy_decision.event.event_id)
+                    state = policy_advanced.state
+                    disposition = policy_advanced.disposition
+                    if (
+                        policy_decision.intents
+                        and policy_decision.disposition
+                        is AdvanceDisposition.DELEGATE
+                    ):
+                        disposition = AdvanceDisposition.DELEGATE
+                elif (
+                    policy_decision is not None
+                    and policy_decision.intents
+                ):
+                    disposition = policy_decision.disposition
+            except (InvalidCampaignTransition, ValueError):
+                return self._failure(
+                    request,
+                    StewardAdvanceStatus.FAILED,
+                    "Specification policy violated the orchestration contract.",
+                    "spec_policy_invalid",
+                    snapshot,
+                )
+            except Exception:
+                return self._failure(
+                    request,
+                    StewardAdvanceStatus.FAILED,
+                    "Specification policy could not be evaluated.",
+                    "spec_policy_unavailable",
+                    snapshot,
+                )
+
+        existing_outbox_ids = (
+            {record.record_id for record in snapshot.outbox}
+            if snapshot is not None
+            else set()
+        )
+        intent_outbox = tuple(
+            OutboxRecord(
+                record_id=intent.intent_id,
+                kind=intent.kind,
+                generation=state.generation,
+                sequence=state.sequence,
+                payload=intent.payload,
+            )
+            for intent in (
+                policy_decision.intents if policy_decision is not None else ()
+            )
+            if intent.intent_id not in existing_outbox_ids
+        )
+        if not pending and not intent_outbox:
             return self._result(
                 request,
                 StewardAdvanceStatus.WAITING,
                 "No new campaign events.",
-                snapshot.state,
+                state,
                 AdvanceDisposition.WAIT,
                 snapshot.revision,
             )
 
-        try:
-            advanced = self._campaign.advance(
-                AdvanceRequest(
-                    issue_number=request.issue_number,
-                    state=snapshot.state if snapshot is not None else None,
-                    events=tuple(pending),
-                )
-            )
-        except (InvalidCampaignTransition, ValueError):
-            return self._failure(
-                request,
-                StewardAdvanceStatus.FAILED,
-                "Campaign events violate the orchestration contract.",
-                "invalid_campaign_transition",
-                snapshot,
-            )
-
-        status = _status(advanced.disposition)
-        outbox = (
-            OutboxRecord(
-                record_id=_outbox_id(advanced.state, tuple(pending)),
-                kind=(
-                    "campaign_waiting"
-                    if advanced.disposition is AdvanceDisposition.WAIT
-                    else "campaign_advanced"
+        status = _status(disposition)
+        dashboard_payload: dict[str, object] = {
+            "disposition": disposition.value,
+            "issue_number": request.issue_number,
+            "phase": state.phase.value,
+            "status": status.value,
+        }
+        if policy_decision is not None:
+            dashboard_payload.update(policy_decision.dashboard_payload)
+        dashboard = OutboxRecord(
+            record_id=_outbox_id(
+                state,
+                tuple(pending),
+                extra=tuple(
+                    record.record_id for record in intent_outbox
                 ),
-                generation=advanced.state.generation,
-                sequence=advanced.state.sequence,
-                payload={
-                    "disposition": advanced.disposition.value,
-                    "issue_number": request.issue_number,
-                    "phase": advanced.state.phase.value,
-                    "status": status.value,
-                },
             ),
+            kind=(
+                "campaign_waiting"
+                if disposition is AdvanceDisposition.WAIT
+                else "campaign_advanced"
+            ),
+            generation=state.generation,
+            sequence=state.sequence,
+            payload=dashboard_payload,
         )
+        outbox = (dashboard, *intent_outbox)
         try:
             persisted = self._ledger.commit(
                 request.repository_root,
@@ -255,7 +366,7 @@ class StewardAdvanceService:
                 expected_revision=(
                     snapshot.revision if snapshot is not None else None
                 ),
-                state=advanced.state,
+                state=state,
                 inbox=tuple(pending),
                 outbox=outbox,
             )
@@ -278,9 +389,9 @@ class StewardAdvanceService:
         return self._result(
             request,
             status,
-            _summary(status, advanced.state),
-            advanced.state,
-            advanced.disposition,
+            _summary(status, state),
+            state,
+            disposition,
             persisted.revision,
         )
 
@@ -354,8 +465,12 @@ def _summary(
 def _outbox_id(
     state: CampaignState,
     events: tuple[CampaignEvent, ...],
+    *,
+    extra: tuple[str, ...] = (),
 ) -> str:
-    identity = "\n".join(event.event_id for event in events)
+    identity = "\n".join(
+        (*[event.event_id for event in events], *extra)
+    )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return (
         f"advance-{state.generation}-{state.sequence}-{digest}"

@@ -11,6 +11,9 @@ from typing import Any, Mapping
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_REPOSITORY_PATH = re.compile(
+    r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$"
+)
 
 
 class CampaignPhase(StrEnum):
@@ -67,6 +70,18 @@ class CandidateRecord:
 
 
 @dataclass(frozen=True)
+class SpecFileHash:
+    path: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not _REPOSITORY_PATH.fullmatch(self.path):
+            raise ValueError("spec file path must be repository-relative")
+        if not _SHA256.fullmatch(self.sha256):
+            raise ValueError("spec file hash must be a SHA-256 digest")
+
+
+@dataclass(frozen=True)
 class CampaignEvent:
     event_id: str
     kind: EventKind
@@ -94,9 +109,13 @@ class CampaignState:
     generation: int
     sequence: int
     phase: CampaignPhase
-    schema_version: int = 1
+    schema_version: int = 2
     processed_event_ids: tuple[str, ...] = ()
     spec_sha256: str | None = None
+    spec_base_ref_name: str | None = None
+    spec_head_commit: str | None = None
+    spec_tree_sha: str | None = None
+    spec_files: tuple[SpecFileHash | Mapping[str, Any], ...] = ()
     baseline_evaluation_id: str | None = None
     candidates: tuple[CandidateRecord | Mapping[str, Any], ...] = ()
     selected_candidate_id: str | None = None
@@ -105,7 +124,7 @@ class CampaignState:
     block_reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version not in {1, 2}:
             raise ValueError("unsupported campaign state schema_version")
         if self.issue_number < 1:
             raise ValueError("issue_number must be positive")
@@ -130,6 +149,30 @@ class CampaignState:
             self.spec_sha256
         ):
             raise ValueError("spec_sha256 must be a SHA-256 digest")
+        spec_files = tuple(
+            item if isinstance(item, SpecFileHash) else SpecFileHash(**item)
+            for item in self.spec_files
+        )
+        if len({item.path for item in spec_files}) != len(spec_files):
+            raise ValueError("spec file paths must be unique")
+        object.__setattr__(self, "spec_files", spec_files)
+        if self.spec_base_ref_name is not None and not _REPOSITORY_PATH.fullmatch(
+            self.spec_base_ref_name
+        ):
+            raise ValueError("spec_base_ref_name must be a safe ref name")
+        for value in (self.spec_head_commit, self.spec_tree_sha):
+            if value is not None and not _COMMIT.fullmatch(value):
+                raise ValueError(
+                    "spec materialization commits must be full Git objects"
+                )
+        materialization = (
+            self.spec_base_ref_name,
+            self.spec_head_commit,
+            self.spec_tree_sha,
+            self.spec_files,
+        )
+        if any(materialization) and not all(materialization):
+            raise ValueError("spec materialization metadata must be complete")
         if self.merge_commit is not None and not _COMMIT.fullmatch(
             self.merge_commit
         ):

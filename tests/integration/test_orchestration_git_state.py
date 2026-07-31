@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
@@ -23,6 +24,18 @@ from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 
 
 NOW = datetime(2026, 7, 31, tzinfo=UTC)
+V1_STATE_FIXTURE = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "orchestration"
+    / "state-v1"
+)
+V1_AWAITING_SPEC_FIXTURE = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "orchestration"
+    / "state-v1-awaiting-spec-approval"
+)
 
 
 def _run(arguments: tuple[str, ...], cwd: Path) -> str:
@@ -67,6 +80,164 @@ def _event(
         occurred_at=NOW,
         payload=payload,
     )
+
+
+def _install_state_fixture(
+    repository: Path,
+    fixture: Path = V1_STATE_FIXTURE,
+) -> None:
+    _run(("git", "checkout", "--orphan", "state-v1-fixture"), repository)
+    _run(("git", "rm", "-rf", "."), repository)
+    shutil.copytree(fixture, repository, dirs_exist_ok=True)
+    _run(("git", "add", "."), repository)
+    _run(("git", "commit", "-m", "install v1 state fixture"), repository)
+    _run(
+        (
+            "git",
+            "push",
+            "origin",
+            "HEAD:refs/heads/foundry-opt/state/issue-31",
+        ),
+        repository,
+    )
+    _run(("git", "checkout", "main"), repository)
+
+
+def test_state_ref_replays_exact_historical_v1_fixture(
+    tmp_path: Path,
+) -> None:
+    repository, _ = _repository(tmp_path)
+    _install_state_fixture(repository)
+
+    loaded = GitStateRef().load(repository, 31)
+
+    assert loaded is not None
+    assert loaded.state.schema_version == 1
+    assert loaded.state.phase.value == "specification"
+    assert loaded.state.processed_event_ids == ("event-1",)
+    assert loaded.state.spec_base_ref_name is None
+    assert loaded.state.spec_files == ()
+
+
+def test_state_ref_replays_historical_v1_awaiting_spec_fixture(
+    tmp_path: Path,
+) -> None:
+    repository, _ = _repository(tmp_path)
+    _install_state_fixture(repository, V1_AWAITING_SPEC_FIXTURE)
+
+    loaded = GitStateRef().load(repository, 31)
+
+    assert loaded is not None
+    assert loaded.state.schema_version == 1
+    assert loaded.state.phase.value == "awaiting_spec_approval"
+    assert loaded.state.spec_sha256 == "d" * 64
+    assert loaded.state.spec_head_commit is None
+    assert [event.kind for event in loaded.inbox] == [
+        EventKind.ISSUE_CREATED,
+        EventKind.SPEC_REVIEW_REQUIRED,
+    ]
+
+    recovery = _event(
+        "spec-rematerialized-1-dddddddddddddddd",
+        EventKind.SPEC_REVIEW_REQUIRED,
+        base_ref_name="main",
+        files=[
+            {
+                "path": (
+                    ".foundry-optimizer/specs/issue-31/"
+                    "optimization-spec.yaml"
+                ),
+                "sha256": "e" * 64,
+            }
+        ],
+        head_commit="a" * 40,
+        spec_sha256="d" * 64,
+        tree_sha="b" * 40,
+    )
+    recovered = OptimizationCampaign().advance(
+        AdvanceRequest(31, loaded.state, (recovery,))
+    ).state
+    intent = OutboxRecord(
+        "spec-planner-1-legacy-dddddddddddddddd",
+        "specialist_work_request",
+        generation=1,
+        sequence=recovered.sequence,
+        payload={"issue_number": 31},
+    )
+
+    migrated = GitStateRef().commit(
+        repository,
+        issue_number=31,
+        expected_revision=loaded.revision,
+        state=recovered,
+        inbox=(recovery,),
+        outbox=(intent,),
+    )
+
+    assert migrated.state.schema_version == 2
+    assert migrated.state.spec_head_commit == "a" * 40
+    assert migrated.state.spec_tree_sha == "b" * 40
+    assert migrated.state.spec_files[0].sha256 == "e" * 64
+    assert migrated.outbox[-1] == intent
+    assert GitStateRef().load(repository, 31) == migrated
+
+
+def test_state_ref_migrates_v1_fixture_on_next_write_without_rehashing_history(
+    tmp_path: Path,
+) -> None:
+    repository, _ = _repository(tmp_path)
+    _install_state_fixture(repository)
+    store = GitStateRef()
+    loaded = store.load(repository, 31)
+    assert loaded is not None
+    outbox = OutboxRecord(
+        "dispatch-migration",
+        "continue_campaign",
+        generation=1,
+        sequence=1,
+        payload={"issue_number": 31},
+    )
+
+    migrated = store.commit(
+        repository,
+        issue_number=31,
+        expected_revision=loaded.revision,
+        state=loaded.state,
+        outbox=(outbox,),
+    )
+
+    journal = _run(
+        ("git", "show", f"{migrated.revision}:journal.jsonl"),
+        repository,
+    ).splitlines()
+    snapshot = json.loads(
+        _run(
+            ("git", "show", f"{migrated.revision}:snapshot.json"),
+            repository,
+        )
+    )
+    historical_event = json.loads(
+        _run(
+            (
+                "git",
+                "show",
+                f"{migrated.revision}:inbox/event-1.json",
+            ),
+            repository,
+        )
+    )
+
+    assert journal[0] == (
+        V1_STATE_FIXTURE / "journal.jsonl"
+    ).read_text(encoding="utf-8").strip()
+    assert json.loads(journal[1])["schema_version"] == 2
+    assert snapshot["schema_version"] == 2
+    assert snapshot["state"]["schema_version"] == 2
+    assert snapshot["state"]["spec_base_ref_name"] is None
+    assert snapshot["state"]["spec_files"] == []
+    assert historical_event["schema_version"] == 1
+    assert migrated.state.schema_version == 2
+    assert store.load(repository, 31) == migrated
 
 
 def test_state_ref_creates_and_loads_atomic_snapshot_inbox_and_outbox(
@@ -407,7 +578,7 @@ def test_state_ref_deserialization_is_strict_and_versioned(
     snapshot_path = corrupt / "snapshot.json"
     snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
     if mutation == "state-version":
-        snapshot["state"]["schema_version"] = 2
+        snapshot["state"]["schema_version"] = 3
     elif mutation == "candidate-version":
         snapshot["state"]["candidates"] = [
             {

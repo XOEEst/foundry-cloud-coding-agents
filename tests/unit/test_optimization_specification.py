@@ -25,6 +25,7 @@ from foundry_opt.optimization.assets import (
 )
 from foundry_opt.optimization.specification import (
     OptimizationSpecService,
+    PreparedSpecCommit,
     SpecBranchConflictError,
     SpecServiceStatus,
     provenance_file_path,
@@ -112,7 +113,7 @@ def _issue_body(
     mutations: str = "- system_instructions",
     candidate: str = "human",
     deployment: str = "human",
-) -> str:
+) -> PreparedSpecCommit:
     sections = (
         ("Configured target", target),
         ("Optimization goal", goal),
@@ -338,7 +339,11 @@ class FakePublisher:
                 ),
             )
         )
-        return hashlib.sha1(digest_source).hexdigest()
+        tree_sha = hashlib.sha1(b"tree|" + digest_source).hexdigest()
+        return PreparedSpecCommit(
+            hashlib.sha1(digest_source).hexdigest(),
+            tree_sha,
+        )
 
     def publish(
         self,
@@ -388,6 +393,38 @@ def _issue(
     )
 
 
+def test_classification_resolution_materializes_without_publishing(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "evaluators").mkdir()
+    (tmp_path / "evaluators" / "quality.py").write_text(
+        "def evaluate(value): return value\n",
+        encoding="utf-8",
+    )
+    gateway = FakeGateway(issue=_issue(body=_issue_body()), state=_state())
+    publisher = FakePublisher()
+    service = _service(
+        config=_config(),
+        gateway=gateway,
+        publisher=publisher,
+    )
+
+    result = service.prepare_specification(
+        tmp_path,
+        _ISSUE_NUMBER,
+        publish=False,
+    )
+
+    assert result.status is SpecServiceStatus.COMPLETE
+    assert result.spec is not None
+    assert result.spec_sha256 == result.spec.sha256
+    assert result.pull_request is None
+    assert len(publisher.commits) == 1
+    assert result.head_commit is not None
+    assert result.tree_sha is not None
+    assert publisher.published == []
+
+
 def _state(
     *,
     repository: str = _REPOSITORY,
@@ -418,12 +455,18 @@ def _service(
     gateway: FakeGateway,
     publisher: FakePublisher,
     max_rows: int = 50,
+    generation: int | None = None,
 ) -> OptimizationSpecService:
     return OptimizationSpecService(
         config,
         registry=_registry(max_rows=max_rows),
         gateway=gateway,
         publisher=publisher,
+        generation_provider=(
+            (lambda repository_root, issue_number: generation)
+            if generation is not None
+            else None
+        ),
     )
 
 
@@ -452,6 +495,26 @@ def test_prepares_a_complete_specification_for_synthetic_assets(
     assert result.pull_request is not None
     assert result.pull_request.head_branch == result.branch
     assert result.issue_updated is True
+
+
+def test_published_spec_pr_is_pinned_to_steward_generation(
+    tmp_path: Path,
+) -> None:
+    _write_evaluator_file(tmp_path)
+    gateway = FakeGateway(issue=_issue(body=_issue_body()), state=_state())
+    publisher = FakePublisher()
+    service = _service(
+        config=_config(),
+        gateway=gateway,
+        publisher=publisher,
+        generation=4,
+    )
+
+    result = service.prepare_specification(tmp_path, _ISSUE_NUMBER)
+
+    assert result.pull_request is not None
+    assert result.pull_request.head_branch.endswith("/generation-4")
+    assert "Generation: `4`" in result.pull_request.body
     assert not result.failures
 
     prepared_paths = {item.path for item in result.prepared_files}
@@ -485,6 +548,29 @@ def test_prepares_a_complete_specification_for_synthetic_assets(
 
     assert gateway.added_labels == [(_ISSUE_NUMBER, ("ready-for-human",))]
     assert gateway.removed_labels == [(_ISSUE_NUMBER, ("needs-triage",))]
+
+
+def test_spec_result_pins_expected_head_tree_and_file_hashes(
+    tmp_path: Path,
+) -> None:
+    _write_evaluator_file(tmp_path)
+    publisher = FakePublisher()
+    result = _service(
+        config=_config(),
+        gateway=FakeGateway(issue=_issue(body=_issue_body()), state=_state()),
+        publisher=publisher,
+        generation=4,
+    ).prepare_specification(tmp_path, _ISSUE_NUMBER)
+
+    assert result.head_commit == result.pull_request.head_commit
+    assert len(result.tree_sha) == 40
+    assert result.base_ref_name == _DEFAULT_BRANCH
+    assert result.prepared_files
+    body = result.pull_request.body
+    assert f"Expected head: `{result.head_commit}`" in body
+    assert f"Expected tree: `{result.tree_sha}`" in body
+    for item in result.prepared_files:
+        assert f"`{item.path.as_posix()}`: `{item.sha256}`" in body
 
 
 def test_never_claims_approval_before_merge(tmp_path: Path) -> None:
@@ -617,9 +703,15 @@ def test_provenance_records_the_materialized_local_path_for_each_asset(
     evaluators_by_id = {
         item["asset_id"]: item for item in provenance["evaluators"]
     }
-    # The custom evaluator remains a hash reference to its existing tracked
-    # path; it is recorded for lookup after merge but never re-committed.
-    assert evaluators_by_id["quality-eval"]["path"] == "evaluators/quality.py"
+    assert evaluators_by_id["quality-eval"]["path"] == (
+        ".foundry-optimizer/specs/issue-7/assets/"
+        "quality-eval/quality.py"
+    )
+    materialized = Path(
+        ".foundry-optimizer/specs/issue-7/assets/"
+        "quality-eval/quality.py"
+    )
+    assert files[materialized] == b"def evaluate(row):\n    return 1.0\n"
 
 
 # ---------------------------------------------------------------------------
@@ -627,9 +719,10 @@ def test_provenance_records_the_materialized_local_path_for_each_asset(
 # ---------------------------------------------------------------------------
 
 
-def test_trace_datasets_are_blocked_before_anything_is_committed(
+def test_trace_datasets_materialize_privacy_safe_review_without_raw_rows(
     tmp_path: Path,
 ) -> None:
+    _write_evaluator_file(tmp_path)
     datasets = dedent(
         """
         - asset_id: dev-set
@@ -654,11 +747,20 @@ def test_trace_datasets_are_blocked_before_anything_is_committed(
 
     result = service.prepare_specification(tmp_path, _ISSUE_NUMBER)
 
-    assert result.status is SpecServiceStatus.BLOCKED
-    assert any("human review" in blocker for blocker in result.blockers)
-    assert not publisher.commits
-    assert not publisher.published
-    assert gateway.comments
+    assert result.status is SpecServiceStatus.COMPLETE
+    assert result.spec is not None
+    trace = next(
+        asset for asset in result.spec.datasets if asset.source == "trace"
+    )
+    assert trace.content_sha256 is None
+    assert result.spec_sha256 == result.spec.sha256
+    assert len(publisher.commits) == 1
+    committed_paths = set(publisher.commits[0]["files"])
+    assert spec_file_path(_ISSUE_NUMBER) in committed_paths
+    assert provenance_file_path(_ISSUE_NUMBER) in committed_paths
+    assert all("trace" not in path.name for path in committed_paths)
+    assert len(publisher.published) == 1
+    assert publisher.published[0].draft is True
 
 
 # ---------------------------------------------------------------------------

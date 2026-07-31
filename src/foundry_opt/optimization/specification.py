@@ -4,20 +4,20 @@ This module turns a triaged, labeled GitHub issue into an immutable
 :class:`~foundry_opt.optimization.models.OptimizationSpec`, prepares its
 evaluation assets without registering them with Foundry, and opens (or
 idempotently reuses) a draft specification pull request. It never merges,
-approves, deploys, or reads raw trace rows; a trace-derived dataset request
-always stops the service with a typed blocked result before anything is
-committed.
+approves, deploys, or reads raw trace rows. Trace requests materialize only
+privacy-safe provenance metadata into the immutable human-review spec.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Mapping, Protocol
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Protocol
 
 import yaml
 
@@ -96,6 +96,23 @@ class PreparedSpecFile:
     sha256: str
 
 
+class PreparedSpecCommit(str):
+    tree_sha: str
+
+    def __new__(
+        cls,
+        head_commit: str,
+        tree_sha: str,
+    ) -> PreparedSpecCommit:
+        value = str.__new__(cls, head_commit)
+        value.tree_sha = tree_sha
+        return value
+
+    @property
+    def head_commit(self) -> str:
+        return str(self)
+
+
 @dataclass(frozen=True)
 class SpecServiceResult:
     status: SpecServiceStatus
@@ -108,10 +125,20 @@ class SpecServiceResult:
     blockers: tuple[str, ...] = ()
     issue_updated: bool = False
     failures: tuple[SpecServiceFailure, ...] = ()
+    asset_paths: Mapping[str, Path | None] = field(default_factory=dict)
+    new_asset_paths: tuple[Path, ...] = ()
+    base_ref_name: str | None = None
+    head_commit: str | None = None
+    tree_sha: str | None = None
 
     def __post_init__(self) -> None:
         if self.issue_number < 1:
             raise ValueError("issue_number must be positive")
+        object.__setattr__(
+            self,
+            "asset_paths",
+            MappingProxyType(dict(self.asset_paths)),
+        )
 
 
 class OptimizationSpecGateway(Protocol):
@@ -178,7 +205,7 @@ class SpecPublisher(Protocol):
         base_commit: str,
         files: Mapping[Path, bytes],
         message: str,
-    ) -> str: ...
+    ) -> PreparedSpecCommit: ...
 
     def publish(
         self,
@@ -196,8 +223,21 @@ def spec_issue_marker(issue_number: int) -> str:
     return f"<!-- foundry-opt:spec:issue-{issue_number} -->"
 
 
-def spec_branch_name(issue_number: int, spec_sha256: str) -> str:
-    return f"foundry-opt/spec/issue-{issue_number}/{spec_sha256[:_SPEC_SHA_PREFIX_LENGTH]}"
+def spec_branch_name(
+    issue_number: int,
+    spec_sha256: str,
+    *,
+    generation: int | None = None,
+) -> str:
+    branch = (
+        f"foundry-opt/spec/issue-{issue_number}/"
+        f"{spec_sha256[:_SPEC_SHA_PREFIX_LENGTH]}"
+    )
+    if generation is not None:
+        if generation < 1:
+            raise ValueError("generation must be positive")
+        branch += f"/generation-{generation}"
+    return branch
 
 
 def spec_directory(issue_number: int) -> Path:
@@ -219,6 +259,19 @@ def _synthetic_asset_commit_path(issue_number: int, original_path: Path) -> Path
     return spec_directory(issue_number) / "assets" / original_path.name
 
 
+def _review_asset_commit_path(
+    issue_number: int,
+    asset_id: str,
+    original_path: Path,
+) -> Path:
+    return (
+        spec_directory(issue_number)
+        / "assets"
+        / asset_id
+        / original_path.name
+    )
+
+
 class OptimizationSpecService:
     def __init__(
         self,
@@ -227,26 +280,31 @@ class OptimizationSpecService:
         registry: EvaluationAssetProviderRegistry,
         gateway: OptimizationSpecGateway,
         publisher: SpecPublisher,
+        generation_provider: Callable[[Path, int], int | None] | None = None,
     ) -> None:
         self._config = config
         self._registry = registry
         self._gateway = gateway
         self._publisher = publisher
+        self._generation_provider = generation_provider
 
     def prepare_specification(
         self,
         repository_root: Path,
         issue_number: int,
+        *,
+        publish: bool = True,
     ) -> SpecServiceResult:
         if issue_number < 1:
             raise ValueError("issue_number must be positive")
 
-        required = (
-            GitHubCapabilities.METADATA_READ
-            | GitHubCapabilities.ISSUES_WRITE
-            | GitHubCapabilities.CONTENTS_WRITE
-            | GitHubCapabilities.PULL_REQUESTS_WRITE
-        )
+        required = GitHubCapabilities.METADATA_READ
+        if publish:
+            required |= (
+                GitHubCapabilities.ISSUES_WRITE
+                | GitHubCapabilities.CONTENTS_WRITE
+                | GitHubCapabilities.PULL_REQUESTS_WRITE
+            )
         permissions = self._gateway.verify_permissions(required)
         missing = required & ~permissions.granted
         if missing:
@@ -420,14 +478,26 @@ class OptimizationSpecService:
             deployment_mode=request.deployment_mode,
         )
         spec_sha256 = spec.sha256
-        branch = spec_branch_name(issue_number, spec_sha256)
+        generation = (
+            self._generation_provider(repository_root, issue_number)
+            if publish and self._generation_provider is not None
+            else None
+        )
+        branch = spec_branch_name(
+            issue_number,
+            spec_sha256,
+            generation=generation,
+        )
 
         prepared_asset_paths: dict[str, Path | None] = {}
+        source_asset_paths: dict[str, Path | None] = {}
         committed_asset_files: dict[Path, bytes] = {}
+        new_asset_paths: list[Path] = []
         for prepared in (*prepared_datasets, *prepared_evaluators):
             asset_id = prepared.provenance.asset_id
             if not prepared.files:
                 prepared_asset_paths[asset_id] = None
+                source_asset_paths[asset_id] = None
                 continue
             if len(prepared.files) != 1:
                 raise OptimizationSpecServiceError(
@@ -435,6 +505,7 @@ class OptimizationSpecService:
                     "expected exactly one"
                 )
             ((original_path, content),) = prepared.files.items()
+            source_asset_paths[asset_id] = original_path
             if prepared.provenance.source == "synthetic":
                 # Newly generated content is namespaced under the issue's
                 # own spec directory and committed there, so it can never
@@ -452,10 +523,23 @@ class OptimizationSpecService:
                     )
                 committed_asset_files[committed_path] = content
                 prepared_asset_paths[asset_id] = committed_path
+                new_asset_paths.append(committed_path)
+            elif prepared.provenance.source in {"repository", "custom"}:
+                committed_path = _review_asset_commit_path(
+                    issue_number,
+                    asset_id,
+                    original_path,
+                )
+                if committed_path in committed_asset_files and (
+                    committed_asset_files[committed_path] != content
+                ):
+                    raise OptimizationSpecServiceError(
+                        "prepared asset path collision: "
+                        f"{committed_path.as_posix()}"
+                    )
+                committed_asset_files[committed_path] = content
+                prepared_asset_paths[asset_id] = committed_path
             else:
-                # Repository/custom assets already exist, unchanged, at
-                # their tracked path; they remain hash references
-                # (content_sha256) and are never redundantly re-committed.
                 prepared_asset_paths[asset_id] = original_path
 
         spec_yaml = _render_spec_yaml(spec)
@@ -494,12 +578,30 @@ class OptimizationSpecService:
             f"foundry-opt: prepare optimization spec for issue "
             f"#{issue_number}\n\nSpec SHA-256: {spec_sha256}\n"
         )
-        commit_sha = self._publisher.prepare_commit(
+        prepared_commit = self._publisher.prepare_commit(
             repository_root,
             base_commit=state.default_commit,
             files=commit_files,
             message=message,
         )
+        commit_sha = prepared_commit.head_commit
+
+        if not publish:
+            return SpecServiceResult(
+                status=SpecServiceStatus.COMPLETE,
+                issue_number=issue_number,
+                spec=spec,
+                spec_sha256=spec_sha256,
+                branch=branch,
+                prepared_files=prepared_files,
+                asset_paths=source_asset_paths,
+                new_asset_paths=tuple(
+                    sorted(new_asset_paths, key=lambda path: path.as_posix())
+                ),
+                base_ref_name=state.default_branch,
+                head_commit=commit_sha,
+                tree_sha=prepared_commit.tree_sha,
+            )
 
         existing = self._gateway.find_spec_pull_request(
             repository_root, issue_number
@@ -513,6 +615,8 @@ class OptimizationSpecService:
                 spec_sha256=spec_sha256,
                 base_commit=state.default_commit,
                 head_commit=commit_sha,
+                tree_sha=prepared_commit.tree_sha,
+                prepared_files=prepared_files,
             ):
                 pull_request = existing
             else:
@@ -545,8 +649,12 @@ class OptimizationSpecService:
                         spec,
                         issue_number=issue_number,
                         spec_sha256=spec_sha256,
+                        generation=generation,
                         prepared_datasets=prepared_datasets,
                         prepared_evaluators=prepared_evaluators,
+                        prepared_files=prepared_files,
+                        head_commit=commit_sha,
+                        tree_sha=prepared_commit.tree_sha,
                     ),
                 )
             except SpecBranchConflictError as error:
@@ -585,8 +693,15 @@ class OptimizationSpecService:
             branch=branch,
             pull_request=pull_request,
             prepared_files=prepared_files,
+            base_ref_name=state.default_branch,
+            head_commit=commit_sha,
+            tree_sha=prepared_commit.tree_sha,
             issue_updated=issue_updated,
             failures=tuple(failures),
+            asset_paths=source_asset_paths,
+            new_asset_paths=tuple(
+                sorted(new_asset_paths, key=lambda path: path.as_posix())
+            ),
         )
 
     def _update_issue(
@@ -697,6 +812,8 @@ def _spec_pull_request_matches(
     spec_sha256: str,
     base_commit: str,
     head_commit: str,
+    tree_sha: str,
+    prepared_files: tuple[PreparedSpecFile, ...],
 ) -> bool:
     marker = spec_issue_marker(issue_number)
     return (
@@ -708,6 +825,13 @@ def _spec_pull_request_matches(
         and marker in pull_request.body
         and f"Spec SHA-256: `{spec_sha256}`" in pull_request.body
         and f"Base commit: `{base_commit}`" in pull_request.body
+        and f"Expected head: `{head_commit}`" in pull_request.body
+        and f"Expected tree: `{tree_sha}`" in pull_request.body
+        and all(
+            f"`{item.path.as_posix()}`: `{item.sha256}`"
+            in pull_request.body
+            for item in prepared_files
+        )
     )
 
 
@@ -716,8 +840,12 @@ def _spec_pull_request_body(
     *,
     issue_number: int,
     spec_sha256: str,
+    generation: int | None,
     prepared_datasets: list[PreparedEvaluationAsset],
     prepared_evaluators: list[PreparedEvaluationAsset],
+    prepared_files: tuple[PreparedSpecFile, ...],
+    head_commit: str,
+    tree_sha: str,
 ) -> str:
     def _asset_lines(prepared: list[PreparedEvaluationAsset]) -> str:
         return "\n".join(
@@ -726,13 +854,19 @@ def _spec_pull_request_body(
             for item in prepared
         )
 
-    return "\n".join(
-        (
+    lines = [
             spec_issue_marker(issue_number),
             f"Issue: #{issue_number}",
             f"Target: `{spec.target}`",
             f"Base commit: `{spec.base_commit}`",
             f"Spec SHA-256: `{spec_sha256}`",
+            f"Expected head: `{head_commit}`",
+            f"Expected tree: `{tree_sha}`",
+    ]
+    if generation is not None:
+        lines.append(f"Generation: `{generation}`")
+    lines.extend(
+        (
             "",
             "## Datasets",
             _asset_lines(prepared_datasets),
@@ -740,12 +874,19 @@ def _spec_pull_request_body(
             "## Evaluators",
             _asset_lines(prepared_evaluators),
             "",
+            "## Immutable files",
+            *(
+                f"- `{item.path.as_posix()}`: `{item.sha256}`"
+                for item in prepared_files
+            ),
+            "",
             "This pull request is not approved. Approval is recorded only "
             "when a maintainer merges it; policy-gated assets remain "
             "provisional and human-gated assets always require explicit "
             "human review before merge.",
         )
-    ) + "\n"
+    )
+    return "\n".join(lines) + "\n"
 
 
 def _spec_ready_comment_body(
