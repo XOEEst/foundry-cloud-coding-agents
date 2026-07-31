@@ -51,6 +51,7 @@ from foundry_opt.optimization.production import (
     build_optimization_command_service,
     build_specification_asset_registry,
 )
+from foundry_opt.orchestration import StateRefError
 from foundry_opt.optimization.runner import (
     CapabilityUnavailableError,
     IssueOptimizationRunner,
@@ -531,6 +532,47 @@ def test_dependencies_use_live_foundry_and_publication_adapters() -> None:
     assert isinstance(
         IssueOptimizationRunner(dependencies), IssueOptimizationRunner
     )
+
+
+def test_orchestrated_spec_generation_propagates_state_load_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    def fail_load(*args, **kwargs):
+        raise StateRefError("state unavailable")
+
+    monkeypatch.setattr(
+        "foundry_opt.optimization.production.GitStateRef.load",
+        fail_load,
+    )
+    dependencies = build_issue_optimization_dependencies(_config())
+
+    with pytest.raises(StateRefError, match="state unavailable"):
+        dependencies.spec_service._generation_provider(tmp_path, 31)
+
+
+def test_orchestrated_spec_generation_rejects_missing_campaign_state(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "foundry_opt.optimization.production.GitStateRef.load",
+        lambda *args, **kwargs: None,
+    )
+    dependencies = build_issue_optimization_dependencies(_config())
+
+    with pytest.raises(StateRefError, match="campaign state"):
+        dependencies.spec_service._generation_provider(tmp_path, 31)
+
+
+def test_explicit_non_orchestrated_dependencies_allow_generationless_specs(
+) -> None:
+    dependencies = build_issue_optimization_dependencies(
+        _config(),
+        orchestrated=False,
+    )
+
+    assert dependencies.spec_service._generation_provider is None
 
 
 def test_dependencies_share_one_campaign_state_store() -> None:
