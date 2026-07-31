@@ -1,0 +1,422 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+
+from foundry_opt.orchestration import (
+    AdvanceDisposition,
+    AdvanceRequest,
+    CampaignEvent,
+    CampaignPhase,
+    CampaignState,
+    EventKind,
+    InvalidCampaignTransition,
+    OptimizationCampaign,
+)
+
+
+NOW = datetime(2026, 7, 31, tzinfo=UTC)
+
+
+def _event(
+    event_id: str,
+    kind: EventKind,
+    *,
+    generation: int = 1,
+    **payload: object,
+) -> CampaignEvent:
+    return CampaignEvent(
+        event_id=event_id,
+        kind=kind,
+        generation=generation,
+        occurred_at=NOW,
+        payload=payload,
+    )
+
+
+def test_issue_creation_starts_steward_specification() -> None:
+    campaign = OptimizationCampaign()
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=None,
+            events=(_event("event-1", EventKind.ISSUE_CREATED),),
+        )
+    )
+
+    assert result.state.phase is CampaignPhase.SPECIFICATION
+    assert result.state.generation == 1
+    assert result.state.sequence == 1
+    assert result.disposition is AdvanceDisposition.ADVANCE
+
+
+def test_policy_spec_baseline_candidates_and_slate_progress() -> None:
+    campaign = OptimizationCampaign()
+    state = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=None,
+            events=(_event("event-1", EventKind.ISSUE_CREATED),),
+        )
+    ).state
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(
+                _event(
+                    "event-2",
+                    EventKind.SPEC_POLICY_APPROVED,
+                    spec_sha256="a" * 64,
+                ),
+                _event(
+                    "event-3",
+                    EventKind.BASELINE_COMPLETED,
+                    evaluation_id="eval-baseline",
+                ),
+                _event(
+                    "event-4",
+                    EventKind.CANDIDATE_EVALUATED,
+                    candidate_id="candidate-1",
+                    eligible=True,
+                    evidence_sha256="b" * 64,
+                ),
+                _event(
+                    "event-5",
+                    EventKind.SLATE_PUBLISHED,
+                ),
+            ),
+        )
+    )
+
+    assert result.state.phase is CampaignPhase.AWAITING_SELECTION
+    assert result.state.spec_sha256 == "a" * 64
+    assert result.state.baseline_evaluation_id == "eval-baseline"
+    assert result.state.candidates[0].candidate_id == "candidate-1"
+    assert result.state.candidates[0].eligible is True
+    assert result.disposition is AdvanceDisposition.WAIT
+
+
+def test_merge_deployment_and_retention_complete_campaign() -> None:
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=4,
+        phase=CampaignPhase.AWAITING_SELECTION,
+        processed_event_ids=("event-1", "event-2", "event-3", "event-4"),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+    )
+    campaign = OptimizationCampaign()
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(
+                _event(
+                    "event-5",
+                    EventKind.CANDIDATE_MERGED,
+                    candidate_id="candidate-1",
+                    merge_commit="c" * 40,
+                ),
+                _event(
+                    "event-6",
+                    EventKind.DEPLOYMENT_COMPLETED,
+                    deployment_version=5,
+                ),
+                _event(
+                    "event-7",
+                    EventKind.RETENTION_COMPLETED,
+                    retained=True,
+                ),
+            ),
+        )
+    )
+
+    assert result.state.phase is CampaignPhase.COMPLETED
+    assert result.state.selected_candidate_id == "candidate-1"
+    assert result.state.merge_commit == "c" * 40
+    assert result.state.deployment_version == 5
+    assert result.disposition is AdvanceDisposition.COMPLETE
+
+
+def test_issue_edit_supersedes_generation_and_old_events() -> None:
+    campaign = OptimizationCampaign()
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=2,
+        phase=CampaignPhase.CANDIDATES,
+        processed_event_ids=("event-1", "event-2"),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+    )
+
+    edited = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(_event("event-3", EventKind.ISSUE_EDITED),),
+        )
+    ).state
+    stale = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=edited,
+            events=(
+                _event(
+                    "event-4",
+                    EventKind.CANDIDATE_EVALUATED,
+                    generation=1,
+                    candidate_id="candidate-old",
+                    eligible=True,
+                    evidence_sha256="b" * 64,
+                ),
+            ),
+        )
+    ).state
+
+    assert edited.generation == 2
+    assert edited.phase is CampaignPhase.SPECIFICATION
+    assert edited.spec_sha256 is None
+    assert stale == edited
+
+
+def test_duplicate_event_is_idempotent() -> None:
+    campaign = OptimizationCampaign()
+    state = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=None,
+            events=(_event("event-1", EventKind.ISSUE_CREATED),),
+        )
+    ).state
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(_event("event-1", EventKind.ISSUE_CREATED),),
+        )
+    )
+
+    assert result.state == state
+    assert result.disposition is AdvanceDisposition.WAIT
+
+
+def test_invalid_selection_and_regression_fail_closed() -> None:
+    campaign = OptimizationCampaign()
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=1,
+        phase=CampaignPhase.AWAITING_SELECTION,
+        processed_event_ids=("event-1",),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": False,
+                "evidence_sha256": "b" * 64,
+            },
+            {
+                "candidate_id": "candidate-2",
+                "eligible": True,
+                "evidence_sha256": "d" * 64,
+            },
+        ),
+    )
+
+    invalid_merge = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(
+                _event(
+                    "event-2",
+                    EventKind.CANDIDATE_MERGED,
+                    candidate_id="candidate-1",
+                    merge_commit="c" * 40,
+                ),
+            ),
+        )
+    )
+
+    retained_state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=1,
+        phase=CampaignPhase.RETENTION,
+        processed_event_ids=("event-1",),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+        selected_candidate_id="candidate-1",
+        merge_commit="c" * 40,
+        deployment_version=5,
+    )
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=retained_state,
+            events=(
+                _event(
+                    "event-2",
+                    EventKind.RETENTION_COMPLETED,
+                    retained=False,
+                ),
+            ),
+        )
+    )
+
+    assert invalid_merge.state.phase is CampaignPhase.BLOCKED
+    assert invalid_merge.state.block_reason == "ineligible_candidate_merged"
+    assert result.state.phase is CampaignPhase.BLOCKED
+    assert result.disposition is AdvanceDisposition.BLOCKED
+
+
+def test_all_ineligible_slate_blocks_without_waiting_forever() -> None:
+    campaign = OptimizationCampaign()
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=3,
+        phase=CampaignPhase.CANDIDATES,
+        processed_event_ids=("event-1", "event-2", "event-3"),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": False,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+    )
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(_event("event-4", EventKind.SLATE_PUBLISHED),),
+        )
+    )
+
+    assert result.state.phase is CampaignPhase.BLOCKED
+    assert result.state.block_reason == "no_eligible_candidates"
+
+
+def test_state_contract_rejects_truthy_non_boolean_and_impossible_phase() -> None:
+    with pytest.raises(ValueError, match="eligible must be boolean"):
+        CampaignState(
+            issue_number=31,
+            generation=1,
+            sequence=1,
+            phase=CampaignPhase.CANDIDATES,
+            processed_event_ids=("event-1",),
+            spec_sha256="a" * 64,
+            baseline_evaluation_id="eval-baseline",
+            candidates=(
+                {
+                    "candidate_id": "candidate-1",
+                    "eligible": "false",
+                    "evidence_sha256": "b" * 64,
+                },
+            ),
+        )
+
+    with pytest.raises(ValueError, match="deployment lineage"):
+        CampaignState(
+            issue_number=31,
+            generation=1,
+            sequence=1,
+            phase=CampaignPhase.RETENTION,
+            processed_event_ids=("event-1",),
+            spec_sha256="a" * 64,
+            baseline_evaluation_id="eval-baseline",
+        )
+
+
+def test_terminal_campaign_cannot_be_resurrected_by_edit() -> None:
+    campaign = OptimizationCampaign()
+    completed = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=1,
+        phase=CampaignPhase.COMPLETED,
+        processed_event_ids=("event-1",),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+        selected_candidate_id="candidate-1",
+        merge_commit="c" * 40,
+        deployment_version=5,
+    )
+
+    with pytest.raises(InvalidCampaignTransition):
+        campaign.advance(
+            AdvanceRequest(
+                issue_number=31,
+                state=completed,
+                events=(_event("event-2", EventKind.ISSUE_EDITED),),
+            )
+        )
+
+
+def test_issue_closure_preserves_completed_outcome() -> None:
+    campaign = OptimizationCampaign()
+    completed = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=1,
+        phase=CampaignPhase.COMPLETED,
+        processed_event_ids=("event-1",),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+        selected_candidate_id="candidate-1",
+        merge_commit="c" * 40,
+        deployment_version=5,
+    )
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=completed,
+            events=(_event("event-2", EventKind.ISSUE_CLOSED),),
+        )
+    )
+
+    assert result.state.phase is CampaignPhase.COMPLETED
+    assert result.state.sequence == 2
+    assert result.disposition is AdvanceDisposition.COMPLETE
