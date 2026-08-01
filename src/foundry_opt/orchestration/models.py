@@ -40,6 +40,8 @@ class EventKind(StrEnum):
     SPEC_HUMAN_APPROVED = "spec_human_approved"
     BASELINE_COMPLETED = "baseline_completed"
     CANDIDATE_EVALUATED = "candidate_evaluated"
+    CANDIDATE_ELIGIBILITY_REVISED = "candidate_eligibility_revised"
+    CANDIDATE_WORKERS_COMPLETED = "candidate_workers_completed"
     SLATE_PUBLISHED = "slate_published"
     CANDIDATE_MERGED = "candidate_merged"
     DEPLOYMENT_COMPLETED = "deployment_completed"

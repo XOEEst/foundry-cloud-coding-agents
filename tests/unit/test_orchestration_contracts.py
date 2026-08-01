@@ -354,6 +354,64 @@ def test_all_ineligible_slate_blocks_without_waiting_forever() -> None:
     assert result.state.block_reason == "no_eligible_candidates"
 
 
+def test_candidate_worker_completion_blocks_without_publishing_slate() -> None:
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=3,
+        phase=CampaignPhase.CANDIDATES,
+        processed_event_ids=("event-1", "event-2", "event-3"),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": False,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+    )
+
+    result = OptimizationCampaign().advance(
+        AdvanceRequest(
+            31,
+            state,
+            (
+                _event(
+                    "candidate-workers-1-max_candidates",
+                    EventKind.CANDIDATE_WORKERS_COMPLETED,
+                    attempted_count=1,
+                    eligible_count=0,
+                    stop_reason="max_candidates",
+                ),
+            ),
+        )
+    )
+
+    assert result.state.phase is CampaignPhase.BLOCKED
+    assert result.state.block_reason == "no_eligible_candidates"
+
+    with pytest.raises(
+        InvalidCampaignTransition,
+        match="counters",
+    ):
+        OptimizationCampaign().advance(
+            AdvanceRequest(
+                31,
+                state,
+                (
+                    _event(
+                        "candidate-workers-mismatch",
+                        EventKind.CANDIDATE_WORKERS_COMPLETED,
+                        attempted_count=2,
+                        eligible_count=0,
+                        stop_reason="max_candidates",
+                    ),
+                ),
+            )
+        )
+
+
 def test_state_contract_rejects_truthy_non_boolean_and_impossible_phase() -> None:
     with pytest.raises(ValueError, match="eligible must be boolean"):
         CampaignState(

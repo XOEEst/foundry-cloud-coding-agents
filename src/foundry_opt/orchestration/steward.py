@@ -10,6 +10,11 @@ from foundry_opt.orchestration.campaign import (
     InvalidCampaignTransition,
     OptimizationCampaign,
 )
+from foundry_opt.orchestration.candidate_workers import (
+    CandidateWorkerRequest,
+    CandidateWorkerResult,
+    CandidateWorkerStatus,
+)
 from foundry_opt.orchestration.git_state import (
     GitStateRef,
     OutboxRecord,
@@ -21,6 +26,7 @@ from foundry_opt.orchestration.models import (
     AdvanceDisposition,
     AdvanceRequest,
     CampaignEvent,
+    CampaignPhase,
     CampaignState,
     EventKind,
 )
@@ -43,10 +49,16 @@ class StewardAdvanceStatus(StrEnum):
 class StewardAdvanceRequest:
     repository_root: Path
     issue_number: int
+    session_deadline: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.issue_number < 1:
             raise ValueError("issue_number must be positive")
+        if (
+            self.session_deadline is not None
+            and self.session_deadline.tzinfo is None
+        ):
+            raise ValueError("session_deadline must be timezone-aware")
 
 
 @dataclass(frozen=True)
@@ -150,6 +162,13 @@ class StewardSpecPolicy(Protocol):
     ) -> SpecPolicyDecision | None: ...
 
 
+class StewardCandidateWorkers(Protocol):
+    def advance(
+        self,
+        request: CandidateWorkerRequest,
+    ) -> CandidateWorkerResult: ...
+
+
 class StewardAdvanceService:
     """Consume campaign events and atomically advance the steward ledger."""
 
@@ -160,11 +179,13 @@ class StewardAdvanceService:
         inbox: CampaignInbox | None = None,
         campaign: OptimizationCampaign | None = None,
         spec_policy: StewardSpecPolicy | None = None,
+        candidate_workers: StewardCandidateWorkers | None = None,
     ) -> None:
         self._ledger = ledger or GitStateRef()
         self._inbox = inbox or EmptyCampaignInbox()
         self._campaign = campaign or OptimizationCampaign()
         self._spec_policy = spec_policy
+        self._candidate_workers = candidate_workers
 
     def advance(
         self,
@@ -323,6 +344,16 @@ class StewardAdvanceService:
             if intent.intent_id not in existing_outbox_ids
         )
         if not pending and not intent_outbox:
+            if (
+                snapshot is not None
+                and self._candidate_workers is not None
+                and state.phase
+                in {CampaignPhase.BASELINE, CampaignPhase.CANDIDATES}
+            ):
+                return self._advance_candidate_workers(
+                    request,
+                    snapshot,
+                )
             return self._result(
                 request,
                 StewardAdvanceStatus.WAITING,
@@ -386,13 +417,82 @@ class StewardAdvanceService:
                 "state_ref_persist_failed",
                 snapshot,
             )
-        return self._result(
+        result = self._result(
             request,
             status,
             _summary(status, state),
             state,
             disposition,
             persisted.revision,
+        )
+        if (
+            self._candidate_workers is not None
+            and persisted.state.phase
+            in {CampaignPhase.BASELINE, CampaignPhase.CANDIDATES}
+        ):
+            return self._advance_candidate_workers(request, persisted)
+        return result
+
+    def _advance_candidate_workers(
+        self,
+        request: StewardAdvanceRequest,
+        snapshot: StateRefSnapshot,
+    ) -> StewardAdvanceResult:
+        assert self._candidate_workers is not None
+        try:
+            result = self._candidate_workers.advance(
+                CandidateWorkerRequest(
+                    request.repository_root,
+                    request.issue_number,
+                    request.session_deadline,
+                )
+            )
+        except Exception:
+            return self._failure(
+                request,
+                StewardAdvanceStatus.FAILED,
+                "Candidate workers could not be advanced.",
+                "candidate_workers_unavailable",
+                snapshot,
+            )
+        status_by_worker = {
+            CandidateWorkerStatus.COMPLETE: StewardAdvanceStatus.ADVANCED,
+            CandidateWorkerStatus.WAITING: StewardAdvanceStatus.WAITING,
+            CandidateWorkerStatus.BLOCKED: StewardAdvanceStatus.BLOCKED,
+            CandidateWorkerStatus.FAILED: StewardAdvanceStatus.FAILED,
+            CandidateWorkerStatus.CONFLICT: StewardAdvanceStatus.CONFLICT,
+        }
+        status = status_by_worker[result.status]
+        if (
+            result.status is CandidateWorkerStatus.COMPLETE
+            and result.snapshot.revision == snapshot.revision
+        ):
+            status = StewardAdvanceStatus.WAITING
+        return StewardAdvanceResult(
+            status=status,
+            issue_number=request.issue_number,
+            summary=result.summary,
+            phase=result.snapshot.state.phase.value,
+            disposition=(
+                AdvanceDisposition.WAIT.value
+                if status is StewardAdvanceStatus.WAITING
+                else (
+                    AdvanceDisposition.BLOCKED.value
+                    if status is StewardAdvanceStatus.BLOCKED
+                    else (
+                        AdvanceDisposition.ADVANCE.value
+                        if status
+                        in {
+                            StewardAdvanceStatus.ADVANCED,
+                            StewardAdvanceStatus.COMPLETE,
+                        }
+                        else None
+                    )
+                )
+            ),
+            revision=result.snapshot.revision,
+            code=result.code,
+            state=result.snapshot.state,
         )
 
     def _failure(

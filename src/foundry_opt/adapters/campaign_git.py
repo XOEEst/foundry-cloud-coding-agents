@@ -282,6 +282,11 @@ class CampaignGit:
         message: str,
     ) -> str:
         path = self._owned(worktree)
+        if not self._git(path, "status", "--porcelain=v1", "--"):
+            head = self._git_text(path, "rev-parse", "HEAD^{commit}")
+            if head == worktree.base_commit:
+                raise ValueError("candidate worktree has no changes")
+            return head
         self._git(path, "add", "-A")
         self._git(
             path,
@@ -351,39 +356,78 @@ class CampaignGit:
     ) -> None:
         root = _repository_root(repository_root)
         path = require_managed_worktree(root, worktree.path)
-        self._owned(worktree)
-        result = subprocess.run(
-            ("git", "worktree", "remove", "--force", str(path)),
-            cwd=root,
-            check=False,
-            capture_output=True,
-        )
-        if result.returncode != 0 and path.exists():
-            listed = subprocess.run(
-                ("git", "worktree", "list", "--porcelain"),
+        branch_parts = worktree.branch.split("/")
+        if (
+            len(branch_parts) != 3
+            or branch_parts[0] != "foundry-opt"
+            or branch_parts[2] != worktree.candidate_id
+        ):
+            raise ValueError("worktree cleanup binding is invalid")
+        campaign_id = branch_parts[1]
+        _identifier(campaign_id, "campaign_id")
+        expected_path = (
+            contained_worktree_root(root, campaign_id)
+            / worktree.candidate_id
+        ).resolve()
+        if path != expected_path:
+            raise ValueError("worktree cleanup path does not match branch")
+        owned = self._worktrees.get(path)
+        if owned is not None and owned != worktree:
+            raise ValueError("worktree cleanup ownership changed")
+        registered = _registered_worktrees(root)
+        if path in registered:
+            registered_branch = registered[path]
+            if registered_branch != f"refs/heads/{worktree.branch}":
+                raise ValueError("registered worktree branch changed")
+            result = subprocess.run(
+                ("git", "worktree", "remove", "--force", str(path)),
                 cwd=root,
                 check=False,
                 capture_output=True,
             )
-            registered = {
-                Path(line.removeprefix(b"worktree ").decode("utf-8"))
-                .expanduser()
-                .resolve()
-                for line in listed.stdout.splitlines()
-                if line.startswith(b"worktree ")
-            }
-            if path not in registered:
-                shutil.rmtree(path)
-        if result.returncode != 0 and path.exists():
-            raise RuntimeError(
-                result.stderr.decode("utf-8", errors="replace").strip()
-            )
-        subprocess.run(
+            if result.returncode != 0 and path.exists():
+                raise RuntimeError(
+                    result.stderr.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).strip()
+                )
+        if os.path.lexists(path):
+            _remove_managed_tree(path)
+        deleted = subprocess.run(
             ("git", "branch", "-D", worktree.branch),
             cwd=root,
             check=False,
             capture_output=True,
         )
+        remaining = subprocess.run(
+            (
+                "git",
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{worktree.branch}",
+            ),
+            cwd=root,
+            check=False,
+            capture_output=True,
+        )
+        if remaining.returncode == 0:
+            raise RuntimeError(
+                deleted.stderr.decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+                or "optimizer worktree branch still exists"
+            )
+        if remaining.returncode != 1:
+            raise RuntimeError(
+                remaining.stderr.decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+                or "optimizer worktree branch state is unavailable"
+            )
         self._git(root, "worktree", "prune")
         self._worktrees.pop(path, None)
 
@@ -451,6 +495,34 @@ def _repository_root(path: Path) -> Path:
 def _identifier(value: str, field: str) -> None:
     if not _IDENTIFIER.fullmatch(value):
         raise ValueError(f"{field} is invalid")
+
+
+def _registered_worktrees(repository_root: Path) -> dict[Path, str | None]:
+    result = subprocess.run(
+        ("git", "worktree", "list", "--porcelain"),
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+    )
+    registered: dict[Path, str | None] = {}
+    path: Path | None = None
+    for line in result.stdout.splitlines():
+        if line.startswith(b"worktree "):
+            path = Path(
+                line.removeprefix(b"worktree ").decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            ).expanduser().resolve()
+            registered[path] = None
+        elif line.startswith(b"branch ") and path is not None:
+            registered[path] = line.removeprefix(b"branch ").decode(
+                "utf-8",
+                errors="replace",
+            )
+        elif not line:
+            path = None
+    return registered
 
 
 def _remove_managed_tree(path: Path) -> None:

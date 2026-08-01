@@ -74,10 +74,11 @@ class CompatibilityOptimizationCommandService:
         self,
         request: OptimizeCommandRequest,
     ) -> OptimizeCommandResult:
-        if self._precheck is not None:
-            precheck = self._precheck(request)
-            if precheck is not None:
-                return precheck
+        precheck = (
+            self._precheck(request)
+            if self._precheck is not None
+            else None
+        )
         steward_result = self._steward.advance(
             StewardAdvanceRequest(
                 request.repository_root,
@@ -88,13 +89,19 @@ class CompatibilityOptimizationCommandService:
             steward_result.status is StewardAdvanceStatus.BLOCKED
             and steward_result.code == "campaign_not_initialized"
         ):
+            if precheck is not None:
+                return precheck
             return _gate_failure(request, steward_result.code)
         if steward_result.status in {
             StewardAdvanceStatus.CONFLICT,
             StewardAdvanceStatus.FAILED,
         }:
+            if precheck is not None:
+                return precheck
             return _gate_failure(request, steward_result.code)
         if steward_result.state is None:
+            if precheck is not None:
+                return precheck
             return _gate_failure(request, "campaign_state_unavailable")
         projected = self._project_trusted(request, steward_result.state)
         if isinstance(projected, OptimizeCommandResult):
@@ -128,6 +135,11 @@ class CompatibilityOptimizationCommandService:
         gate = _gate(request, steward_result.state)
         if gate is not None:
             return gate
+        canonical = _canonical_candidate_result(request, steward_result)
+        if canonical is not None:
+            return canonical
+        if precheck is not None:
+            return precheck
         if self._runtime_namespace is not None:
             try:
                 self._runtime_namespace.prepare(
@@ -845,6 +857,54 @@ def _gate(
             "code": code,
             "generation": state.generation,
             "phase": state.phase.value,
+        },
+    )
+
+
+def _canonical_candidate_result(
+    request: OptimizeCommandRequest,
+    steward_result: Any,
+) -> OptimizeCommandResult | None:
+    if request.phase not in {
+        OptimizePhase.RUN,
+        OptimizePhase.CANDIDATE_REQUEST,
+        OptimizePhase.CANDIDATE_SUBMIT,
+    }:
+        return None
+    state = steward_result.state
+    if state is None:
+        return None
+    if steward_result.code == "session_timeout":
+        return OptimizeCommandResult(
+            OptimizeCommandStatus.AWAITING_AGENT,
+            request.phase,
+            steward_result.summary,
+            request.issue_number,
+            details={
+                "generation": state.generation,
+                "phase": state.phase.value,
+                "source": "canonical_steward",
+            },
+            next_action="A replacement steward session will resume the ledger.",
+        )
+    completed = any(
+        event_id.startswith(
+            f"candidate-workers-{state.generation}-"
+        )
+        for event_id in state.processed_event_ids
+    )
+    if not completed:
+        return None
+    return OptimizeCommandResult(
+        OptimizeCommandStatus.COMPLETE,
+        request.phase,
+        steward_result.summary,
+        request.issue_number,
+        details={
+            "candidate_count": len(state.candidates),
+            "generation": state.generation,
+            "phase": state.phase.value,
+            "source": "canonical_steward",
         },
     )
 

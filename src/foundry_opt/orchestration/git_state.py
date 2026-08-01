@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import hashlib
 import json
+from math import isfinite
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,7 @@ from foundry_opt.orchestration.models import (
     EventKind,
     SpecFileHash,
 )
+from foundry_opt.security import reject_secret_content
 
 
 _STATE_SCHEMA_VERSION = 2
@@ -58,6 +60,12 @@ _EVENT_PAYLOAD_FIELDS = {
     EventKind.CANDIDATE_EVALUATED: frozenset(
         {"candidate_id", "eligible", "evidence_sha256"}
     ),
+    EventKind.CANDIDATE_ELIGIBILITY_REVISED: frozenset(
+        {"candidate_id", "eligible"}
+    ),
+    EventKind.CANDIDATE_WORKERS_COMPLETED: frozenset(
+        {"attempted_count", "eligible_count", "stop_reason"}
+    ),
     EventKind.SLATE_PUBLISHED: frozenset(),
     EventKind.CANDIDATE_MERGED: frozenset(
         {"candidate_id", "merge_commit"}
@@ -68,30 +76,59 @@ _EVENT_PAYLOAD_FIELDS = {
 _OUTBOX_PAYLOAD_FIELDS = frozenset(
     {
         "assignee",
+        "attestation_sha256",
+        "base_commit",
         "branch",
         "base_ref_name",
+        "bundle_sha256",
+        "campaign_id",
         "candidate_id",
+        "changed_paths",
         "commit_sha",
+        "complexity",
+        "cutoff_at",
+        "deadline_at",
         "files",
         "head_commit",
         "deployment_version",
         "disposition",
+        "draft_id",
+        "effect_id",
+        "effect_kind",
         "eligible",
         "evaluation_id",
         "evidence_sha256",
+        "goal_sha256",
         "idempotency_key",
+        "idea_id",
         "issue_number",
         "label",
+        "lessons",
+        "lineage_sha256",
+        "max_changed_candidates",
         "merge_commit",
+        "metrics",
+        "motivation",
+        "mutation_class",
+        "parent_idea_ids",
+        "patch_sha256",
         "phase",
         "pull_request_number",
         "ref",
+        "required_opt_ins",
+        "result",
+        "result_commit",
+        "result_id",
         "retained",
+        "run_id",
+        "slot",
         "spec_sha256",
         "spec_classification",
         "specialist",
+        "started_at",
         "state_sha256",
         "status",
+        "target",
         "tree_sha",
         "reason",
         "work_kind",
@@ -100,17 +137,57 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
 _HASH_FIELDS = frozenset(
     {
         "evidence_sha256",
+        "attestation_sha256",
+        "bundle_sha256",
+        "goal_sha256",
         "idempotency_key",
+        "lineage_sha256",
+        "patch_sha256",
         "spec_sha256",
         "state_sha256",
     }
 )
 _NUMBER_FIELDS = frozenset(
-    {"deployment_version", "issue_number", "pull_request_number"}
+    {
+        "deployment_version",
+        "issue_number",
+        "max_changed_candidates",
+        "pull_request_number",
+    }
+)
+_NONNEGATIVE_NUMBER_FIELDS = frozenset(
+    {"attempted_count", "eligible_count", "slot"}
 )
 _BOOLEAN_FIELDS = frozenset({"eligible", "retained"})
 _COMMIT_FIELDS = frozenset(
-    {"commit_sha", "head_commit", "merge_commit", "tree_sha"}
+    {
+        "base_commit",
+        "commit_sha",
+        "head_commit",
+        "merge_commit",
+        "result_commit",
+        "tree_sha",
+    }
+)
+_IDENTIFIER_LIST_FIELDS = frozenset(
+    {"parent_idea_ids", "required_opt_ins"}
+)
+_REDACTED_TEXT_FIELDS = frozenset(
+    {"complexity", "motivation"}
+)
+_SENSITIVE_TEXT_MARKERS = (
+    "authorization: bearer ",
+    "authorization=bearer ",
+    "access_token=",
+    "access-token=",
+    "api_key=",
+    "api-key=",
+    "client_secret=",
+    "clientsecret=",
+    "sharedaccesskey=",
+    "sharedaccesssignature=",
+    "?sig=",
+    "&sig=",
 )
 _COMMIT_ENVIRONMENT = {
     "GIT_AUTHOR_NAME": "Foundry Optimizer Steward",
@@ -1065,6 +1142,65 @@ def _validate_payload_value(key: str, value: Any) -> None:
         if len({item.path for item in files}) != len(files):
             raise StateRefPrivacyError("files must contain unique paths")
         return
+    if key == "changed_paths":
+        if not isinstance(value, list):
+            raise StateRefPrivacyError(
+                "changed_paths must be a path list"
+            )
+        try:
+            paths = tuple(
+                SpecFileHash(path=item, sha256="0" * 64).path
+                for item in value
+            )
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError(
+                "changed_paths must contain privacy-safe paths"
+            ) from error
+        if len(set(paths)) != len(paths):
+            raise StateRefPrivacyError(
+                "changed_paths must contain unique paths"
+            )
+        return
+    if key in _IDENTIFIER_LIST_FIELDS:
+        if not isinstance(value, list):
+            raise StateRefPrivacyError(f"{key} must be an identifier list")
+        try:
+            for item in value:
+                _identifier(item, key)
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError(
+                f"{key} must be an identifier list"
+            ) from error
+        if len(set(value)) != len(value):
+            raise StateRefPrivacyError(f"{key} must contain unique values")
+        return
+    if key == "lessons":
+        if not isinstance(value, list) or not value:
+            raise StateRefPrivacyError(
+                "lessons must be non-empty redacted text"
+            )
+        for item in value:
+            _validate_redacted_text(item, "lesson")
+        return
+    if key == "metrics":
+        if not isinstance(value, dict):
+            raise StateRefPrivacyError("metrics must be an aggregate mapping")
+        for name, metric in value.items():
+            try:
+                _identifier(name, "metric")
+            except ValueError as error:
+                raise StateRefPrivacyError(
+                    "metrics must use identifier keys"
+                ) from error
+            if (
+                not isinstance(metric, (int, float))
+                or isinstance(metric, bool)
+                or not isfinite(metric)
+            ):
+                raise StateRefPrivacyError(
+                    "metrics must contain finite aggregates"
+                )
+        return
     if key in _HASH_FIELDS:
         if not isinstance(value, str) or not _SHA256.fullmatch(value):
             raise StateRefPrivacyError(f"{key} must be a SHA-256 digest")
@@ -1077,6 +1213,14 @@ def _validate_payload_value(key: str, value: Any) -> None:
                 f"{key} must be a positive integer"
             ) from error
         return
+    if key in _NONNEGATIVE_NUMBER_FIELDS:
+        try:
+            _nonnegative_integer(value, key)
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError(
+                f"{key} must be a non-negative integer"
+            ) from error
+        return
     if key in _BOOLEAN_FIELDS:
         if type(value) is not bool:
             raise StateRefPrivacyError(f"{key} must be boolean")
@@ -1085,10 +1229,38 @@ def _validate_payload_value(key: str, value: Any) -> None:
         if not isinstance(value, str) or not _COMMIT.fullmatch(value):
             raise StateRefPrivacyError(f"{key} must be a full Git commit")
         return
+    if key in _REDACTED_TEXT_FIELDS:
+        _validate_redacted_text(value, key)
+        return
     if not isinstance(value, str) or not _SAFE_TEXT.fullmatch(value):
         raise StateRefPrivacyError(
             f"{key} must be allowlisted metadata"
         )
+
+
+def _validate_redacted_text(value: Any, key: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise StateRefPrivacyError(
+            f"{key} must be bounded redacted text"
+        )
+    if any(
+        marker in value.casefold()
+        for marker in _SENSITIVE_TEXT_MARKERS
+    ):
+        raise StateRefPrivacyError(
+            f"{key} contains sensitive content"
+        )
+    try:
+        reject_secret_content(value)
+    except ValueError as error:
+        raise StateRefPrivacyError(
+            f"{key} contains sensitive content"
+        ) from error
 
 
 def _read_document(content: bytes, description: str) -> Any:

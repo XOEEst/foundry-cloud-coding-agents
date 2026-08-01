@@ -21,6 +21,10 @@ from foundry_opt.orchestration.steward import (
     StewardAdvanceService,
     StewardAdvanceStatus,
 )
+from foundry_opt.orchestration.candidate_workers import (
+    CandidateWorkerResult,
+    CandidateWorkerStatus,
+)
 from foundry_opt.orchestration.spec_policy import (
     MergedSpecApproval,
     OptimizationSpecPolicy,
@@ -622,3 +626,80 @@ def test_git_campaign_inbox_reads_transport_events_for_requested_issue(
         StewardAdvanceRequest(tmp_path, 31),
         None,
     ) == (event,)
+
+
+def test_steward_owns_and_invokes_candidate_worker_phase(
+    tmp_path: Path,
+) -> None:
+    created = _event("event-1", EventKind.ISSUE_CREATED)
+    approved = CampaignEvent(
+        "event-2",
+        EventKind.SPEC_POLICY_APPROVED,
+        1,
+        NOW,
+        {"spec_sha256": "d" * 64},
+    )
+    baseline = OptimizationCampaign().advance(
+        __import__(
+            "foundry_opt.orchestration",
+            fromlist=["AdvanceRequest"],
+        ).AdvanceRequest(31, None, (created, approved))
+    ).state
+    completed = CampaignState(
+        31,
+        1,
+        4,
+        CampaignPhase.CANDIDATES,
+        processed_event_ids=(
+            "event-1",
+            "event-2",
+            "baseline-worker",
+            "candidate-workers-1-max_candidates",
+        ),
+        spec_sha256="d" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "e" * 64,
+            },
+        ),
+    )
+    initial = SimpleNamespace(
+        revision="a" * 40,
+        state=baseline,
+        inbox=(created, approved),
+        outbox=(),
+    )
+    final = SimpleNamespace(
+        revision="b" * 40,
+        state=completed,
+        inbox=initial.inbox,
+        outbox=(),
+    )
+
+    class CandidateWorkers:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def advance(self, request):
+            self.requests.append(request)
+            return CandidateWorkerResult(
+                CandidateWorkerStatus.COMPLETE,
+                final,
+                "candidate workers complete",
+            )
+
+    workers = CandidateWorkers()
+    result = StewardAdvanceService(
+        ledger=Ledger(initial),
+        inbox=Inbox(()),
+        candidate_workers=workers,
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.status is StewardAdvanceStatus.ADVANCED
+    assert result.phase == "candidates"
+    assert result.state == completed
+    assert workers.requests[0].issue_number == 31
+    assert workers.requests[0].repository_root == tmp_path

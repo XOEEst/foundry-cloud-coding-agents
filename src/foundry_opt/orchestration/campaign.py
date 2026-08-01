@@ -271,6 +271,58 @@ class OptimizationCampaign:
                 event,
                 candidates=(*state.candidates, candidate),
             )
+        if event.kind is EventKind.CANDIDATE_ELIGIBILITY_REVISED:
+            self._require_phase(state, CampaignPhase.CANDIDATES, event)
+            candidate_id = _identifier(
+                event.payload,
+                "candidate_id",
+            )
+            eligible = _boolean(event.payload, "eligible")
+            if candidate_id not in {
+                item.candidate_id for item in state.candidates
+            }:
+                raise InvalidCampaignTransition(
+                    "candidate eligibility revision requires an evaluation"
+                )
+            return self._next(
+                state,
+                event,
+                candidates=tuple(
+                    replace(item, eligible=eligible)
+                    if item.candidate_id == candidate_id
+                    else item
+                    for item in state.candidates
+                ),
+            )
+        if event.kind is EventKind.CANDIDATE_WORKERS_COMPLETED:
+            self._require_phase(state, CampaignPhase.CANDIDATES, event)
+            attempted = _nonnegative_integer(
+                event.payload,
+                "attempted_count",
+            )
+            eligible = _nonnegative_integer(
+                event.payload,
+                "eligible_count",
+            )
+            _identifier(event.payload, "stop_reason")
+            actual_eligible = sum(
+                1 for candidate in state.candidates if candidate.eligible
+            )
+            if (
+                attempted != len(state.candidates)
+                or eligible != actual_eligible
+            ):
+                raise InvalidCampaignTransition(
+                    "candidate worker completion counters do not match state"
+                )
+            if eligible == 0:
+                return self._next(
+                    state,
+                    event,
+                    phase=CampaignPhase.BLOCKED,
+                    block_reason="no_eligible_candidates",
+                )
+            return self._next(state, event)
         if event.kind is EventKind.SLATE_PUBLISHED:
             self._require_phase(state, CampaignPhase.CANDIDATES, event)
             if not state.candidates:
@@ -423,6 +475,15 @@ def _boolean(payload: Any, field: str) -> bool:
     value = payload.get(field)
     if not isinstance(value, bool):
         raise InvalidCampaignTransition(f"{field} must be boolean")
+    return value
+
+
+def _nonnegative_integer(payload: Any, field: str) -> int:
+    value = payload.get(field)
+    if type(value) is not int or value < 0:
+        raise InvalidCampaignTransition(
+            f"{field} must be a non-negative integer"
+        )
     return value
 
 

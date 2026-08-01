@@ -20,11 +20,17 @@ from foundry_opt.orchestration import (
     AdvanceRequest,
     CampaignEvent,
     CampaignPhase,
+    CampaignState,
     EventKind,
     GitStateRef,
     OptimizationCampaign,
+    StateRefSnapshot,
 )
 from foundry_opt.orchestration.steward import StewardAdvanceService
+from foundry_opt.orchestration.candidate_workers import (
+    CandidateWorkerResult,
+    CandidateWorkerStatus,
+)
 
 
 NOW = datetime(2026, 7, 31, tzinfo=UTC)
@@ -239,3 +245,87 @@ def test_legacy_bootstrap_accepts_later_trusted_creation_and_continues(
         "github-delivery-created",
         "policy-approved",
     )
+
+
+def test_run_phase_adapts_completed_canonical_candidate_workers(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    store = _seed(
+        repository,
+        (
+            _event("created", EventKind.ISSUE_CREATED),
+            _event(
+                "spec",
+                EventKind.SPEC_POLICY_APPROVED,
+                spec_sha256="a" * 64,
+            ),
+        ),
+    )
+    baseline = store.load(repository, 7)
+    assert baseline is not None
+    completed_event = _event(
+        "candidate-workers-1-max_candidates",
+        EventKind.CANDIDATE_WORKERS_COMPLETED,
+        attempted_count=1,
+        eligible_count=1,
+        stop_reason="max_candidates",
+    )
+    completed_state = CampaignState(
+        7,
+        1,
+        5,
+        CampaignPhase.CANDIDATES,
+        processed_event_ids=(
+            "created",
+            "spec",
+            "baseline",
+            "candidate",
+            completed_event.event_id,
+        ),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+    )
+
+    class CandidateWorkers:
+        def advance(self, request):
+            return CandidateWorkerResult(
+                CandidateWorkerStatus.COMPLETE,
+                StateRefSnapshot(
+                    "f" * 40,
+                    completed_state,
+                    (*baseline.inbox, completed_event),
+                    baseline.outbox,
+                ),
+                "candidate workers complete",
+            )
+
+    legacy = Legacy(OptimizePhase.RUN)
+    service = CompatibilityOptimizationCommandService(
+        legacy=legacy,
+        steward=StewardAdvanceService(
+            ledger=store,
+            candidate_workers=CandidateWorkers(),
+        ),
+        precheck=lambda request: OptimizeCommandResult(
+            OptimizeCommandStatus.BLOCKED,
+            request.phase,
+            "legacy precheck must not mask canonical workers",
+            request.issue_number,
+        ),
+    )
+
+    result = service.execute(
+        OptimizeCommandRequest(repository, 7, OptimizePhase.RUN)
+    )
+
+    assert result.status is OptimizeCommandStatus.COMPLETE
+    assert result.details["source"] == "canonical_steward"
+    assert legacy.calls == 0
