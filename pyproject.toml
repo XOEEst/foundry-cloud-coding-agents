@@ -29,7 +29,6 @@ packages = ["src/foundry_opt"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "--basetemp=.pytest-tmp"
 markers = [
     "acceptance: requires the dedicated private GitHub repository and disposable Foundry project",
 ]
