@@ -171,6 +171,57 @@ def test_new_dashboard_record_updates_the_single_dashboard_comment() -> None:
     assert "awaiting_selection" in gateway.updated[0][1]
 
 
+def test_final_deployment_dashboard_renders_only_aggregate_comparison() -> None:
+    gateway = FakeDashboardGateway()
+    source = FakeOutbox(
+        (
+            _record(
+                "final-dashboard-2",
+                "deployment_final_dashboard",
+                14,
+                phase="completed",
+                status="completed",
+                disposition="complete",
+                candidate_id="candidate-1",
+                deployment_version=13,
+                lineage_sha256="a" * 64,
+                merge_actor="maintainer",
+                required_checks=["exact-candidate", "tests"],
+                spec_sha256="b" * 64,
+                merge_commit="c" * 40,
+                tree_sha="d" * 40,
+                patch_sha256="e" * 64,
+                bundle_sha256="f" * 64,
+                evidence_sha256="1" * 64,
+                metadata_sha256="2" * 64,
+                source_sha256="f" * 64,
+                run_id=991,
+                run_url=(
+                    "https://github.com/octo-org/agents/actions/runs/991"
+                ),
+                portal_url=(
+                    "https://ai.azure.com/projects/demo/agents/"
+                    "support/versions/13"
+                ),
+                baseline_metrics={"quality": 0.7},
+                draft_metrics={"quality": 0.9},
+                deployed_metrics={"quality": 0.88},
+            ),
+        )
+    )
+
+    DashboardProjection(source, gateway).project(31)
+
+    assert len(gateway.created) == 1
+    body = gateway.created[0]
+    assert "Candidate: `candidate-1`" in body
+    assert "Published version: `13`" in body
+    assert "Baseline aggregates: `quality=0.7`" in body
+    assert "Selected draft aggregates: `quality=0.9`" in body
+    assert "Deployed aggregates: `quality=0.88`" in body
+    assert "raw_response" not in body
+
+
 def test_dashboard_explains_specification_digest_and_classification() -> None:
     gateway = FakeDashboardGateway()
     source = FakeOutbox(

@@ -103,12 +103,14 @@ def build_optimization_command_service() -> OptimizationCommandService:
 def build_steward_advance_service() -> StewardAdvanceService:
     """Return the durable Copilot steward advance service."""
     from foundry_opt.optimization.production import (
+        build_production_steward_deployment,
         build_production_steward_spec_policy,
     )
 
     return StewardAdvanceService(
         inbox=GitCampaignInbox(),
         spec_policy=build_production_steward_spec_policy(),
+        deployment=build_production_steward_deployment(),
     )
 
 
@@ -219,6 +221,90 @@ def steward_advance(
         if result.revision is not None:
             typer.echo(f"- revision: {result.revision}")
     raise typer.Exit(result.exit_code)
+
+
+@steward_app.command("deployment-bridge", hidden=True)
+def steward_deployment_bridge(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+) -> None:
+    """Apply persisted deployment workflow effects from the thin bridge."""
+    from foundry_opt.adapters.commands import SubprocessCommandRunner
+    from foundry_opt.orchestration.deployment import DeploymentBridgeStatus
+    from foundry_opt.orchestration.deployment import (
+        DeploymentCleanupBridgeStatus,
+    )
+    from foundry_opt.orchestration.deployment_bridge import (
+        reconcile_deployment_workflow_effects,
+    )
+
+    result = reconcile_deployment_workflow_effects(
+        Path.cwd(),
+        issue_number,
+        SubprocessCommandRunner(),
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "issue_number": issue_number,
+                "statuses": [
+                    item.status.value for item in result.results
+                ],
+                "cleanup_statuses": [
+                    item.status.value for item in result.cleanup_results
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    if any(
+        item.status is DeploymentBridgeStatus.INVALID
+        for item in result.results
+    ) or any(
+        item.status is DeploymentCleanupBridgeStatus.INVALID
+        for item in result.cleanup_results
+    ):
+        raise typer.Exit(1)
+
+
+@steward_app.command("publication-result", hidden=True)
+def steward_publication_result(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    result_file: Annotated[
+        Path,
+        typer.Option(
+            "--result-file",
+            help="Repository-relative redacted deployment result JSON.",
+        ),
+    ],
+) -> None:
+    """Persist a deployment-identity bridge publication result."""
+    from foundry_opt.orchestration.deployment_bridge import (
+        record_deployment_publication_file,
+    )
+
+    result = record_deployment_publication_file(
+        Path.cwd(),
+        issue_number,
+        result_file,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "deployment_version": result.deployment_version,
+                "issue_number": issue_number,
+                "status": result.status.value,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 @optimize_app.callback()

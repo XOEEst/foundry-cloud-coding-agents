@@ -38,6 +38,9 @@ _PR_EVENT_KINDS = frozenset(
         EventKind.CANDIDATE_PR_MERGED,
     }
 )
+_WORKFLOW_EVENT_KINDS = frozenset(
+    {EventKind.DEPLOYMENT_WORKFLOW_OBSERVED}
+)
 
 
 class TrustedIssueEventError(ValueError):
@@ -163,6 +166,177 @@ class IssueEventIntake:
                 f"{trigger_id}-issue-{issue_number}",
             )
             self._projection.project(issue_number)
+
+
+class DeploymentWorkflowEventRouter:
+    """Route one trusted workflow_run to its exact persisted deployment."""
+
+    def __init__(
+        self,
+        repository_root: Path,
+        inbox: IssueEventInbox,
+        assignments: StewardAssignments,
+        projection: IssueProjection,
+    ) -> None:
+        self._root = repository_root
+        self._inbox = inbox
+        self._assignments = assignments
+        self._projection = projection
+
+    def ingest(
+        self,
+        payload: Mapping[str, Any],
+        context: TrustedEventContext,
+    ) -> IntakeResult | None:
+        if context.event_name != "workflow_run":
+            raise TrustedIssueEventError(
+                "workflow router requires workflow_run"
+            )
+        repository = payload.get("repository")
+        run = payload.get("workflow_run")
+        action = payload.get("action")
+        if (
+            not isinstance(repository, Mapping)
+            or not isinstance(run, Mapping)
+            or action not in {"requested", "in_progress", "completed"}
+            or repository.get("full_name") != context.repository
+            or repository.get("id") != context.repository_id
+        ):
+            raise TrustedIssueEventError(
+                "workflow payload identity is invalid"
+            )
+        from foundry_opt.orchestration.deployment import (
+            DeploymentWorkflowEventIntake,
+            DeploymentWorkflowResultRecorder,
+            TrustedDeploymentWorkflowContext,
+            deployment_workflow_event_from_payload,
+            deployment_workflow_intent,
+        )
+        from foundry_opt.orchestration.git_state import GitStateRef
+
+        matches: list[tuple[int, Any]] = []
+        for issue_number in self._inbox.issue_numbers():
+            snapshot = GitStateRef().load(self._root, issue_number)
+            if snapshot is None:
+                continue
+            intents = []
+            for record in snapshot.outbox:
+                if record.kind != "deployment_workflow_planned" or (
+                    record.generation != snapshot.state.generation
+                ):
+                    continue
+                try:
+                    intents.append(deployment_workflow_intent(record))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if not intents:
+                continue
+            run_id = run.get("id")
+            bound_effects = {
+                str(record.payload["effect_id"])
+                for record in snapshot.outbox
+                if (
+                    record.kind == "deployment_workflow_run_bound"
+                    and record.generation == snapshot.state.generation
+                    and record.payload.get("run_id") == run_id
+                    and isinstance(record.payload.get("effect_id"), str)
+                )
+            }
+            bound = tuple(
+                intent
+                for intent in intents
+                if intent.effect_id in bound_effects
+            )
+            if len(bound) == 1:
+                intent = bound[0]
+            elif len(bound) > 1:
+                raise TrustedIssueEventError(
+                    "workflow run is not bound to one deployment attempt"
+                )
+            elif any(
+                intent.workflow.trigger.value == "manual"
+                for intent in intents
+            ):
+                intent = max(intents, key=lambda item: item.attempt)
+            elif len(intents) > 1:
+                intent = max(intents, key=lambda item: item.attempt)
+            else:
+                intent = intents[0]
+            path = run.get("path")
+            if (
+                intent.workflow.repository == context.repository
+                and intent.workflow.repository_id == context.repository_id
+                and run.get("workflow_id") == intent.workflow.workflow_id
+                and path
+                == (
+                    f"{intent.workflow.path.as_posix()}@"
+                    f"{intent.workflow.ref}"
+                )
+                and (
+                    (
+                        intent.workflow.trigger.value == "manual"
+                        and run.get("display_title") == intent.effect_id
+                    )
+                    or (
+                        intent.workflow.trigger.value != "manual"
+                        and run.get("head_sha")
+                        == intent.binding.merge_commit
+                    )
+                )
+            ):
+                matches.append((issue_number, intent))
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise TrustedIssueEventError(
+                "workflow payload matches multiple deployment intents"
+            )
+        issue_number, intent = matches[0]
+        occurred_at = _workflow_time(run)
+        actor = run.get("actor")
+        actor_login = (
+            actor.get("login") if isinstance(actor, Mapping) else None
+        )
+        if not isinstance(actor_login, str):
+            raise TrustedIssueEventError("workflow actor is invalid")
+        event = deployment_workflow_event_from_payload(
+            TrustedDeploymentWorkflowContext(
+                event_name="workflow_run",
+                action=str(action),
+                delivery_id=context.delivery_id,
+                repository=context.repository,
+                repository_id=context.repository_id,
+                workflow_id=int(intent.workflow.workflow_id),
+                workflow_path=intent.workflow.path,
+                actor=(
+                    intent.workflow.actor
+                    if intent.workflow.trigger.value == "manual"
+                    and intent.workflow.actor == "workflow-dispatch"
+                    else actor_login
+                ),
+                deployment_client_id=(
+                    intent.workflow.deployment_client_id
+                ),
+            ),
+            payload,
+            intent,
+            occurred_at,
+        )
+        DeploymentWorkflowResultRecorder(GitStateRef()).record(
+            self._root,
+            issue_number,
+            event.result,
+        )
+        result = DeploymentWorkflowEventIntake(self._inbox).ingest(event)
+        self._assignments.assign(
+            issue_number,
+            result.event.event_id,
+        )
+        self._projection.project(issue_number)
+        return IntakeResult(
+            result.event,
+            result.status.value == "recorded",
+        )
 
 
 class GitIssueEventInbox:
@@ -618,6 +792,21 @@ def _event_kind(
     return _ACTIONS[action]
 
 
+def _workflow_time(run: Mapping[str, Any]) -> datetime:
+    value = run.get("updated_at") or run.get("run_started_at")
+    if not isinstance(value, str):
+        raise TrustedIssueEventError("workflow timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise TrustedIssueEventError(
+            "workflow timestamp is invalid"
+        ) from error
+    if parsed.tzinfo is None:
+        raise TrustedIssueEventError("workflow timestamp is invalid")
+    return parsed
+
+
 def _inbox_ref(issue_number: int) -> str:
     if type(issue_number) is not int or issue_number < 1:
         raise ValueError("issue number must be positive")
@@ -630,6 +819,18 @@ def _require_transport_event(event: CampaignEvent) -> None:
             raise IssueInboxError(
                 "Git issue transport event payload must be empty"
             )
+        return
+    if event.kind in _WORKFLOW_EVENT_KINDS:
+        try:
+            from foundry_opt.orchestration.deployment import (
+                deployment_workflow_result_from_event,
+            )
+
+            deployment_workflow_result_from_event(event)
+        except ValueError as error:
+            raise IssueInboxError(
+                "deployment workflow transport payload is invalid"
+            ) from error
         return
     if event.kind not in _PR_EVENT_KINDS:
         raise IssueInboxError(
@@ -684,7 +885,7 @@ def _validate_transport_sequence(
     prior: tuple[CampaignEvent, ...] = ()
     for event in events:
         _require_transport_event(event)
-        if event.kind in _PR_EVENT_KINDS:
+        if event.kind in {*_PR_EVENT_KINDS, *_WORKFLOW_EVENT_KINDS}:
             issue_events = tuple(
                 item
                 for item in prior
@@ -829,10 +1030,20 @@ def main() -> None:
     intake = IssueEventIntake(inbox, assignments, projection)
     run_id = _required_environment("TRUSTED_RUN_ID")
     _identifier(run_id, "trusted run ID")
-    if event_name == "schedule":
+    if event_name in {"schedule", "workflow_dispatch"}:
+        from foundry_opt.orchestration.deployment_bridge import (
+            reconcile_deployment_workflow_effects,
+        )
+
+        for issue_number in inbox.issue_numbers():
+            reconcile_deployment_workflow_effects(
+                root,
+                issue_number,
+                commands,
+            )
         intake.recover(f"schedule-{run_id}")
         return
-    if event_name not in {"issues", "pull_request"}:
+    if event_name not in {"issues", "pull_request", "workflow_run"}:
         raise TrustedIssueEventError("event name is not trusted")
     event_path = Path(_required_environment("TRUSTED_EVENT_PATH"))
     try:
@@ -851,6 +1062,14 @@ def main() -> None:
         repository=repository,
         repository_id=repository_id,
     )
+    if event_name == "workflow_run":
+        DeploymentWorkflowEventRouter(
+            root,
+            inbox,
+            assignments,
+            projection,
+        ).ingest(payload, context)
+        return
     if event_name == "pull_request":
         pull_request = payload.get("pull_request")
         body = (

@@ -22,11 +22,12 @@ Design
 Two typed seams keep the coordinator testable and honest:
 
 ``WorkflowRunGateway``
-    Finds the GitHub Actions run for an exact ``(workflow file, event, head
-    SHA)`` — never an arbitrary "latest run" of the workflow — and, for a
-    manual workflow, dispatches it with the exact merge commit forwarded as an
-    explicit ``workflow_dispatch`` input the workflow declares. The production
-    implementation is :class:`GhWorkflowRunGateway` (authenticated ``gh``).
+    Finds the GitHub Actions run for an exact workflow and event. Merge runs
+    are additionally bound by head SHA. Manual runs carry the exact merge
+    commit and a deterministic effect ID as declared ``workflow_dispatch``
+    inputs because GitHub reports the dispatch ref tip, not the selected input
+    commit, as ``headSha``. The production implementation is
+    :class:`GhWorkflowRunGateway` (authenticated ``gh``).
 
 ``PublishedDeploymentReader``
     Reads the latest *numeric* published version for the target hosted agent
@@ -56,6 +57,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import hashlib
+import json
 import re
 import time
 from pathlib import Path
@@ -110,6 +113,7 @@ _LINEAGE_PROVENANCE_KEY = "foundry-opt-lineage-sha256"
 # The exact-commit ``workflow_dispatch`` input names the coordinator will use,
 # in order of preference, when auto-dispatching a manual deployment workflow.
 _DEFAULT_DISPATCH_INPUT_NAMES = ("selected_commit",)
+_CORRELATION_INPUT_NAME = "foundry_opt_effect_id"
 
 _COMPLETED_STATUSES = frozenset({"completed"})
 _QUEUED_STATUSES = frozenset(
@@ -139,16 +143,18 @@ class WorkflowRunQuery:
     """The exact identity of the deployment run the coordinator is after.
 
     ``events`` bounds the acceptable ``workflow_dispatch`` / ``push`` /
-    ``workflow_run`` triggers; ``head_sha`` is the *merge* commit (never the
-    pull-request head). A gateway must only ever return a run matching this
-    exact workflow file, one of these events, and this exact head SHA — never
-    an arbitrary latest run of the workflow.
+    ``workflow_run`` triggers; ``head_sha`` is the selected merge commit
+    (never the pull-request head). ``match_head_sha`` is false only for manual
+    dispatch because GitHub's run ``headSha`` is the ref tip; canonical
+    orchestration separately binds those runs with the effect-ID input.
     """
 
     workflow_path: Path
     events: tuple[str, ...]
     head_sha: str
     trigger: DeploymentTrigger
+    match_head_sha: bool = True
+    display_title: str | None = None
 
 
 class WorkflowRunGateway(Protocol):
@@ -168,6 +174,8 @@ class WorkflowRunGateway(Protocol):
         workflow_path: Path,
         input_name: str,
         commit: str,
+        correlation_input_name: str | None = None,
+        correlation_id: str | None = None,
     ) -> None: ...
 
 
@@ -314,7 +322,11 @@ class LiveDeploymentCoordinator:
         request: DeploymentLifecycleRequest,
     ) -> DeploymentWorkflowRun | None:
         workflow = request.workflow
-        query = self._run_query(workflow, request.merge_commit)
+        query = self._run_query(
+            workflow,
+            request.merge_commit,
+            self._correlation_id(request),
+        )
         run = self._workflow_gateway.find_run(
             request.repository_root, query=query
         )
@@ -332,11 +344,24 @@ class LiveDeploymentCoordinator:
 
     def _dispatch(self, request: DeploymentLifecycleRequest) -> None:
         input_name = self._dispatch_input_name(request)
+        if (
+            _CORRELATION_INPUT_NAME
+            not in self._declared_dispatch_inputs(request)
+            or self._declared_run_name(request)
+            != "${{ inputs.foundry_opt_effect_id }}"
+        ):
+            raise OptimizationDeploymentError(
+                "the manual deployment workflow does not declare the "
+                "exact foundry-opt correlation contract"
+            )
+        correlation_id = self._correlation_id(request)
         self._workflow_gateway.dispatch(
             request.repository_root,
             workflow_path=request.workflow.path,
             input_name=input_name,
             commit=request.merge_commit,
+            correlation_input_name=_CORRELATION_INPUT_NAME,
+            correlation_id=correlation_id,
         )
 
     def _dispatch_input_name(
@@ -382,6 +407,24 @@ class LiveDeploymentCoordinator:
             str(name) for name in inputs if isinstance(name, str)
         )
 
+    def _declared_run_name(
+        self,
+        request: DeploymentLifecycleRequest,
+    ) -> str | None:
+        path = request.repository_root / request.workflow.path
+        try:
+            document = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, UnicodeError, yaml.YAMLError) as error:
+            raise OptimizationDeploymentError(
+                "the deployment workflow file could not be read"
+            ) from error
+        if not isinstance(document, dict):
+            raise OptimizationDeploymentError(
+                "the deployment workflow file is malformed"
+            )
+        value = document.get("run-name")
+        return value.strip() if isinstance(value, str) else None
+
     def _locate_after_dispatch(
         self,
         request: DeploymentLifecycleRequest,
@@ -402,7 +445,11 @@ class LiveDeploymentCoordinator:
         request: DeploymentLifecycleRequest,
         run: DeploymentWorkflowRun,
     ) -> DeploymentWorkflowRun:
-        query = self._run_query(request.workflow, request.merge_commit)
+        query = self._run_query(
+            request.workflow,
+            request.merge_commit,
+            self._correlation_id(request),
+        )
         for attempt in range(self._poll_attempts):
             if run.status not in {
                 WorkflowRunStatus.QUEUED,
@@ -423,6 +470,7 @@ class LiveDeploymentCoordinator:
         self,
         workflow: DeploymentWorkflow,
         commit: str,
+        correlation_id: str | None = None,
     ) -> WorkflowRunQuery:
         if workflow.trigger is DeploymentTrigger.MANUAL:
             events = ("workflow_dispatch",)
@@ -433,6 +481,23 @@ class LiveDeploymentCoordinator:
             events=events,
             head_sha=commit,
             trigger=workflow.trigger,
+            match_head_sha=(
+                workflow.trigger is not DeploymentTrigger.MANUAL
+            ),
+            display_title=(
+                correlation_id
+                if workflow.trigger is DeploymentTrigger.MANUAL
+                else None
+            ),
+        )
+
+    def _correlation_id(
+        self,
+        request: DeploymentLifecycleRequest,
+    ) -> str:
+        return (
+            "legacy-deployment-"
+            f"{optimization_deployment_lineage_sha256(request.lineage)[:20]}"
         )
 
     def _no_run_outcome(
@@ -488,6 +553,22 @@ class LiveDeploymentCoordinator:
             run_url=run.url,
             portal_url=published.runtime.portal_url,
             reason_code="verified",
+            source_sha256=published.runtime.source_sha256,
+            tree_sha=published.record.tree_hash,
+            bundle_sha256=published.record.sha256,
+            merge_commit=request.merge_commit,
+            lineage_sha256=optimization_deployment_lineage_sha256(
+                request.lineage
+            ),
+            metadata_sha256=hashlib.sha256(
+                json.dumps(
+                    dict(published.record.metadata),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
         )
 
     def _provenance_matches(
@@ -569,8 +650,10 @@ class GhWorkflowRunGateway:
     """``gh``/``git`` implementation of :class:`WorkflowRunGateway`.
 
     ``find_run`` lists the runs of the *exact* deployment workflow file and
-    returns only a run whose event is one of the query's accepted events and
-    whose head SHA is the exact merge commit — never an arbitrary latest run.
+    returns only a run whose event is accepted. Merge-trigger runs also require
+    the exact merge SHA. Manual callers must bind the selected run through the
+    canonical effect-ID correlation rather than treating ``headSha`` as the
+    workflow input.
     ``dispatch`` launches the workflow against the repository default branch,
     forwarding the exact merge commit as an explicit ``workflow_dispatch``
     input. It performs no name-based process operations.
@@ -610,7 +693,10 @@ class GhWorkflowRunGateway:
                 "--limit",
                 str(self._run_limit),
                 "--json",
-                "databaseId,headSha,status,conclusion,event,path,url",
+                (
+                    "databaseId,displayTitle,headSha,status,"
+                    "conclusion,event,path,url"
+                ),
             ),
             cwd=repository_root,
         )
@@ -634,25 +720,50 @@ class GhWorkflowRunGateway:
         workflow_path: Path,
         input_name: str,
         commit: str,
+        correlation_input_name: str | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         if not _COMMIT.fullmatch(commit):
             raise OptimizationDeploymentError("dispatch commit is invalid")
         if not _IDENTIFIER_INPUT.fullmatch(input_name):
             raise OptimizationDeploymentError("dispatch input name is invalid")
+        if (correlation_input_name is None) != (correlation_id is None):
+            raise OptimizationDeploymentError(
+                "dispatch correlation input is incomplete"
+            )
+        if (
+            correlation_input_name is not None
+            and (
+                not _IDENTIFIER_INPUT.fullmatch(correlation_input_name)
+                or not isinstance(correlation_id, str)
+                or not correlation_id
+            )
+        ):
+            raise OptimizationDeploymentError(
+                "dispatch correlation input is invalid"
+            )
+        arguments = [
+            "gh",
+            "workflow",
+            "run",
+            workflow_path.as_posix(),
+            "--repo",
+            self._repository_name(repository_root),
+            "--ref",
+            self._default_branch_name(repository_root),
+            "--field",
+            f"{input_name}={commit}",
+        ]
+        if correlation_input_name is not None:
+            arguments.extend(
+                (
+                    "--field",
+                    f"{correlation_input_name}={correlation_id}",
+                )
+            )
         self._run(
             "dispatch",
-            (
-                "gh",
-                "workflow",
-                "run",
-                workflow_path.as_posix(),
-                "--repo",
-                self._repository_name(repository_root),
-                "--ref",
-                self._default_branch_name(repository_root),
-                "--field",
-                f"{input_name}={commit}",
-            ),
+            tuple(arguments),
             cwd=repository_root,
         )
 
@@ -725,7 +836,11 @@ def _run_matches(
     path = item.get("path")
     return (
         isinstance(head, str)
-        and head == query.head_sha
+        and (not query.match_head_sha or head == query.head_sha)
+        and (
+            query.display_title is None
+            or item.get("displayTitle") == query.display_title
+        )
         and isinstance(event, str)
         and event in query.events
         and isinstance(path, str)

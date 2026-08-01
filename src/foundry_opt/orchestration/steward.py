@@ -29,6 +29,11 @@ from foundry_opt.orchestration.git_state import (
     StateRefError,
     StateRefSnapshot,
 )
+from foundry_opt.orchestration.deployment import (
+    DeploymentOrchestrationRequest,
+    DeploymentOrchestrationResult,
+    DeploymentOrchestrationStatus,
+)
 from foundry_opt.orchestration.models import (
     AdvanceDisposition,
     AdvanceRequest,
@@ -190,6 +195,13 @@ class StewardCandidateSelection(Protocol):
     ) -> CandidateSelectionResult: ...
 
 
+class StewardDeployment(Protocol):
+    def advance(
+        self,
+        request: DeploymentOrchestrationRequest,
+    ) -> DeploymentOrchestrationResult: ...
+
+
 class StewardAdvanceService:
     """Consume campaign events and atomically advance the steward ledger."""
 
@@ -203,6 +215,7 @@ class StewardAdvanceService:
         candidate_workers: StewardCandidateWorkers | None = None,
         candidate_slate: StewardCandidateSlate | None = None,
         candidate_selection: StewardCandidateSelection | None = None,
+        deployment: StewardDeployment | None = None,
     ) -> None:
         self._ledger = ledger or GitStateRef()
         self._inbox = inbox or EmptyCampaignInbox()
@@ -211,6 +224,7 @@ class StewardAdvanceService:
         self._candidate_workers = candidate_workers
         self._candidate_slate = candidate_slate
         self._candidate_selection = candidate_selection
+        self._deployment = deployment
 
     def advance(
         self,
@@ -394,6 +408,17 @@ class StewardAdvanceService:
                 )
             if (
                 snapshot is not None
+                and self._deployment is not None
+                and state.phase
+                in {
+                    CampaignPhase.DEPLOYMENT,
+                    CampaignPhase.RETENTION,
+                    CampaignPhase.COMPLETED,
+                }
+            ):
+                return self._advance_deployment(request, snapshot)
+            if (
+                snapshot is not None
                 and self._candidate_slate is not None
                 and state.phase
                 in {
@@ -489,6 +514,16 @@ class StewardAdvanceService:
             in {CampaignPhase.BASELINE, CampaignPhase.CANDIDATES}
         ):
             return self._advance_candidate_workers(request, persisted)
+        if (
+            self._deployment is not None
+            and persisted.state.phase
+            in {
+                CampaignPhase.DEPLOYMENT,
+                CampaignPhase.RETENTION,
+                CampaignPhase.COMPLETED,
+            }
+        ):
+            return self._advance_deployment(request, persisted)
         if (
             self._candidate_slate is not None
             and persisted.state.phase
@@ -600,6 +635,19 @@ class StewardAdvanceService:
             CandidateSelectionStatus.CONFLICT: StewardAdvanceStatus.CONFLICT,
         }
         status = status_by_selection[result.status]
+        if (
+            self._deployment is not None
+            and result.snapshot.state.phase is CampaignPhase.DEPLOYMENT
+            and status
+            in {
+                StewardAdvanceStatus.ADVANCED,
+                StewardAdvanceStatus.WAITING,
+            }
+        ):
+            return self._advance_deployment(
+                request,
+                result.snapshot,
+            )
         return StewardAdvanceResult(
             status=status,
             issue_number=request.issue_number,
@@ -615,6 +663,78 @@ class StewardAdvanceService:
                         AdvanceDisposition.BLOCKED.value
                         if status is StewardAdvanceStatus.BLOCKED
                         else None
+                    )
+                )
+            ),
+            revision=result.snapshot.revision,
+            code=result.code,
+            state=result.snapshot.state,
+        )
+
+    def _advance_deployment(
+        self,
+        request: StewardAdvanceRequest,
+        snapshot: StateRefSnapshot,
+    ) -> StewardAdvanceResult:
+        assert self._deployment is not None
+        try:
+            result = self._deployment.advance(
+                DeploymentOrchestrationRequest(
+                    request.repository_root,
+                    request.issue_number,
+                )
+            )
+        except Exception:
+            return self._failure(
+                request,
+                StewardAdvanceStatus.FAILED,
+                "Deployment orchestration could not be advanced.",
+                "deployment_orchestration_unavailable",
+                snapshot,
+            )
+        status_by_deployment = {
+            DeploymentOrchestrationStatus.PLANNED: (
+                StewardAdvanceStatus.ADVANCED
+            ),
+            DeploymentOrchestrationStatus.RETRYING: (
+                StewardAdvanceStatus.ADVANCED
+            ),
+            DeploymentOrchestrationStatus.WAITING: (
+                StewardAdvanceStatus.WAITING
+            ),
+            DeploymentOrchestrationStatus.COMPLETE: (
+                StewardAdvanceStatus.COMPLETE
+            ),
+            DeploymentOrchestrationStatus.READY_FOR_HUMAN: (
+                StewardAdvanceStatus.BLOCKED
+            ),
+            DeploymentOrchestrationStatus.CONFLICT: (
+                StewardAdvanceStatus.CONFLICT
+            ),
+            DeploymentOrchestrationStatus.FAILED: (
+                StewardAdvanceStatus.FAILED
+            ),
+        }
+        status = status_by_deployment[result.status]
+        return StewardAdvanceResult(
+            status=status,
+            issue_number=request.issue_number,
+            summary=result.summary,
+            phase=result.snapshot.state.phase.value,
+            disposition=(
+                AdvanceDisposition.COMPLETE.value
+                if status is StewardAdvanceStatus.COMPLETE
+                else (
+                    AdvanceDisposition.WAIT.value
+                    if status is StewardAdvanceStatus.WAITING
+                    else (
+                        AdvanceDisposition.BLOCKED.value
+                        if status is StewardAdvanceStatus.BLOCKED
+                        else (
+                            AdvanceDisposition.ADVANCE.value
+                            if status is StewardAdvanceStatus.ADVANCED
+                            else None
+                        )
                     )
                 )
             ),

@@ -50,6 +50,8 @@ class EventKind(StrEnum):
     CANDIDATE_PR_MERGED = "candidate_pr_merged"
     CANDIDATE_SELECTION_FAILED = "candidate_selection_failed"
     CANDIDATE_MERGED = "candidate_merged"
+    DEPLOYMENT_WORKFLOW_OBSERVED = "deployment_workflow_observed"
+    DEPLOYMENT_FAILED = "deployment_failed"
     DEPLOYMENT_COMPLETED = "deployment_completed"
     RETENTION_COMPLETED = "retention_completed"
 

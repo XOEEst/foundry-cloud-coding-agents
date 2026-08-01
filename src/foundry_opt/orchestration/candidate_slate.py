@@ -1587,6 +1587,7 @@ class CandidatePullRequestSnapshot:
     merge_parent_commit: str | None = None
     merge_tree_sha: str | None = None
     merge_reachable_from_default: bool = False
+    merge_actor: str | None = None
 
     def __post_init__(self) -> None:
         for value, field_name in (
@@ -1687,6 +1688,16 @@ class CandidatePullRequestSnapshot:
                 "merge_reachable_from_default must be boolean"
             )
         if (
+            self.merge_actor is not None
+            and re.fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}|"
+                r"[A-Za-z0-9-]{0,34}\[bot\])",
+                self.merge_actor,
+            )
+            is None
+        ):
+            raise ValueError("merge_actor must be a GitHub login")
+        if (
             self.state is CandidatePullRequestState.MERGED
             and (
                 self.merge_commit is None
@@ -1705,6 +1716,7 @@ class CandidatePullRequestSnapshot:
                     self.merge_parent_commit,
                     self.merge_tree_sha,
                     self.merge_reachable_from_default,
+                    self.merge_actor,
                 )
             )
         ):

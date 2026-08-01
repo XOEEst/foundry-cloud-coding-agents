@@ -351,11 +351,15 @@ def _write_dispatch_workflow(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "name: Deploy Foundry\n"
+        "run-name: ${{ inputs.foundry_opt_effect_id }}\n"
         "on:\n"
         "  workflow_dispatch:\n"
         "    inputs:\n"
         f"      {input_name}:\n"
         "        description: exact selected commit\n"
+        "        required: true\n"
+        "      foundry_opt_effect_id:\n"
+        "        description: exact deployment effect\n"
         "        required: true\n"
         "jobs:\n"
         "  publish:\n"
@@ -382,7 +386,9 @@ class FakeWorkflowRunGateway:
         self._last = self._results[-1] if self._results else None
         self._dispatch_error = dispatch_error
         self.find_calls: list[WorkflowRunQuery] = []
-        self.dispatch_calls: list[tuple[Path, str, str]] = []
+        self.dispatch_calls: list[
+            tuple[Path, str, str, str | None, str | None]
+        ] = []
 
     def find_run(
         self,
@@ -402,10 +408,20 @@ class FakeWorkflowRunGateway:
         workflow_path: Path,
         input_name: str,
         commit: str,
+        correlation_input_name: str | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         if self._dispatch_error is not None:
             raise self._dispatch_error
-        self.dispatch_calls.append((workflow_path, input_name, commit))
+        self.dispatch_calls.append(
+            (
+                workflow_path,
+                input_name,
+                commit,
+                correlation_input_name,
+                correlation_id,
+            )
+        )
 
 
 class FakeReader:
@@ -485,6 +501,10 @@ def test_manual_observe_only_returns_manual_trigger_required(
     # Only the exact merge commit is ever queried, never a latest run.
     assert gateway.find_calls[0].head_sha == MERGE_COMMIT
     assert gateway.find_calls[0].events == ("workflow_dispatch",)
+    assert gateway.find_calls[0].display_title == (
+        "legacy-deployment-"
+        f"{optimization_deployment_lineage_sha256(_lineage())[:20]}"
+    )
 
 
 def test_manual_dispatch_forwards_exact_merge_commit(tmp_path: Path) -> None:
@@ -504,11 +524,22 @@ def test_manual_dispatch_forwards_exact_merge_commit(tmp_path: Path) -> None:
     assert outcome.portal_url == PORTAL_URL
     # Dispatched exactly once with the exact merge commit (not the PR head).
     assert len(gateway.dispatch_calls) == 1
-    workflow_path, input_name, commit = gateway.dispatch_calls[0]
+    (
+        workflow_path,
+        input_name,
+        commit,
+        correlation_input_name,
+        correlation_id,
+    ) = gateway.dispatch_calls[0]
     assert workflow_path == WORKFLOW_PATH
     assert input_name == "selected_commit"
     assert commit == MERGE_COMMIT
     assert commit != PR_HEAD_COMMIT
+    assert correlation_input_name == "foundry_opt_effect_id"
+    assert correlation_id == (
+        "legacy-deployment-"
+        f"{optimization_deployment_lineage_sha256(_lineage())[:20]}"
+    )
 
 
 def test_manual_dispatch_requires_declared_commit_input(

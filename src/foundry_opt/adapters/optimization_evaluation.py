@@ -336,7 +336,7 @@ class OptimizationEvaluationBinder:
             subject_id=subject.subject_id,
             split=split,
         )
-        created = gateway.create_run(request)
+        created = gateway.create_or_reuse_run(request)
         run = gateway.get_run(created.run_id)
         if run.status in {
             EvaluationStatus.FAILED,

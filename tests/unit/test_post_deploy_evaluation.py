@@ -568,6 +568,8 @@ def test_retained_improvement_when_published_matches_selection(
     assert outcome.reason_code is None
     # Aggregate metrics only — the median, never per-case rows.
     assert outcome.metrics == {"quality": 0.95}
+    assert outcome.baseline_metrics == {"quality": 0.85}
+    assert outcome.selected_draft_metrics == {"quality": 0.95}
     # The published subject drove exactly one validation attempt (no repeat)
     # against the per-project binder using the campaign's materialized assets.
     assert harness.runner.calls[0][1] is DatasetSplit.VALIDATION

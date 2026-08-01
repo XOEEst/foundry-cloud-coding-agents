@@ -750,7 +750,12 @@ _ALLOWED_PHASES = {
         {CampaignPhase.AWAITING_SELECTION}
     ),
     OptimizePhase.RECONCILE: frozenset(
-        {CampaignPhase.DEPLOYMENT, CampaignPhase.RETENTION}
+        {
+            CampaignPhase.DEPLOYMENT,
+            CampaignPhase.RETENTION,
+            CampaignPhase.COMPLETED,
+            CampaignPhase.BLOCKED,
+        }
     ),
 }
 _WAITING_PHASES = frozenset(
@@ -848,15 +853,57 @@ def _canonical_selection_result(
     if (
         request.phase is not OptimizePhase.RECONCILE
         or state is None
-        or state.phase is not CampaignPhase.DEPLOYMENT
     ):
+        return None
+    if state.phase is CampaignPhase.COMPLETED:
+        return OptimizeCommandResult(
+            OptimizeCommandStatus.COMPLETE,
+            request.phase,
+            (
+                "The canonical steward verified deployment and retained "
+                "improvement; cleanup and root closure were durably planned."
+            ),
+            request.issue_number,
+            details={
+                "candidate_id": state.selected_candidate_id,
+                "deployment_version": state.deployment_version,
+                "generation": state.generation,
+                "merge_commit": state.merge_commit,
+                "phase": state.phase.value,
+                "source": "canonical_steward",
+            },
+        )
+    if state.phase is CampaignPhase.BLOCKED:
+        return OptimizeCommandResult(
+            OptimizeCommandStatus.BLOCKED,
+            request.phase,
+            (
+                "The canonical steward left the root issue open for human "
+                "remediation."
+            ),
+            request.issue_number,
+            details={
+                "code": state.block_reason or "deployment_blocked",
+                "generation": state.generation,
+                "phase": state.phase.value,
+                "source": "canonical_steward",
+            },
+            next_action=(
+                "Inspect the redacted deployment dashboard and retry only "
+                "after resolving the recorded reason."
+            ),
+        )
+    if state.phase not in {
+        CampaignPhase.DEPLOYMENT,
+        CampaignPhase.RETENTION,
+    }:
         return None
     return OptimizeCommandResult(
         OptimizeCommandStatus.AWAITING_AGENT,
         request.phase,
         (
-            "The canonical steward recorded the human merge selection. "
-            "Deployment belongs to the next gated orchestration phase."
+            "The canonical steward is reconciling the exact deployment and "
+            "pinned held-out retained-improvement evaluation."
         ),
         request.issue_number,
         details={
@@ -867,8 +914,8 @@ def _canonical_selection_result(
             "source": "canonical_steward",
         },
         next_action=(
-            "Wait for the deployment phase; this compatibility command "
-            "does not dispatch deployment."
+            "Wait for the steward and thin deployment bridge; this "
+            "compatibility command does not own deployment transitions."
         ),
     )
 

@@ -440,6 +440,31 @@ class OptimizationCampaign:
                 selected_candidate_id=candidate_id,
                 merge_commit=merge_commit,
             )
+        if event.kind is EventKind.DEPLOYMENT_WORKFLOW_OBSERVED:
+            if state.phase not in {
+                CampaignPhase.DEPLOYMENT,
+                CampaignPhase.RETENTION,
+                CampaignPhase.COMPLETED,
+                CampaignPhase.BLOCKED,
+            }:
+                raise InvalidCampaignTransition(
+                    "deployment workflow observation requires deployment"
+                )
+            return self._next(state, event)
+        if event.kind is EventKind.DEPLOYMENT_FAILED:
+            if state.phase not in {
+                CampaignPhase.DEPLOYMENT,
+                CampaignPhase.RETENTION,
+            }:
+                raise InvalidCampaignTransition(
+                    "deployment failure requires deployment or retention"
+                )
+            return self._next(
+                state,
+                event,
+                phase=CampaignPhase.BLOCKED,
+                block_reason=_identifier(event.payload, "reason"),
+            )
         if event.kind is EventKind.DEPLOYMENT_COMPLETED:
             self._require_phase(state, CampaignPhase.DEPLOYMENT, event)
             version = event.payload.get("deployment_version")

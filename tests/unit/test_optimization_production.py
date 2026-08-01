@@ -414,6 +414,22 @@ def _fake_credential_provider() -> Any:
 def test_build_optimization_command_service_is_available() -> None:
     service = build_optimization_command_service()
     assert isinstance(service, ProductionOptimizationCommandService)
+    assert service._steward._deployment is not None
+
+
+def test_cli_steward_builder_wires_canonical_deployment() -> None:
+    from foundry_opt.cli import build_steward_advance_service
+    from foundry_opt.optimization.production import (
+        DeploymentIdentityCredentialProvider,
+    )
+
+    service = build_steward_advance_service()
+
+    assert service._deployment is not None
+    assert not isinstance(
+        service._deployment._credential,
+        DeploymentIdentityCredentialProvider,
+    )
 
 
 def test_missing_configuration_is_blocked(tmp_path: Path) -> None:

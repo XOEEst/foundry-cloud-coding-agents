@@ -395,6 +395,46 @@ def test_reconcile_adapts_deployment_ready_canonical_selection(
     assert steward.state.phase is CampaignPhase.DEPLOYMENT
 
 
+def test_reconcile_reports_canonical_deployment_completion_without_legacy(
+    tmp_path: Path,
+) -> None:
+    from foundry_opt.orchestration import CandidateRecord
+
+    state = CampaignState(
+        7,
+        1,
+        8,
+        CampaignPhase.COMPLETED,
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="baseline-1",
+        candidates=(CandidateRecord("candidate-1", True, "c" * 64),),
+        selected_candidate_id="candidate-1",
+        merge_commit="d" * 40,
+        deployment_version=13,
+    )
+    steward = AdvancingSteward(state)
+    legacy = Legacy(
+        OptimizeCommandResult(
+            OptimizeCommandStatus.COMPLETE,
+            OptimizePhase.RECONCILE,
+            "legacy should not run",
+            7,
+        )
+    )
+
+    result = CompatibilityOptimizationCommandService(
+        legacy=legacy,
+        steward=steward,
+    ).execute(
+        OptimizeCommandRequest(tmp_path, 7, OptimizePhase.RECONCILE)
+    )
+
+    assert result.status is OptimizeCommandStatus.COMPLETE
+    assert result.details["source"] == "canonical_steward"
+    assert result.details["deployment_version"] == 13
+    assert legacy.requests == []
+
+
 def test_compatibility_adapter_projects_legacy_progress_through_advance(
     tmp_path: Path,
 ) -> None:

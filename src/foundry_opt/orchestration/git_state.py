@@ -11,6 +11,7 @@ import re
 import subprocess
 from types import MappingProxyType
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from foundry_opt.orchestration.campaign import OptimizationCampaign
@@ -113,6 +114,41 @@ _EVENT_PAYLOAD_FIELDS = {
     EventKind.CANDIDATE_MERGED: frozenset(
         {"candidate_id", "merge_commit"}
     ),
+    EventKind.DEPLOYMENT_WORKFLOW_OBSERVED: frozenset(
+        {
+            "attempt",
+            "binding_sha256",
+            "bundle_sha256",
+            "candidate_id",
+            "candidate_issue_number",
+            "candidate_pull_request_number",
+            "deployment_client_id",
+            "draft_id",
+            "effect_id",
+            "evidence_sha256",
+            "issue_number",
+            "merge_actor",
+            "merge_commit",
+            "patch_sha256",
+            "repository",
+            "repository_id",
+            "required_checks",
+            "result_id",
+            "run_actor",
+            "run_conclusion",
+            "run_id",
+            "run_status",
+            "run_url",
+            "spec_sha256",
+            "tree_sha",
+            "workflow_actor",
+            "workflow_id",
+            "workflow_path",
+            "workflow_ref",
+            "workflow_trigger",
+        }
+    ),
+    EventKind.DEPLOYMENT_FAILED: frozenset({"reason"}),
     EventKind.DEPLOYMENT_COMPLETED: frozenset({"deployment_version"}),
     EventKind.RETENTION_COMPLETED: frozenset({"retained"}),
 }
@@ -131,6 +167,8 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "binding_sha256",
         "campaign_id",
         "candidate_id",
+        "candidate_issue_number",
+        "candidate_pull_request_number",
         "changed_paths",
         "candidate_slate",
         "commit_sha",
@@ -141,12 +179,18 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "files",
         "head_commit",
         "deployment_version",
+        "deployment_client_id",
+        "deployment_effect_id",
+        "depends_on_effect_ids",
         "disposition",
+        "deployed_metrics",
         "draft_id",
+        "draft_metrics",
         "effect_id",
         "effect_kind",
         "eligible",
         "evaluation_id",
+        "evaluation_policy_sha256",
         "evidence_path",
         "evidence_sha256",
         "evidence_url",
@@ -159,7 +203,9 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "lineage_sha256",
         "max_changed_candidates",
         "marker",
+        "merge_actor",
         "merge_commit",
+        "metadata_sha256",
         "metrics",
         "motivation",
         "mutation_class",
@@ -167,7 +213,10 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "patch_sha256",
         "patch_path",
         "phase",
+        "portal_url",
         "pull_request_number",
+        "repository",
+        "repository_id",
         "ref",
         "required_opt_ins",
         "required_checks",
@@ -176,6 +225,11 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "result_id",
         "retained",
         "run_id",
+        "run_actor",
+        "run_conclusion",
+        "run_status",
+        "run_url",
+        "source_sha256",
         "slot",
         "spec_sha256",
         "spec_classification",
@@ -186,6 +240,13 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "status",
         "target",
         "tree_sha",
+        "attempt",
+        "timeout_seconds",
+        "workflow_actor",
+        "workflow_id",
+        "workflow_path",
+        "workflow_ref",
+        "workflow_trigger",
         "next_action",
         "reason",
         "work_kind",
@@ -204,14 +265,23 @@ _HASH_FIELDS = frozenset(
         "spec_sha256",
         "state_sha256",
         "binding_sha256",
+        "evaluation_policy_sha256",
+        "metadata_sha256",
+        "source_sha256",
     }
 )
 _NUMBER_FIELDS = frozenset(
     {
         "deployment_version",
+        "candidate_issue_number",
+        "candidate_pull_request_number",
         "issue_number",
         "max_changed_candidates",
         "pull_request_number",
+        "repository_id",
+        "attempt",
+        "timeout_seconds",
+        "workflow_id",
         "worker_issue_number",
     }
 )
@@ -230,7 +300,12 @@ _COMMIT_FIELDS = frozenset(
     }
 )
 _IDENTIFIER_LIST_FIELDS = frozenset(
-    {"parent_idea_ids", "required_checks", "required_opt_ins"}
+    {
+        "depends_on_effect_ids",
+        "parent_idea_ids",
+        "required_checks",
+        "required_opt_ins",
+    }
 )
 _REDACTED_TEXT_FIELDS = frozenset(
     {"complexity", "motivation"}
@@ -1375,12 +1450,77 @@ def _validate_candidate_slate(value: Any) -> None:
 
 
 def _validate_payload_value(key: str, value: Any) -> None:
-    if key in {"attestation_path", "evidence_path", "patch_path"}:
+    if key in {
+        "attestation_path",
+        "evidence_path",
+        "patch_path",
+        "workflow_path",
+    }:
         try:
             SpecFileHash(path=value, sha256="0" * 64)
         except (TypeError, ValueError) as error:
             raise StateRefPrivacyError(
                 f"{key} must be a privacy-safe repository path"
+            ) from error
+        return
+    if key in {"merge_actor", "run_actor", "workflow_actor"}:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}|"
+                r"[A-Za-z0-9-]{0,34}\[bot\])",
+                value,
+            )
+            is None
+        ):
+            raise StateRefPrivacyError(
+                f"{key} must be a GitHub login"
+            )
+        return
+    if key == "run_url":
+        try:
+            parsed = urlsplit(value)
+            parts = tuple(part for part in parsed.path.split("/") if part)
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError("run_url is invalid") from error
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "github.com"
+            or parsed.port is not None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or len(parts) != 5
+            or parts[2:4] != ("actions", "runs")
+            or not parts[4].isdigit()
+        ):
+            raise StateRefPrivacyError("run_url is invalid")
+        return
+    if key == "portal_url":
+        try:
+            parsed = urlsplit(value)
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError("portal_url is invalid") from error
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in {"ai.azure.com", "portal.azure.com"}
+            or parsed.port is not None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise StateRefPrivacyError("portal_url is invalid")
+        return
+    if key == "run_id":
+        if type(value) is int and value >= 1:
+            return
+        try:
+            _identifier(value, "run_id")
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError(
+                "run_id must be a positive number or identifier"
             ) from error
         return
     if key == "candidate_slate":
@@ -1454,7 +1594,12 @@ def _validate_payload_value(key: str, value: Any) -> None:
         for item in value:
             _validate_redacted_text(item, "lesson")
         return
-    if key in {"baseline_metrics", "metrics"}:
+    if key in {
+        "baseline_metrics",
+        "deployed_metrics",
+        "draft_metrics",
+        "metrics",
+    }:
         if not isinstance(value, dict):
             raise StateRefPrivacyError("metrics must be an aggregate mapping")
         for name, metric in value.items():

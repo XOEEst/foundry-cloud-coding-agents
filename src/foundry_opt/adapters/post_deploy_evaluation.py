@@ -289,6 +289,10 @@ def _decide(
     policy: EvaluationPolicy,
 ) -> PostDeployOutcome:
     metrics = _aggregate_metrics(published)
+    comparison = {
+        "baseline_metrics": _aggregate_metrics(baseline),
+        "selected_draft_metrics": _aggregate_metrics(selected),
+    }
 
     if not _is_evaluable(published):
         # The provider run has not completed; the lifecycle re-runs later.
@@ -296,6 +300,7 @@ def _decide(
             status=PostDeployStatus.PENDING,
             reason_code="provider_run_incomplete",
             metrics=metrics,
+            **comparison,
         )
 
     if not _same_lineage(published, baseline) or not _same_lineage(
@@ -305,6 +310,7 @@ def _decide(
             status=PostDeployStatus.REGRESSED,
             reason_code="lineage_mismatch",
             metrics=metrics,
+            **comparison,
         )
 
     eligibility = select_eligible_candidates(baseline, (published,), policy)
@@ -318,6 +324,7 @@ def _decide(
             status=PostDeployStatus.REGRESSED,
             reason_code=reason_code,
             metrics=metrics,
+            **comparison,
         )
 
     if _regresses_beyond_noise(selected, published, policy):
@@ -325,12 +332,14 @@ def _decide(
             status=PostDeployStatus.REGRESSED,
             reason_code="selected_draft_regression",
             metrics=metrics,
+            **comparison,
         )
 
     return PostDeployOutcome(
         status=PostDeployStatus.RETAINED_IMPROVEMENT,
         reason_code=None,
         metrics=metrics,
+        **comparison,
     )
 
 

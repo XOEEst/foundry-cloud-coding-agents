@@ -17,11 +17,17 @@ from foundry_opt.preflight.interfaces import CommandRunner
 _DASHBOARD = "dashboard_projection"
 _CANDIDATE_SLATE_DASHBOARD = "candidate_slate_dashboard"
 _CANDIDATE_SELECTION_DASHBOARD = "candidate_selection_dashboard"
+_DEPLOYMENT_DASHBOARD = "deployment_dashboard"
+_DEPLOYMENT_FINAL_DASHBOARD = "deployment_final_dashboard"
+_DEPLOYMENT_READY_FOR_HUMAN = "deployment_ready_for_human"
 _DASHBOARD_KINDS = frozenset(
     {
         _DASHBOARD,
         _CANDIDATE_SLATE_DASHBOARD,
         _CANDIDATE_SELECTION_DASHBOARD,
+        _DEPLOYMENT_DASHBOARD,
+        _DEPLOYMENT_FINAL_DASHBOARD,
+        _DEPLOYMENT_READY_FOR_HUMAN,
         "campaign_advanced",
         "campaign_waiting",
     }
@@ -127,6 +133,7 @@ class DashboardProjection:
             "status",
         }
         optional = {
+            "effect_id",
             "reason",
             "spec_classification",
             "spec_sha256",
@@ -147,6 +154,40 @@ class DashboardProjection:
                     "next_action",
                     "selected_candidate_id",
                     "spec_sha256",
+                }
+            )
+        if record.kind == _DEPLOYMENT_DASHBOARD:
+            expected.update(
+                {
+                    "candidate_id",
+                    "merge_commit",
+                    "next_action",
+                }
+            )
+        if record.kind == _DEPLOYMENT_READY_FOR_HUMAN:
+            expected.add("next_action")
+        if record.kind == _DEPLOYMENT_FINAL_DASHBOARD:
+            expected.update(
+                {
+                    "baseline_metrics",
+                    "bundle_sha256",
+                    "candidate_id",
+                    "deployed_metrics",
+                    "deployment_version",
+                    "draft_metrics",
+                    "evidence_sha256",
+                    "lineage_sha256",
+                    "merge_actor",
+                    "merge_commit",
+                    "metadata_sha256",
+                    "patch_sha256",
+                    "portal_url",
+                    "run_id",
+                    "run_url",
+                    "required_checks",
+                    "source_sha256",
+                    "spec_sha256",
+                    "tree_sha",
                 }
             )
         if (
@@ -413,7 +454,7 @@ def _dashboard_body(
         )
     if "reason" in record.payload:
         details += (
-            f"- Specification policy reason: `{record.payload['reason']}`\n"
+            f"- Reason: `{record.payload['reason']}`\n"
         )
     slate = ""
     if record.kind == _CANDIDATE_SLATE_DASHBOARD:
@@ -474,6 +515,79 @@ def _dashboard_body(
                 f"- Merge commit: `{record.payload['merge_commit']}`",
                 "- Next action: Deployment-ready; deployment has not been "
                 "dispatched. The next gated phase owns deployment.",
+                "",
+            )
+        )
+    if record.kind == _DEPLOYMENT_DASHBOARD:
+        slate = "\n".join(
+            (
+                "",
+                "### Deployment",
+                "",
+                f"- Candidate: `{record.payload['candidate_id']}`",
+                f"- Merge commit: `{record.payload['merge_commit']}`",
+                "- The exact deployment intent is durable and awaiting the "
+                "separate deployment bridge.",
+                "",
+            )
+        )
+    if record.kind == _DEPLOYMENT_READY_FOR_HUMAN:
+        slate = "\n".join(
+            (
+                "",
+                "### Deployment needs human attention",
+                "",
+                f"- Remediation: `{record.payload['next_action']}`",
+                "- The root issue remains open. No automatic rollback was "
+                "claimed.",
+                "",
+            )
+        )
+    if record.kind == _DEPLOYMENT_FINAL_DASHBOARD:
+        baseline = ", ".join(
+            f"`{name}={_number(value)}`"
+            for name, value in sorted(
+                record.payload["baseline_metrics"].items()
+            )
+        )
+        draft = ", ".join(
+            f"`{name}={_number(value)}`"
+            for name, value in sorted(
+                record.payload["draft_metrics"].items()
+            )
+        )
+        deployed = ", ".join(
+            f"`{name}={_number(value)}`"
+            for name, value in sorted(
+                record.payload["deployed_metrics"].items()
+            )
+        )
+        slate = "\n".join(
+            (
+                "",
+                "### Verified deployment result",
+                "",
+                f"- Candidate: `{record.payload['candidate_id']}`",
+                "- Published version: "
+                f"`{record.payload['deployment_version']}`",
+                "- Deployment lineage SHA-256: "
+                f"`{record.payload['lineage_sha256']}`",
+                f"- Merge actor: `{record.payload['merge_actor']}`",
+                "- Required checks: "
+                + ", ".join(
+                    f"`{check}`"
+                    for check in record.payload["required_checks"]
+                ),
+                f"- Merge commit: `{record.payload['merge_commit']}`",
+                f"- Tree: `{record.payload['tree_sha']}`",
+                f"- Patch SHA-256: `{record.payload['patch_sha256']}`",
+                f"- Bundle SHA-256: `{record.payload['bundle_sha256']}`",
+                f"- Evidence SHA-256: `{record.payload['evidence_sha256']}`",
+                f"- Workflow run: {record.payload['run_url']}",
+                f"- Foundry portal: {record.payload['portal_url']}",
+                f"- Baseline aggregates: {baseline}",
+                f"- Selected draft aggregates: {draft}",
+                f"- Deployed aggregates: {deployed}",
                 "",
             )
         )

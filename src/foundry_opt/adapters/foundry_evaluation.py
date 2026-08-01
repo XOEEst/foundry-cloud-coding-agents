@@ -53,6 +53,7 @@ _METADATA_PREFIX = "foundry_opt_"
 _BINDING_CHUNK_SIZE = 400
 _MAX_BINDING_CHUNKS = 10
 _MAX_DEFINITION_PAGES = 1000
+_MAX_RUN_PAGES = 1000
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,80 @@ class FoundryEvaluationTransport(EvaluationTransport):
             raise EvaluationSchemaError(
                 "Foundry reused an evaluation run ID with conflicting context."
             )
+        self._runs[run_id] = context
+        return normalized
+
+    def find_run(
+        self,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object] | None:
+        context = _run_context(payload)
+        evaluation_id = _reference_value(
+            context["evaluator"],
+            "definition_id",
+            "evaluator definition_id",
+        )
+        binding = self._bindings.get(evaluation_id)
+        if binding is None:
+            raise EvaluationSchemaError(
+                "The Foundry evaluation definition binding was not loaded."
+            )
+        list_runs = getattr(self._client.evals.runs, "list", None)
+        if not callable(list_runs):
+            return None
+        expected_name = _required_string(
+            payload.get("display_name"),
+            "run display_name",
+        )
+        expected_metadata = _run_metadata(context)
+        matches: list[dict[str, object]] = []
+        continuation: str | None = None
+        seen: set[str] = set()
+        for _ in range(_MAX_RUN_PAGES):
+            kwargs: dict[str, object] = {
+                "eval_id": evaluation_id,
+                "limit": 100,
+                "order": "desc",
+            }
+            if continuation is not None:
+                kwargs["after"] = continuation
+            page = _provider_call(lambda: list_runs(**kwargs))
+            for raw_run in _page_data(page):
+                run = _provider_mapping(raw_run, "evaluation run")
+                metadata = run.get("metadata")
+                if (
+                    run.get("name") != expected_name
+                    or not isinstance(metadata, Mapping)
+                    or any(
+                        metadata.get(key) != value
+                        for key, value in expected_metadata.items()
+                    )
+                ):
+                    continue
+                matches.append(
+                    self._normalize_run(run, context=context)
+                )
+            continuation = _next_token(page)
+            if continuation is None:
+                break
+            if continuation in seen:
+                raise EvaluationConflictError(
+                    "Foundry evaluation run pagination repeated a token."
+                )
+            seen.add(continuation)
+        else:
+            raise EvaluationConflictError(
+                "Foundry evaluation run pagination exceeded its bound."
+            )
+        if len(matches) > 1:
+            raise EvaluationConflictError(
+                "Multiple Foundry evaluation runs have the same exact "
+                "binding."
+            )
+        if not matches:
+            return None
+        normalized = matches[0]
+        run_id = _required_string(normalized.get("run_id"), "run_id")
         self._runs[run_id] = context
         return normalized
 

@@ -29,6 +29,7 @@ class FakeEvaluationTransport:
         self.definition: Mapping[str, object] | None = None
         self.created_definitions: list[Mapping[str, object]] = []
         self.created_runs: list[Mapping[str, object]] = []
+        self.found_run: Mapping[str, object] | None = None
         self.run_responses: list[Mapping[str, object] | Exception] = []
         self.page_responses: dict[str | None, Mapping[str, object]] = {}
         self.page_calls: list[tuple[str, str | None, int]] = []
@@ -50,6 +51,12 @@ class FakeEvaluationTransport:
     def create_run(self, payload: Mapping[str, object]) -> Mapping[str, object]:
         self.created_runs.append(payload)
         return _run_payload("queued")
+
+    def find_run(
+        self,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object] | None:
+        return self.found_run
 
     def get_run(self, run_id: str) -> Mapping[str, object]:
         response = self.run_responses.pop(0)
@@ -154,6 +161,18 @@ def test_create_run_serializes_only_pinned_batch_inputs() -> None:
             "evaluator": {"definition_id": "eval-def-1", "version": "7"},
         }
     ]
+
+
+def test_create_or_reuse_run_recovers_existing_exact_operation() -> None:
+    transport = FakeEvaluationTransport()
+    transport.found_run = _run_payload("completed")
+    gateway = EvaluationGateway(transport)
+
+    run = gateway.create_or_reuse_run(_batch_request())
+
+    assert run.run_id == "run-1"
+    assert run.status is EvaluationStatus.COMPLETED
+    assert transport.created_runs == []
 
 
 def test_create_run_accepts_foundry_dataset_resource_id() -> None:

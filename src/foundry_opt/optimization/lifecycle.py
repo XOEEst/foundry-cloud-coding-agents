@@ -296,6 +296,12 @@ class DeploymentOutcome:
     run_url: str | None = None
     portal_url: str | None = None
     reason_code: str | None = None
+    source_sha256: str | None = None
+    tree_sha: str | None = None
+    bundle_sha256: str | None = None
+    merge_commit: str | None = None
+    lineage_sha256: str | None = None
+    metadata_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -350,13 +356,20 @@ class PostDeployOutcome:
     status: PostDeployStatus
     reason_code: str | None = None
     metrics: Mapping[str, float] = field(default_factory=dict)
+    baseline_metrics: Mapping[str, float] = field(default_factory=dict)
+    selected_draft_metrics: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
+        for field_name in (
             "metrics",
-            MappingProxyType(dict(self.metrics)),
-        )
+            "baseline_metrics",
+            "selected_draft_metrics",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                MappingProxyType(dict(getattr(self, field_name))),
+            )
 
 
 @dataclass(frozen=True)

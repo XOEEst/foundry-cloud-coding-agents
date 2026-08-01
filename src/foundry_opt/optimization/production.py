@@ -37,9 +37,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+import hashlib
 from pathlib import Path
 import shlex
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 
@@ -1060,6 +1062,583 @@ def build_production_steward_spec_policy(
     return RepositorySpecPolicy(factory)
 
 
+class _ProductionDeploymentPlanResolver:
+    def __init__(
+        self,
+        commands: CommandRunner,
+        config_path: Path,
+    ) -> None:
+        self._commands = commands
+        self._config_path = config_path
+
+    def resolve(self, request: Any, state: Any) -> Any:
+        from foundry_opt.campaign.state import FileCampaignStateStore
+        from foundry_opt.deployment import (
+            DeploymentTrigger as DomainDeploymentTrigger,
+        )
+        from foundry_opt.orchestration.candidate_slate import (
+            candidate_worker_bindings,
+        )
+        from foundry_opt.orchestration.deployment import (
+            DeploymentPlan,
+            DeploymentWorkflowIdentity,
+        )
+
+        root = request.repository_root
+        config = load_config(root / self._config_path)
+        spec = OptimizationSpec.model_validate(
+            yaml.safe_load(
+                (root / spec_file_path(request.issue_number)).read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+        if spec.sha256 != state.spec_sha256:
+            raise ValueError("approved deployment specification changed")
+        environment = config.environments[spec.environment]
+        repository_document = _production_json(
+            self._commands,
+            (
+                "gh",
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner,databaseId,defaultBranchRef",
+            ),
+            root,
+        )
+        repository = repository_document.get("nameWithOwner")
+        repository_id = repository_document.get("databaseId")
+        default_ref = repository_document.get("defaultBranchRef")
+        default_branch = (
+            default_ref.get("name")
+            if isinstance(default_ref, Mapping)
+            else None
+        )
+        if (
+            not isinstance(repository, str)
+            or type(repository_id) is not int
+            or not isinstance(default_branch, str)
+        ):
+            raise ValueError("GitHub repository identity is unavailable")
+        if spec.repository != repository:
+            raise ValueError("deployment repository changed")
+        workflow_path = Path(str(environment.deployment_workflow.path))
+        workflow_document = _production_json(
+            self._commands,
+            (
+                "gh",
+                "api",
+                (
+                    f"repos/{repository}/actions/workflows/"
+                    f"{quote(workflow_path.as_posix(), safe='')}"
+                ),
+            ),
+            root,
+        )
+        workflow_id = workflow_document.get("id")
+        if type(workflow_id) is not int or workflow_id < 1:
+            raise ValueError("deployment workflow identity is unavailable")
+        snapshot = GitStateRef().load(root, request.issue_number)
+        if snapshot is None:
+            raise ValueError("deployment campaign state is unavailable")
+        selections = tuple(
+            record
+            for record in snapshot.outbox
+            if (
+                record.kind == "candidate_selection_recorded"
+                and record.generation == state.generation
+                and record.payload.get("candidate_id")
+                == state.selected_candidate_id
+            )
+        )
+        if len(selections) != 1:
+            raise ValueError("selected candidate pull request is unavailable")
+        pull_request_number = selections[0].payload.get(
+            "pull_request_number"
+        )
+        if type(pull_request_number) is not int:
+            raise ValueError("selected candidate pull request is invalid")
+        pull_request = _production_json(
+            self._commands,
+            (
+                "gh",
+                "pr",
+                "view",
+                str(pull_request_number),
+                "--repo",
+                repository,
+                "--json",
+                "mergedBy",
+            ),
+            root,
+        )
+        merged_by = pull_request.get("mergedBy")
+        merge_actor = (
+            merged_by.get("login")
+            if isinstance(merged_by, Mapping)
+            else None
+        )
+        if not isinstance(merge_actor, str):
+            raise ValueError("candidate merge actor is unavailable")
+        configured_actor = config.automation_policy.merge_actor
+        if configured_actor is not None:
+            allowed_actors = (configured_actor,)
+        else:
+            permission = _production_json(
+                self._commands,
+                (
+                    "gh",
+                    "api",
+                    (
+                        f"repos/{repository}/collaborators/"
+                        f"{merge_actor}/permission"
+                    ),
+                ),
+                root,
+            ).get("permission")
+            if permission not in {"admin", "maintain", "write"}:
+                raise ValueError("candidate merge actor is not authorized")
+            allowed_actors = (merge_actor,)
+        bindings = tuple(
+            binding
+            for binding in candidate_worker_bindings(snapshot)
+            if binding.candidate_id == state.selected_candidate_id
+        )
+        if len(bindings) != 1:
+            raise ValueError("selected candidate binding is unavailable")
+        binding = bindings[0]
+        plans = tuple(
+            record
+            for record in snapshot.outbox
+            if (
+                record.kind == "applier_worker_issue_planned"
+                and record.generation == state.generation
+                and record.payload.get("binding_sha256")
+                == binding.binding_sha256
+            )
+        )
+        if len(plans) != 1:
+            raise ValueError("candidate required checks are unavailable")
+        required_checks = tuple(plans[0].payload["required_checks"])
+        campaign_id = (
+            f"issue-{request.issue_number}-g{state.generation}-"
+            f"{state.spec_sha256[:8]}-{binding.base_commit[:8]}"
+        )
+        legacy_state = FileCampaignStateStore().load(root, campaign_id)
+        campaign_pr = (
+            legacy_state.finalized.campaign_pull_request_number
+            if legacy_state is not None
+            and legacy_state.finalized is not None
+            else None
+        )
+        policy_document = {
+            name: policy.model_dump(mode="json")
+            for name, policy in sorted(spec.metrics.items())
+        }
+        policy_sha256 = hashlib.sha256(
+            json.dumps(
+                policy_document,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        trigger = DomainDeploymentTrigger(
+            environment.deployment_workflow.trigger.value
+        )
+        if trigger is DomainDeploymentTrigger.MANUAL:
+            workflow_source = yaml.safe_load(
+                (root / workflow_path).read_text(encoding="utf-8")
+            )
+            if not isinstance(workflow_source, Mapping):
+                raise ValueError("manual deployment workflow is invalid")
+            triggers = workflow_source.get(
+                "on",
+                workflow_source.get(True),
+            )
+            dispatch = (
+                triggers.get("workflow_dispatch")
+                if isinstance(triggers, Mapping)
+                else None
+            )
+            inputs = (
+                dispatch.get("inputs")
+                if isinstance(dispatch, Mapping)
+                else None
+            )
+            run_name = workflow_source.get("run-name")
+            if (
+                not isinstance(inputs, Mapping)
+                or not {
+                    "selected_commit",
+                    "foundry_opt_effect_id",
+                }
+                <= set(inputs)
+                or not isinstance(run_name, str)
+                or run_name.strip()
+                != "${{ inputs.foundry_opt_effect_id }}"
+            ):
+                raise ValueError(
+                    "manual deployment workflow lacks exact correlation"
+                )
+        workflow_actor = (
+            merge_actor
+            if trigger is DomainDeploymentTrigger.MERGE
+            else "workflow-dispatch"
+        )
+        return DeploymentPlan(
+            issue_number=request.issue_number,
+            generation=state.generation,
+            repository=repository,
+            repository_id=repository_id,
+            workflow=DeploymentWorkflowIdentity(
+                repository=repository,
+                repository_id=repository_id,
+                path=workflow_path,
+                ref=f"refs/heads/{default_branch}",
+                trigger=trigger,
+                workflow_id=workflow_id,
+                actor=workflow_actor,
+            ),
+            allowed_merge_actors=allowed_actors,
+            required_checks=required_checks,
+            max_attempts=(
+                config.campaign.transient_retries + 1
+                if trigger is DomainDeploymentTrigger.MANUAL
+                else 1
+            ),
+            timeout_seconds=1800,
+            held_out_evaluation_id=(
+                f"held-out-{spec.sha256[:16]}"
+            ),
+            evaluation_policy_sha256=policy_sha256,
+            campaign_pull_request_number=campaign_pr,
+            optimization_pull_request_number=None,
+        )
+
+
+class _ProductionDeploymentSelectionReader:
+    def __init__(self, commands: CommandRunner) -> None:
+        self._commands = commands
+
+    def read(self, request: Any, binding: Any, plan: Any) -> Any:
+        from foundry_opt.orchestration.candidate_bridge import (
+            GhCandidatePullRequestReader,
+        )
+        from foundry_opt.orchestration.deployment import (
+            CandidateDeploymentSelectionReader,
+        )
+
+        return CandidateDeploymentSelectionReader(
+            GhCandidatePullRequestReader(
+                self._commands,
+                request.repository_root,
+                plan.repository,
+            )
+        ).read(request, binding, plan)
+
+
+class _ProductionPostDeploymentEvaluationEffects:
+    def __init__(
+        self,
+        repository_root: Path,
+        config_path: Path,
+        credential_provider: AzureCredentialProvider,
+    ) -> None:
+        from foundry_opt.adapters.post_deploy_evaluation import (
+            build_live_post_deploy_evaluator,
+        )
+        from foundry_opt.orchestration.deployment import (
+            ExistingPostDeploymentEvaluationEffects,
+        )
+
+        self._root = repository_root
+        self._config_path = config_path
+        self._state = FileCampaignStateStore()
+        self._adapter = ExistingPostDeploymentEvaluationEffects(
+            build_live_post_deploy_evaluator(
+                credential_provider,
+                state_store=self._state,
+            ),
+            request_factory=self._request,
+        )
+
+    def reconcile(self, intent: Any) -> Any:
+        from foundry_opt.orchestration.deployment import (
+            post_deployment_evaluation_result_from_record,
+        )
+
+        snapshot = GitStateRef().load(
+            self._root,
+            intent.binding.issue_number,
+        )
+        if snapshot is not None:
+            observed = tuple(
+                record
+                for record in snapshot.outbox
+                if (
+                    record.kind
+                    == "post_deployment_evaluation_observed"
+                    and record.payload.get("effect_id") == intent.effect_id
+                )
+            )
+            if len(observed) > 1:
+                raise RuntimeError("evaluation observations conflict")
+            if observed:
+                return post_deployment_evaluation_result_from_record(
+                    observed[0],
+                    intent,
+                )
+        return self._adapter.reconcile(intent)
+
+    def run(self, intent: Any) -> Any:
+        from foundry_opt.orchestration import OutboxRecord
+        from foundry_opt.orchestration.deployment import (
+            PostDeploymentEvaluationResult,
+            PostDeploymentEvaluationStatus,
+            post_deployment_evaluation_observation_record,
+            post_deployment_evaluation_result_from_record,
+        )
+
+        ledger = GitStateRef()
+        snapshot = ledger.load(
+            self._root,
+            intent.binding.issue_number,
+        )
+        if snapshot is None:
+            raise RuntimeError("evaluation claim state is unavailable")
+        claim_id = f"{intent.effect_id}-claimed"
+        existing = tuple(
+            record
+            for record in snapshot.outbox
+            if record.record_id == claim_id
+        )
+        if existing:
+            if (
+                len(existing) != 1
+                or existing[0].kind
+                != "post_deployment_evaluation_claimed"
+                or existing[0].payload.get("effect_id")
+                != intent.effect_id
+                or existing[0].payload.get("binding_sha256")
+                != intent.binding_sha256
+            ):
+                raise RuntimeError("evaluation claim conflicts")
+            result = self._adapter.run(intent)
+            if result.status is PostDeploymentEvaluationStatus.PENDING:
+                return result
+            latest = ledger.load(self._root, intent.binding.issue_number)
+            if latest is None:
+                raise RuntimeError("evaluation result state is unavailable")
+            observation = post_deployment_evaluation_observation_record(
+                result,
+                sequence=latest.state.sequence,
+            )
+            existing_observation = tuple(
+                record
+                for record in latest.outbox
+                if record.record_id == observation.record_id
+            )
+            if existing_observation:
+                return post_deployment_evaluation_result_from_record(
+                    existing_observation[0],
+                    intent,
+                )
+            try:
+                ledger.commit(
+                    self._root,
+                    issue_number=intent.binding.issue_number,
+                    expected_revision=latest.revision,
+                    state=latest.state,
+                    outbox=(observation,),
+                )
+            except StateRefError:
+                recovered = self.reconcile(intent)
+                if recovered is not None:
+                    return recovered
+                raise
+            return result
+        claim = OutboxRecord(
+            record_id=claim_id,
+            kind="post_deployment_evaluation_claimed",
+            generation=snapshot.state.generation,
+            sequence=snapshot.state.sequence,
+            payload={
+                "binding_sha256": intent.binding_sha256,
+                "candidate_id": intent.binding.candidate_id,
+                "effect_id": intent.effect_id,
+                "evaluation_id": intent.evaluation_id,
+                "idempotency_key": intent.idempotency_key,
+                "issue_number": intent.binding.issue_number,
+                "result": "claimed",
+            },
+        )
+        try:
+            ledger.commit(
+                self._root,
+                issue_number=intent.binding.issue_number,
+                expected_revision=snapshot.revision,
+                state=snapshot.state,
+                outbox=(claim,),
+            )
+        except StateRefError:
+            return PostDeploymentEvaluationResult(
+                result_id=f"{intent.effect_id}-pending",
+                intent=intent,
+                status=PostDeploymentEvaluationStatus.PENDING,
+            )
+        return self._adapter.run(intent)
+
+    def _request(self, intent: Any) -> Any:
+        from foundry_opt.deployment import OptimizationDeploymentLineage
+        from foundry_opt.optimization.lifecycle import PostDeployRequest
+
+        config = load_config(self._root / self._config_path)
+        spec = OptimizationSpec.model_validate(
+            yaml.safe_load(
+                (
+                    self._root
+                    / spec_file_path(intent.binding.issue_number)
+                ).read_text(encoding="utf-8")
+            )
+        )
+        if spec.sha256 != intent.binding.spec_sha256:
+            raise ValueError("post-deployment specification changed")
+        snapshot = GitStateRef().load(
+            self._root,
+            intent.binding.issue_number,
+        )
+        if snapshot is None:
+            raise ValueError("campaign state is unavailable")
+        plans = tuple(
+            record
+            for record in snapshot.outbox
+            if (
+                record.kind == "applier_worker_issue_planned"
+                and record.payload.get("binding_sha256")
+                == intent.binding.binding_sha256
+            )
+        )
+        if len(plans) != 1:
+            raise ValueError("candidate base commit is unavailable")
+        base_commit = str(plans[0].payload["base_commit"])
+        campaign_id = (
+            f"issue-{intent.binding.issue_number}-"
+            f"g{intent.binding.generation}-"
+            f"{intent.binding.spec_sha256[:8]}-{base_commit[:8]}"
+        )
+        campaign = self._state.load(self._root, campaign_id)
+        if campaign is None or campaign.finalized is None:
+            raise ValueError("finalized campaign state is unavailable")
+        lineage = OptimizationDeploymentLineage(
+            parent_issue_number=intent.binding.issue_number,
+            spec_sha256=intent.binding.spec_sha256,
+            campaign_id=campaign_id,
+            campaign_pull_request_number=(
+                campaign.finalized.campaign_pull_request_number
+            ),
+            candidate_issue_number=(
+                intent.binding.candidate_issue_number
+            ),
+            candidate_pull_request_number=(
+                intent.binding.candidate_pull_request_number
+            ),
+            candidate_id=intent.binding.candidate_id,
+            selected_draft_id=intent.binding.draft_id,
+            patch_sha256=intent.binding.patch_sha256,
+            evidence_sha256=intent.binding.evidence_sha256,
+            selected_tree_sha=intent.binding.tree_sha,
+            selected_merge_commit=intent.binding.merge_commit,
+        )
+        endpoint = str(
+            config.environments[spec.environment].project_endpoint
+        )
+        return PostDeployRequest(
+            repository_root=self._root,
+            lineage=lineage,
+            selected_candidate_id=intent.binding.candidate_id,
+            deployment_version=intent.deployment_version,
+            project_endpoint=endpoint,
+            spec=spec,
+        )
+
+
+class ProductionDeploymentOrchestration:
+    """Lazily assemble canonical deployment without deployment credentials."""
+
+    def __init__(
+        self,
+        *,
+        config_path: Path = _DEFAULT_CONFIG_PATH,
+        commands: CommandRunner | None = None,
+        environment: EnvironmentReader | None = None,
+        credential_provider: AzureCredentialProvider | None = None,
+    ) -> None:
+        self._config_path = config_path
+        self._commands = commands or SubprocessCommandRunner()
+        self._environment = environment or OsEnvironmentReader()
+        self._credential = credential_provider or _default_credential_provider(
+            self._environment
+        )
+        self._evaluations: dict[
+            tuple[Path, int], _ProductionPostDeploymentEvaluationEffects
+        ] = {}
+
+    def advance(self, request: Any) -> Any:
+        from foundry_opt.orchestration.deployment import (
+            DeploymentOrchestrationService,
+            LedgerDeploymentPublicationVerifier,
+        )
+
+        key = (request.repository_root.resolve(), request.issue_number)
+        effects = self._evaluations.get(key)
+        if effects is None:
+            effects = _ProductionPostDeploymentEvaluationEffects(
+                key[0],
+                self._config_path,
+                self._credential,
+            )
+            self._evaluations[key] = effects
+        ledger = GitStateRef()
+        return DeploymentOrchestrationService(
+            ledger=ledger,
+            resolver=_ProductionDeploymentPlanResolver(
+                self._commands,
+                self._config_path,
+            ),
+            selection_reader=_ProductionDeploymentSelectionReader(
+                self._commands
+            ),
+            publication_verifier=LedgerDeploymentPublicationVerifier(
+                ledger
+            ),
+            evaluation_effects=effects,
+        ).advance(request)
+
+
+def build_production_steward_deployment(
+    *,
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+) -> ProductionDeploymentOrchestration:
+    return ProductionDeploymentOrchestration(config_path=config_path)
+
+
+def _production_json(
+    commands: CommandRunner,
+    arguments: tuple[str, ...],
+    cwd: Path,
+) -> dict[str, Any]:
+    try:
+        value = json.loads(commands.run(arguments, cwd=cwd).stdout)
+    except (json.JSONDecodeError, OSError) as error:
+        raise ValueError("production GitHub response is invalid") from error
+    if not isinstance(value, dict):
+        raise ValueError("production GitHub response is invalid")
+    return value
+
+
 class ProductionOptimizationCommandService(
     CompatibilityOptimizationCommandService
 ):
@@ -1075,6 +1654,9 @@ class ProductionOptimizationCommandService(
             steward=StewardAdvanceService(
                 inbox=GitCampaignInbox(),
                 spec_policy=build_production_steward_spec_policy(
+                    config_path=config_path
+                ),
+                deployment=build_production_steward_deployment(
                     config_path=config_path
                 ),
             ),

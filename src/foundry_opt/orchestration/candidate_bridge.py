@@ -459,7 +459,7 @@ class GhCandidatePullRequestReader:
                     "--json",
                     (
                         "number,body,author,isDraft,baseRefName,"
-                        "headRefOid,state,mergeCommit"
+                        "headRefOid,state,mergeCommit,mergedBy"
                     ),
                     "--limit",
                     "10",
@@ -504,7 +504,7 @@ class GhCandidatePullRequestReader:
                     "--json",
                     (
                         "number,body,author,isDraft,baseRefName,"
-                        "headRefOid,state,mergeCommit"
+                        "headRefOid,state,mergeCommit,mergedBy"
                     ),
                 )
             )
@@ -651,6 +651,7 @@ class GhCandidatePullRequestReader:
         merge_parent_commit: str | None = None
         merge_tree_sha: str | None = None
         merge_reachable = False
+        merge_actor: str | None = None
         if state is CandidatePullRequestState.MERGED:
             if (
                 not isinstance(merge_commit, str)
@@ -691,6 +692,12 @@ class GhCandidatePullRequestReader:
                 merge_commit,
                 current_default_commit,
             )
+            merged_by = item.get("mergedBy")
+            if (
+                isinstance(merged_by, dict)
+                and isinstance(merged_by.get("login"), str)
+            ):
+                merge_actor = str(merged_by["login"])
         worker_issue = (
             expected_worker_issue_number
             if expected_worker_issue_number is not None
@@ -729,6 +736,7 @@ class GhCandidatePullRequestReader:
             merge_parent_commit=merge_parent_commit,
             merge_tree_sha=merge_tree_sha,
             merge_reachable_from_default=merge_reachable,
+            merge_actor=merge_actor,
         )
 
     def _checks_json(self, arguments: tuple[str, ...]) -> Any:

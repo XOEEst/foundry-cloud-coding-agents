@@ -237,6 +237,11 @@ class EvaluationTransport(Protocol):
         payload: Mapping[str, object],
     ) -> Mapping[str, object]: ...
 
+    def find_run(
+        self,
+        payload: Mapping[str, object],
+    ) -> Mapping[str, object] | None: ...
+
     def get_run(self, run_id: str) -> Mapping[str, object]: ...
 
     def list_output_items(
@@ -327,6 +332,40 @@ class EvaluationGateway:
             raise EvaluationSchemaError(
                 "Evaluation run ID was reused with conflicting pinned context."
             )
+        self._contexts[run.run_id] = context
+        return run
+
+    def create_or_reuse_run(
+        self,
+        request: BatchEvaluationRequest | MultiTurnSimulationRequest,
+    ) -> EvaluationRun:
+        request_payload = _serialize_run_request(request)
+        finder = getattr(self._transport, "find_run", None)
+        existing = (
+            finder(request_payload) if callable(finder) else None
+        )
+        if existing is None:
+            return self.create_run(request)
+        response = _validate_and_fill_context(
+            existing,
+            kind=str(request_payload["kind"]),
+            subject_id=request.subject_id,
+            split=request.split,
+            agent=request.agent,
+            dataset=request.dataset,
+            evaluator=request.evaluator,
+        )
+        run = _parse_run(response)
+        context = _RunContext(
+            run_id=run.run_id,
+            evaluation_id=run.evaluation_id,
+            kind=str(request_payload["kind"]),
+            subject_id=request.subject_id,
+            split=request.split,
+            agent=request.agent,
+            dataset=request.dataset,
+            evaluator=request.evaluator,
+        )
         self._contexts[run.run_id] = context
         return run
 
