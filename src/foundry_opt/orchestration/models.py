@@ -43,6 +43,12 @@ class EventKind(StrEnum):
     CANDIDATE_ELIGIBILITY_REVISED = "candidate_eligibility_revised"
     CANDIDATE_WORKERS_COMPLETED = "candidate_workers_completed"
     SLATE_PUBLISHED = "slate_published"
+    CANDIDATE_PR_OPENED = "candidate_pr_opened"
+    CANDIDATE_PR_SYNCHRONIZED = "candidate_pr_synchronized"
+    CANDIDATE_PR_EDITED = "candidate_pr_edited"
+    CANDIDATE_PR_CLOSED = "candidate_pr_closed"
+    CANDIDATE_PR_MERGED = "candidate_pr_merged"
+    CANDIDATE_SELECTION_FAILED = "candidate_selection_failed"
     CANDIDATE_MERGED = "candidate_merged"
     DEPLOYMENT_COMPLETED = "deployment_completed"
     RETENTION_COMPLETED = "retention_completed"
@@ -250,7 +256,6 @@ class CampaignState:
             raise ValueError(
                 "block_reason is only valid for blocked campaigns"
             )
-
 
 @dataclass(frozen=True)
 class AdvanceRequest:

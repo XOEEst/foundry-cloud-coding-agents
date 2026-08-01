@@ -15,6 +15,13 @@ from foundry_opt.orchestration.candidate_workers import (
     CandidateWorkerResult,
     CandidateWorkerStatus,
 )
+from foundry_opt.orchestration.candidate_slate import (
+    CandidateSelectionResult,
+    CandidateSelectionStatus,
+    CandidateSlateRequest,
+    CandidateSlateResult,
+    CandidateSlateStatus,
+)
 from foundry_opt.orchestration.git_state import (
     GitStateRef,
     OutboxRecord,
@@ -169,6 +176,20 @@ class StewardCandidateWorkers(Protocol):
     ) -> CandidateWorkerResult: ...
 
 
+class StewardCandidateSlate(Protocol):
+    def advance(
+        self,
+        request: CandidateSlateRequest,
+    ) -> CandidateSlateResult: ...
+
+
+class StewardCandidateSelection(Protocol):
+    def advance(
+        self,
+        request: CandidateSlateRequest,
+    ) -> CandidateSelectionResult: ...
+
+
 class StewardAdvanceService:
     """Consume campaign events and atomically advance the steward ledger."""
 
@@ -180,12 +201,16 @@ class StewardAdvanceService:
         campaign: OptimizationCampaign | None = None,
         spec_policy: StewardSpecPolicy | None = None,
         candidate_workers: StewardCandidateWorkers | None = None,
+        candidate_slate: StewardCandidateSlate | None = None,
+        candidate_selection: StewardCandidateSelection | None = None,
     ) -> None:
         self._ledger = ledger or GitStateRef()
         self._inbox = inbox or EmptyCampaignInbox()
         self._campaign = campaign or OptimizationCampaign()
         self._spec_policy = spec_policy
         self._candidate_workers = candidate_workers
+        self._candidate_slate = candidate_slate
+        self._candidate_selection = candidate_selection
 
     def advance(
         self,
@@ -346,6 +371,19 @@ class StewardAdvanceService:
         if not pending and not intent_outbox:
             if (
                 snapshot is not None
+                and self._candidate_selection is not None
+                and state.phase
+                in {
+                    CampaignPhase.AWAITING_SELECTION,
+                    CampaignPhase.DEPLOYMENT,
+                }
+            ):
+                return self._advance_candidate_selection(
+                    request,
+                    snapshot,
+                )
+            if (
+                snapshot is not None
                 and self._candidate_workers is not None
                 and state.phase
                 in {CampaignPhase.BASELINE, CampaignPhase.CANDIDATES}
@@ -354,6 +392,17 @@ class StewardAdvanceService:
                     request,
                     snapshot,
                 )
+            if (
+                snapshot is not None
+                and self._candidate_slate is not None
+                and state.phase
+                in {
+                    CampaignPhase.CANDIDATES,
+                    CampaignPhase.AWAITING_SELECTION,
+                    CampaignPhase.DEPLOYMENT,
+                }
+            ):
+                return self._advance_candidate_slate(request, snapshot)
             return self._result(
                 request,
                 StewardAdvanceStatus.WAITING,
@@ -426,11 +475,30 @@ class StewardAdvanceService:
             persisted.revision,
         )
         if (
+            self._candidate_selection is not None
+            and persisted.state.phase
+            in {
+                CampaignPhase.AWAITING_SELECTION,
+                CampaignPhase.DEPLOYMENT,
+            }
+        ):
+            return self._advance_candidate_selection(request, persisted)
+        if (
             self._candidate_workers is not None
             and persisted.state.phase
             in {CampaignPhase.BASELINE, CampaignPhase.CANDIDATES}
         ):
             return self._advance_candidate_workers(request, persisted)
+        if (
+            self._candidate_slate is not None
+            and persisted.state.phase
+            in {
+                CampaignPhase.CANDIDATES,
+                CampaignPhase.AWAITING_SELECTION,
+                CampaignPhase.DEPLOYMENT,
+            }
+        ):
+            return self._advance_candidate_slate(request, persisted)
         return result
 
     def _advance_candidate_workers(
@@ -468,6 +536,14 @@ class StewardAdvanceService:
             and result.snapshot.revision == snapshot.revision
         ):
             status = StewardAdvanceStatus.WAITING
+        if (
+            result.status is CandidateWorkerStatus.COMPLETE
+            and self._candidate_slate is not None
+        ):
+            return self._advance_candidate_slate(
+                request,
+                result.snapshot,
+            )
         return StewardAdvanceResult(
             status=status,
             issue_number=request.issue_number,
@@ -486,6 +562,110 @@ class StewardAdvanceService:
                             StewardAdvanceStatus.ADVANCED,
                             StewardAdvanceStatus.COMPLETE,
                         }
+                        else None
+                    )
+                )
+            ),
+            revision=result.snapshot.revision,
+            code=result.code,
+            state=result.snapshot.state,
+        )
+
+    def _advance_candidate_selection(
+        self,
+        request: StewardAdvanceRequest,
+        snapshot: StateRefSnapshot,
+    ) -> StewardAdvanceResult:
+        assert self._candidate_selection is not None
+        try:
+            result = self._candidate_selection.advance(
+                CandidateSlateRequest(
+                    request.repository_root,
+                    request.issue_number,
+                )
+            )
+        except Exception:
+            return self._failure(
+                request,
+                StewardAdvanceStatus.FAILED,
+                "Candidate selection could not be advanced.",
+                "candidate_selection_unavailable",
+                snapshot,
+            )
+        status_by_selection = {
+            CandidateSelectionStatus.SELECTED: StewardAdvanceStatus.ADVANCED,
+            CandidateSelectionStatus.WAITING: StewardAdvanceStatus.WAITING,
+            CandidateSelectionStatus.BLOCKED: StewardAdvanceStatus.BLOCKED,
+            CandidateSelectionStatus.FAILED: StewardAdvanceStatus.FAILED,
+            CandidateSelectionStatus.CONFLICT: StewardAdvanceStatus.CONFLICT,
+        }
+        status = status_by_selection[result.status]
+        return StewardAdvanceResult(
+            status=status,
+            issue_number=request.issue_number,
+            summary=result.summary,
+            phase=result.snapshot.state.phase.value,
+            disposition=(
+                AdvanceDisposition.ADVANCE.value
+                if status is StewardAdvanceStatus.ADVANCED
+                else (
+                    AdvanceDisposition.WAIT.value
+                    if status is StewardAdvanceStatus.WAITING
+                    else (
+                        AdvanceDisposition.BLOCKED.value
+                        if status is StewardAdvanceStatus.BLOCKED
+                        else None
+                    )
+                )
+            ),
+            revision=result.snapshot.revision,
+            code=result.code,
+            state=result.snapshot.state,
+        )
+
+    def _advance_candidate_slate(
+        self,
+        request: StewardAdvanceRequest,
+        snapshot: StateRefSnapshot,
+    ) -> StewardAdvanceResult:
+        assert self._candidate_slate is not None
+        try:
+            result = self._candidate_slate.advance(
+                CandidateSlateRequest(
+                    request.repository_root,
+                    request.issue_number,
+                )
+            )
+        except Exception:
+            return self._failure(
+                request,
+                StewardAdvanceStatus.FAILED,
+                "Candidate slate could not be advanced.",
+                "candidate_slate_unavailable",
+                snapshot,
+            )
+        status_by_slate = {
+            CandidateSlateStatus.PUBLISHED: StewardAdvanceStatus.ADVANCED,
+            CandidateSlateStatus.WAITING: StewardAdvanceStatus.WAITING,
+            CandidateSlateStatus.BLOCKED: StewardAdvanceStatus.BLOCKED,
+            CandidateSlateStatus.FAILED: StewardAdvanceStatus.FAILED,
+            CandidateSlateStatus.CONFLICT: StewardAdvanceStatus.CONFLICT,
+        }
+        status = status_by_slate[result.status]
+        return StewardAdvanceResult(
+            status=status,
+            issue_number=request.issue_number,
+            summary=result.summary,
+            phase=result.snapshot.state.phase.value,
+            disposition=(
+                AdvanceDisposition.ADVANCE.value
+                if status is StewardAdvanceStatus.ADVANCED
+                else (
+                    AdvanceDisposition.WAIT.value
+                    if status is StewardAdvanceStatus.WAITING
+                    else (
+                        AdvanceDisposition.BLOCKED.value
+                        if status is StewardAdvanceStatus.BLOCKED
                         else None
                     )
                 )

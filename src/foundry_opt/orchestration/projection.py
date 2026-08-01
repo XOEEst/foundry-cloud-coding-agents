@@ -15,8 +15,16 @@ from foundry_opt.preflight.interfaces import CommandRunner
 
 
 _DASHBOARD = "dashboard_projection"
+_CANDIDATE_SLATE_DASHBOARD = "candidate_slate_dashboard"
+_CANDIDATE_SELECTION_DASHBOARD = "candidate_selection_dashboard"
 _DASHBOARD_KINDS = frozenset(
-    {_DASHBOARD, "campaign_advanced", "campaign_waiting"}
+    {
+        _DASHBOARD,
+        _CANDIDATE_SLATE_DASHBOARD,
+        _CANDIDATE_SELECTION_DASHBOARD,
+        "campaign_advanced",
+        "campaign_waiting",
+    }
 )
 _LABEL_ADD = "label_add"
 _LABEL_REMOVE = "label_remove"
@@ -123,6 +131,24 @@ class DashboardProjection:
             "spec_classification",
             "spec_sha256",
         }
+        if record.kind == _CANDIDATE_SLATE_DASHBOARD:
+            expected.update(
+                {
+                    "baseline_metrics",
+                    "candidate_slate",
+                    "next_action",
+                    "spec_sha256",
+                }
+            )
+        if record.kind == _CANDIDATE_SELECTION_DASHBOARD:
+            expected.update(
+                {
+                    "merge_commit",
+                    "next_action",
+                    "selected_candidate_id",
+                    "spec_sha256",
+                }
+            )
         if (
             not expected <= set(record.payload)
             or set(record.payload) - expected - optional
@@ -389,6 +415,68 @@ def _dashboard_body(
         details += (
             f"- Specification policy reason: `{record.payload['reason']}`\n"
         )
+    slate = ""
+    if record.kind == _CANDIDATE_SLATE_DASHBOARD:
+        baseline = record.payload["baseline_metrics"]
+        rows = record.payload["candidate_slate"]
+        baseline_text = ", ".join(
+            f"`{name}={_number(value)}`"
+            for name, value in sorted(baseline.items())
+        )
+        table = [
+            "| Rank | Candidate | Aggregates | Deltas | Guardrails | Evidence |",
+            "| ---: | --- | --- | --- | --- | --- |",
+        ]
+        for row in rows:
+            metrics = ", ".join(
+                f"`{name}={_number(value)}`"
+                for name, value in sorted(row["metrics"].items())
+            )
+            deltas = ", ".join(
+                f"`{name}={_signed_number(value)}`"
+                for name, value in sorted(row["deltas"].items())
+            )
+            guardrails = ", ".join(
+                f"`{name}={outcome}`"
+                for name, outcome in sorted(row["guardrails"].items())
+            ) or "—"
+            table.append(
+                "| "
+                f"{row['rank']} | `{row['candidate_id']}` | "
+                f"{metrics} | {deltas} | {guardrails} | "
+                f"[redacted evidence]({row['evidence_url']}) |"
+            )
+        slate = "\n".join(
+            (
+                "",
+                "### Candidate comparison",
+                "",
+                f"- Baseline aggregates: {baseline_text}",
+                "",
+                *table,
+                "",
+                "### Next human action",
+                "",
+                "Merge exactly one eligible candidate PR. A comment, label, "
+                "or CLI command does not select a candidate. Deployment is "
+                "not dispatched in this phase.",
+                "",
+            )
+        )
+    if record.kind == _CANDIDATE_SELECTION_DASHBOARD:
+        slate = "\n".join(
+            (
+                "",
+                "### Candidate selection",
+                "",
+                "- Selected candidate: "
+                f"`{record.payload['selected_candidate_id']}`",
+                f"- Merge commit: `{record.payload['merge_commit']}`",
+                "- Next action: Deployment-ready; deployment has not been "
+                "dispatched. The next gated phase owns deployment.",
+                "",
+            )
+        )
     return (
         f"{dashboard_marker(issue_number)}\n"
         f"{_projection_marker(record.record_id)}\n"
@@ -399,4 +487,13 @@ def _dashboard_body(
         f"- Status: `{record.payload['status']}`\n"
         f"- Disposition: `{record.payload['disposition']}`\n"
         f"{details}"
+        f"{slate}"
     )
+
+
+def _number(value: float) -> str:
+    return format(value, "g")
+
+
+def _signed_number(value: float) -> str:
+    return f"{value:+g}"

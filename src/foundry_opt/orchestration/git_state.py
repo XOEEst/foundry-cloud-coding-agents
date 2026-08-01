@@ -26,6 +26,7 @@ from foundry_opt.orchestration.models import (
 from foundry_opt.security import reject_secret_content
 
 
+_LEDGER_SCHEMA_VERSION = 3
 _STATE_SCHEMA_VERSION = 2
 _RECORD_SCHEMA_VERSION = 1
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -67,6 +68,48 @@ _EVENT_PAYLOAD_FIELDS = {
         {"attempted_count", "eligible_count", "stop_reason"}
     ),
     EventKind.SLATE_PUBLISHED: frozenset(),
+    EventKind.CANDIDATE_PR_OPENED: frozenset(
+        {
+            "binding_sha256",
+            "candidate_id",
+            "head_commit",
+            "pull_request_number",
+        }
+    ),
+    EventKind.CANDIDATE_PR_SYNCHRONIZED: frozenset(
+        {
+            "binding_sha256",
+            "candidate_id",
+            "head_commit",
+            "pull_request_number",
+        }
+    ),
+    EventKind.CANDIDATE_PR_EDITED: frozenset(
+        {
+            "binding_sha256",
+            "candidate_id",
+            "head_commit",
+            "pull_request_number",
+        }
+    ),
+    EventKind.CANDIDATE_PR_CLOSED: frozenset(
+        {
+            "binding_sha256",
+            "candidate_id",
+            "head_commit",
+            "pull_request_number",
+        }
+    ),
+    EventKind.CANDIDATE_PR_MERGED: frozenset(
+        {
+            "binding_sha256",
+            "candidate_id",
+            "head_commit",
+            "merge_commit",
+            "pull_request_number",
+        }
+    ),
+    EventKind.CANDIDATE_SELECTION_FAILED: frozenset({"reason"}),
     EventKind.CANDIDATE_MERGED: frozenset(
         {"candidate_id", "merge_commit"}
     ),
@@ -76,16 +119,23 @@ _EVENT_PAYLOAD_FIELDS = {
 _OUTBOX_PAYLOAD_FIELDS = frozenset(
     {
         "assignee",
+        "assigned",
+        "allowed_paths",
         "attestation_sha256",
+        "attestation_path",
         "base_commit",
+        "baseline_metrics",
         "branch",
         "base_ref_name",
         "bundle_sha256",
+        "binding_sha256",
         "campaign_id",
         "candidate_id",
         "changed_paths",
+        "candidate_slate",
         "commit_sha",
         "complexity",
+        "created",
         "cutoff_at",
         "deadline_at",
         "files",
@@ -97,7 +147,9 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "effect_kind",
         "eligible",
         "evaluation_id",
+        "evidence_path",
         "evidence_sha256",
+        "evidence_url",
         "goal_sha256",
         "idempotency_key",
         "idea_id",
@@ -106,16 +158,19 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "lessons",
         "lineage_sha256",
         "max_changed_candidates",
+        "marker",
         "merge_commit",
         "metrics",
         "motivation",
         "mutation_class",
         "parent_idea_ids",
         "patch_sha256",
+        "patch_path",
         "phase",
         "pull_request_number",
         "ref",
         "required_opt_ins",
+        "required_checks",
         "result",
         "result_commit",
         "result_id",
@@ -124,14 +179,17 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "slot",
         "spec_sha256",
         "spec_classification",
+        "selected_candidate_id",
         "specialist",
         "started_at",
         "state_sha256",
         "status",
         "target",
         "tree_sha",
+        "next_action",
         "reason",
         "work_kind",
+        "worker_issue_number",
     }
 )
 _HASH_FIELDS = frozenset(
@@ -145,6 +203,7 @@ _HASH_FIELDS = frozenset(
         "patch_sha256",
         "spec_sha256",
         "state_sha256",
+        "binding_sha256",
     }
 )
 _NUMBER_FIELDS = frozenset(
@@ -153,12 +212,13 @@ _NUMBER_FIELDS = frozenset(
         "issue_number",
         "max_changed_candidates",
         "pull_request_number",
+        "worker_issue_number",
     }
 )
 _NONNEGATIVE_NUMBER_FIELDS = frozenset(
     {"attempted_count", "eligible_count", "slot"}
 )
-_BOOLEAN_FIELDS = frozenset({"eligible", "retained"})
+_BOOLEAN_FIELDS = frozenset({"assigned", "created", "eligible", "retained"})
 _COMMIT_FIELDS = frozenset(
     {
         "base_commit",
@@ -170,7 +230,7 @@ _COMMIT_FIELDS = frozenset(
     }
 )
 _IDENTIFIER_LIST_FIELDS = frozenset(
-    {"parent_idea_ids", "required_opt_ins"}
+    {"parent_idea_ids", "required_checks", "required_opt_ins"}
 )
 _REDACTED_TEXT_FIELDS = frozenset(
     {"complexity", "motivation"}
@@ -234,11 +294,54 @@ class OutboxRecord:
 
 
 @dataclass(frozen=True)
+class StateObject:
+    path: str
+    content: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or re.fullmatch(
+            r"objects/(?:"
+            r"candidates/g[1-9][0-9]*-[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+            r"\.json|"
+            r"evidence/[0-9a-f]{64}\.json|"
+            r"patches/[0-9a-f]{64}\.patch"
+            r")",
+            self.path,
+        ) is None:
+            raise ValueError("state object path is invalid")
+        if not isinstance(self.content, bytes) or not self.content:
+            raise ValueError("state object content must be non-empty bytes")
+        if len(self.content) > 10_000_000:
+            raise ValueError("state object content is too large")
+        digest = hashlib.sha256(self.content).hexdigest()
+        filename = self.path.rsplit("/", 1)[-1].split(".", 1)[0]
+        if self.path.startswith(("objects/evidence/", "objects/patches/")):
+            if filename != digest:
+                raise ValueError("content-addressed state object hash changed")
+        if self.path.endswith(".json"):
+            try:
+                document = json.loads(self.content)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("state JSON object is invalid") from error
+            if (
+                self.path.startswith("objects/candidates/")
+                and self.content != _canonical_json(document)
+            ):
+                raise ValueError("state JSON object must be canonical")
+            _validate_state_object_privacy(document)
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.content).hexdigest()
+
+
+@dataclass(frozen=True)
 class StateRefSnapshot:
     revision: str
     state: CampaignState
     inbox: tuple[CampaignEvent, ...]
     outbox: tuple[OutboxRecord, ...]
+    objects: tuple[StateObject, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -276,6 +379,7 @@ class GitStateRef:
         state: CampaignState,
         inbox: tuple[CampaignEvent, ...] = (),
         outbox: tuple[OutboxRecord, ...] = (),
+        objects: tuple[StateObject, ...] = (),
     ) -> StateRefSnapshot:
         root = _repository_root(repository_root)
         ref = _state_ref(issue_number)
@@ -296,11 +400,12 @@ class GitStateRef:
             )
         if state.issue_number != issue_number:
             raise ValueError("state issue does not match state ref")
-        if not inbox and not outbox:
+        if not inbox and not outbox and not objects:
             raise ValueError("a state transaction cannot be empty")
 
         existing_inbox = loaded.snapshot.inbox if loaded else ()
         existing_outbox = loaded.snapshot.outbox if loaded else ()
+        existing_objects = loaded.snapshot.objects if loaded else ()
         _require_new_ids(
             (event.event_id for event in existing_inbox),
             (event.event_id for event in inbox),
@@ -310,6 +415,11 @@ class GitStateRef:
             (record.record_id for record in existing_outbox),
             (record.record_id for record in outbox),
             "outbox record",
+        )
+        _require_new_ids(
+            (item.path for item in existing_objects),
+            (item.path for item in objects),
+            "state object",
         )
         for record in outbox:
             if (
@@ -322,6 +432,12 @@ class GitStateRef:
 
         all_inbox = (*existing_inbox, *inbox)
         all_outbox = (*existing_outbox, *outbox)
+        all_objects = tuple(
+            sorted(
+                (*existing_objects, *objects),
+                key=lambda item: item.path,
+            )
+        )
         inbox_documents = {
             event.event_id: _event_to_document(event)
             for event in all_inbox
@@ -362,9 +478,17 @@ class GitStateRef:
                 }
                 for record in outbox
             ],
+            "objects": [
+                {
+                    "path": item.path,
+                    "sha256": item.sha256,
+                }
+                for item in sorted(objects, key=lambda value: value.path)
+            ],
             "previous_sha256": previous_hash,
-            "schema_version": _STATE_SCHEMA_VERSION,
+            "schema_version": _LEDGER_SCHEMA_VERSION,
             "sequence": state.sequence,
+            "state_schema_version": state.schema_version,
             "state_sha256": state_sha256,
         }
         entry = {
@@ -374,7 +498,7 @@ class GitStateRef:
         journal.append(entry)
         snapshot_document = {
             "journal_head": entry["entry_sha256"],
-            "schema_version": _STATE_SCHEMA_VERSION,
+            "schema_version": _LEDGER_SCHEMA_VERSION,
             "state": state_document,
         }
         files = {
@@ -390,6 +514,7 @@ class GitStateRef:
                 f"outbox/{record_id}.json": _canonical_json(document)
                 for record_id, document in outbox_documents.items()
             },
+            **{item.path: item.content for item in all_objects},
         }
         revision = self._write_commit(
             root,
@@ -403,6 +528,7 @@ class GitStateRef:
             state=state,
             inbox=all_inbox,
             outbox=all_outbox,
+            objects=all_objects,
         )
 
     def _remote_revision(self, root: Path, ref: str) -> str | None:
@@ -451,7 +577,7 @@ class GitStateRef:
             )
             if not paths or any(
                 path not in {"journal.jsonl", "snapshot.json"}
-                and not path.startswith(("inbox/", "outbox/"))
+                and not path.startswith(("inbox/", "outbox/", "objects/"))
                 for path in paths
             ):
                 raise StateRefCorruptionError(
@@ -486,12 +612,21 @@ class GitStateRef:
                 for path in paths
                 if path.startswith("outbox/")
             }
-            state, inbox, outbox = _validate_ledger(
+            objects = tuple(
+                StateObject(
+                    path,
+                    _git_bytes(root, "show", f"{revision}:{path}"),
+                )
+                for path in paths
+                if path.startswith("objects/")
+            )
+            state, inbox, outbox, objects = _validate_ledger(
                 issue_number,
                 snapshot_document,
                 journal,
                 inbox_documents,
                 outbox_documents,
+                objects,
             )
         except StateRefError:
             raise
@@ -500,7 +635,7 @@ class GitStateRef:
                 "state ref is corrupt"
             ) from error
         return _LoadedRef(
-            StateRefSnapshot(revision, state, inbox, outbox),
+            StateRefSnapshot(revision, state, inbox, outbox, objects),
             journal,
         )
 
@@ -587,17 +722,19 @@ def _validate_ledger(
     journal: tuple[dict[str, Any], ...],
     inbox_documents: Mapping[str, Any],
     outbox_documents: Mapping[str, Any],
+    objects: tuple[StateObject, ...],
 ) -> tuple[
     CampaignState,
     tuple[CampaignEvent, ...],
     tuple[OutboxRecord, ...],
+    tuple[StateObject, ...],
 ]:
     _exact_keys(
         snapshot_document,
         {"journal_head", "schema_version", "state"},
         "snapshot",
     )
-    _require_state_version(
+    _require_ledger_version(
         snapshot_document["schema_version"],
         "snapshot",
     )
@@ -613,27 +750,28 @@ def _validate_ledger(
     outbox: list[OutboxRecord] = []
     seen_inbox: set[str] = set()
     seen_outbox: set[str] = set()
+    seen_objects: set[str] = set()
+    object_documents = {item.path: item for item in objects}
+    if len(object_documents) != len(objects):
+        raise StateRefCorruptionError("state object paths are not unique")
     replayed: CampaignState | None = None
     for expected_index, entry in enumerate(journal, 1):
-        _exact_keys(
-            entry,
-            {
-                "entry_sha256",
-                "generation",
-                "inbox",
-                "index",
-                "outbox",
-                "previous_sha256",
-                "schema_version",
-                "sequence",
-                "state_sha256",
-            },
-            "journal entry",
-        )
-        _require_state_version(
-            entry["schema_version"],
-            "journal entry",
-        )
+        version = entry.get("schema_version")
+        _require_ledger_version(version, "journal entry")
+        keys = {
+            "entry_sha256",
+            "generation",
+            "inbox",
+            "index",
+            "outbox",
+            "previous_sha256",
+            "schema_version",
+            "sequence",
+            "state_sha256",
+        }
+        if version == 3:
+            keys.update({"objects", "state_schema_version"})
+        _exact_keys(entry, keys, "journal entry")
         _exact_integer(entry["index"], "journal index")
         _positive_integer(entry["generation"], "journal generation")
         _nonnegative_integer(entry["sequence"], "journal sequence")
@@ -698,6 +836,19 @@ def _validate_ledger(
                 )
             outbox.append(record)
             seen_outbox.add(record_id)
+        if version == 3:
+            for reference in _object_reference_list(entry["objects"]):
+                path = reference["path"]
+                if path in seen_objects or path not in object_documents:
+                    raise StateRefCorruptionError(
+                        "journal state object reference is invalid"
+                    )
+                item = object_documents[path]
+                if reference["sha256"] != item.sha256:
+                    raise StateRefCorruptionError(
+                        "state object hash is invalid"
+                    )
+                seen_objects.add(path)
         replayed = _advance(issue_number, replayed, tuple(inbox), entry)
         previous_hash = entry["entry_sha256"]
 
@@ -705,11 +856,13 @@ def _validate_ledger(
         raise StateRefCorruptionError("unreferenced inbox record")
     if set(outbox_documents) != seen_outbox:
         raise StateRefCorruptionError("unreferenced outbox record")
+    if set(object_documents) != seen_objects:
+        raise StateRefCorruptionError("unreferenced state object")
     if snapshot_document["journal_head"] != previous_hash:
         raise StateRefCorruptionError("snapshot journal head is invalid")
     if replayed != state:
         raise StateRefCorruptionError("snapshot does not match replay")
-    return state, tuple(inbox), tuple(outbox)
+    return state, tuple(inbox), tuple(outbox), objects
 
 
 def _advance(
@@ -730,10 +883,13 @@ def _advance(
         raise StateRefCorruptionError(
             "the first journal entry requires an inbox event"
         )
-    replayed = replace(
-        replayed,
-        schema_version=entry["schema_version"],
+    state_schema_version = (
+        entry["state_schema_version"]
+        if entry["schema_version"] == 3
+        else entry["schema_version"]
     )
+    _require_state_version(state_schema_version, "journal state")
+    replayed = replace(replayed, schema_version=state_schema_version)
     if (
         entry["generation"] != replayed.generation
         or entry["sequence"] != replayed.sequence
@@ -1127,7 +1283,123 @@ def _validate_outbox_payload(payload: Mapping[str, Any]) -> None:
         _validate_payload_value(key, value)
 
 
+def _validate_candidate_slate(value: Any) -> None:
+    if not isinstance(value, list) or not value:
+        raise StateRefPrivacyError(
+            "candidate_slate must be a non-empty list"
+        )
+    candidate_ids: list[str] = []
+    for row in value:
+        if type(row) is not dict or set(row) != {
+            "candidate_id",
+            "deltas",
+            "draft_id",
+            "evidence_sha256",
+            "evidence_url",
+            "guardrails",
+            "metrics",
+            "rank",
+        }:
+            raise StateRefPrivacyError("candidate slate row is invalid")
+        try:
+            _identifier(row["candidate_id"], "candidate_id")
+            _identifier(row["draft_id"], "draft_id")
+            _sha256_text(row["evidence_sha256"], "evidence_sha256")
+            _positive_integer(row["rank"], "rank")
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError(
+                "candidate slate identity is invalid"
+            ) from error
+        if not str(row["draft_id"]).startswith("draft-"):
+            raise StateRefPrivacyError(
+                "candidate slate draft is invalid"
+            )
+        for field_name in ("deltas", "metrics"):
+            values = row[field_name]
+            if not isinstance(values, dict):
+                raise StateRefPrivacyError(
+                    "candidate slate aggregates are invalid"
+                )
+            for name, metric in values.items():
+                try:
+                    _identifier(name, "metric")
+                except ValueError as error:
+                    raise StateRefPrivacyError(
+                        "candidate slate metric is invalid"
+                    ) from error
+                if (
+                    not isinstance(metric, (int, float))
+                    or isinstance(metric, bool)
+                    or not isfinite(metric)
+                ):
+                    raise StateRefPrivacyError(
+                        "candidate slate aggregate is invalid"
+                    )
+        guardrails = row["guardrails"]
+        if not isinstance(guardrails, dict):
+            raise StateRefPrivacyError(
+                "candidate slate guardrails are invalid"
+            )
+        for name, outcome in guardrails.items():
+            try:
+                _identifier(name, "guardrail")
+            except ValueError as error:
+                raise StateRefPrivacyError(
+                    "candidate slate guardrail is invalid"
+                ) from error
+            if outcome not in {"pass", "fail"}:
+                raise StateRefPrivacyError(
+                    "candidate slate guardrail outcome is invalid"
+                )
+        url = row["evidence_url"]
+        if (
+            not isinstance(url, str)
+            or len(url) > 2048
+            or re.fullmatch(
+                r"https://github\.com/"
+                r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/blob/"
+                r"foundry-opt/state/issue-[1-9][0-9]*/"
+                r"objects/evidence/[0-9a-f]{64}\.json",
+                url,
+            )
+            is None
+        ):
+            raise StateRefPrivacyError(
+                "candidate slate evidence URL is invalid"
+            )
+        candidate_ids.append(row["candidate_id"])
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise StateRefPrivacyError(
+            "candidate slate candidates must be unique"
+        )
+
+
 def _validate_payload_value(key: str, value: Any) -> None:
+    if key in {"attestation_path", "evidence_path", "patch_path"}:
+        try:
+            SpecFileHash(path=value, sha256="0" * 64)
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError(
+                f"{key} must be a privacy-safe repository path"
+            ) from error
+        return
+    if key == "candidate_slate":
+        _validate_candidate_slate(value)
+        return
+    if key == "marker":
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(
+                r"<!-- foundry-opt:candidate-pr:"
+                r"issue-[1-9][0-9]*:g[1-9][0-9]*:"
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}:"
+                r"[0-9a-f]{20} -->",
+                value,
+            )
+            is None
+        ):
+            raise StateRefPrivacyError("marker is invalid")
+        return
     if key == "files":
         if not isinstance(value, list) or not value:
             raise StateRefPrivacyError(
@@ -1142,10 +1414,10 @@ def _validate_payload_value(key: str, value: Any) -> None:
         if len({item.path for item in files}) != len(files):
             raise StateRefPrivacyError("files must contain unique paths")
         return
-    if key == "changed_paths":
+    if key in {"allowed_paths", "changed_paths"}:
         if not isinstance(value, list):
             raise StateRefPrivacyError(
-                "changed_paths must be a path list"
+                f"{key} must be a path list"
             )
         try:
             paths = tuple(
@@ -1154,11 +1426,11 @@ def _validate_payload_value(key: str, value: Any) -> None:
             )
         except (TypeError, ValueError) as error:
             raise StateRefPrivacyError(
-                "changed_paths must contain privacy-safe paths"
+                f"{key} must contain privacy-safe paths"
             ) from error
         if len(set(paths)) != len(paths):
             raise StateRefPrivacyError(
-                "changed_paths must contain unique paths"
+                f"{key} must contain unique paths"
             )
         return
     if key in _IDENTIFIER_LIST_FIELDS:
@@ -1182,7 +1454,7 @@ def _validate_payload_value(key: str, value: Any) -> None:
         for item in value:
             _validate_redacted_text(item, "lesson")
         return
-    if key == "metrics":
+    if key in {"baseline_metrics", "metrics"}:
         if not isinstance(value, dict):
             raise StateRefPrivacyError("metrics must be an aggregate mapping")
         for name, metric in value.items():
@@ -1263,6 +1535,60 @@ def _validate_redacted_text(value: Any, key: str) -> None:
         ) from error
 
 
+def _validate_state_object_privacy(value: Any, key: str = "object") -> None:
+    forbidden = {
+        "credential",
+        "dataset_row",
+        "prompt",
+        "raw_prompt",
+        "raw_response",
+        "response",
+        "secret",
+        "token",
+        "tool_payload",
+        "trace",
+    }
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            if not isinstance(child_key, str):
+                raise StateRefPrivacyError(
+                    "state object keys must be text"
+                )
+            normalized = child_key.casefold().replace("-", "_")
+            if normalized in forbidden:
+                raise StateRefPrivacyError(
+                    "state object contains prohibited raw content"
+                )
+            _validate_state_object_privacy(child, child_key)
+        return
+    if isinstance(value, list):
+        for child in value:
+            _validate_state_object_privacy(child, key)
+        return
+    if isinstance(value, str):
+        if any(
+            marker in value.casefold()
+            for marker in _SENSITIVE_TEXT_MARKERS
+        ):
+            raise StateRefPrivacyError(
+                "state object contains sensitive content"
+            )
+        try:
+            reject_secret_content(value)
+        except ValueError as error:
+            raise StateRefPrivacyError(
+                "state object contains sensitive content"
+            ) from error
+        return
+    if value is None or type(value) in {bool, int, float}:
+        if isinstance(value, float) and not isfinite(value):
+            raise StateRefPrivacyError(
+                "state object numbers must be finite"
+            )
+        return
+    raise StateRefPrivacyError("state object value is invalid")
+
+
 def _read_document(content: bytes, description: str) -> Any:
     try:
         document = json.loads(content)
@@ -1318,6 +1644,23 @@ def _reference_list(
             raise StateRefCorruptionError(
                 f"{description} reference hash is invalid"
             )
+        references.append(item)
+    return tuple(references)
+
+
+def _object_reference_list(value: Any) -> tuple[dict[str, str], ...]:
+    if type(value) is not list:
+        raise StateRefCorruptionError(
+            "journal state object references must be a list"
+        )
+    references: list[dict[str, str]] = []
+    for item in value:
+        _exact_keys(item, {"path", "sha256"}, "state object reference")
+        if not isinstance(item["path"], str):
+            raise StateRefCorruptionError(
+                "state object reference path is invalid"
+            )
+        _sha256_text(item["sha256"], "state object reference hash")
         references.append(item)
     return tuple(references)
 
@@ -1415,6 +1758,13 @@ def _require_version(value: Any, description: str) -> None:
 
 def _require_state_version(value: Any, description: str) -> None:
     if type(value) is not int or value not in {1, 2}:
+        raise StateRefCorruptionError(
+            f"unsupported {description} schema_version"
+        )
+
+
+def _require_ledger_version(value: Any, description: str) -> None:
+    if type(value) is not int or value not in {1, 2, 3}:
         raise StateRefCorruptionError(
             f"unsupported {description} schema_version"
         )

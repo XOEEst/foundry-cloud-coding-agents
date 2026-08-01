@@ -341,14 +341,82 @@ class OptimizationCampaign:
                 event,
                 phase=CampaignPhase.AWAITING_SELECTION,
             )
+        if event.kind in {
+            EventKind.CANDIDATE_PR_OPENED,
+            EventKind.CANDIDATE_PR_SYNCHRONIZED,
+            EventKind.CANDIDATE_PR_EDITED,
+            EventKind.CANDIDATE_PR_CLOSED,
+            EventKind.CANDIDATE_PR_MERGED,
+        }:
+            if state.phase in {
+                CampaignPhase.BLOCKED,
+                CampaignPhase.CANCELLED,
+                CampaignPhase.COMPLETED,
+            }:
+                return self._next(state, event)
+            if state.phase not in {
+                CampaignPhase.AWAITING_SELECTION,
+                CampaignPhase.DEPLOYMENT,
+            }:
+                raise InvalidCampaignTransition(
+                    f"{event.kind.value} requires candidate selection"
+                )
+            candidate_id = _identifier(
+                event.payload,
+                "candidate_id",
+            )
+            if candidate_id not in {
+                item.candidate_id
+                for item in state.candidates
+                if item.eligible
+            }:
+                raise InvalidCampaignTransition(
+                    "candidate PR event requires an eligible candidate"
+                )
+            _sha(event.payload, "binding_sha256")
+            _commit(event.payload, "head_commit")
+            _positive_integer(
+                event.payload,
+                "pull_request_number",
+            )
+            if event.kind is EventKind.CANDIDATE_PR_MERGED:
+                _commit(event.payload, "merge_commit")
+            return self._next(state, event)
+        if event.kind is EventKind.CANDIDATE_SELECTION_FAILED:
+            if state.phase not in {
+                CampaignPhase.AWAITING_SELECTION,
+                CampaignPhase.DEPLOYMENT,
+            }:
+                raise InvalidCampaignTransition(
+                    "candidate selection failure requires a selection phase"
+                )
+            return self._next(
+                state,
+                event,
+                phase=CampaignPhase.BLOCKED,
+                block_reason=_identifier(event.payload, "reason"),
+            )
         if event.kind is EventKind.CANDIDATE_MERGED:
+            candidate_id = _identifier(
+                event.payload, "candidate_id"
+            )
+            merge_commit = _commit(event.payload, "merge_commit")
+            if state.phase is CampaignPhase.DEPLOYMENT:
+                if (
+                    candidate_id == state.selected_candidate_id
+                    and merge_commit == state.merge_commit
+                ):
+                    return self._next(state, event)
+                return self._next(
+                    state,
+                    event,
+                    phase=CampaignPhase.BLOCKED,
+                    block_reason="multiple_candidate_merges",
+                )
             self._require_phase(
                 state,
                 CampaignPhase.AWAITING_SELECTION,
                 event,
-            )
-            candidate_id = _identifier(
-                event.payload, "candidate_id"
             )
             selected = next(
                 (
@@ -370,7 +438,7 @@ class OptimizationCampaign:
                 event,
                 phase=CampaignPhase.DEPLOYMENT,
                 selected_candidate_id=candidate_id,
-                merge_commit=_commit(event.payload, "merge_commit"),
+                merge_commit=merge_commit,
             )
         if event.kind is EventKind.DEPLOYMENT_COMPLETED:
             self._require_phase(state, CampaignPhase.DEPLOYMENT, event)
@@ -483,6 +551,15 @@ def _nonnegative_integer(payload: Any, field: str) -> int:
     if type(value) is not int or value < 0:
         raise InvalidCampaignTransition(
             f"{field} must be a non-negative integer"
+        )
+    return value
+
+
+def _positive_integer(payload: Any, field: str) -> int:
+    value = payload.get(field)
+    if type(value) is not int or value < 1:
+        raise InvalidCampaignTransition(
+            f"{field} must be a positive integer"
         )
     return value
 

@@ -23,6 +23,7 @@ from foundry_opt.security import reject_secret_content
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
 class SensitiveEvidenceError(ValueError):
@@ -114,6 +115,19 @@ def _build_document(request: EvidenceRequest) -> dict[str, object]:
                 **_result_document(candidate),
                 "patch_hash": (request.patch_hashes or {}).get(
                     candidate.run.subject_id
+                ),
+                **(
+                    {
+                        "result_tree": request.result_trees[
+                            candidate.run.subject_id
+                        ]
+                    }
+                    if (
+                        request.result_trees is not None
+                        and candidate.run.subject_id
+                        in request.result_trees
+                    )
+                    else {}
                 ),
             }
             for candidate in request.candidates
@@ -414,6 +428,10 @@ def _validate_evidence_identifiers(request: EvidenceRequest) -> None:
     for subject_id, patch_hash in (request.patch_hashes or {}).items():
         _require_identifier(subject_id, "patch subject_id")
         _require_identifier(patch_hash, "patch_hash")
+    for subject_id, result_tree in (request.result_trees or {}).items():
+        _require_identifier(subject_id, "result tree subject_id")
+        if not _COMMIT.fullmatch(result_tree):
+            raise ValueError("result_tree must be a full Git tree")
     for subject_id in (
         *request.pareto.frontier_ids,
         *request.pareto.eligible_ids,

@@ -13,7 +13,6 @@ from foundry_opt.optimization import (
 from foundry_opt.optimization.compatibility import (
     CompatibilityOptimizationCommandService,
     LegacyCampaignEventProjector,
-    VerifiedCandidateMerge,
     VerifiedSpecApproval,
 )
 from foundry_opt.orchestration import (
@@ -148,7 +147,7 @@ def test_verified_spec_approval_is_cas_persisted_before_run(
     )
 
 
-def test_verified_candidate_merge_is_cas_persisted_before_reconcile(
+def test_compatibility_does_not_duplicate_canonical_merge_selection(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
@@ -183,9 +182,6 @@ def test_verified_candidate_merge_is_cas_persisted_before_reconcile(
         projector=LegacyCampaignEventProjector(
             campaign_state=lambda root, campaign_id: None,
             lifecycle_state=lambda root, campaign_id: None,
-            verified_candidate_merge=lambda root, issue, candidates: (
-                VerifiedCandidateMerge("candidate-1", "d" * 40, 19)
-            ),
         ),
     )
 
@@ -193,13 +189,14 @@ def test_verified_candidate_merge_is_cas_persisted_before_reconcile(
         OptimizeCommandRequest(repository, 7, OptimizePhase.RECONCILE)
     )
 
-    assert result.status is OptimizeCommandStatus.COMPLETE
-    assert legacy.calls == 1
+    assert result.status is OptimizeCommandStatus.BLOCKED
+    assert result.details["code"] == "campaign_phase_waiting"
+    assert legacy.calls == 0
     snapshot = store.load(repository, 7)
     assert snapshot is not None
-    assert snapshot.state.phase is CampaignPhase.DEPLOYMENT
-    assert any(
-        event.kind is EventKind.CANDIDATE_MERGED
+    assert snapshot.state.phase is CampaignPhase.AWAITING_SELECTION
+    assert all(
+        event.kind is not EventKind.CANDIDATE_MERGED
         for event in snapshot.inbox
     )
 

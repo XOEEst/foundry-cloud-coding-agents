@@ -34,6 +34,7 @@ from foundry_opt.evidence import EvaluationAssetReference, EvidenceRequest
 from foundry_opt.orchestration.campaign import OptimizationCampaign
 from foundry_opt.orchestration.git_state import (
     OutboxRecord,
+    StateObject,
     StateRefConflictError,
     StateRefSnapshot,
 )
@@ -505,6 +506,7 @@ class CandidateWorkerLedger(Protocol):
         state: CampaignState,
         inbox: tuple[CampaignEvent, ...] = (),
         outbox: tuple[OutboxRecord, ...] = (),
+        objects: tuple[StateObject, ...] = (),
     ) -> StateRefSnapshot: ...
 
 
@@ -1050,6 +1052,8 @@ class CandidateWorkerService:
         (
             snapshot,
             result_commit,
+            result_tree,
+            patch_path,
             patch_sha256,
             bundle,
         ) = self._artifact(
@@ -1103,6 +1107,7 @@ class CandidateWorkerService:
                 spec_sha256=plan.spec_sha256,
                 assets=plan.assets,
                 patch_hashes={candidate_id: patch_sha256},
+                result_trees={candidate_id: result_tree},
             )
         )
         attestation = _attestation(
@@ -1110,11 +1115,19 @@ class CandidateWorkerService:
             design,
             changed_paths,
             result_commit,
+            result_tree,
+            patch_path,
             patch_sha256,
             bundle.sha256,
             draft,
             evaluation,
             evidence.sha256,
+            (
+                plan.evidence_root
+                / plan.campaign_id
+                / candidate_id
+                / "development-evidence.json"
+            ),
             eligible,
         )
         event = CampaignEvent(
@@ -1167,6 +1180,18 @@ class CandidateWorkerService:
             state=state,
             inbox=(event,),
             outbox=(attestation_record, cleanup_record),
+            objects=_new_state_objects(
+                snapshot,
+                _candidate_objects(
+                    request.repository_root,
+                    plan,
+                    attestation,
+                    patch_path,
+                    patch_sha256,
+                    evidence.path,
+                    evidence.sha256,
+                ),
+            ),
         )
         return self._reconcile_worktree_cleanups(
             request,
@@ -1181,12 +1206,21 @@ class CandidateWorkerService:
         worktree: CampaignWorktree,
         candidate_id: str,
         slot: int,
-    ) -> tuple[StateRefSnapshot, str, str, BundleArtifact]:
+    ) -> tuple[
+        StateRefSnapshot,
+        str,
+        str,
+        Path,
+        str,
+        BundleArtifact,
+    ]:
         record_id = f"candidate-artifact-{plan.generation}-{slot}"
         existing = _record(snapshot, record_id)
         output = worktree.path / f".foundry-opt-{candidate_id}.zip"
         if existing is not None:
             result_commit = str(existing.payload["result_commit"])
+            result_tree = str(existing.payload["tree_sha"])
+            patch_path = Path(str(existing.payload["patch_path"]))
             patch_sha256 = str(existing.payload["patch_sha256"])
             bundle_sha256 = str(existing.payload["bundle_sha256"])
             bundle = _restore_bundle(
@@ -1198,6 +1232,8 @@ class CandidateWorkerService:
             return (
                 snapshot,
                 result_commit,
+                result_tree,
+                patch_path,
                 patch_sha256,
                 bundle,
             )
@@ -1211,6 +1247,8 @@ class CandidateWorkerService:
             worktree,
             result_commit,
         )
+        if patch.result_tree is None:
+            raise ValueError("candidate patch is missing its exact result tree")
         bundle = _build_fresh_bundle(
             self._deps.build_bundle,
             worktree.path,
@@ -1229,15 +1267,24 @@ class CandidateWorkerService:
                         "bundle_sha256": bundle.sha256,
                         "candidate_id": candidate_id,
                         "issue_number": plan.issue_number,
+                        "patch_path": patch.path.as_posix(),
                         "patch_sha256": patch.sha256,
                         "result_commit": result_commit,
                         "slot": slot,
                         "spec_sha256": plan.spec_sha256,
+                        "tree_sha": patch.result_tree,
                     },
                 ),
             ),
         )
-        return snapshot, result_commit, patch.sha256, bundle
+        return (
+            snapshot,
+            result_commit,
+            patch.result_tree,
+            patch.path,
+            patch.sha256,
+            bundle,
+        )
 
     def _reject_candidate(
         self,
@@ -2462,11 +2509,14 @@ def _attestation(
     design: CandidateDesignResult,
     changed_paths: tuple[Path, ...],
     result_commit: str,
+    result_tree: str,
+    patch_path: Path,
     patch_sha256: str,
     bundle_sha256: str,
     draft: DraftRecord,
     evaluation: EvaluationResult,
     evidence_sha256: str,
+    evidence_path: Path,
     eligible: bool,
 ) -> dict[str, object]:
     lineage = {
@@ -2480,6 +2530,9 @@ def _attestation(
     lineage_sha256 = _sha256(lineage)
     document: dict[str, object] = {
         "base_commit": plan.base_commit,
+        "allowed_paths": [
+            path.as_posix() for path in plan.edit_paths
+        ],
         "bundle_sha256": bundle_sha256,
         "candidate_id": design.candidate_id,
         "changed_paths": lineage["changed_paths"],
@@ -2487,6 +2540,7 @@ def _attestation(
         "draft_id": draft.version_id,
         "eligible": eligible,
         "evaluation_id": evaluation.run.evaluation_id,
+        "evidence_path": evidence_path.as_posix(),
         "evidence_sha256": evidence_sha256,
         "idea_id": design.idea_id,
         "issue_number": plan.issue_number,
@@ -2497,11 +2551,13 @@ def _attestation(
         "mutation_class": design.mutation_class,
         "parent_idea_ids": list(design.parent_idea_ids),
         "patch_sha256": patch_sha256,
+        "patch_path": patch_path.as_posix(),
         "result": "eligible" if eligible else "ineligible",
         "result_commit": result_commit,
         "run_id": evaluation.run.run_id,
         "slot": design.slot,
         "spec_sha256": plan.spec_sha256,
+        "tree_sha": result_tree,
     }
     document["attestation_sha256"] = _sha256(document)
     return document
@@ -2516,3 +2572,71 @@ def _sha256(document: Mapping[str, object]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(serialized).hexdigest()
+
+
+def _candidate_objects(
+    repository_root: Path,
+    plan: CandidateWorkerPlan,
+    attestation: Mapping[str, object],
+    patch_path: Path,
+    patch_sha256: str,
+    evidence_path: Path,
+    evidence_sha256: str,
+) -> tuple[StateObject, ...]:
+    objects: list[StateObject] = [
+        StateObject(
+            (
+                f"objects/candidates/g{plan.generation}-"
+                f"{attestation['candidate_id']}.json"
+            ),
+            (
+                json.dumps(
+                    dict(attestation),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+    ]
+    root = repository_root.resolve()
+    for kind, path, expected_sha256, suffix in (
+        ("evidence", evidence_path, evidence_sha256, ".json"),
+        ("patches", root / patch_path, patch_sha256, ".patch"),
+    ):
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            raise ValueError("candidate durable object path is unsafe")
+        content = resolved.read_bytes()
+        if hashlib.sha256(content).hexdigest() != expected_sha256:
+            raise ValueError("candidate durable object hash changed")
+        objects.append(
+            StateObject(
+                f"objects/{kind}/{expected_sha256}{suffix}",
+                content,
+            )
+        )
+    return tuple(objects)
+
+
+def _new_state_objects(
+    snapshot: StateRefSnapshot,
+    candidates: tuple[StateObject, ...],
+) -> tuple[StateObject, ...]:
+    known = {item.path: item for item in snapshot.objects}
+    additions: dict[str, StateObject] = {}
+    for item in candidates:
+        existing = known.get(item.path) or additions.get(item.path)
+        if existing is not None:
+            if existing.content != item.content:
+                raise ValueError("candidate state object content changed")
+            continue
+        additions[item.path] = item
+    return tuple(
+        additions[path] for path in sorted(additions)
+    )

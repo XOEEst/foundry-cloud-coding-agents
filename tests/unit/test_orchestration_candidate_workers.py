@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -143,6 +145,10 @@ class Ledger:
             state=kwargs["state"],
             inbox=(*self.snapshot.inbox, *inbox),
             outbox=(*self.snapshot.outbox, *outbox),
+            objects=(
+                *self.snapshot.objects,
+                *kwargs.get("objects", ()),
+            ),
         )
         return self.snapshot
 
@@ -232,15 +238,24 @@ class Repository:
         worktree: CampaignWorktree,
         result_commit: str,
     ) -> PatchArtifact:
+        path = Path(
+            f".foundry-optimizer/campaigns/{campaign_id}/"
+            f"{worktree.candidate_id}.patch"
+        )
+        content = (
+            "diff --git a/agent/instructions.md "
+            "b/agent/instructions.md\n"
+        ).encode()
+        output = repository_root / path
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(content)
         return PatchArtifact(
             worktree.candidate_id,
-            Path(
-                f".foundry-optimizer/campaigns/{campaign_id}/"
-                f"{worktree.candidate_id}.patch"
-            ),
-            "d" * 64,
+            path,
+            hashlib.sha256(content).hexdigest(),
             worktree.base_commit,
             result_commit,
+            "f" * 40,
         )
 
     def cleanup_worktree(
@@ -539,10 +554,24 @@ def test_steward_candidate_worker_completes_baseline_and_one_candidate(
         )
 
     def write_evidence(request) -> EvidenceManifest:
+        content = (
+            json.dumps(
+                {
+                    "campaign_id": request.campaign_id,
+                    "metrics": {"quality": 0.9},
+                    "schema_version": 1,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode()
+        request.output_path.parent.mkdir(parents=True, exist_ok=True)
+        request.output_path.write_bytes(content)
         return EvidenceManifest(
             request.output_path,
-            "f" * 64,
-            10,
+            hashlib.sha256(content).hexdigest(),
+            len(content),
             tuple(
                 result.run.evaluation_id
                 for result in (request.baseline, *request.candidates)
@@ -589,9 +618,17 @@ def test_steward_candidate_worker_completes_baseline_and_one_candidate(
         "agent/instructions.md"
     ]
     assert attestation.payload["result"] == "eligible"
+    assert attestation.payload["tree_sha"] == "f" * 40
+    assert attestation.payload["allowed_paths"] == ["agent"]
+    assert attestation.payload["patch_path"].endswith("candidate-1.patch")
     assert attestation.payload["motivation"] == (
         "Clarify the escalation rule."
     )
+    assert [item.path for item in result.snapshot.objects] == [
+        "objects/candidates/g1-candidate-1.json",
+        "objects/evidence/" + attestation.payload["evidence_sha256"] + ".json",
+        "objects/patches/" + attestation.payload["patch_sha256"] + ".patch",
+    ]
 
     duplicate = service.advance(CandidateWorkerRequest(tmp_path, 31))
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -19,6 +20,7 @@ from foundry_opt.orchestration import (
     StateRefConflictError,
     StateRefCorruptionError,
     StateRefPrivacyError,
+    StateObject,
 )
 from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 
@@ -230,8 +232,9 @@ def test_state_ref_migrates_v1_fixture_on_next_write_without_rehashing_history(
     assert journal[0] == (
         V1_STATE_FIXTURE / "journal.jsonl"
     ).read_text(encoding="utf-8").strip()
-    assert json.loads(journal[1])["schema_version"] == 2
-    assert snapshot["schema_version"] == 2
+    assert json.loads(journal[1])["schema_version"] == 3
+    assert json.loads(journal[1])["state_schema_version"] == 2
+    assert snapshot["schema_version"] == 3
     assert snapshot["state"]["schema_version"] == 2
     assert snapshot["state"]["spec_base_ref_name"] is None
     assert snapshot["state"]["spec_files"] == []
@@ -283,6 +286,63 @@ def test_state_ref_creates_and_loads_atomic_snapshot_inbox_and_outbox(
             tmp_path,
         )
         == "refs/heads/foundry-opt/state/issue-31\n"
+    )
+
+
+def test_state_ref_persists_exact_candidate_objects(
+    tmp_path: Path,
+) -> None:
+    repository, _ = _repository(tmp_path)
+    event = _event("event-1", EventKind.ISSUE_CREATED)
+    state = OptimizationCampaign().advance(
+        AdvanceRequest(31, None, (event,))
+    ).state
+    attestation = b'{"candidate_id":"candidate-1","schema_version":1}\n'
+    evidence = b'{"metrics":{"quality":0.9},"schema_version":1}\n'
+    patch = b"diff --git a/agent.md b/agent.md\n"
+    objects = (
+        StateObject(
+            "objects/patches/" + hashlib.sha256(patch).hexdigest() + ".patch",
+            patch,
+        ),
+        StateObject(
+            "objects/candidates/g1-candidate-1.json",
+            attestation,
+        ),
+        StateObject(
+            "objects/evidence/" + hashlib.sha256(evidence).hexdigest() + ".json",
+            evidence,
+        ),
+    )
+
+    created = GitStateRef().commit(
+        repository,
+        issue_number=31,
+        expected_revision=None,
+        state=state,
+        inbox=(event,),
+        objects=objects,
+    )
+
+    assert created.objects == tuple(
+        sorted(objects, key=lambda item: item.path)
+    )
+    assert GitStateRef().load(repository, 31) == created
+    assert (
+        subprocess.run(
+            (
+                "git",
+                "show",
+                (
+                    f"{created.revision}:objects/patches/"
+                    f"{hashlib.sha256(patch).hexdigest()}.patch"
+                ),
+            ),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        ).stdout
+        == patch
     )
 
 
@@ -638,3 +698,34 @@ def test_issue_event_inbox_appends_idempotent_transport_events(
 
     assert inbox.events(31) == (opened, edited)
     assert inbox.issue_numbers() == (31,)
+
+
+def test_issue_event_inbox_durably_accepts_reordered_candidate_pr_events(
+    tmp_path: Path,
+) -> None:
+    repository, _ = _repository(tmp_path)
+    inbox = GitIssueEventInbox(repository)
+    opened = _event("github-delivery-1", EventKind.ISSUE_CREATED)
+    synchronized = _event(
+        "github-pr-sync",
+        EventKind.CANDIDATE_PR_SYNCHRONIZED,
+        binding_sha256="a" * 64,
+        candidate_id="candidate-1",
+        head_commit="b" * 40,
+        pull_request_number=91,
+    )
+    pr_opened = _event(
+        "github-pr-open",
+        EventKind.CANDIDATE_PR_OPENED,
+        binding_sha256="a" * 64,
+        candidate_id="candidate-1",
+        head_commit="c" * 40,
+        pull_request_number=91,
+    )
+
+    assert inbox.append(31, opened) is True
+    assert inbox.append(31, synchronized) is True
+    assert inbox.append(31, pr_opened) is True
+    assert inbox.append(31, synchronized) is False
+
+    assert inbox.events(31) == (opened, synchronized, pr_opened)

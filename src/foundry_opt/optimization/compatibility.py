@@ -138,6 +138,12 @@ class CompatibilityOptimizationCommandService:
         canonical = _canonical_candidate_result(request, steward_result)
         if canonical is not None:
             return canonical
+        canonical_selection = _canonical_selection_result(
+            request,
+            steward_result,
+        )
+        if canonical_selection is not None:
+            return canonical_selection
         if precheck is not None:
             return precheck
         if self._runtime_namespace is not None:
@@ -237,21 +243,6 @@ class VerifiedSpecApproval:
             raise ValueError("spec_sha256 must be a SHA-256 digest")
         if not _is_commit(self.approval_commit):
             raise ValueError("approval_commit must be a full Git commit")
-
-
-@dataclass(frozen=True)
-class VerifiedCandidateMerge:
-    candidate_id: str
-    merge_commit: str
-    pull_request_number: int
-
-    def __post_init__(self) -> None:
-        if not self.candidate_id:
-            raise ValueError("candidate_id is required")
-        if not _is_commit(self.merge_commit):
-            raise ValueError("merge_commit must be a full Git commit")
-        if self.pull_request_number < 1:
-            raise ValueError("pull_request_number must be positive")
 
 
 class LegacyRuntimeNamespace:
@@ -449,11 +440,6 @@ class LegacyCampaignEventProjector:
             [Path, int, str], VerifiedSpecApproval | None
         ]
         | None = None,
-        verified_candidate_merge: Callable[
-            [Path, int, tuple[str, ...]],
-            VerifiedCandidateMerge | None,
-        ]
-        | None = None,
         artifact_generation: Callable[
             [OptimizeCommandRequest, str, str], int | None
         ]
@@ -471,9 +457,6 @@ class LegacyCampaignEventProjector:
         )
         self._verified_spec_approval = (
             verified_spec_approval or _load_verified_spec_approval
-        )
-        self._verified_candidate_merge = (
-            verified_candidate_merge or _load_verified_candidate_merge
         )
         self._artifact_generation = (
             artifact_generation
@@ -648,27 +631,6 @@ class LegacyCampaignEventProjector:
                         for candidate in working.candidates
                     ),
                 )
-        if working.phase is CampaignPhase.AWAITING_SELECTION:
-            merge = self._verified_candidate_merge(
-                request.repository_root,
-                request.issue_number,
-                tuple(
-                    candidate.candidate_id
-                    for candidate in working.candidates
-                    if candidate.eligible
-                ),
-            )
-            if merge is not None:
-                append(
-                    EventKind.CANDIDATE_MERGED,
-                    (
-                        f"{merge.candidate_id}:"
-                        f"{merge.merge_commit}:"
-                        f"{merge.pull_request_number}"
-                    ),
-                    candidate_id=merge.candidate_id,
-                    merge_commit=merge.merge_commit,
-                )
         if lifecycle is not None:
             deployment_version = getattr(
                 lifecycle,
@@ -739,37 +701,6 @@ class LegacyCampaignEventProjector:
                         kind=EventKind.SPEC_HUMAN_APPROVED,
                         generation=state.generation,
                         occurred_at=self._clock(),
-                    ),
-                )
-        if state.phase is CampaignPhase.AWAITING_SELECTION:
-            merge = self._verified_candidate_merge(
-                request.repository_root,
-                request.issue_number,
-                tuple(
-                    candidate.candidate_id
-                    for candidate in state.candidates
-                    if candidate.eligible
-                ),
-            )
-            if merge is not None:
-                return (
-                    CampaignEvent(
-                        event_id=_event_id(
-                            EventKind.CANDIDATE_MERGED,
-                            state.generation,
-                            (
-                                f"{merge.candidate_id}:"
-                                f"{merge.merge_commit}:"
-                                f"{merge.pull_request_number}"
-                            ),
-                        ),
-                        kind=EventKind.CANDIDATE_MERGED,
-                        generation=state.generation,
-                        occurred_at=self._clock(),
-                        payload={
-                            "candidate_id": merge.candidate_id,
-                            "merge_commit": merge.merge_commit,
-                        },
                     ),
                 )
         return ()
@@ -909,6 +840,39 @@ def _canonical_candidate_result(
     )
 
 
+def _canonical_selection_result(
+        request: OptimizeCommandRequest,
+        steward_result: Any,
+) -> OptimizeCommandResult | None:
+    state = steward_result.state
+    if (
+        request.phase is not OptimizePhase.RECONCILE
+        or state is None
+        or state.phase is not CampaignPhase.DEPLOYMENT
+    ):
+        return None
+    return OptimizeCommandResult(
+        OptimizeCommandStatus.AWAITING_AGENT,
+        request.phase,
+        (
+            "The canonical steward recorded the human merge selection. "
+            "Deployment belongs to the next gated orchestration phase."
+        ),
+        request.issue_number,
+        details={
+            "generation": state.generation,
+            "merge_commit": state.merge_commit,
+            "phase": state.phase.value,
+            "selected_candidate_id": state.selected_candidate_id,
+            "source": "canonical_steward",
+        },
+        next_action=(
+            "Wait for the deployment phase; this compatibility command "
+            "does not dispatch deployment."
+        ),
+    )
+
+
 def _gate_failure(
     request: OptimizeCommandRequest,
     code: str | None,
@@ -1014,73 +978,6 @@ def _load_verified_spec_approval(
             path,
         )
         return VerifiedSpecApproval(expected_sha256, approval_commit)
-    except Exception:
-        return None
-
-
-def _load_verified_candidate_merge(
-    repository_root: Path,
-    issue_number: int,
-    candidate_ids: tuple[str, ...],
-) -> VerifiedCandidateMerge | None:
-    if not candidate_ids:
-        return None
-    try:
-        raw = _command(
-            repository_root,
-            "gh",
-            "pr",
-            "list",
-            "--state",
-            "merged",
-            "--json",
-            "number,body,state",
-            "--limit",
-            "100",
-        )
-        pull_requests = json.loads(raw)
-        matches: list[tuple[str, int]] = []
-        campaign_id = f"issue-{issue_number}"
-        for item in pull_requests:
-            body = item.get("body")
-            number = item.get("number")
-            if (
-                not isinstance(body, str)
-                or type(number) is not int
-                or str(item.get("state", "")).upper() != "MERGED"
-            ):
-                continue
-            for candidate_id in candidate_ids:
-                marker = (
-                    f"foundry-opt:candidate-pr:{campaign_id}:"
-                    f"{candidate_id}:"
-                )
-                if marker in body:
-                    matches.append((candidate_id, number))
-        if len(matches) != 1:
-            return None
-        candidate_id, number = matches[0]
-        detail = json.loads(
-            _command(
-                repository_root,
-                "gh",
-                "pr",
-                "view",
-                str(number),
-                "--json",
-                "mergeCommit,state,mergedAt",
-            )
-        )
-        if (
-            str(detail.get("state", "")).upper() != "MERGED"
-            or not detail.get("mergedAt")
-            or not isinstance(detail.get("mergeCommit"), dict)
-        ):
-            return None
-        commit = detail["mergeCommit"].get("oid")
-        if not isinstance(commit, str):
-            return None
-        return VerifiedCandidateMerge(candidate_id, commit, number)
     except Exception:
         return None
 

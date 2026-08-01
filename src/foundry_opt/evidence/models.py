@@ -176,6 +176,7 @@ class EvidenceRequest:
     spec_sha256: str
     assets: tuple[EvaluationAssetReference, ...]
     patch_hashes: dict[str, str] | None = None
+    result_trees: dict[str, str] | None = None
     telemetry: tuple[TelemetryEvidence, ...] = ()
     sensitive_values: tuple[str, ...] = ()
     generated_at: datetime | None = None

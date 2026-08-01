@@ -25,6 +25,12 @@ from foundry_opt.orchestration.candidate_workers import (
     CandidateWorkerResult,
     CandidateWorkerStatus,
 )
+from foundry_opt.orchestration.candidate_slate import (
+    CandidateSelectionResult,
+    CandidateSelectionStatus,
+    CandidateSlateResult,
+    CandidateSlateStatus,
+)
 from foundry_opt.orchestration.spec_policy import (
     MergedSpecApproval,
     OptimizationSpecPolicy,
@@ -703,3 +709,227 @@ def test_steward_owns_and_invokes_candidate_worker_phase(
     assert result.state == completed
     assert workers.requests[0].issue_number == 31
     assert workers.requests[0].repository_root == tmp_path
+
+
+def test_steward_publishes_slate_after_candidate_workers_complete(
+    tmp_path: Path,
+) -> None:
+    created = _event("event-1", EventKind.ISSUE_CREATED)
+    approved = CampaignEvent(
+        "event-2",
+        EventKind.SPEC_POLICY_APPROVED,
+        1,
+        NOW,
+        {"spec_sha256": "d" * 64},
+    )
+    baseline = CampaignEvent(
+        "event-3",
+        EventKind.BASELINE_COMPLETED,
+        1,
+        NOW,
+        {"evaluation_id": "eval-baseline"},
+    )
+    candidate = CampaignEvent(
+        "event-4",
+        EventKind.CANDIDATE_EVALUATED,
+        1,
+        NOW,
+        {
+            "candidate_id": "candidate-1",
+            "eligible": True,
+            "evidence_sha256": "e" * 64,
+        },
+    )
+    completed = CampaignEvent(
+        "event-5",
+        EventKind.CANDIDATE_WORKERS_COMPLETED,
+        1,
+        NOW,
+        {
+            "attempted_count": 1,
+            "eligible_count": 1,
+            "stop_reason": "max_candidates",
+        },
+    )
+    candidate_state = OptimizationCampaign().advance(
+        __import__(
+            "foundry_opt.orchestration",
+            fromlist=["AdvanceRequest"],
+        ).AdvanceRequest(
+            31,
+            None,
+            (created, approved, baseline, candidate, completed),
+        )
+    ).state
+    slate_event = CampaignEvent(
+        "event-6",
+        EventKind.SLATE_PUBLISHED,
+        1,
+        NOW,
+    )
+    selection_state = OptimizationCampaign().advance(
+        __import__(
+            "foundry_opt.orchestration",
+            fromlist=["AdvanceRequest"],
+        ).AdvanceRequest(31, candidate_state, (slate_event,))
+    ).state
+    workers_snapshot = SimpleNamespace(
+        revision="b" * 40,
+        state=candidate_state,
+        inbox=(created, approved, baseline, candidate, completed),
+        outbox=(),
+        objects=(),
+    )
+    slate_snapshot = SimpleNamespace(
+        revision="c" * 40,
+        state=selection_state,
+        inbox=(*workers_snapshot.inbox, slate_event),
+        outbox=(),
+        objects=(),
+    )
+
+    class Workers:
+        def advance(self, request):
+            return CandidateWorkerResult(
+                CandidateWorkerStatus.COMPLETE,
+                workers_snapshot,
+                "workers complete",
+            )
+
+    class Slate:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def advance(self, request):
+            self.requests.append(request)
+            return CandidateSlateResult(
+                CandidateSlateStatus.PUBLISHED,
+                slate_snapshot,
+                "slate published",
+            )
+
+    slate = Slate()
+    result = StewardAdvanceService(
+        ledger=Ledger(workers_snapshot),
+        inbox=Inbox(()),
+        candidate_workers=Workers(),
+        candidate_slate=slate,
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.status is StewardAdvanceStatus.ADVANCED
+    assert result.phase == CampaignPhase.AWAITING_SELECTION.value
+    assert result.revision == "c" * 40
+    assert slate.requests[0].issue_number == 31
+
+
+def test_steward_invokes_merge_selection_after_trusted_pr_event(
+    tmp_path: Path,
+) -> None:
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=5,
+        phase=CampaignPhase.AWAITING_SELECTION,
+        processed_event_ids=(
+            "event-1",
+            "event-2",
+            "event-3",
+            "event-4",
+            "event-5",
+        ),
+        spec_sha256="d" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "e" * 64,
+            },
+        ),
+    )
+    selected = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=7,
+        phase=CampaignPhase.DEPLOYMENT,
+        processed_event_ids=(
+            *state.processed_event_ids,
+            "delivery-merge",
+            "selection-recorded",
+        ),
+        spec_sha256="d" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=state.candidates,
+        selected_candidate_id="candidate-1",
+        merge_commit="f" * 40,
+    )
+    initial = SimpleNamespace(
+        revision="a" * 40,
+        state=state,
+        inbox=(),
+        outbox=(),
+        objects=(),
+    )
+    after_event = SimpleNamespace(
+        revision="b" * 40,
+        state=state,
+        inbox=(),
+        outbox=(),
+        objects=(),
+    )
+    final = SimpleNamespace(
+        revision="c" * 40,
+        state=selected,
+        inbox=(),
+        outbox=(),
+        objects=(),
+    )
+
+    class EventCampaign:
+        def advance(self, request):
+            return SimpleNamespace(
+                state=state,
+                disposition=AdvanceDisposition.WAIT,
+            )
+
+    class Selection:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def advance(self, request):
+            self.requests.append(request)
+            return CandidateSelectionResult(
+                CandidateSelectionStatus.SELECTED,
+                final,
+                "selected",
+            )
+
+    selection = Selection()
+    ledger = Ledger(initial)
+    ledger.commit = lambda repository_root, **kwargs: after_event
+    result = StewardAdvanceService(
+        ledger=ledger,
+        inbox=Inbox(
+            (
+                CampaignEvent(
+                    "delivery-merge",
+                    EventKind.CANDIDATE_PR_MERGED,
+                    1,
+                    NOW,
+                    {
+                        "binding_sha256": "a" * 64,
+                        "candidate_id": "candidate-1",
+                        "head_commit": "b" * 40,
+                        "merge_commit": "f" * 40,
+                        "pull_request_number": 91,
+                    },
+                ),
+            )
+        ),
+        campaign=EventCampaign(),
+        candidate_selection=selection,
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.status is StewardAdvanceStatus.ADVANCED
+    assert result.phase == CampaignPhase.DEPLOYMENT.value
+    assert selection.requests[0].issue_number == 31

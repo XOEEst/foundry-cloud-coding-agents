@@ -14,7 +14,6 @@ from foundry_opt.optimization.compatibility import (
     LegacyGenerationFence,
     LegacyCampaignEventProjector,
     LegacyRuntimeNamespace,
-    VerifiedCandidateMerge,
     VerifiedSpecApproval,
 )
 from foundry_opt.orchestration.steward import (
@@ -355,7 +354,7 @@ def test_verified_spec_approval_is_persisted_then_reloaded_before_run(
     assert steward.state.phase is CampaignPhase.BASELINE
 
 
-def test_verified_candidate_merge_is_persisted_then_reloaded_before_reconcile(
+def test_reconcile_adapts_deployment_ready_canonical_selection(
     tmp_path: Path,
 ) -> None:
     from foundry_opt.orchestration import CandidateRecord
@@ -363,11 +362,13 @@ def test_verified_candidate_merge_is_persisted_then_reloaded_before_reconcile(
     state = CampaignState(
         7,
         1,
-        5,
-        CampaignPhase.AWAITING_SELECTION,
+        6,
+        CampaignPhase.DEPLOYMENT,
         spec_sha256="a" * 64,
         baseline_evaluation_id="baseline-1",
         candidates=(CandidateRecord("candidate-1", True, "c" * 64),),
+        selected_candidate_id="candidate-1",
+        merge_commit="d" * 40,
     )
     steward = AdvancingSteward(state)
     legacy = Legacy(
@@ -378,27 +379,19 @@ def test_verified_candidate_merge_is_persisted_then_reloaded_before_reconcile(
             7,
         )
     )
-    projector = LegacyCampaignEventProjector(
-        campaign_state=lambda root, campaign_id: None,
-        lifecycle_state=lambda root, campaign_id: None,
-        verified_candidate_merge=lambda root, issue, candidates: (
-            VerifiedCandidateMerge("candidate-1", "d" * 40, 19)
-        ),
-    )
 
     result = CompatibilityOptimizationCommandService(
         legacy=legacy,
         steward=steward,
-        projector=projector,
     ).execute(
         OptimizeCommandRequest(tmp_path, 7, OptimizePhase.RECONCILE)
     )
 
-    assert result.status is OptimizeCommandStatus.COMPLETE
-    assert legacy.requests
-    assert len(steward.calls) == 3
-    assert steward.calls[1][1][0].kind is EventKind.CANDIDATE_MERGED
-    assert steward.calls[2][1] == ()
+    assert result.status is OptimizeCommandStatus.AWAITING_AGENT
+    assert result.details["source"] == "canonical_steward"
+    assert result.details["selected_candidate_id"] == "candidate-1"
+    assert legacy.requests == []
+    assert len(steward.calls) == 1
     assert steward.state.phase is CampaignPhase.DEPLOYMENT
 
 
@@ -579,9 +572,6 @@ def test_legacy_projector_maps_completed_runner_and_lifecycle_state(
         verified_spec_approval=lambda root, issue, digest: (
             VerifiedSpecApproval(digest, "c" * 40)
         ),
-        verified_candidate_merge=lambda root, issue, candidates: (
-            VerifiedCandidateMerge("candidate-1", "b" * 40, 19)
-        ),
         artifact_generation=lambda request, key, digest: 1,
         clock=lambda: datetime(2026, 7, 31, tzinfo=UTC),
     )
@@ -601,9 +591,6 @@ def test_legacy_projector_maps_completed_runner_and_lifecycle_state(
         EventKind.BASELINE_COMPLETED,
         EventKind.CANDIDATE_EVALUATED,
         EventKind.SLATE_PUBLISHED,
-        EventKind.CANDIDATE_MERGED,
-        EventKind.DEPLOYMENT_COMPLETED,
-        EventKind.RETENTION_COMPLETED,
     ]
 
 

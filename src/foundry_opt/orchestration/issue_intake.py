@@ -26,6 +26,18 @@ _ACTIONS = {
     "reopened": EventKind.ISSUE_REOPENED,
     "closed": EventKind.ISSUE_CLOSED,
 }
+_ISSUE_EVENT_KINDS = frozenset(
+    {*_ACTIONS.values(), EventKind.ISSUE_DECLASSIFIED}
+)
+_PR_EVENT_KINDS = frozenset(
+    {
+        EventKind.CANDIDATE_PR_OPENED,
+        EventKind.CANDIDATE_PR_SYNCHRONIZED,
+        EventKind.CANDIDATE_PR_EDITED,
+        EventKind.CANDIDATE_PR_CLOSED,
+        EventKind.CANDIDATE_PR_MERGED,
+    }
+)
 
 
 class TrustedIssueEventError(ValueError):
@@ -554,6 +566,9 @@ def _generation(
     kind: EventKind,
     existing: tuple[CampaignEvent, ...],
 ) -> int:
+    existing = tuple(
+        event for event in existing if event.kind in _ISSUE_EVENT_KINDS
+    )
     if kind is EventKind.ISSUE_CREATED:
         if existing:
             raise TrustedIssueEventError(
@@ -610,32 +625,83 @@ def _inbox_ref(issue_number: int) -> str:
 
 
 def _require_transport_event(event: CampaignEvent) -> None:
-    if event.kind not in {
-        EventKind.ISSUE_CREATED,
-        EventKind.ISSUE_EDITED,
-        EventKind.ISSUE_DECLASSIFIED,
-        EventKind.ISSUE_REOPENED,
-        EventKind.ISSUE_CLOSED,
-    } or event.payload:
+    if event.kind in _ISSUE_EVENT_KINDS:
+        if event.payload:
+            raise IssueInboxError(
+                "Git issue transport event payload must be empty"
+            )
+        return
+    if event.kind not in _PR_EVENT_KINDS:
         raise IssueInboxError(
-            "Git issue inbox accepts only transport issue events"
+            "Git issue inbox accepts only trusted transport events"
+        )
+    expected = {
+        "binding_sha256",
+        "candidate_id",
+        "head_commit",
+        "pull_request_number",
+    }
+    if event.kind is EventKind.CANDIDATE_PR_MERGED:
+        expected.add("merge_commit")
+    payload = event.payload
+    if set(payload) != expected:
+        raise IssueInboxError(
+            "candidate PR transport payload is invalid"
+        )
+    if (
+        not isinstance(payload["binding_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", payload["binding_sha256"]) is None
+        or not isinstance(payload["candidate_id"], str)
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            payload["candidate_id"],
+        )
+        is None
+        or not isinstance(payload["head_commit"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", payload["head_commit"]) is None
+        or type(payload["pull_request_number"]) is not int
+        or payload["pull_request_number"] < 1
+        or (
+            "merge_commit" in payload
+            and (
+                not isinstance(payload["merge_commit"], str)
+                or re.fullmatch(
+                    r"[0-9a-f]{40}",
+                    payload["merge_commit"],
+                )
+                is None
+            )
+        )
+    ):
+        raise IssueInboxError(
+            "candidate PR transport binding is invalid"
         )
 
 
 def _validate_transport_sequence(
     events: tuple[CampaignEvent, ...],
 ) -> None:
-    actions = {
-        EventKind.ISSUE_CREATED: EventKind.ISSUE_CREATED,
-        EventKind.ISSUE_EDITED: EventKind.ISSUE_EDITED,
-        EventKind.ISSUE_DECLASSIFIED: EventKind.ISSUE_DECLASSIFIED,
-        EventKind.ISSUE_REOPENED: EventKind.ISSUE_REOPENED,
-        EventKind.ISSUE_CLOSED: EventKind.ISSUE_CLOSED,
-    }
     prior: tuple[CampaignEvent, ...] = ()
     for event in events:
+        _require_transport_event(event)
+        if event.kind in _PR_EVENT_KINDS:
+            issue_events = tuple(
+                item
+                for item in prior
+                if item.kind in _ISSUE_EVENT_KINDS
+            )
+            if (
+                not issue_events
+                or event.generation < 1
+                or event.generation > issue_events[-1].generation
+            ):
+                raise IssueInboxError(
+                    "candidate PR event generation is invalid"
+                )
+            prior = (*prior, event)
+            continue
         try:
-            expected = _generation(actions[event.kind], prior)
+            expected = _generation(event.kind, prior)
         except TrustedIssueEventError as error:
             raise IssueInboxError(
                 "inbox event sequence is invalid"
@@ -655,7 +721,7 @@ def _event_bytes(event: CampaignEvent) -> bytes:
             "+00:00",
             "Z",
         ),
-        "payload": {},
+        "payload": dict(event.payload),
         "schema_version": 1,
     }
     return (
@@ -676,7 +742,10 @@ def _event_from_bytes(content: bytes) -> CampaignEvent:
             "schema_version",
         }:
             raise ValueError
-        if document["schema_version"] != 1 or document["payload"] != {}:
+        if (
+            document["schema_version"] != 1
+            or type(document["payload"]) is not dict
+        ):
             raise ValueError
         event = CampaignEvent(
             event_id=document["event_id"],
@@ -685,6 +754,7 @@ def _event_from_bytes(content: bytes) -> CampaignEvent:
             occurred_at=datetime.fromisoformat(
                 document["occurred_at"].replace("Z", "+00:00")
             ),
+            payload=document["payload"],
         )
         _require_transport_event(event)
         return event
@@ -762,7 +832,7 @@ def main() -> None:
     if event_name == "schedule":
         intake.recover(f"schedule-{run_id}")
         return
-    if event_name != "issues":
+    if event_name not in {"issues", "pull_request"}:
         raise TrustedIssueEventError("event name is not trusted")
     event_path = Path(_required_environment("TRUSTED_EVENT_PATH"))
     try:
@@ -781,6 +851,72 @@ def main() -> None:
         repository=repository,
         repository_id=repository_id,
     )
+    if event_name == "pull_request":
+        pull_request = payload.get("pull_request")
+        body = (
+            pull_request.get("body")
+            if isinstance(pull_request, dict)
+            else None
+        )
+        changes = payload.get("changes")
+        changed_body = (
+            changes.get("body")
+            if isinstance(changes, dict)
+            else None
+        )
+        previous_body = (
+            changed_body.get("from")
+            if isinstance(changed_body, dict)
+            else None
+        )
+        marker = None
+        for candidate_body in (body, previous_body):
+            if not isinstance(candidate_body, str):
+                continue
+            marker = re.search(
+                r"<!-- foundry-opt:candidate-pr:"
+                r"issue-([1-9][0-9]*):g[1-9][0-9]*:"
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}:"
+                r"[0-9a-f]{20} -->",
+                candidate_body,
+            )
+            if marker is not None:
+                break
+        if marker is None:
+            return
+        issue_number = int(marker.group(1))
+        from foundry_opt.orchestration.candidate_slate import (
+            CandidatePullRequestEventIntake,
+            TrustedCandidatePullRequestContext,
+            candidate_pull_request_event_from_payload,
+            candidate_pr_marker,
+            candidate_worker_bindings,
+        )
+        from foundry_opt.orchestration.git_state import GitStateRef
+
+        snapshot = GitStateRef().load(root, issue_number)
+        if snapshot is None:
+            return
+        bindings = candidate_worker_bindings(snapshot)
+        if not any(
+            candidate_pr_marker(binding) == marker.group(0)
+            for binding in bindings
+        ):
+            return
+        event = candidate_pull_request_event_from_payload(
+            payload,
+            TrustedCandidatePullRequestContext(
+                event_name=event_name,
+                delivery_id=run_id,
+                repository=repository,
+                repository_id=repository_id,
+            ),
+            bindings,
+        )
+        recorded = CandidatePullRequestEventIntake(inbox).ingest(event)
+        assignments.assign(issue_number, recorded.event.event_id)
+        projection.project(issue_number)
+        return
     issue_number, action, _, _ = _validate_payload(payload, context)
     if action != "opened" and not inbox.events(issue_number):
         return

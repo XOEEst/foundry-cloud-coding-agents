@@ -347,6 +347,11 @@ class CampaignGit:
             sha256=digest,
             base_commit=worktree.base_commit,
             result_commit=result_commit,
+            result_tree=self._git_text(
+                worktree.path,
+                "rev-parse",
+                f"{result_commit}^{{tree}}",
+            ),
         )
 
     def cleanup_worktree(

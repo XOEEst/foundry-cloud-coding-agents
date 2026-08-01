@@ -63,6 +63,7 @@ class PatchArtifact:
     sha256: str
     base_commit: str
     result_commit: str
+    result_tree: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.candidate_id, "candidate_id")
@@ -77,6 +78,10 @@ class PatchArtifact:
             raise ValueError("base_commit is invalid")
         if not _COMMIT.fullmatch(self.result_commit):
             raise ValueError("result_commit is invalid")
+        if self.result_tree is not None and not _COMMIT.fullmatch(
+            self.result_tree
+        ):
+            raise ValueError("result_tree is invalid")
 
 
 @dataclass(frozen=True)

@@ -198,6 +198,88 @@ def test_dashboard_explains_specification_digest_and_classification() -> None:
     assert "existing_immutable_assets" in gateway.created[0]
 
 
+def test_dashboard_renders_redacted_ranked_candidate_slate() -> None:
+    gateway = FakeDashboardGateway()
+    source = FakeOutbox(
+        (
+            _record(
+                "slate-dashboard-2",
+                "candidate_slate_dashboard",
+                9,
+                phase="awaiting_selection",
+                status="waiting",
+                disposition="wait",
+                spec_sha256="d" * 64,
+                baseline_metrics={"quality": 0.5, "safety": 1.0},
+                candidate_slate=[
+                    {
+                        "candidate_id": "candidate-1",
+                        "rank": 1,
+                        "draft_id": "draft-candidate-1",
+                        "metrics": {"quality": 0.9, "safety": 1.0},
+                        "deltas": {"quality": 0.4, "safety": 0.0},
+                        "guardrails": {"safety": "pass"},
+                        "evidence_sha256": "e" * 64,
+                        "evidence_url": (
+                            "https://github.com/octo-org/optimizer/blob/"
+                            "foundry-opt/state/issue-31/objects/evidence/"
+                            + "e" * 64
+                            + ".json"
+                        ),
+                    }
+                ],
+                next_action="merge_exactly_one_candidate_pr",
+            ),
+        )
+    )
+
+    DashboardProjection(source, gateway).project(31)
+
+    body = gateway.created[0]
+    assert "| Rank | Candidate | Aggregates | Deltas | Guardrails | Evidence |" in body
+    assert "| 1 | `candidate-1` | `quality=0.9`, `safety=1` |" in body
+    assert "`quality=+0.4`, `safety=+0`" in body
+    assert "`safety=pass`" in body
+    assert "[redacted evidence]" in body
+    assert "Merge exactly one eligible candidate PR" in body
+    assert all(
+        forbidden not in body.casefold()
+        for forbidden in (
+            "raw prompt",
+            "raw response",
+            "dataset row",
+            "tool payload",
+        )
+    )
+
+
+def test_dashboard_reports_merge_selection_as_deployment_ready() -> None:
+    gateway = FakeDashboardGateway()
+    source = FakeOutbox(
+        (
+            _record(
+                "selection-dashboard-2",
+                "candidate_selection_dashboard",
+                10,
+                phase="deployment",
+                status="ready",
+                disposition="wait",
+                spec_sha256="d" * 64,
+                selected_candidate_id="candidate-1",
+                merge_commit="e" * 40,
+                next_action="deployment_ready_for_next_phase",
+            ),
+        )
+    )
+
+    DashboardProjection(source, gateway).project(31)
+
+    body = gateway.created[0]
+    assert "Selected candidate: `candidate-1`" in body
+    assert "Merge commit: `" + "e" * 40 + "`" in body
+    assert "Deployment-ready; deployment has not been dispatched" in body
+
+
 class FakeCommands:
     def __init__(self, responses: dict[tuple[str, ...], str]) -> None:
         self.responses = responses
