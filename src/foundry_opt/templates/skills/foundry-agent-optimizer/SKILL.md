@@ -11,13 +11,39 @@ description: >-
 Create one `[Optimize]` issue from the generated form. That issue is the sole normal campaign
 initiation action. Do not start a campaign with `workflow_dispatch`, a phase command, a label, or a
 handwritten branch. The only normal human action after filing is to merge exactly one eligible
-candidate pull request.
+candidate pull request. Until then, the user watches the root issue dashboard and candidate PRs;
+policy/specification, baseline, candidate design, draft evaluation, and evidence publication require
+no normal human action.
+
+The only exceptional human gate is an immutable specification PR. Request it only when the resolved
+spec contains new asset bytes, custom, synthetic, or trace-derived assets, changed repository
+content, unpinned assets, human-gated assets, or policy that disables auto-approval. Existing
+immutable policy-approved assets advance without a spec PR.
 
 The assigned `foundry-optimization-steward` must run
 `foundry-opt steward advance --issue <number>` and resume from the issue's durable Git-state ref.
 Comments and labels are projections, never authority. Transport workflows record trusted events,
 apply only persisted outbox effects, and reassign Copilot; they never classify assets, design or
 evaluate candidates, select a winner, or declare completion.
+
+## User-visible contract
+
+`.github/foundry-optimizer.yaml` is durable repository policy: environments, configured targets,
+allowed paths and mutations, asset sources, limits/defaults, validation, checks, identities, and
+deployment capabilities. Each issue selects one target and supplies its own optimization goal,
+assets, metrics, and requested mutations within that boundary. Different issues may optimize
+different measurable behaviors without rewriting repository policy.
+
+The root issue dashboard is the user's primary surface. Project specification classification and
+digest; bounded-campaign phase/status; baseline and ranked candidate aggregates, deltas, guardrails,
+and redacted-evidence links; selected merge lineage; deployment state; and the final Foundry
+version, Actions run, portal link, hashes, required checks, and retained baseline/draft/deployed
+metrics. Candidate PRs show the exact patch and the `Foundry exact candidate check`. Merge exactly
+one eligible PR; the steward then automatically deploys, re-evaluates retained improvement,
+supersedes competing candidates, updates the final dashboard, and closes the root issue.
+
+The private `refs/heads/foundry-opt/state/issue-<number>` ref is the canonical hash-chained history
+and recovery source. The completed issue and candidate PRs are its user-facing projection.
 
 This adaptation keeps an unmodified Tenzing snapshot under `references/tenzing/`. Read
 `references/tenzing/README.md`, `references/tenzing/climb.md`, and `ADAPTER_MAPPING.md`; never edit
@@ -35,6 +61,10 @@ The steward is the only owner of campaign transitions. It consumes trusted issue
 candidate PR, and deployment workflow events; advances canonical steward interfaces; persists
 privacy-safe state and outbox intents; and resumes after session replacement. It never exposes raw
 evidence, held-out rows, traces, or credentials.
+
+GitHub Actions are transport/capability only. Pull requests must be opened natively by Copilot
+planner and applier sessions, not by Actions or direct PR APIs, because enterprise policy reserves
+PR authorship to Copilot.
 
 ### Specification planner
 
@@ -75,3 +105,7 @@ request; merging is the selection signal.
   requests.
 - Deployment runs under the separate deployment OIDC identity and consumes only persisted
   deployment intents, claims, and results.
+- Reconciliation may retry or reassign from the durable ref, but it must not invent state from
+  comments, labels, or conversation history.
+- Keep the optimizer identity separate from the deployment identity. Azure tenant, subscription,
+  and client IDs are non-secret variables; never request an Azure client secret.

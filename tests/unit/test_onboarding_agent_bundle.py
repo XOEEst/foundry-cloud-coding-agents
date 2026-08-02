@@ -227,6 +227,10 @@ def test_bundle_copies_tenzing_snapshot_license_and_context() -> None:
     assert "repository_id:123" in context
     assert "tenant-id" not in context
     assert "client-id" not in context
+    assert "durable repository policy" in context
+    assert "merge exactly one eligible candidate PR" in context
+    assert "Exceptional action" in context
+    assert "refs/heads/foundry-opt/state/issue-<N>" in context
 
 
 def test_generated_skill_documents_issue_only_orchestration() -> None:
@@ -245,6 +249,25 @@ def test_generated_skill_documents_issue_only_orchestration() -> None:
     assert "Merge exactly one eligible candidate pull request" in normalized
     assert "Do not start a campaign with `workflow_dispatch`" in skill
     assert "foundry-opt optimize run --issue" not in skill
+    assert "The only exceptional human gate" in skill
+    assert "Foundry exact candidate check" in skill
+    assert "deployment identity" in skill
+
+
+def test_generated_issue_form_explains_normal_and_exceptional_user_actions() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    issue_form = yaml.safe_load(
+        files[Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml")]
+    )
+    guidance = issue_form["body"][0]["attributes"]["value"]
+
+    assert "Creating this one issue starts the campaign" in guidance
+    assert "merge exactly one" in guidance
+    assert "immutable spec PR" in guidance
+    assert "root issue dashboard" in guidance
 
 
 def test_bundle_generates_transport_and_verification_workflows() -> None:
@@ -648,3 +671,5 @@ def test_bundle_generates_copilot_steward_domain_instructions() -> None:
     assert "canonical steward interfaces" in steward
     assert "foundry-opt steward advance" in steward
     assert "raw evidence" in steward
+    assert "root issue dashboard" in steward
+    assert "retained-improvement evaluation" in steward

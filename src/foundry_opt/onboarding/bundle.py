@@ -43,6 +43,16 @@ def generate_repository_agent_bundle(
         "`AZURE_DEPLOYMENT_CLIENT_ID` Actions-environment variable.\n"
         "- Create the generated `[Optimize]` issue to start; workflow "
         "dispatch is retry-only.\n"
+        "- `.github/foundry-optimizer.yaml` is durable repository policy; "
+        "each issue supplies its own goal and assets within that boundary.\n"
+        "- Normal user action: watch the root dashboard and candidate PRs, "
+        "then merge exactly one eligible candidate PR.\n"
+        "- Exceptional action: review and merge an immutable spec PR only "
+        "when the dashboard reports new, changed, custom, synthetic, trace, "
+        "human-gated, or unpinned assets.\n"
+        "- Canonical state and recovery history live at "
+        "`refs/heads/foundry-opt/state/issue-<N>`; issue comments and labels "
+        "are projections.\n"
     )
     contents.update(
         {
@@ -118,9 +128,15 @@ def _issue_form(request: OnboardingRequest) -> str:
                 "type": "markdown",
                 "attributes": {
                     "value": (
-                        "Describe the desired behavior and evaluation contract. "
-                        "Do not include credentials, raw traces, or private "
-                        "dataset rows."
+                        "Creating this one issue starts the campaign. Normally "
+                        "you take no action until eligible candidate PRs are "
+                        "ready, then merge exactly one. An immutable spec PR "
+                        "needs review only when the dashboard identifies new, "
+                        "changed, custom, synthetic, trace-derived, human-gated, "
+                        "or unpinned assets. Track bounded experiments, "
+                        "held-out evidence, deployment, and retained improvement "
+                        "in the root issue dashboard. Do not include credentials, "
+                        "raw traces, or private dataset rows."
                     )
                 },
             },
@@ -265,6 +281,9 @@ Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
 `REPOSITORY_CONTEXT.md`, the assigned optimization issue, and the exact
 `specialist_work_request` whose `work_kind` is `prepare_specification_pr`.
 
+This is an exceptional human gate, not a normal phase. The steward requests it
+only for new, changed, custom, synthetic, trace-derived, human-gated, or
+unpinned assets, or when repository policy disables automatic spec approval.
 Use the canonical specification interface to materialize only the requested
 immutable specification and approved repository evaluation assets. Do not
 classify policy, generate candidates, evaluate drafts, select, merge, deploy,
@@ -291,7 +310,8 @@ Edit only the reserved worktree and only its declared edit paths. Follow the
 pinned goal, mutation allowlist, restricted opt-ins, baseline aggregates, and
 redacted prior feedback. Return only the matching privacy-safe
 `CandidateDesignResult`; never claim evaluation status, eligibility, or
-selection. Never read held-out rows or raw evidence, call GitHub APIs, create a
+selection. The campaign budget and cutoff are authoritative and must not be
+extended. Never read held-out rows or raw evidence, call GitHub APIs, create a
 branch or pull request, merge, or deploy.
 """
 
@@ -312,8 +332,9 @@ binding. Invoke
 
 Do not edit files directly, reinterpret the patch, repair conflicts, change the
 base, merge, or deploy. The native Copilot session opens the pull request from
-the exact verified result. Stop when deterministic verification rejects the
-candidate.
+the exact verified result so the user can inspect its diff, redacted evidence,
+and `Foundry exact candidate check`. Stop when deterministic verification
+rejects the candidate.
 """
 
 
@@ -336,6 +357,14 @@ reconstruct campaign state from comments, labels, or conversation history.
 Execute domain logic only through canonical steward interfaces, never by
 reproducing transitions in instructions, workflows, or shell.
 
+Maintain the root issue dashboard as the user-facing projection: specification
+classification/digest, bounded experiment progress, baseline and eligible
+candidate aggregates with redacted-evidence links, selected merge lineage,
+deployment workflow/run and Foundry version, retained improvement, and final
+closure. The user normally does nothing until merging exactly one eligible
+candidate PR. Delegate a specification PR only for the exceptional immutable
+asset gate described by policy.
+
 Never expose raw evidence, traces, held-out rows, credentials, or private
 dataset content. Treat only privacy-allowlisted aggregates and durable
 references as readable.
@@ -352,7 +381,10 @@ Handle persisted specialist intents exactly as designed:
 
 Do not create pull requests, merge, deploy, or apply GitHub effects directly.
 Native Copilot specialist sessions create their own pull requests; transport
-workflows apply only effects already persisted in the outbox.
+workflows apply only effects already persisted in the outbox. After one
+eligible candidate merge, automatically advance persisted deployment,
+retained-improvement evaluation, competing-candidate supersession, final
+dashboard projection, and root issue closure.
 """
 
 
