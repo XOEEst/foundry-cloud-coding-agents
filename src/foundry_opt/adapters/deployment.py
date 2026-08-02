@@ -332,11 +332,20 @@ def _provenance_metadata(request: DeploymentRequest) -> dict[str, str]:
         "foundry-opt-tree-hash": request.tree_hash,
         "foundry-opt-evidence-sha256": request.evidence_sha256,
     }
-    if request.lineage is not None:
-        provenance[_LINEAGE_PROVENANCE_KEY] = (
-            optimization_deployment_lineage_sha256(request.lineage)
-        )
+    lineage_sha256 = _request_lineage_sha256(request)
+    if lineage_sha256 is not None:
+        provenance[_LINEAGE_PROVENANCE_KEY] = lineage_sha256
     return provenance
+
+
+def _request_lineage_sha256(
+    request: DeploymentRequest,
+) -> str | None:
+    if request.lineage_sha256 is not None:
+        return request.lineage_sha256
+    if request.lineage is not None:
+        return optimization_deployment_lineage_sha256(request.lineage)
+    return None
 
 
 def _verify_published_baseline(
@@ -439,12 +448,11 @@ def _parse_published_readback(
     # match, the record is bound to the exact lineage object the caller
     # supplied on the request (not a value rebuilt from the readback).
     lineage: OptimizationDeploymentLineage | None = None
-    if request.lineage is not None:
-        expected_digest = optimization_deployment_lineage_sha256(
-            request.lineage
-        )
+    expected_digest = _request_lineage_sha256(request)
+    if expected_digest is not None:
         if metadata.get(_LINEAGE_PROVENANCE_KEY) != expected_digest:
             raise DeploymentLineageMismatchError()
+    if request.lineage is not None:
         lineage = request.lineage
     try:
         return DeploymentRecord(

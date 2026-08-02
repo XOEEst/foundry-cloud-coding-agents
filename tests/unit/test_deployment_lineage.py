@@ -227,6 +227,54 @@ def test_deployment_request_defaults_lineage_to_none() -> None:
     request = DeploymentRequest(**_request_kwargs())
 
     assert request.lineage is None
+    assert request.lineage_sha256 is None
+
+
+def test_deployment_request_accepts_persisted_lineage_digest() -> None:
+    request = DeploymentRequest(
+        **_request_kwargs(lineage_sha256="9" * 64)
+    )
+
+    assert request.lineage is None
+    assert request.lineage_sha256 == "9" * 64
+
+
+@pytest.mark.parametrize(
+    "lineage_sha256",
+    ["", "9" * 63, "A" * 64, "not-a-digest"],
+)
+def test_deployment_request_rejects_invalid_persisted_lineage_digest(
+    lineage_sha256: str,
+) -> None:
+    with pytest.raises(ValueError):
+        DeploymentRequest(
+            **_request_kwargs(lineage_sha256=lineage_sha256)
+        )
+
+
+def test_deployment_request_rejects_conflicting_lineage_digests() -> None:
+    with pytest.raises(ValueError, match="lineage digests"):
+        DeploymentRequest(
+            **_request_kwargs(
+                lineage=_lineage(),
+                lineage_sha256="9" * 64,
+            )
+        )
+
+
+def test_deployment_request_accepts_matching_lineage_digests() -> None:
+    lineage = _lineage()
+    digest = optimization_deployment_lineage_sha256(lineage)
+
+    request = DeploymentRequest(
+        **_request_kwargs(
+            lineage=lineage,
+            lineage_sha256=digest,
+        )
+    )
+
+    assert request.lineage is lineage
+    assert request.lineage_sha256 == digest
 
 
 @pytest.mark.parametrize(

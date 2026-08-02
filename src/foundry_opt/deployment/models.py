@@ -210,6 +210,7 @@ class DeploymentRequest:
     tree_hash: str
     evidence_sha256: str
     lineage: OptimizationDeploymentLineage | None = None
+    lineage_sha256: str | None = None
     description: str | None = None
     metadata: Mapping[str, str] = field(default_factory=dict)
 
@@ -261,8 +262,21 @@ class DeploymentRequest:
                     "lineage patch/tree/evidence hashes must match the "
                     "deployment request"
                 )
+        if self.lineage_sha256 is not None:
+            _sha256(self.lineage_sha256, "lineage_sha256")
+        if (
+            self.lineage is not None
+            and self.lineage_sha256 is not None
+            and optimization_deployment_lineage_sha256(self.lineage)
+            != self.lineage_sha256
+        ):
+            raise ValueError("lineage digests must match")
         metadata = dict(self.metadata)
-        maximum_caller_entries = 9 if self.lineage is not None else 10
+        maximum_caller_entries = (
+            9
+            if self.lineage is not None or self.lineage_sha256 is not None
+            else 10
+        )
         if len(metadata) > maximum_caller_entries:
             raise ValueError(
                 "metadata exceeds the caller entry budget after reserved "

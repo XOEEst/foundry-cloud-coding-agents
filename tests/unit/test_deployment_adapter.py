@@ -212,7 +212,11 @@ def _readback(
         "foundry-opt-tree-hash": request.tree_hash,
         "foundry-opt-evidence-sha256": request.evidence_sha256,
     }
-    if request.lineage is not None:
+    if request.lineage_sha256 is not None:
+        provenance["foundry-opt-lineage-sha256"] = (
+            request.lineage_sha256
+        )
+    elif request.lineage is not None:
         provenance["foundry-opt-lineage-sha256"] = (
             optimization_deployment_lineage_sha256(request.lineage)
         )
@@ -856,6 +860,61 @@ def test_publish_includes_lineage_digest_in_published_and_readback_metadata(
     )["metadata"]
     assert published_metadata["foundry-opt-lineage-sha256"] == expected_digest
     assert record.metadata["foundry-opt-lineage-sha256"] == expected_digest
+
+
+def test_publish_includes_persisted_orchestration_lineage_digest(
+    tmp_path: Path,
+) -> None:
+    expected_digest = "9" * 64
+    request = replace(
+        _request(tmp_path),
+        lineage_sha256=expected_digest,
+    )
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(request, status="creating"),
+            _readback(request),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    record = gateway.publish(request)
+
+    published_metadata = json.loads(
+        _multipart_part(client.requests[1], "metadata")
+    )["metadata"]
+    assert published_metadata["foundry-opt-lineage-sha256"] == (
+        expected_digest
+    )
+    assert record.metadata["foundry-opt-lineage-sha256"] == expected_digest
+    assert record.lineage is None
+
+
+def test_publish_rejects_wrong_persisted_orchestration_lineage_digest(
+    tmp_path: Path,
+) -> None:
+    request = replace(
+        _request(tmp_path),
+        lineage_sha256="9" * 64,
+    )
+    client = FakeClient(
+        [
+            _baseline(),
+            _published(request.bundle.sha256),
+            _readback(
+                request,
+                mutate=lambda payload: payload["metadata"].update(
+                    {"foundry-opt-lineage-sha256": "0" * 64}
+                ),
+            ),
+        ]
+    )
+    gateway, _ = _gateway(client)
+
+    with pytest.raises(DeploymentLineageMismatchError):
+        gateway.publish(request)
 
 
 def test_publish_returns_record_retaining_exact_request_lineage(
