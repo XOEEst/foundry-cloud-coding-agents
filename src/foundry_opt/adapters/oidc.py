@@ -25,6 +25,10 @@ class CommandOidcVerifier:
         request: OnboardingRequest,
         discovery: RepositoryDiscovery,
     ) -> OidcTrustResult:
+        if request.client_id == request.deployment_client_id:
+            raise OidcVerificationError(
+                "Optimizer and deployment Entra applications must be distinct."
+            )
         customization = self._json(
             (
                 "gh",
@@ -70,6 +74,16 @@ class CommandOidcVerifier:
             f"{request.environment_name.replace(':', '%3A')}"
             if use_default
             else f"{subject_prefix}:repository_id:{discovery.repository_id}"
+        )
+        deployment_environment = (
+            request.mirror_actions_environment
+            or request.environment_name
+        )
+        deployment_subject = (
+            f"{subject_prefix}:environment:"
+            f"{deployment_environment.replace(':', '%3A')}"
+            if use_default
+            else subject
         )
 
         account = self._json(
@@ -124,6 +138,38 @@ class CommandOidcVerifier:
                 "The Azure CLI operator cannot access the requested subscription."
             )
 
+        self._verify_application(
+            request,
+            request.client_id,
+            subject,
+            description="target",
+        )
+        self._verify_application(
+            request,
+            request.deployment_client_id,
+            deployment_subject,
+            description="deployment",
+        )
+
+        return OidcTrustResult(
+            subject=subject,
+            repository_id=discovery.repository_id,
+            verified=True,
+            detail=(
+                "GitHub immutable subject, Azure operator access, optimizer "
+                "and deployment Entra applications, and exact federated "
+                "credentials are verified."
+            ),
+        )
+
+    def _verify_application(
+        self,
+        request: OnboardingRequest,
+        client_id: str,
+        subject: str,
+        *,
+        description: str,
+    ) -> None:
         application = self._json(
             (
                 "az",
@@ -131,7 +177,7 @@ class CommandOidcVerifier:
                 "app",
                 "show",
                 "--id",
-                request.client_id,
+                client_id,
                 "--query",
                 "{appId:appId,id:id}",
                 "-o",
@@ -141,16 +187,16 @@ class CommandOidcVerifier:
         )
         if (
             not isinstance(application, dict)
-            or application.get("appId") != request.client_id
+            or application.get("appId") != client_id
             or not application.get("id")
         ):
             raise OidcVerificationError(
-                "The target Entra application could not be verified."
+                f"The {description} Entra application could not be verified."
             )
         application_object_id = application["id"]
         if not isinstance(application_object_id, str):
             raise OidcVerificationError(
-                "The target Entra application object ID is invalid."
+                f"The {description} Entra application object ID is invalid."
             )
 
         credentials = self._json(
@@ -172,18 +218,9 @@ class CommandOidcVerifier:
             for credential in credentials
         ):
             raise OidcVerificationError(
-                "The Entra application lacks the exact repository-ID subject trust."
+                f"The {description} Entra application lacks the exact "
+                "repository-ID subject trust."
             )
-
-        return OidcTrustResult(
-            subject=subject,
-            repository_id=discovery.repository_id,
-            verified=True,
-            detail=(
-                "GitHub immutable subject, Azure operator access, target Entra "
-                "application, and exact federated credential are verified."
-            ),
-        )
 
     def _text(
         self,

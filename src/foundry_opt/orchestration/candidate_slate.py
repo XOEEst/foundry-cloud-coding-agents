@@ -415,13 +415,16 @@ def applier_worker_result_record(
     result: ApplierWorkerResult,
     *,
     sequence: int | None = None,
+    generation: int | None = None,
 ) -> OutboxRecord:
     intent = _worker_intent(planned)
     result.require_matches(intent)
     return OutboxRecord(
         record_id=f"{planned.record_id}-succeeded",
         kind="applier_worker_issue_succeeded",
-        generation=planned.generation,
+        generation=(
+            planned.generation if generation is None else generation
+        ),
         sequence=planned.sequence if sequence is None else sequence,
         payload={
             "assigned": result.assigned,
@@ -480,6 +483,7 @@ class CandidateEffectResultRecorder:
             planned[0],
             result,
             sequence=snapshot.state.sequence,
+            generation=snapshot.state.generation,
         )
         existing = tuple(
             record
@@ -1937,6 +1941,12 @@ def _worker_intent(record: OutboxRecord) -> ApplierWorkerIntent:
     ):
         raise ValueError("worker intent binding is invalid")
     return ApplierWorkerIntent(record.record_id, binding)
+
+
+def applier_worker_intent(record: OutboxRecord) -> ApplierWorkerIntent:
+    """Parse one persisted applier intent for a transport bridge."""
+
+    return _worker_intent(record)
 
 
 def _completed_worker_bindings(

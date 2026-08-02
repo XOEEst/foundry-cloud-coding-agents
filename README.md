@@ -24,25 +24,19 @@ Repository policy and allowed capabilities live in
 goal, datasets, evaluators, metric thresholds, materiality, mutation classes,
 and human/autopilot decision mode.
 
-```shell
-foundry-opt optimize spec --issue 42
-# Review and merge the generated immutable specification PR.
-foundry-opt optimize run --issue 42
-foundry-opt optimize candidate request --issue 42
-# Edit only the reserved worktree and write the idea JSON outside it.
-foundry-opt optimize candidate submit \
-  --issue 42 \
-  --candidate candidate-1 \
-  --idea-file .foundry-optimizer/campaigns/issue-42/candidates/candidate-1/idea.json
-foundry-opt optimize run --issue 42
-```
+`foundry-opt init` generates the `[Optimize]` issue form, Copilot custom
+agents, and transport-only workflows. Create that issue to start a campaign.
+The assigned steward resumes with `foundry-opt steward advance --issue 42`;
+scheduled reconciliation can recover an inactive tracked campaign. Workflow
+dispatch is an administrative retry, not a normal phase launcher.
 
 Eligible candidates are published as redacted evidence plus exact patch
-artifacts. A Copilot coding agent may apply the patch, but the deterministic
-candidate check verifies the campaign issue, base commit, patch, evidence, and
-result tree before a human merge. `foundry-opt optimize reconcile --issue 42`
-then observes merge/deployment lineage and closes the issue only when the
-published version retains the measured improvement.
+artifacts. Copilot-native planner and applier sessions open their own pull
+requests; GitHub Actions never create them. The deterministic candidate check
+verifies the campaign issue, base commit, patch, evidence, and result tree.
+Merge exactly one eligible candidate pull request. The steward then observes
+deployment lineage and closes the issue only when the published version
+retains the measured improvement.
 
 Runtime campaign state and worktrees remain ignored. Approved specifications
 under `.foundry-optimizer/specs/issue-<N>/` and published evidence are the
@@ -67,7 +61,12 @@ Azure client secrets are not required for the acceptance environment.
 `foundry-opt init` can create the repository-level GitHub Agents variables
 `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_SUBSCRIPTION_ID`; use its
 Actions-environment mirroring option when ordinary workflows also need those
-non-secret values.
+non-secret values. The generated deployment bridge uses the separate
+`AZURE_DEPLOYMENT_CLIENT_ID` Actions-environment variable and never exposes
+that identity to Copilot Agents variables. The configured deployment job must
+authenticate with that identity before deployment and upload its
+`deployment-result.json` as the
+`foundry-optimization-deployment-result` artifact.
 
 ## Deployment constraint
 

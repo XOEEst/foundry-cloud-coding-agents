@@ -142,6 +142,40 @@ def run_onboarding(
             discovery=discovery,
             oidc=oidc,
         )
+    if planned_changes and all(
+        change.status is ChangeStatus.UNCHANGED
+        for change in planned_changes
+    ):
+        variable_changes = ()
+        if request.set_github_variables:
+            try:
+                variable_changes = dependencies.variables.configure(
+                    request,
+                    discovery,
+                )
+            except RuntimeError as error:
+                return OnboardingResult(
+                    status=OnboardingStatus.PARTIAL,
+                    changes=planned_changes,
+                    draft_pull_request=draft_pr,
+                    discovery=discovery,
+                    oidc=oidc,
+                    blockers=(
+                        "GitHub variable configuration failed: "
+                        f"{_safe_error(error)}",
+                    ),
+                )
+        return OnboardingResult(
+            status=OnboardingStatus.READY,
+            changes=planned_changes,
+            draft_pull_request=draft_pr,
+            discovery=discovery,
+            oidc=oidc,
+            variable_changes=variable_changes,
+            guidance=(
+                "Generated onboarding files are already current.",
+            ),
+        )
     foundry_agent = next(
         agent
         for agent in discovery.foundry_agents
@@ -329,7 +363,22 @@ def run_onboarding(
                     "AZURE_SUBSCRIPTION_ID.",
                 )
             ),
+            *(
+                (
+                    "The Actions deployment environment "
+                    f"{request.mirror_actions_environment} received the "
+                    "separate AZURE_DEPLOYMENT_CLIENT_ID variable.",
+                )
+                if request.mirror_actions_environment is not None
+                else (
+                    "Create AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and "
+                    "AZURE_DEPLOYMENT_CLIENT_ID in the Actions environment "
+                    f"{request.environment_name}.",
+                )
+            ),
             "Azure OIDC does not require GitHub Agents or Actions secrets.",
+            "Create the generated [Optimize] issue to start a campaign; "
+            "workflow dispatch is retry-only.",
             f"Draft onboarding pull request created: {publication.url}",
         ),
     )
@@ -370,12 +419,13 @@ def _conflict_result(
     **values,
 ) -> OnboardingResult:
     conflict_set = set(error.paths)
+    paths = (*contents, *(path for path in error.paths if path not in contents))
     return OnboardingResult(
         status=OnboardingStatus.CONFLICT,
         changes=tuple(
             OnboardingChange(
                 path=path,
-                content=content,
+                content=contents.get(path, ""),
                 status=(
                     ChangeStatus.CONFLICT
                     if path in conflict_set
@@ -387,7 +437,7 @@ def _conflict_result(
                     else None
                 ),
             )
-            for path, content in contents.items()
+            for path in paths
         ),
         draft_pull_request=draft_pr,
         blockers=tuple(

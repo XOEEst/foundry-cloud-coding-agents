@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 import json
@@ -109,7 +109,14 @@ class LocalOnboardingDiscovery:
             datasets=inventory.datasets,
             evaluators=inventory.evaluators,
             app_insights=inventory.app_insights,
-            deployment_workflows=_discover_deployment_workflows(root),
+            deployment_workflows=_discover_deployment_workflows(
+                root,
+                actions_environment=(
+                    request.mirror_actions_environment
+                    or request.environment_name
+                ),
+                default_branch=default_branch,
+            ),
         )
 
     def _run(self, arguments: tuple[str, ...], cwd: Path) -> str:
@@ -332,6 +339,9 @@ def _is_validation_command(command: str) -> bool:
 
 def _discover_deployment_workflows(
     root: Path,
+    *,
+    actions_environment: str,
+    default_branch: str,
 ) -> tuple[DeploymentWorkflowDiscovery, ...]:
     workflow_root = root / ".github/workflows"
     if not workflow_root.is_dir():
@@ -339,6 +349,14 @@ def _discover_deployment_workflows(
     discoveries: list[DeploymentWorkflowDiscovery] = []
     paths = sorted((*workflow_root.glob("*.yml"), *workflow_root.glob("*.yaml")))
     for path in paths:
+        if path.name in {
+            "copilot-setup-steps.yml",
+            "foundry-exact-candidate-check.yml",
+            "foundry-optimization-deployment-bridge.yml",
+            "foundry-optimization-issue-intake.yml",
+            "foundry-optimization-reconcile.yml",
+        }:
+            continue
         try:
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -352,10 +370,9 @@ def _discover_deployment_workflows(
             marker in lowered for marker in ("foundry", "azure", "azd")
         ):
             continue
-        trigger = (
-            "merge"
-            if re.search(r"(?m)^\s*push\s*:", content)
-            else "manual"
+        trigger, trigger_verified = _deployment_trigger(
+            document,
+            default_branch,
         )
         discoveries.append(
             DeploymentWorkflowDiscovery(
@@ -367,9 +384,212 @@ def _discover_deployment_workflows(
                     and document.get("x-foundry-opt-role") == "deployment"
                     else None
                 ),
+                name=(
+                    str(document["name"])
+                    if isinstance(document, dict)
+                    and isinstance(document.get("name"), str)
+                    and str(document["name"]).strip()
+                    else path.relative_to(root).as_posix()
+                ),
+                deployment_identity_verified=(
+                    _uses_deployment_identity(
+                        document,
+                        actions_environment,
+                    )
+                ),
+                trigger_contract_verified=trigger_verified,
             )
         )
     return tuple(discoveries)
+
+
+def _deployment_trigger(
+    document: object,
+    default_branch: str,
+) -> tuple[str, bool]:
+    if not isinstance(document, Mapping):
+        return "manual", False
+    triggers = document.get("on", document.get(True))
+    if isinstance(triggers, str):
+        trigger_names = {triggers}
+        trigger_config: Mapping[object, object] = {}
+    elif isinstance(triggers, list):
+        trigger_names = {
+            str(value) for value in triggers if isinstance(value, str)
+        }
+        trigger_config = {}
+    elif isinstance(triggers, Mapping):
+        trigger_names = {
+            str(value) for value in triggers
+        }
+        trigger_config = triggers
+    else:
+        return "manual", False
+    manual = "workflow_dispatch" in trigger_names
+    merge = bool({"push", "workflow_run"} & trigger_names)
+    if manual == merge:
+        return ("merge" if merge else "manual"), False
+    if manual:
+        dispatch = trigger_config.get("workflow_dispatch")
+        inputs = (
+            dispatch.get("inputs")
+            if isinstance(dispatch, Mapping)
+            else None
+        )
+        return (
+            "manual",
+            isinstance(inputs, Mapping)
+            and {
+                "selected_commit",
+                "foundry_opt_effect_id",
+            }
+            <= {str(name) for name in inputs}
+            and document.get("run-name")
+            == "${{ inputs.foundry_opt_effect_id }}",
+        )
+    if "push" in trigger_names:
+        push = trigger_config.get("push")
+        branches = (
+            push.get("branches")
+            if isinstance(push, Mapping)
+            else None
+        )
+        return (
+            "merge",
+            isinstance(branches, list)
+            and default_branch in branches,
+        )
+    workflow_run = trigger_config.get("workflow_run")
+    workflows = (
+        workflow_run.get("workflows")
+        if isinstance(workflow_run, Mapping)
+        else None
+    )
+    types = (
+        workflow_run.get("types")
+        if isinstance(workflow_run, Mapping)
+        else None
+    )
+    return (
+        "merge",
+        isinstance(workflows, list)
+        and bool(workflows)
+        and isinstance(types, list)
+        and "completed" in types,
+    )
+
+
+def _uses_deployment_identity(
+    document: object,
+    actions_environment: str,
+) -> bool:
+    if not isinstance(document, Mapping):
+        return False
+    workflow_permissions = document.get("permissions")
+    jobs = document.get("jobs")
+    if not isinstance(jobs, Mapping):
+        return False
+    for job in jobs.values():
+        if not isinstance(job, Mapping):
+            continue
+        environment = job.get("environment")
+        environment_name = (
+            environment.get("name")
+            if isinstance(environment, Mapping)
+            else environment
+        )
+        permissions = job.get("permissions", workflow_permissions)
+        if (
+            environment_name != actions_environment
+            or not isinstance(permissions, Mapping)
+            or permissions.get("id-token") != "write"
+        ):
+            continue
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        deployment_steps = tuple(
+            index
+            for index, step in enumerate(steps)
+            if (
+                isinstance(step, Mapping)
+                and isinstance(step.get("run"), str)
+                and re.search(
+                    r"(?i)(?:^|\s)(?:azd\s+deploy|"
+                    r"foundry-opt(?:\s+\S+)*\s+deploy)(?:\s|$)",
+                    str(step["run"]),
+                )
+                is not None
+                and _runs_on_success(step.get("if"))
+            )
+        )
+        if not deployment_steps:
+            continue
+        login_steps: list[int] = []
+        publication_steps: list[int] = []
+        for index, step in enumerate(steps):
+            if not isinstance(step, Mapping):
+                continue
+            uses = step.get("uses")
+            values = step.get("with")
+            client_id = (
+                values.get("client-id")
+                if isinstance(values, Mapping)
+                else None
+            )
+            job_environment = job.get("env")
+            deployment_client = (
+                client_id
+                == "${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}"
+                or (
+                    client_id == "${{ env.AZURE_CLIENT_ID }}"
+                    and isinstance(job_environment, Mapping)
+                    and job_environment.get("AZURE_CLIENT_ID")
+                    == "${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}"
+                )
+            )
+            if (
+                isinstance(uses, str)
+                and re.fullmatch(
+                    r"azure/login@[0-9a-fA-F]{40}",
+                    uses,
+                )
+                and deployment_client
+            ):
+                login_steps.append(index)
+            if (
+                isinstance(uses, str)
+                and re.fullmatch(
+                    r"actions/upload-artifact@[0-9a-fA-F]{40}",
+                    uses,
+                )
+                and isinstance(values, Mapping)
+                and values.get("name")
+                == "foundry-optimization-deployment-result"
+                and isinstance(values.get("path"), str)
+                and Path(str(values["path"])).name
+                == "deployment-result.json"
+                and _runs_on_success(step.get("if"))
+            ):
+                publication_steps.append(index)
+        if (
+            len(login_steps) == 1
+            and login_steps[0] < min(deployment_steps)
+            and publication_steps
+            and min(publication_steps) > max(deployment_steps)
+        ):
+            return True
+    return False
+
+
+def _runs_on_success(condition: object) -> bool:
+    if condition is None:
+        return True
+    return (
+        isinstance(condition, str)
+        and condition.strip()
+        in {"success()", "${{ success() }}"}
+    )
 
 
 def _group_versions(

@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from foundry_opt.deployment import DEPLOYMENT_OIDC_CLIENT_ID
+
 
 class OnboardingStatus(StrEnum):
     READY = "ready"
@@ -14,6 +16,9 @@ class OnboardingStatus(StrEnum):
 
 class ChangeStatus(StrEnum):
     CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    REMOVED = "removed"
     PLANNED = "planned"
     CONFLICT = "conflict"
 
@@ -83,6 +88,9 @@ class DeploymentWorkflowDiscovery:
     path: Path
     trigger: str
     role: str | None = None
+    name: str | None = None
+    deployment_identity_verified: bool | None = None
+    trigger_contract_verified: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +137,7 @@ class OnboardingRequest:
     client_id: str
     subscription_id: str
     product_install: str
+    deployment_client_id: str = DEPLOYMENT_OIDC_CLIENT_ID
     set_github_variables: bool = False
     mirror_actions_environment: str | None = None
     update_github_variables: bool = False

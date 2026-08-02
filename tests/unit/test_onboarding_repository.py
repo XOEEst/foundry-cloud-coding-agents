@@ -1,4 +1,6 @@
 from collections.abc import Mapping, Sequence
+import hashlib
+import json
 from pathlib import Path
 import subprocess
 
@@ -25,6 +27,7 @@ from foundry_opt.onboarding.repository import (
     GitChangeSetWriter,
     OnboardingPublishError,
     UnsafeChangePathError,
+    normalize_legacy_generated_content,
 )
 from foundry_opt.preflight.interfaces import CommandResult
 
@@ -49,6 +52,24 @@ def _repository(tmp_path: Path) -> Path:
     _git(repository, "add", "README.md")
     _git(repository, "commit", "-m", "baseline")
     return repository
+
+
+def _managed_contents(path: Path, content: str) -> dict[Path, str]:
+    manifest = {
+        "files": {
+            path.as_posix(): hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest(),
+        },
+        "generator": "foundry-opt init",
+        "schema_version": 1,
+    }
+    return {
+        path: content,
+        Path(".github/foundry-optimizer.generated.json"): (
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        ),
+    }
 
 
 def test_git_change_set_builds_commit_without_materializing_generated_paths(
@@ -90,6 +111,260 @@ def test_git_change_set_builds_commit_without_materializing_generated_paths(
         )
         == "name: Setup"
     )
+
+
+def test_git_change_set_updates_only_manifest_owned_generated_files(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    path = Path(".github/workflows/foundry-optimization-control.yml")
+    old = _managed_contents(path, "name: Old generated control\n")
+    for relative, content in old.items():
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    _git(repository, "add", ".github")
+    _git(repository, "commit", "-m", "generated onboarding v1")
+    base = _git(repository, "rev-parse", "HEAD")
+    desired = _managed_contents(
+        path,
+        "name: Trusted transport retry\n",
+    )
+    writer = GitChangeSetWriter(SubprocessCommandRunner())
+
+    planned = writer.prevalidate(repository, desired)
+    changes = writer.write(repository, desired)
+
+    assert {change.status for change in planned} == {
+        ChangeStatus.UPDATED
+    }
+    assert {change.status for change in changes} == {
+        ChangeStatus.UPDATED
+    }
+    commit = changes[0].commit_sha
+    assert commit and commit != base
+    assert (
+        _git(repository, "show", f"{commit}:{path.as_posix()}")
+        == "name: Trusted transport retry"
+    )
+    assert _git(repository, "rev-parse", "HEAD") == base
+
+
+def test_git_change_set_is_idempotent_when_generated_files_match(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    path = Path(".github/workflows/foundry-optimization-reconcile.yml")
+    contents = _managed_contents(path, "name: Trusted transport retry\n")
+    for relative, content in contents.items():
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    _git(repository, "add", ".github")
+    _git(repository, "commit", "-m", "generated onboarding")
+    base = _git(repository, "rev-parse", "HEAD")
+    writer = GitChangeSetWriter(SubprocessCommandRunner())
+
+    planned = writer.prevalidate(repository, contents)
+    changes = writer.write(repository, contents)
+
+    assert {change.status for change in planned} == {
+        ChangeStatus.UNCHANGED
+    }
+    assert {change.status for change in changes} == {
+        ChangeStatus.UNCHANGED
+    }
+    assert {change.commit_sha for change in changes} == {base}
+    assert _git(repository, "rev-parse", "HEAD") == base
+
+
+def test_git_change_set_migrates_exact_legacy_generated_content(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    path = Path(".github/workflows/foundry-optimization-control.yml")
+    old_content = "name: Foundry optimization control\n"
+    destination = repository / path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(old_content, encoding="utf-8")
+    _git(repository, "add", path.as_posix())
+    _git(repository, "commit", "-m", "legacy generated onboarding")
+    desired = _managed_contents(
+        path,
+        "name: Trusted transport retry\n",
+    )
+    manifest_path = Path(".github/foundry-optimizer.generated.json")
+    manifest = json.loads(desired[manifest_path])
+    manifest["accepted_previous_sha256"] = {
+        path.as_posix(): [
+            hashlib.sha256(old_content.encode("utf-8")).hexdigest()
+        ]
+    }
+    desired[manifest_path] = (
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    writer = GitChangeSetWriter(SubprocessCommandRunner())
+
+    changes = writer.write(repository, desired)
+
+    updated = next(change for change in changes if change.path == path)
+    assert updated.status is ChangeStatus.UPDATED
+    assert updated.commit_sha
+    assert (
+        _git(
+            repository,
+            "show",
+            f"{updated.commit_sha}:{path.as_posix()}",
+        )
+        == "name: Trusted transport retry"
+    )
+
+
+def test_git_change_set_migrates_legacy_workflow_across_package_pins(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    path = Path(
+        ".github/workflows/foundry-optimization-issue-intake.yml"
+    )
+    old_content = (
+        "name: Foundry optimization issue intake\n"
+        "jobs:\n"
+        "  bridge:\n"
+        "    env:\n"
+        '      OPTIMIZER_PACKAGE: "foundry-cloud-coding-agent==0.1.0"\n'
+    )
+    destination = repository / path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(old_content, encoding="utf-8")
+    _git(repository, "add", path.as_posix())
+    _git(repository, "commit", "-m", "legacy package pin")
+    new_content = old_content.replace("==0.1.0", "==0.2.0")
+    desired = _managed_contents(path, new_content)
+    manifest_path = Path(".github/foundry-optimizer.generated.json")
+    manifest = json.loads(desired[manifest_path])
+    normalized = old_content.replace(
+        'OPTIMIZER_PACKAGE: "foundry-cloud-coding-agent==0.1.0"',
+        "OPTIMIZER_PACKAGE: <PINNED_PRODUCT_INSTALL>",
+    )
+    manifest["accepted_previous_normalized_sha256"] = {
+        path.as_posix(): [
+            hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        ]
+    }
+    desired[manifest_path] = (
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+
+    changes = GitChangeSetWriter(SubprocessCommandRunner()).write(
+        repository,
+        desired,
+    )
+
+    assert next(change for change in changes if change.path == path).status is (
+        ChangeStatus.UPDATED
+    )
+
+
+def test_legacy_pin_normalization_rejects_custom_shell_suffix() -> None:
+    path = Path(".github/workflows/foundry-optimization-control.yml")
+
+    assert normalize_legacy_generated_content(
+        path,
+        "      run: uv tool install 'foundry-cloud-coding-agent==0.1.0' "
+        "&& echo custom\n",
+    ) is None
+    assert normalize_legacy_generated_content(
+        path,
+        "      run: uv tool install 'private-custom-runner==9.9.9'\n",
+    ) is None
+
+
+def test_git_change_set_removes_only_exact_obsolete_generated_files(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    obsolete = Path(
+        ".github/workflows/foundry-post-deployment-check.yml"
+    )
+    old_content = "name: Foundry post-deployment check\n"
+    destination = repository / obsolete
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(old_content, encoding="utf-8")
+    _git(repository, "add", obsolete.as_posix())
+    _git(repository, "commit", "-m", "legacy generated workflow")
+    current = Path(
+        ".github/workflows/foundry-optimization-reconcile.yml"
+    )
+    desired = _managed_contents(current, "name: Trusted transport retry\n")
+    manifest_path = Path(".github/foundry-optimizer.generated.json")
+    manifest = json.loads(desired[manifest_path])
+    manifest["obsolete"] = {
+        obsolete.as_posix(): [
+            hashlib.sha256(old_content.encode("utf-8")).hexdigest()
+        ]
+    }
+    desired[manifest_path] = (
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    writer = GitChangeSetWriter(SubprocessCommandRunner())
+
+    changes = writer.write(repository, desired)
+
+    removed = next(change for change in changes if change.path == obsolete)
+    assert removed.status is ChangeStatus.REMOVED
+    assert removed.commit_sha
+    assert (
+        _git(
+            repository,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            removed.commit_sha,
+            "--",
+            obsolete.as_posix(),
+        )
+        == ""
+    )
+
+
+def test_git_change_set_preserves_modified_obsolete_user_file(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    obsolete = Path(
+        ".github/workflows/foundry-optimization-control.yml"
+    )
+    generated = "name: Foundry optimization control\n"
+    modified = generated + "# user policy\n"
+    destination = repository / obsolete
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(modified, encoding="utf-8")
+    _git(repository, "add", obsolete.as_posix())
+    _git(repository, "commit", "-m", "user modified generated workflow")
+    current = Path(
+        ".github/workflows/foundry-optimization-reconcile.yml"
+    )
+    desired = _managed_contents(current, "name: Trusted transport retry\n")
+    manifest_path = Path(".github/foundry-optimizer.generated.json")
+    manifest = json.loads(desired[manifest_path])
+    manifest["obsolete"] = {
+        obsolete.as_posix(): [
+            hashlib.sha256(generated.encode("utf-8")).hexdigest()
+        ]
+    }
+    desired[manifest_path] = (
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+
+    with pytest.raises(ChangeSetConflictError) as raised:
+        GitChangeSetWriter(SubprocessCommandRunner()).prevalidate(
+            repository,
+            desired,
+        )
+
+    assert raised.value.paths == (obsolete,)
+    assert destination.read_text(encoding="utf-8") == modified
 
 
 def test_git_change_set_rechecks_head_conflicts_after_prevalidation(
@@ -171,9 +446,11 @@ class FakeCommands:
         self,
         *,
         fail_pr: bool = False,
+        pr_exists: bool = False,
         current_head: str = "base123",
     ) -> None:
         self.fail_pr = fail_pr
+        self.pr_exists = pr_exists
         self.current_head = current_head
         self.invocations: list[tuple[str, ...]] = []
         self.local_ref: str | None = None
@@ -190,7 +467,10 @@ class FakeCommands:
     ) -> CommandResult:
         command = tuple(arguments)
         self.invocations.append(command)
-        branch_ref = "refs/heads/foundry-opt/onboarding-support-agent"
+        branch_ref = (
+            "refs/heads/foundry-opt/"
+            "onboarding-support-agent-commit123"
+        )
         if command == ("git", "rev-parse", "--verify", "HEAD"):
             return CommandResult(0, f"{self.current_head}\n", "")
         if command == (
@@ -242,6 +522,16 @@ class FakeCommands:
                 "https://github.com/octo-org/agents/pull/42\n",
                 "",
             )
+        if command[0:3] == ("gh", "pr", "list"):
+            return CommandResult(
+                0,
+                (
+                    '[{"url":"https://github.com/octo-org/agents/pull/42"}]'
+                    if self.pr_exists
+                    else "[]"
+                ),
+                "",
+            )
         raise AssertionError(f"Unexpected command: {command}")
 
 
@@ -258,7 +548,7 @@ def test_github_publisher_pushes_prepared_commit_without_checkout(
         draft_pr,
     )
 
-    branch = "foundry-opt/onboarding-support-agent"
+    branch = "foundry-opt/onboarding-support-agent-commit123"
     assert result.commit_sha == "commit123"
     assert result.branch == branch
     assert (
@@ -299,7 +589,9 @@ def test_github_publisher_deletes_only_invocation_refs_after_pr_failure(
     assert raised.value.residual_state == ()
     assert commands.local_ref is None
     assert commands.remote_ref is None
-    branch_ref = "refs/heads/foundry-opt/onboarding-support-agent"
+    branch_ref = (
+        "refs/heads/foundry-opt/onboarding-support-agent-commit123"
+    )
     assert (
         "git",
         "push",
@@ -333,6 +625,49 @@ def test_github_publisher_rejects_commit_when_clean_head_changed(
     assert raised.value.phase == "inspect"
     assert commands.local_ref is None
     assert commands.remote_ref is None
+
+
+def test_github_publisher_never_deletes_preexisting_remote_branch(
+    tmp_path: Path,
+) -> None:
+    commands = FakeCommands()
+    commands.remote_ref = "commit123"
+    request, discovery, changes, draft_pr = _publication_inputs(tmp_path)
+
+    with pytest.raises(OnboardingPublishError, match="already exists"):
+        GhOnboardingPublisher(commands).publish(
+            request,
+            discovery,
+            changes,
+            draft_pr,
+        )
+
+    assert commands.remote_ref == "commit123"
+    assert not any(
+        command[0:2] == ("git", "push")
+        and command[-1].startswith(":")
+        for command in commands.invocations
+    )
+
+
+def test_github_publisher_preserves_branch_when_pr_creation_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    commands = FakeCommands(fail_pr=True, pr_exists=True)
+    request, discovery, changes, draft_pr = _publication_inputs(tmp_path)
+
+    with pytest.raises(OnboardingPublishError) as raised:
+        GhOnboardingPublisher(commands).publish(
+            request,
+            discovery,
+            changes,
+            draft_pr,
+        )
+
+    assert commands.remote_ref == "commit123"
+    assert any("draft pr may already exist" in item for item in (
+        value.casefold() for value in raised.value.residual_state
+    ))
 
 
 def test_production_onboarding_uses_git_plumbing_repository() -> None:

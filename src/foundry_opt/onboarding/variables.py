@@ -20,11 +20,12 @@ from foundry_opt.onboarding.models import (
 from foundry_opt.preflight.interfaces import CommandRunner
 
 
-_VARIABLE_NAMES = (
+_AGENT_VARIABLE_NAMES = (
     "AZURE_TENANT_ID",
     "AZURE_CLIENT_ID",
     "AZURE_SUBSCRIPTION_ID",
 )
+_DEPLOYMENT_VARIABLE_NAME = "AZURE_DEPLOYMENT_CLIENT_ID"
 
 
 class GitHubVariableConflictError(RuntimeError):
@@ -94,10 +95,14 @@ class GitHubVariableConfigurator:
         request: OnboardingRequest,
         discovery: RepositoryDiscovery,
     ) -> tuple[GitHubVariableChange, ...]:
-        desired = {
+        agents_desired = {
             "AZURE_TENANT_ID": request.tenant_id,
             "AZURE_CLIENT_ID": request.client_id,
             "AZURE_SUBSCRIPTION_ID": request.subscription_id,
+        }
+        environment_desired = {
+            **agents_desired,
+            _DEPLOYMENT_VARIABLE_NAME: request.deployment_client_id,
         }
         agents = self._gateway.list_agents_variables(discovery.repository)
         environment_name = request.mirror_actions_environment
@@ -111,9 +116,11 @@ class GitHubVariableConfigurator:
         )
         conflicts = tuple(
             name
-            for name, value in desired.items()
+            for name, value in environment_desired.items()
             if (
-                name in agents and agents[name] != value
+                name in agents_desired
+                and name in agents
+                and agents[name] != value
             )
             or (
                 environment is not None
@@ -127,7 +134,7 @@ class GitHubVariableConfigurator:
         changes: list[GitHubVariableChange] = []
         changes.extend(
             self._apply_scope(
-                desired,
+                agents_desired,
                 agents,
                 scope=GitHubVariableScope.AGENTS,
                 create=lambda name, value: (
@@ -150,7 +157,7 @@ class GitHubVariableConfigurator:
         if environment_name is not None and environment is not None:
             changes.extend(
                 self._apply_scope(
-                    desired,
+                    environment_desired,
                     environment,
                     scope=GitHubVariableScope.ACTIONS_ENVIRONMENT,
                     create=lambda name, value: (
@@ -187,7 +194,7 @@ class GitHubVariableConfigurator:
         environment: str | None = None,
     ) -> tuple[GitHubVariableChange, ...]:
         changes: list[GitHubVariableChange] = []
-        for name in _VARIABLE_NAMES:
+        for name in desired:
             value = desired[name]
             if name not in existing:
                 create(name, value)

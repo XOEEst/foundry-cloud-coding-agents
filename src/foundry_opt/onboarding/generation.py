@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -7,7 +8,14 @@ import re
 import yaml
 
 from foundry_opt.config.models import OptimizerConfig
-from foundry_opt.onboarding.bundle import generate_repository_agent_bundle
+from foundry_opt.onboarding.bundle import (
+    generate_repository_agent_bundle,
+    legacy_repository_agent_bundle,
+    legacy_repository_agent_hashes,
+)
+from foundry_opt.onboarding.repository import (
+    normalize_legacy_generated_content,
+)
 from foundry_opt.onboarding.models import (
     DeploymentWorkflowDiscovery,
     EvaluatorDiscovery,
@@ -194,6 +202,10 @@ jobs:
       - name: Install pinned Foundry optimizer
         run: uv tool install {shell_quote(request.product_install)}
 """
+    legacy_setup_workflow_text = workflow_text
+    workflow_text += """      - name: Verify issue-only steward entry point
+        run: foundry-opt steward advance --help
+"""
 
     contents = {
         Path(".github/foundry-optimizer.yaml"): config_text,
@@ -203,7 +215,83 @@ jobs:
         generate_repository_agent_bundle(
             request,
             oidc_subject=oidc_subject,
+            deployment_workflow_name=(
+                workflow.name or workflow.path.as_posix()
+            ),
         )
+    )
+    legacy_hashes = legacy_repository_agent_hashes(
+        request,
+        oidc_subject=oidc_subject,
+    )
+    legacy_hashes[
+        Path(".github/workflows/copilot-setup-steps.yml")
+    ] = hashlib.sha256(
+        legacy_setup_workflow_text.encode("utf-8")
+    ).hexdigest()
+    legacy_contents = legacy_repository_agent_bundle(
+        request,
+        oidc_subject=oidc_subject,
+    )
+    legacy_contents[
+        Path(".github/workflows/copilot-setup-steps.yml")
+    ] = legacy_setup_workflow_text
+    accepted_previous = {
+        path.as_posix(): [digest]
+        for path, digest in legacy_hashes.items()
+        if (
+            path in contents
+            and hashlib.sha256(
+                contents[path].encode("utf-8")
+            ).hexdigest()
+            != digest
+        )
+    }
+    obsolete = {
+        path.as_posix(): [digest]
+        for path, digest in legacy_hashes.items()
+        if path not in contents
+    }
+    accepted_previous_normalized = {}
+    obsolete_normalized = {}
+    for path, content in legacy_contents.items():
+        normalized = normalize_legacy_generated_content(path, content)
+        if normalized is None:
+            continue
+        destination = (
+            accepted_previous_normalized
+            if path in contents
+            else obsolete_normalized
+        )
+        destination[path.as_posix()] = [
+            hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        ]
+    manifest_path = Path(".github/foundry-optimizer.generated.json")
+    contents[manifest_path] = (
+        json.dumps(
+            {
+                "accepted_previous_sha256": accepted_previous,
+                "accepted_previous_normalized_sha256": (
+                    accepted_previous_normalized
+                ),
+                "files": {
+                    path.as_posix(): hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest()
+                    for path, content in sorted(
+                        contents.items(),
+                        key=lambda item: item[0].as_posix(),
+                    )
+                },
+                "generator": "foundry-opt init",
+                "obsolete": obsolete,
+                "obsolete_normalized_sha256": obsolete_normalized,
+                "schema_version": 1,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
     )
     return contents
 
@@ -252,11 +340,27 @@ def validate_generation_inputs(
             )
     if not discovery.deployment_workflows:
         blockers.append("No deployment workflow was discovered.")
-    elif _deployment_workflow(discovery) is None:
-        blockers.append(
-            "Deployment workflow role is ambiguous; select exactly one "
-            "deployment workflow."
-        )
+    else:
+        deployment_workflow = _deployment_workflow(discovery)
+        if deployment_workflow is None:
+            blockers.append(
+                "Deployment workflow role is ambiguous; select exactly one "
+                "deployment workflow."
+            )
+        elif deployment_workflow.deployment_identity_verified is False:
+            blockers.append(
+                "The deployment job must use pinned azure/login with "
+                "AZURE_DEPLOYMENT_CLIENT_ID before deployment and upload "
+                "the foundry-optimization-deployment-result artifact "
+                "afterward."
+            )
+        elif deployment_workflow.trigger_contract_verified is False:
+            blockers.append(
+                "The deployment workflow trigger must be either a "
+                "default-branch push/workflow_run contract or a "
+                "workflow_dispatch contract with selected_commit and "
+                "foundry_opt_effect_id inputs."
+            )
     local_matches = tuple(
         agent
         for agent in discovery.python_agents
@@ -284,6 +388,10 @@ def validate_request_inputs(request: OnboardingRequest) -> tuple[str, ...]:
     blockers: list[str] = []
     if not _is_pinned_install(request.product_install):
         blockers.append("The product install must be pinned to a version or commit.")
+    if request.client_id == request.deployment_client_id:
+        blockers.append(
+            "Optimizer and deployment client IDs must be distinct."
+        )
     if any(
         not value.strip()
         for value in (
@@ -293,10 +401,31 @@ def validate_request_inputs(request: OnboardingRequest) -> tuple[str, ...]:
             request.project_resource_id,
             request.tenant_id,
             request.client_id,
+            request.deployment_client_id,
             request.subscription_id,
         )
     ):
         blockers.append("All non-secret onboarding identifiers are required.")
+    if any(
+        len(value) > 4096
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+        for value in (
+            request.environment_name,
+            request.target_name,
+            request.project_endpoint,
+            request.project_resource_id,
+            request.tenant_id,
+            request.client_id,
+            request.deployment_client_id,
+            request.subscription_id,
+        )
+    ):
+        blockers.append(
+            "Onboarding identifiers contain unsafe characters."
+        )
     return tuple(blockers)
 
 

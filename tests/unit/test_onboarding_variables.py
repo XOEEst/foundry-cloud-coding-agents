@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from foundry_opt.adapters.commands import CommandExitError
+from foundry_opt.deployment import DEPLOYMENT_OIDC_CLIENT_ID
 from foundry_opt.onboarding.models import (
     GitHubVariableChangeStatus,
     GitHubVariableScope,
@@ -128,7 +129,16 @@ def test_configurator_creates_agents_variables_and_optional_mirror() -> None:
         "AZURE_CLIENT_ID": "client-id",
         "AZURE_SUBSCRIPTION_ID": "subscription-id",
     }
-    assert gateway.environments["production"] == gateway.agents
+    assert gateway.environments["production"] == {
+        **gateway.agents,
+        "AZURE_DEPLOYMENT_CLIENT_ID": DEPLOYMENT_OIDC_CLIENT_ID,
+    }
+    deployment_change = next(
+        change
+        for change in changes
+        if change.name == "AZURE_DEPLOYMENT_CLIENT_ID"
+    )
+    assert deployment_change.scope is GitHubVariableScope.ACTIONS_ENVIRONMENT
     assert {
         (change.scope, change.status)
         for change in changes

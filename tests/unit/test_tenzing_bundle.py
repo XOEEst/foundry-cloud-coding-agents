@@ -292,23 +292,23 @@ def test_skill_template_directs_the_three_named_agents() -> None:
     text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")).lower()
     for role in (
         "specification planner",
-        "optimization runner",
+        "candidate designer",
         "exact-patch applier",
     ):
         assert role in text
-    assert "optimize candidate request" in text
-    assert "optimize candidate submit" in text
+    assert "foundry-opt steward advance --issue <number>" in text
+    assert "candidatedesignintent" in text
 
 
 def test_skill_template_specification_planner_does_not_brainstorm_candidates() -> None:
     text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")).lower()
-    assert "issue into an" in text and "spec pr" in text
-    assert "does not brainstorm candidate ideas" in text
+    assert "immutable specification" in text
+    assert "does not brainstorm or evaluate candidate ideas" in text
 
 
-def test_skill_template_optimization_runner_owns_idea_generation_and_experiments() -> None:
+def test_skill_template_candidate_designer_owns_bounded_idea_generation() -> None:
     text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")).lower()
-    assert "only agent that generates ideas or writes candidate code" in text
+    assert "only specialist that generates ideas or writes candidate code" in text
     assert "bounded" in text
 
 

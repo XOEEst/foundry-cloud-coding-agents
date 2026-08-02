@@ -176,6 +176,9 @@ class Assignments:
         self.values.append((issue_number, idempotency_key))
         return True
 
+    def has_live_lease(self, issue_number):
+        return False
+
 
 class Projection:
     def __init__(self) -> None:

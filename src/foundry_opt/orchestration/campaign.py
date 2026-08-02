@@ -163,6 +163,22 @@ class OptimizationCampaign:
                 event,
                 phase=CampaignPhase.CANCELLED,
             )
+        if event.kind in {
+            EventKind.SPEC_PR_OPENED,
+            EventKind.SPEC_PR_SYNCHRONIZED,
+            EventKind.SPEC_PR_EDITED,
+            EventKind.SPEC_PR_CLOSED,
+            EventKind.SPEC_PR_MERGED,
+        }:
+            _commit(event.payload, "head_commit")
+            _positive_integer(
+                event.payload,
+                "pull_request_number",
+            )
+            _sha(event.payload, "spec_sha256")
+            if event.kind is EventKind.SPEC_PR_MERGED:
+                _commit(event.payload, "merge_commit")
+            return self._next(state, event)
 
         if event.kind is EventKind.SPEC_POLICY_APPROVED:
             self._require_phase(state, CampaignPhase.SPECIFICATION, event)

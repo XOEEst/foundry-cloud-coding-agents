@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 from typing import Annotated
 
 import typer
@@ -237,13 +238,27 @@ def steward_deployment_bridge(
         DeploymentCleanupBridgeStatus,
     )
     from foundry_opt.orchestration.deployment_bridge import (
+        deployment_bridge_issue_numbers,
         reconcile_deployment_workflow_effects,
+        verify_active_deployment_identity,
     )
+    from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 
+    commands = SubprocessCommandRunner()
+    deployment_bridge_issue_numbers(
+        requested_issue=str(issue_number),
+        state_ref=None,
+        tracked=GitIssueEventInbox(Path.cwd()).issue_numbers(),
+    )
+    verify_active_deployment_identity(
+        commands,
+        Path.cwd(),
+        os.environ,
+    )
     result = reconcile_deployment_workflow_effects(
         Path.cwd(),
         issue_number,
-        SubprocessCommandRunner(),
+        commands,
     )
     typer.echo(
         json.dumps(
@@ -286,13 +301,81 @@ def steward_publication_result(
 ) -> None:
     """Persist a deployment-identity bridge publication result."""
     from foundry_opt.orchestration.deployment_bridge import (
+        deployment_bridge_issue_numbers,
         record_deployment_publication_file,
+        verify_active_deployment_identity,
     )
+    from foundry_opt.adapters.commands import SubprocessCommandRunner
+    from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 
+    deployment_bridge_issue_numbers(
+        requested_issue=str(issue_number),
+        state_ref=None,
+        tracked=GitIssueEventInbox(Path.cwd()).issue_numbers(),
+    )
+    commands = SubprocessCommandRunner()
+    verify_active_deployment_identity(
+        commands,
+        Path.cwd(),
+        os.environ,
+    )
     result = record_deployment_publication_file(
         Path.cwd(),
         issue_number,
         result_file,
+        commands=commands,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "deployment_version": result.deployment_version,
+                "issue_number": issue_number,
+                "status": result.status.value,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+@steward_app.command("publication-result-auto", hidden=True)
+def steward_publication_result_auto(
+    result_file: Annotated[
+        Path,
+        typer.Option(
+            "--result-file",
+            help="Downloaded deployment result JSON.",
+        ),
+    ],
+    expected_run_id: Annotated[
+        int,
+        typer.Option(
+            "--expected-run-id",
+            min=1,
+            help="Trusted workflow_run ID that produced the artifact.",
+        ),
+    ],
+) -> None:
+    """Match and persist one deployment publication result by effect ID."""
+    from foundry_opt.adapters.commands import SubprocessCommandRunner
+    from foundry_opt.orchestration.deployment_bridge import (
+        record_deployment_publication_file_for_effect,
+        verify_active_deployment_identity,
+    )
+
+    commands = SubprocessCommandRunner()
+    verify_active_deployment_identity(
+        commands,
+        Path.cwd(),
+        os.environ,
+    )
+    issue_number, result = (
+        record_deployment_publication_file_for_effect(
+            Path.cwd(),
+            result_file,
+            commands,
+            expected_run_id=expected_run_id,
+        )
     )
     typer.echo(
         json.dumps(

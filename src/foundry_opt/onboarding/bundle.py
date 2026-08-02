@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 
@@ -24,6 +26,7 @@ def generate_repository_agent_bundle(
     request: OnboardingRequest,
     *,
     oidc_subject: str,
+    deployment_workflow_name: str = "Foundry deployment",
 ) -> dict[Path, str]:
     contents = _copy_skill_template()
     skill_root = Path(".github/skills/foundry-agent-optimizer")
@@ -36,6 +39,10 @@ def generate_repository_agent_bundle(
         "- Azure authentication is OIDC-only; never request credentials.\n"
         "- GitHub Copilot receives non-secret Azure identifiers through "
         "repository-level Agents variables.\n"
+        "- Deployment uses only the separate "
+        "`AZURE_DEPLOYMENT_CLIENT_ID` Actions-environment variable.\n"
+        "- Create the generated `[Optimize]` issue to start; workflow "
+        "dispatch is retry-only.\n"
     )
     contents.update(
         {
@@ -43,14 +50,14 @@ def generate_repository_agent_bundle(
                 "campaigns/\nworktrees/\n"
             ),
             Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml"): (
-                _issue_form()
+                _issue_form(request)
             ),
             Path(
                 ".github/agents/foundry-optimization-planner.agent.md"
             ): _planner_agent(),
             Path(
-                ".github/agents/foundry-optimization-runner.agent.md"
-            ): _runner_agent(),
+                ".github/agents/foundry-candidate-designer.agent.md"
+            ): _designer_agent(),
             Path(
                 ".github/agents/foundry-candidate-applier.agent.md"
             ): _applier_agent(),
@@ -61,14 +68,18 @@ def generate_repository_agent_bundle(
                 ".github/workflows/foundry-optimization-issue-intake.yml"
             ): _issue_intake_workflow(request),
             Path(
-                ".github/workflows/foundry-optimization-control.yml"
-            ): _control_workflow(request),
+                ".github/workflows/foundry-optimization-reconcile.yml"
+            ): _reconciliation_workflow(request),
+            Path(
+                ".github/workflows/"
+                "foundry-optimization-deployment-bridge.yml"
+            ): _deployment_bridge_workflow(
+                request,
+                deployment_workflow_name=deployment_workflow_name,
+            ),
             Path(
                 ".github/workflows/foundry-exact-candidate-check.yml"
             ): _candidate_check_workflow(request),
-            Path(
-                ".github/workflows/foundry-post-deployment-check.yml"
-            ): _post_deployment_workflow(request),
         }
     )
     return contents
@@ -93,7 +104,7 @@ def _copy_skill_template() -> dict[Path, str]:
     }
 
 
-def _issue_form() -> str:
+def _issue_form(request: OnboardingRequest) -> str:
     document = {
         "name": "Foundry optimization",
         "description": (
@@ -117,7 +128,7 @@ def _issue_form() -> str:
                 "target",
                 "Configured target",
                 "Target name from `.github/foundry-optimizer.yaml`.",
-                "support-agent",
+                request.target_name,
             ),
             _textarea(
                 "goal",
@@ -244,6 +255,458 @@ def _textarea(
 def _planner_agent() -> str:
     return """---
 name: foundry-optimization-planner
+description: Materialize one steward-requested immutable optimization specification.
+target: github-copilot
+tools: ["read", "search", "edit", "execute"]
+disable-model-invocation: true
+---
+
+Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
+`REPOSITORY_CONTEXT.md`, the assigned optimization issue, and the exact
+`specialist_work_request` whose `work_kind` is `prepare_specification_pr`.
+
+Use the canonical specification interface to materialize only the requested
+immutable specification and approved repository evaluation assets. Do not
+classify policy, generate candidates, evaluate drafts, select, merge, deploy,
+or expose raw trace rows. Do not call GitHub APIs or create a pull request
+yourself. The pull request is opened by the native Copilot session from only
+the exact requested files you commit.
+"""
+
+
+def _designer_agent() -> str:
+    return """---
+name: foundry-candidate-designer
+description: Fulfil one canonical candidate design intent in its reserved worktree.
+target: github-copilot
+tools: ["read", "search", "edit", "execute"]
+disable-model-invocation: false
+---
+
+Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
+`REPOSITORY_CONTEXT.md`, and the exact canonical `CandidateDesignIntent`
+provided by the steward.
+
+Edit only the reserved worktree and only its declared edit paths. Follow the
+pinned goal, mutation allowlist, restricted opt-ins, baseline aggregates, and
+redacted prior feedback. Return only the matching privacy-safe
+`CandidateDesignResult`; never claim evaluation status, eligibility, or
+selection. Never read held-out rows or raw evidence, call GitHub APIs, create a
+branch or pull request, merge, or deploy.
+"""
+
+
+def _applier_agent() -> str:
+    return """---
+name: foundry-candidate-applier
+description: Apply one exact evaluated Foundry optimization patch without repair.
+target: github-copilot
+tools: ["read", "execute"]
+disable-model-invocation: true
+---
+
+Read `.github/skills/foundry-agent-optimizer/SKILL.md` and the assigned
+candidate worker issue and its persisted `applier_worker_issue_planned`
+binding. Invoke
+`foundry-opt optimize apply --issue <number> --candidate <candidate-id>`.
+
+Do not edit files directly, reinterpret the patch, repair conflicts, change the
+base, merge, or deploy. The native Copilot session opens the pull request from
+the exact verified result. Stop when deterministic verification rejects the
+candidate.
+"""
+
+
+def _steward_agent() -> str:
+    return """---
+name: foundry-optimization-steward
+description: Advance one issue-driven optimization campaign from trusted events.
+target: github-copilot
+tools: ["read", "search", "execute"]
+disable-model-invocation: true
+---
+
+Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
+`REPOSITORY_CONTEXT.md`, the assigned issue, and its trusted Git-state inbox.
+
+On every assignment invoke `foundry-opt steward advance --issue <number>`.
+Resume exclusively from
+`refs/heads/foundry-opt/state/issue-<number>` and its trusted inbox; never
+reconstruct campaign state from comments, labels, or conversation history.
+Execute domain logic only through canonical steward interfaces, never by
+reproducing transitions in instructions, workflows, or shell.
+
+Never expose raw evidence, traces, held-out rows, credentials, or private
+dataset content. Treat only privacy-allowlisted aggregates and durable
+references as readable.
+
+Handle persisted specialist intents exactly as designed:
+
+- `specialist_work_request` delegates `prepare_specification_pr` to
+  `foundry-optimization-planner`.
+- `candidate_design` is fulfilled only through the canonical
+  `CandidateDesignIntent` / `CandidateDesignResult` interface by
+  `foundry-candidate-designer`.
+- `applier_worker_issue_planned` is projected by the transport bridge to a
+  worker issue assigned to `foundry-candidate-applier`.
+
+Do not create pull requests, merge, deploy, or apply GitHub effects directly.
+Native Copilot specialist sessions create their own pull requests; transport
+workflows apply only effects already persisted in the outbox.
+"""
+
+
+def _issue_intake_workflow(
+    request: OnboardingRequest,
+) -> str:
+    install = json.dumps(request.product_install)
+    return f"""name: Foundry optimization issue intake
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed]
+  pull_request:
+    types: [opened, synchronize, reopened, edited, closed]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  bridge:
+    if: >-
+      github.event_name != 'issues' ||
+      github.event.action != 'opened' ||
+      startsWith(github.event.issue.title, '[Optimize] ')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Record trusted event and recover projections
+        env:
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
+        run: >-
+          uv run --no-project --with "$OPTIMIZER_PACKAGE"
+          python -m foundry_opt.orchestration.issue_intake
+"""
+
+
+def _reconciliation_workflow(request: OnboardingRequest) -> str:
+    install = json.dumps(request.product_install)
+    return f"""name: Foundry optimization reconciliation
+
+on:
+  push:
+    branches:
+      - foundry-opt/state/issue-*
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Optional tracked optimization issue number to retry
+        required: false
+        type: number
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: foundry-optimization-effects
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Reconcile trusted transport effects
+        env:
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_ISSUE_NUMBER: ${{{{ inputs.issue }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
+          TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
+        run: >-
+          uv run --no-project --with "$OPTIMIZER_PACKAGE"
+          python -m foundry_opt.orchestration.issue_intake
+"""
+
+
+def _deployment_bridge_workflow(
+    request: OnboardingRequest,
+    *,
+    deployment_workflow_name: str,
+) -> str:
+    install = json.dumps(request.product_install)
+    workflow_name = json.dumps(deployment_workflow_name)
+    actions_environment = (
+        request.mirror_actions_environment or request.environment_name
+    )
+    return f"""name: Foundry optimization deployment bridge
+
+on:
+  push:
+    branches:
+      - foundry-opt/state/issue-*
+  schedule:
+    - cron: "29 * * * *"
+  workflow_run:
+    workflows: [{workflow_name}]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Optional tracked optimization issue number to retry
+        required: false
+        type: number
+
+permissions:
+  actions: write
+  contents: write
+  id-token: write
+
+concurrency:
+  group: >-
+    foundry-optimization-deployment-${{{{
+      github.event.workflow_run.id ||
+      inputs.issue ||
+      github.ref_name ||
+      github.run_id
+    }}}}
+  cancel-in-progress: false
+
+jobs:
+  deployment-bridge:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: {json.dumps(actions_environment)}
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      AZURE_CLIENT_ID: ${{{{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}}}
+      AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
+      AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
+        with:
+          client-id: ${{{{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}}}
+          tenant-id: ${{{{ vars.AZURE_TENANT_ID }}}}
+          subscription-id: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      - uses: {_SETUP_PYTHON_ACTION} # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Apply persisted deployment intents
+        env:
+          REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
+          TRUSTED_WORKFLOW_RUN_ID: ${{{{ github.event.workflow_run.id }}}}
+        shell: bash
+        run: |
+          if [ "$TRUSTED_EVENT_NAME" = "workflow_run" ]; then
+            if [[ ! "$TRUSTED_WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Invalid workflow run ID" >&2
+              exit 1
+            fi
+            result_dir="$GITHUB_WORKSPACE/.foundry-optimizer/deployment-result"
+            mkdir -p "$result_dir"
+            gh run download "$TRUSTED_WORKFLOW_RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name foundry-optimization-deployment-result \
+              --dir "$result_dir"
+            mapfile -d '' result_files < <(
+              find "$result_dir" -type f -name deployment-result.json -print0
+            )
+            if [ "${{#result_files[@]}}" -ne 1 ]; then
+              echo "Expected exactly one deployment-result.json" >&2
+              exit 1
+            fi
+            publication_json="$(
+              uv run --no-project --with "$OPTIMIZER_PACKAGE" \
+                foundry-opt steward publication-result-auto \
+                --result-file "${{result_files[0]}}" \
+                --expected-run-id "$TRUSTED_WORKFLOW_RUN_ID"
+            )"
+            printf '%s\\n' "$publication_json"
+            issue="$(
+              PUBLICATION_JSON="$publication_json" python -c \
+                'import json, os; value = json.loads(os.environ["PUBLICATION_JSON"]); issue = value.get("issue_number"); assert type(issue) is int and issue > 0; print(issue)'
+            )"
+            gh workflow run foundry-optimization-reconcile.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$DEFAULT_BRANCH" \
+              -f "issue=$issue"
+          elif [ -n "$REQUESTED_ISSUE" ]; then
+            if [[ ! "$REQUESTED_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Invalid issue number" >&2
+              exit 1
+            fi
+            uv run --no-project --with "$OPTIMIZER_PACKAGE" foundry-opt steward deployment-bridge --issue "$REQUESTED_ISSUE"
+          else
+            uv run --no-project --with "$OPTIMIZER_PACKAGE" \
+              python -m foundry_opt.orchestration.deployment_bridge
+          fi
+"""
+
+
+def _candidate_check_workflow(request: OnboardingRequest) -> str:
+    install = _shell_quote(request.product_install)
+    return f"""name: Foundry exact candidate check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  exact-candidate:
+    if: >-
+      startsWith(github.event.pull_request.head.ref, 'foundry-opt/') &&
+      contains(github.event.pull_request.body, '<!-- foundry-opt:candidate-pr:')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+    steps:
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: {_SETUP_PYTHON_ACTION} # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Install pinned optimizer
+        run: uv tool install {install}
+      - name: Extract validated candidate metadata
+        id: metadata
+        env:
+          PR_BODY: ${{{{ github.event.pull_request.body }}}}
+        shell: python
+        run: |
+          import os
+          import re
+
+          body = os.environ.get("PR_BODY", "")
+          markers = re.findall(
+              r"foundry-opt:candidate-pr:"
+              r"issue-([1-9][0-9]*):"
+              r"g([1-9][0-9]*):"
+              r"([A-Za-z0-9][A-Za-z0-9._-]{{0,127}}):"
+              r"([0-9a-f]{{20}})",
+              body,
+          )
+          if len(markers) != 1:
+              raise SystemExit("candidate metadata is missing or ambiguous")
+          marker = re.search(
+              r"foundry-opt:candidate-pr:"
+              r"issue-([1-9][0-9]*):"
+              r"g([1-9][0-9]*):"
+              r"([A-Za-z0-9][A-Za-z0-9._-]{{0,127}}):"
+              r"([0-9a-f]{{20}})",
+              body,
+          )
+          assert marker is not None
+          candidate = marker.group(3)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"candidate={{candidate}}\\n")
+              output.write(f"issue={{marker.group(1)}}\\n")
+      - name: Verify exact candidate metadata and tree
+        env:
+          CANDIDATE: ${{{{ steps.metadata.outputs.candidate }}}}
+          ISSUE: ${{{{ steps.metadata.outputs.issue }}}}
+        shell: bash
+        run: foundry-opt optimize apply --issue "$ISSUE" --candidate "$CANDIDATE" --verify-only
+"""
+
+
+def legacy_repository_agent_bundle(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str = "repository_id:legacy-placeholder",
+) -> dict[Path, str]:
+    """Return the exact pre-orchestration generated files for safe migration."""
+
+    return {
+        Path(
+            ".github/skills/foundry-agent-optimizer/"
+            "REPOSITORY_CONTEXT.md"
+        ): (
+            "# Repository optimization context\n\n"
+            f"- Configured target: `{request.target_name}`\n"
+            f"- Configured environment: `{request.environment_name}`\n"
+            f"- Verified immutable OIDC subject: `{oidc_subject}`\n"
+            "- Configuration: `.github/foundry-optimizer.yaml`\n"
+            "- Azure authentication is OIDC-only; never request credentials.\n"
+            "- GitHub Copilot receives non-secret Azure identifiers through "
+            "repository-level Agents variables.\n"
+        ),
+        Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml"): (
+            _issue_form(replace(request, target_name="support-agent"))
+        ),
+        Path(
+            ".github/agents/foundry-optimization-planner.agent.md"
+        ): _legacy_planner_agent(),
+        Path(
+            ".github/agents/foundry-optimization-runner.agent.md"
+        ): _legacy_runner_agent(),
+        Path(
+            ".github/agents/foundry-candidate-applier.agent.md"
+        ): _legacy_applier_agent(),
+        Path(
+            ".github/agents/foundry-optimization-steward.agent.md"
+        ): _legacy_steward_agent(),
+        Path(
+            ".github/workflows/foundry-optimization-issue-intake.yml"
+        ): _legacy_issue_intake_workflow(request),
+        Path(
+            ".github/workflows/foundry-optimization-control.yml"
+        ): _legacy_control_workflow(request),
+        Path(
+            ".github/workflows/foundry-post-deployment-check.yml"
+        ): _legacy_post_deployment_workflow(request),
+        Path(
+            ".github/workflows/foundry-exact-candidate-check.yml"
+        ): _legacy_candidate_check_workflow(request),
+    }
+
+
+def _legacy_planner_agent() -> str:
+    return """---
+name: foundry-optimization-planner
 description: Prepare a reviewed immutable Foundry optimization specification from an issue.
 target: github-copilot
 tools: ["read", "search", "edit", "execute", "github/*", "foundry-mcp/*"]
@@ -259,7 +722,7 @@ draft evaluations, merge, deploy, or expose raw trace rows.
 """
 
 
-def _runner_agent() -> str:
+def _legacy_runner_agent() -> str:
     return """---
 name: foundry-optimization-runner
 description: Run an approved bounded Tenzing-style Foundry optimization job.
@@ -292,7 +755,7 @@ merge or deploy.
 """
 
 
-def _applier_agent() -> str:
+def _legacy_applier_agent() -> str:
     return """---
 name: foundry-candidate-applier
 description: Apply one exact evaluated Foundry optimization patch without repair.
@@ -311,7 +774,7 @@ candidate.
 """
 
 
-def _steward_agent() -> str:
+def _legacy_steward_agent() -> str:
     return """---
 name: foundry-optimization-steward
 description: Advance one issue-driven optimization campaign from trusted events.
@@ -338,7 +801,7 @@ when the state-machine disposition requires it.
 """
 
 
-def _issue_intake_workflow(request: OnboardingRequest) -> str:
+def _legacy_issue_intake_workflow(request: OnboardingRequest) -> str:
     install = json.dumps(request.product_install)
     return f"""name: Foundry optimization issue intake
 
@@ -384,7 +847,7 @@ jobs:
 """
 
 
-def _control_workflow(request: OnboardingRequest) -> str:
+def _legacy_control_workflow(request: OnboardingRequest) -> str:
     install = _shell_quote(request.product_install)
     return f"""name: Foundry optimization control
 
@@ -441,7 +904,56 @@ jobs:
 """
 
 
-def _candidate_check_workflow(request: OnboardingRequest) -> str:
+def _legacy_post_deployment_workflow(
+    request: OnboardingRequest,
+) -> str:
+    install = _shell_quote(request.product_install)
+    return f"""name: Foundry post-deployment check
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Optimization issue number
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  actions: read
+  id-token: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    environment: {json.dumps(request.environment_name)}
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+    steps:
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+      - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
+        with:
+          client-id: ${{{{ vars.AZURE_CLIENT_ID }}}}
+          tenant-id: ${{{{ vars.AZURE_TENANT_ID }}}}
+          subscription-id: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      - uses: {_SETUP_PYTHON_ACTION} # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Install pinned optimizer
+        run: uv tool install {install}
+      - name: Verify deployed optimization
+        env:
+          OPTIMIZATION_ISSUE: ${{{{ inputs.issue }}}}
+        run: foundry-opt optimize reconcile --issue "$OPTIMIZATION_ISSUE"
+"""
+
+
+def _legacy_candidate_check_workflow(
+    request: OnboardingRequest,
+) -> str:
     install = _shell_quote(request.product_install)
     return f"""name: Foundry exact candidate check
 
@@ -507,49 +1019,23 @@ jobs:
 """
 
 
-def _post_deployment_workflow(request: OnboardingRequest) -> str:
-    install = _shell_quote(request.product_install)
-    return f"""name: Foundry post-deployment check
-
-on:
-  workflow_dispatch:
-    inputs:
-      issue:
-        description: Optimization issue number
-        required: true
-        type: number
-
-permissions:
-  contents: read
-  issues: write
-  pull-requests: read
-  actions: read
-  id-token: write
-
-jobs:
-  verify:
-    runs-on: ubuntu-latest
-    environment: {json.dumps(request.environment_name)}
-    env:
-      GH_TOKEN: ${{{{ github.token }}}}
-    steps:
-      - uses: {_CHECKOUT_ACTION} # v7.0.1
-      - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
-        with:
-          client-id: ${{{{ vars.AZURE_CLIENT_ID }}}}
-          tenant-id: ${{{{ vars.AZURE_TENANT_ID }}}}
-          subscription-id: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
-      - uses: {_SETUP_PYTHON_ACTION} # v7.0.0
-        with:
-          python-version: "3.12"
-      - uses: {_SETUP_UV_ACTION} # v9.0.0
-      - name: Install pinned optimizer
-        run: uv tool install {install}
-      - name: Verify deployed optimization
-        env:
-          OPTIMIZATION_ISSUE: ${{{{ inputs.issue }}}}
-        run: foundry-opt optimize reconcile --issue "$OPTIMIZATION_ISSUE"
-"""
+def legacy_repository_agent_hashes(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str,
+) -> dict[Path, str]:
+    contents = legacy_repository_agent_bundle(
+        request,
+        oidc_subject=oidc_subject,
+    )
+    hashes = {
+        path: hashlib.sha256(content.encode("utf-8")).hexdigest()
+        for path, content in contents.items()
+    }
+    hashes[
+        Path(".github/skills/foundry-agent-optimizer/SKILL.md")
+    ] = "dc85a8a2246e36d27000a778b7a114419fdb594d56b15569ddc5713f5f0a11ec"
+    return hashes
 
 
 def _shell_quote(value: str) -> str:

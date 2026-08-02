@@ -58,6 +58,26 @@ _EVENT_PAYLOAD_FIELDS = {
             "spec_sha256",
         }
     ),
+    EventKind.SPEC_PR_OPENED: frozenset(
+        {"head_commit", "pull_request_number", "spec_sha256"}
+    ),
+    EventKind.SPEC_PR_SYNCHRONIZED: frozenset(
+        {"head_commit", "pull_request_number", "spec_sha256"}
+    ),
+    EventKind.SPEC_PR_EDITED: frozenset(
+        {"head_commit", "pull_request_number", "spec_sha256"}
+    ),
+    EventKind.SPEC_PR_CLOSED: frozenset(
+        {"head_commit", "pull_request_number", "spec_sha256"}
+    ),
+    EventKind.SPEC_PR_MERGED: frozenset(
+        {
+            "head_commit",
+            "merge_commit",
+            "pull_request_number",
+            "spec_sha256",
+        }
+    ),
     EventKind.BASELINE_COMPLETED: frozenset({"evaluation_id"}),
     EventKind.CANDIDATE_EVALUATED: frozenset(
         {"candidate_id", "eligible", "evidence_sha256"}

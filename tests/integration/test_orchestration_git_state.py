@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import subprocess
+from threading import Barrier
 
 import pytest
 
@@ -729,3 +731,93 @@ def test_issue_event_inbox_durably_accepts_reordered_candidate_pr_events(
     assert inbox.append(31, synchronized) is False
 
     assert inbox.events(31) == (opened, synchronized, pr_opened)
+
+
+def test_issue_event_inbox_durably_records_specification_pr_wakeup(
+    tmp_path: Path,
+) -> None:
+    repository, _ = _repository(tmp_path)
+    inbox = GitIssueEventInbox(repository)
+    opened = _event("github-delivery-1", EventKind.ISSUE_CREATED)
+    spec_pr = _event(
+        "github-spec-pr",
+        EventKind.SPEC_PR_MERGED,
+        head_commit="b" * 40,
+        merge_commit="c" * 40,
+        pull_request_number=91,
+        spec_sha256="a" * 64,
+    )
+
+    assert inbox.append(31, opened) is True
+    assert inbox.append(31, spec_pr) is True
+    assert inbox.events(31) == (opened, spec_pr)
+
+
+def test_issue_event_inbox_retries_concurrent_trusted_deliveries(
+    tmp_path: Path,
+) -> None:
+    repository, origin = _repository(tmp_path)
+    GitIssueEventInbox(repository).append(
+        31,
+        _event("github-delivery-1", EventKind.ISSUE_CREATED),
+    )
+    clones = []
+    for name in ("first", "second"):
+        clone = tmp_path / name
+        _run(("git", "clone", str(origin), str(clone)), tmp_path)
+        _run(("git", "config", "user.name", "State Test"), clone)
+        _run(
+            ("git", "config", "user.email", "state@example.invalid"),
+            clone,
+        )
+        clones.append(clone)
+    inboxes = [GitIssueEventInbox(clone) for clone in clones]
+    barrier = Barrier(2)
+
+    def synchronized(original):
+        calls = 0
+
+        def load(issue_number):
+            nonlocal calls
+            loaded = original(issue_number)
+            calls += 1
+            if calls == 1:
+                barrier.wait(timeout=10)
+            return loaded
+
+        return load
+
+    for inbox in inboxes:
+        inbox._load = synchronized(inbox._load)  # type: ignore[method-assign]
+    events = (
+        _event(
+            "github-spec-1",
+            EventKind.SPEC_PR_OPENED,
+            head_commit="b" * 40,
+            pull_request_number=91,
+            spec_sha256="a" * 64,
+        ),
+        _event(
+            "github-spec-2",
+            EventKind.SPEC_PR_EDITED,
+            head_commit="c" * 40,
+            pull_request_number=91,
+            spec_sha256="a" * 64,
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(
+            executor.map(
+                lambda pair: pair[0].append(31, pair[1]),
+                zip(inboxes, events, strict=True),
+            )
+        )
+
+    assert results == (True, True)
+    persisted = GitIssueEventInbox(repository).events(31)
+    assert {event.event_id for event in persisted} == {
+        "github-delivery-1",
+        "github-spec-1",
+        "github-spec-2",
+    }

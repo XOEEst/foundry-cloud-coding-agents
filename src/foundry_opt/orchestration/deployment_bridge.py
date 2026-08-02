@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
+from foundry_opt.adapters.commands import SubprocessCommandRunner
 from foundry_opt.adapters.optimization_deployment import GhWorkflowRunGateway
 from foundry_opt.adapters.github import github_repository_from_remote_url
+from foundry_opt.deployment import DEPLOYMENT_OIDC_CLIENT_ID
 from foundry_opt.orchestration.deployment import (
     DeploymentBridgeResult,
     DeploymentCleanupBridge,
@@ -257,6 +261,20 @@ def reconcile_deployment_workflow_effects(
                 issue_number,
                 result.result,
             )
+    return DeploymentBridgeReconcileResult(
+        issue_number,
+        tuple(results),
+    )
+
+
+def reconcile_deployment_cleanup_effects(
+    repository_root: Path,
+    issue_number: int,
+    commands: CommandRunner,
+) -> DeploymentBridgeReconcileResult:
+    snapshot = GitStateRef().load(repository_root, issue_number)
+    if snapshot is None:
+        return DeploymentBridgeReconcileResult(issue_number, ())
     cleanup_records = tuple(
         record
         for record in snapshot.outbox
@@ -281,7 +299,7 @@ def reconcile_deployment_workflow_effects(
         cleanup_results = ()
     return DeploymentBridgeReconcileResult(
         issue_number,
-        tuple(results),
+        (),
         cleanup_results,
     )
 
@@ -290,6 +308,8 @@ def record_deployment_publication_file(
     repository_root: Path,
     issue_number: int,
     result_file: Path,
+    *,
+    commands: CommandRunner | None = None,
 ) -> DeploymentPublishedVerification:
     root = repository_root.resolve()
     path = (root / result_file).resolve()
@@ -331,6 +351,22 @@ def record_deployment_publication_file(
     if len(planned) != 1:
         raise ValueError("deployment result intent is unavailable")
     intent = deployment_workflow_intent(planned[0])
+    if commands is not None:
+        verify_deployment_workflow_run(
+            commands,
+            root,
+            repository=intent.workflow.repository,
+            run_id=int(document["run_id"]),
+            run_url=str(document["run_url"]),
+            run_actor=str(document["run_actor"]),
+            effect_id=intent.effect_id,
+            expected_actor=intent.workflow.actor,
+            merge_commit=intent.binding.merge_commit,
+            workflow_id=intent.workflow.workflow_id,
+            workflow_path=intent.workflow.path,
+            workflow_ref=intent.workflow.ref,
+            workflow_trigger=intent.workflow.trigger.value,
+        )
     workflow_result = _workflow_result(document, intent)
     DeploymentWorkflowResultRecorder(ledger).record(
         root,
@@ -357,6 +393,286 @@ def record_deployment_publication_file(
         verification,
     )
     return verification
+
+
+def record_deployment_publication_file_for_effect(
+    repository_root: Path,
+    result_file: Path,
+    commands: CommandRunner,
+    *,
+    expected_run_id: int,
+) -> tuple[int, DeploymentPublishedVerification]:
+    root = repository_root.resolve()
+    path = (root / result_file).resolve()
+    if not path.is_relative_to(root):
+        raise ValueError(
+            "deployment result file must be repository-relative"
+        )
+    try:
+        if path.stat().st_size > 100_000:
+            raise ValueError("deployment result file is too large")
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("deployment result file is invalid") from error
+    effect_id = (
+        document.get("effect_id")
+        if isinstance(document, dict)
+        else None
+    )
+    run_id = (
+        document.get("run_id")
+        if isinstance(document, dict)
+        else None
+    )
+    if (
+        not isinstance(effect_id, str)
+        or not effect_id
+        or type(expected_run_id) is not int
+        or expected_run_id < 1
+        or run_id != expected_run_id
+    ):
+        raise ValueError("deployment result effect ID is invalid")
+    from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
+
+    ledger = GitStateRef()
+    matches: list[int] = []
+    for issue_number in GitIssueEventInbox(root).issue_numbers():
+        snapshot = ledger.load(root, issue_number)
+        if snapshot is None:
+            continue
+        if any(
+            record.record_id == effect_id
+            and record.kind == "deployment_workflow_planned"
+            and record.generation == snapshot.state.generation
+            for record in snapshot.outbox
+        ):
+            matches.append(issue_number)
+    if len(matches) != 1:
+        raise ValueError(
+            "deployment result does not match one tracked active intent"
+        )
+    issue_number = matches[0]
+    return (
+        issue_number,
+        record_deployment_publication_file(
+            root,
+            issue_number,
+            path,
+            commands=commands,
+        ),
+    )
+
+
+def require_deployment_identity(client_id: str | None) -> None:
+    if client_id != DEPLOYMENT_OIDC_CLIENT_ID:
+        raise ValueError("deployment OIDC identity is not active")
+
+
+def verify_active_deployment_identity(
+    commands: CommandRunner,
+    repository_root: Path,
+    environment: Mapping[str, str],
+) -> None:
+    require_deployment_identity(environment.get("AZURE_CLIENT_ID"))
+    expected_tenant = environment.get("AZURE_TENANT_ID")
+    expected_subscription = environment.get("AZURE_SUBSCRIPTION_ID")
+    if not expected_tenant or not expected_subscription:
+        raise ValueError("deployment Azure account scope is unavailable")
+    try:
+        account = json.loads(
+            commands.run(
+                (
+                    "az",
+                    "account",
+                    "show",
+                    "--query",
+                    "{tenant:tenantId,subscription:id,userName:user.name,"
+                    "userType:user.type}",
+                    "-o",
+                    "json",
+                ),
+                cwd=repository_root,
+            ).stdout
+        )
+    except Exception as error:
+        raise ValueError(
+            "active Azure principal could not be verified"
+        ) from error
+    if (
+        not isinstance(account, dict)
+        or account.get("tenant") != expected_tenant
+        or account.get("subscription") != expected_subscription
+        or account.get("userName") != DEPLOYMENT_OIDC_CLIENT_ID
+        or str(account.get("userType", "")).casefold()
+        != "serviceprincipal"
+    ):
+        raise ValueError(
+            "active Azure principal is not the deployment identity"
+        )
+
+
+def verify_deployment_workflow_run(
+    commands: CommandRunner,
+    repository_root: Path,
+    *,
+    repository: str,
+    run_id: int,
+    run_url: str,
+    run_actor: str,
+    effect_id: str,
+    expected_actor: str,
+    merge_commit: str,
+    workflow_id: int,
+    workflow_path: Path,
+    workflow_ref: str,
+    workflow_trigger: str,
+) -> None:
+    branch = (
+        workflow_ref.removeprefix("refs/heads/")
+        if workflow_ref.startswith("refs/heads/")
+        else ""
+    )
+    required_actor = (
+        "github-actions[bot]"
+        if expected_actor == "workflow-dispatch"
+        else expected_actor
+    )
+    if (
+        re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
+            r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}",
+            repository,
+        )
+        is None
+        or type(run_id) is not int
+        or run_id < 1
+        or not run_url
+        or not run_actor
+        or not effect_id
+        or not expected_actor
+        or re.fullmatch(r"[0-9a-f]{40}", merge_commit) is None
+        or type(workflow_id) is not int
+        or workflow_id < 1
+        or workflow_path.is_absolute()
+        or not workflow_path.parts
+        or not branch
+        or workflow_trigger not in {"manual", "merge"}
+    ):
+        raise ValueError("deployment workflow result identity is invalid")
+    try:
+        run = json.loads(
+            commands.run(
+                (
+                    "gh",
+                    "api",
+                    f"repos/{repository}/actions/runs/{run_id}",
+                ),
+                cwd=repository_root,
+            ).stdout
+        )
+    except Exception as error:
+        raise ValueError(
+            "deployment workflow run could not be verified"
+        ) from error
+    actor = run.get("actor") if isinstance(run, dict) else None
+    run_repository = (
+        run.get("repository") if isinstance(run, dict) else None
+    )
+    if (
+        not isinstance(run, dict)
+        or run.get("id") != run_id
+        or run.get("html_url") != run_url
+        or run.get("status") != "completed"
+        or run.get("conclusion") != "success"
+        or run.get("run_attempt") != 1
+        or run.get("workflow_id") != workflow_id
+        or run.get("path") != workflow_path.as_posix()
+        or run.get("head_branch") != branch
+        or not isinstance(actor, dict)
+        or actor.get("login") != run_actor
+        or run_actor != required_actor
+        or not isinstance(run_repository, dict)
+        or run_repository.get("full_name") != repository
+        or (
+            workflow_trigger == "manual"
+            and (
+                run.get("event") != "workflow_dispatch"
+                or run.get("display_title") != effect_id
+            )
+        )
+        or (
+            workflow_trigger == "merge"
+            and (
+                run.get("event") not in {"push", "workflow_run"}
+                or run.get("head_sha") != merge_commit
+            )
+        )
+    ):
+        raise ValueError(
+            "deployment workflow run does not match the persisted result"
+        )
+
+
+def deployment_bridge_issue_numbers(
+    *,
+    requested_issue: str | None,
+    state_ref: str | None,
+    tracked: tuple[int, ...],
+) -> tuple[int, ...]:
+    if requested_issue:
+        if re.fullmatch(r"[1-9][0-9]*", requested_issue) is None:
+            raise ValueError("deployment bridge issue number is invalid")
+        issue_number = int(requested_issue)
+        if issue_number not in tracked:
+            raise ValueError(
+                "deployment bridge issue number is not tracked"
+            )
+        return (issue_number,)
+    if state_ref:
+        match = re.fullmatch(
+            r"foundry-opt/state/issue-([1-9][0-9]*)",
+            state_ref,
+        )
+        if match is not None:
+            issue_number = int(match.group(1))
+            if issue_number not in tracked:
+                raise ValueError(
+                    "deployment bridge issue number is not tracked"
+                )
+            return (issue_number,)
+    if any(type(number) is not int or number < 1 for number in tracked):
+        raise ValueError("tracked issue number is invalid")
+    return tuple(sorted(set(tracked)))
+
+
+def main() -> None:
+    root = Path.cwd()
+    from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
+
+    inbox = GitIssueEventInbox(root)
+    issues = deployment_bridge_issue_numbers(
+        requested_issue=os.environ.get("REQUESTED_ISSUE"),
+        state_ref=os.environ.get("TRUSTED_STATE_REF"),
+        tracked=inbox.issue_numbers(),
+    )
+    commands = SubprocessCommandRunner()
+    verify_active_deployment_identity(commands, root, os.environ)
+    ledger = GitStateRef()
+    for issue_number in issues:
+        snapshot = ledger.load(root, issue_number)
+        if snapshot is None:
+            continue
+        if not any(
+            record.kind == "deployment_workflow_planned"
+            and record.generation == snapshot.state.generation
+            for record in snapshot.outbox
+        ):
+            continue
+        reconcile_deployment_workflow_effects(
+            root,
+            issue_number,
+            commands,
+        )
 
 
 def _workflow_result(
@@ -435,3 +751,7 @@ def _cleanup_body(effect: DeploymentCleanupEffect) -> str:
             "",
         )
     )
+
+
+if __name__ == "__main__":
+    main()

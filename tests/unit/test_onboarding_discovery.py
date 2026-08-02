@@ -8,6 +8,7 @@ from foundry_opt.adapters.discovery import (
     AzureSdkFoundryInventory,
     FoundryInventory,
     LocalOnboardingDiscovery,
+    _uses_deployment_identity,
 )
 from foundry_opt.adapters.foundry import FoundryEndpointError
 from foundry_opt.onboarding import (
@@ -100,7 +101,18 @@ def test_discovery_finds_agents_checks_foundry_resources_and_workflows(
     )
     (workflows / "deploy.yml").write_text(
         "name: Deploy Foundry agent\non:\n  push:\n    branches: [main]\n"
-        "jobs:\n  deploy:\n    steps:\n      - run: azd deploy\n",
+        "permissions:\n  contents: read\n  id-token: write\n"
+        "jobs:\n  deploy:\n    environment: acceptance\n    steps:\n"
+        "      - uses: "
+        "azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43\n"
+        "        with:\n"
+        "          client-id: ${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}\n"
+        "      - run: azd deploy\n"
+        "      - uses: actions/upload-artifact@"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "        with:\n"
+        "          name: foundry-optimization-deployment-result\n"
+        "          path: .foundry-optimizer/deployment-result.json\n",
         encoding="utf-8",
     )
 
@@ -126,6 +138,79 @@ def test_discovery_finds_agents_checks_foundry_resources_and_workflows(
         ".github/workflows/deploy.yml"
     )
     assert result.deployment_workflows[0].trigger == "merge"
+    assert (
+        result.deployment_workflows[0].deployment_identity_verified
+        is True
+    )
+
+
+def test_deployment_identity_must_be_on_the_deploying_job() -> None:
+    document = {
+        "permissions": {"id-token": "write"},
+        "jobs": {
+            "identity-decoy": {
+                "environment": "acceptance",
+                "steps": [
+                    {
+                        "uses": (
+                            "azure/login@"
+                            "532459ea530d8321f2fb9bb10d1e0bcf23869a43"
+                        ),
+                        "with": {
+                            "client-id": (
+                                "${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}"
+                            ),
+                        },
+                    },
+                ],
+            },
+            "deploy": {
+                "environment": "acceptance",
+                "steps": [{"run": "azd deploy"}],
+            },
+        },
+    }
+
+    assert _uses_deployment_identity(document, "acceptance") is False
+
+
+def test_deployment_identity_login_must_precede_deployment() -> None:
+    document = {
+        "permissions": {"id-token": "write"},
+        "jobs": {
+            "deploy": {
+                "environment": "acceptance",
+                "steps": [
+                    {"run": "azd deploy"},
+                    {
+                        "uses": (
+                            "azure/login@"
+                            "532459ea530d8321f2fb9bb10d1e0bcf23869a43"
+                        ),
+                        "with": {
+                            "client-id": (
+                                "${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}"
+                            ),
+                        },
+                    },
+                    {
+                        "uses": (
+                            "actions/upload-artifact@"
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        ),
+                        "with": {
+                            "name": (
+                                "foundry-optimization-deployment-result"
+                            ),
+                            "path": "deployment-result.json",
+                        },
+                    },
+                ],
+            },
+        },
+    }
+
+    assert _uses_deployment_identity(document, "acceptance") is False
 
 
 def test_sdk_inventory_uses_supported_read_only_collections(

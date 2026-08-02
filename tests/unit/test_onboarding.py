@@ -1,6 +1,9 @@
 from pathlib import Path
+import hashlib
+import json
 
 import pytest
+import yaml
 
 from foundry_opt.onboarding import (
     AppInsightsDiscovery,
@@ -23,6 +26,7 @@ from foundry_opt.onboarding import (
     run_onboarding,
 )
 from foundry_opt.config import load_config
+from foundry_opt.onboarding.generation import generate_change_contents
 from foundry_opt.onboarding.repository import (
     ChangeSetConflictError,
     ChangeSetWriteError,
@@ -229,11 +233,18 @@ def test_run_onboarding_generates_secretless_draft_change_set(
         ".github/skills/foundry-agent-optimizer/SKILL.md",
         ".github/ISSUE_TEMPLATE/foundry-optimization.yml",
         ".github/agents/foundry-optimization-planner.agent.md",
-        ".github/agents/foundry-optimization-runner.agent.md",
+        ".github/agents/foundry-candidate-designer.agent.md",
         ".github/agents/foundry-candidate-applier.agent.md",
-        ".github/workflows/foundry-optimization-control.yml",
+        ".github/agents/foundry-optimization-steward.agent.md",
+        ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md",
+        ".github/skills/foundry-agent-optimizer/SKILL.md",
+        ".github/workflows/copilot-setup-steps.yml",
         ".github/workflows/foundry-exact-candidate-check.yml",
-        ".github/workflows/foundry-post-deployment-check.yml",
+        ".github/workflows/foundry-optimization-issue-intake.yml",
+        ".github/workflows/foundry-optimization-reconcile.yml",
+        ".github/workflows/foundry-optimization-deployment-bridge.yml",
+        ".github/workflows/foundry-exact-candidate-check.yml",
+        ".github/foundry-optimizer.generated.json",
     } <= generated_paths
     assert probe.deleted == [
         ("support-agent", "draft-onboarding-probe")
@@ -266,6 +277,20 @@ def test_run_onboarding_generates_secretless_draft_change_set(
         "subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}" in generated
     )
     assert "repository-ID" in generated
+    assert "foundry-opt steward advance --help" in workflow
+    assert "AZURE_DEPLOYMENT_CLIENT_ID" not in workflow
+    deployment_workflow = next(
+        change.content
+        for change in result.changes
+        if change.path.as_posix()
+        == (
+            ".github/workflows/"
+            "foundry-optimization-deployment-bridge.yml"
+        )
+    )
+    assert yaml.safe_load(deployment_workflow)[True]["workflow_run"][
+        "workflows"
+    ] == [".github/workflows/deploy.yml"]
     assert (
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         in generated
@@ -292,6 +317,98 @@ def test_run_onboarding_generates_secretless_draft_change_set(
     )
     loaded = load_config(tmp_path / ".github/foundry-optimizer.yaml")
     assert loaded.default_environment == "acceptance"
+    assert any(
+        "AZURE_DEPLOYMENT_CLIENT_ID" in guidance
+        for guidance in result.guidance
+    )
+    assert any(
+        "generated [Optimize] issue" in guidance
+        for guidance in result.guidance
+    )
+
+
+def test_generated_change_set_has_content_addressed_ownership_manifest(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    discovery = FakeDiscovery().discover(request)
+
+    contents = generate_change_contents(
+        request,
+        discovery,
+        oidc_subject="repository_id:123",
+    )
+
+    manifest_path = Path(".github/foundry-optimizer.generated.json")
+    assert manifest_path in contents
+    manifest = json.loads(contents[manifest_path])
+    assert manifest["schema_version"] == 1
+    assert manifest["generator"] == "foundry-opt init"
+    assert manifest["files"] == {
+        path.as_posix(): hashlib.sha256(content.encode("utf-8")).hexdigest()
+        for path, content in contents.items()
+        if path != manifest_path
+    }
+    assert set(manifest["obsolete"]) == {
+        ".github/agents/foundry-optimization-runner.agent.md",
+        ".github/workflows/foundry-optimization-control.yml",
+        ".github/workflows/foundry-post-deployment-check.yml",
+    }
+    assert {
+        ".github/agents/foundry-optimization-planner.agent.md",
+        ".github/agents/foundry-candidate-applier.agent.md",
+        ".github/agents/foundry-optimization-steward.agent.md",
+        ".github/workflows/foundry-optimization-issue-intake.yml",
+    } <= set(manifest["accepted_previous_sha256"])
+    assert manifest["accepted_previous_sha256"][
+        ".github/skills/foundry-agent-optimizer/SKILL.md"
+    ] == [
+        "dc85a8a2246e36d27000a778b7a114419fdb594d56b15569ddc5713f5f0a11ec"
+    ]
+    assert {
+        ".github/workflows/copilot-setup-steps.yml",
+        ".github/workflows/foundry-exact-candidate-check.yml",
+        ".github/workflows/foundry-optimization-issue-intake.yml",
+    } <= set(manifest["accepted_previous_normalized_sha256"])
+    assert {
+        ".github/workflows/foundry-optimization-control.yml",
+        ".github/workflows/foundry-post-deployment-check.yml",
+    } <= set(manifest["obsolete_normalized_sha256"])
+
+
+def test_legacy_upgrade_signatures_are_independent_of_new_package_pin(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    discovery = FakeDiscovery().discover(request)
+    upgraded = OnboardingRequest(
+        **{
+            **request.__dict__,
+            "product_install": "foundry-cloud-coding-agent==0.2.0",
+        }
+    )
+
+    first = json.loads(
+        generate_change_contents(
+            request,
+            discovery,
+            oidc_subject="repository_id:123",
+        )[Path(".github/foundry-optimizer.generated.json")]
+    )
+    second = json.loads(
+        generate_change_contents(
+            upgraded,
+            discovery,
+            oidc_subject="repository_id:123",
+        )[Path(".github/foundry-optimizer.generated.json")]
+    )
+
+    assert first["accepted_previous_normalized_sha256"] == second[
+        "accepted_previous_normalized_sha256"
+    ]
+    assert first["obsolete_normalized_sha256"] == second[
+        "obsolete_normalized_sha256"
+    ]
 
 
 def test_run_onboarding_reports_partial_after_variable_failure(
@@ -322,6 +439,53 @@ def test_run_onboarding_reports_partial_after_variable_failure(
     assert "GitHub variable configuration failed" in result.blockers[0]
     assert result.residual_state == (
         "Draft onboarding PR: https://github.com/octo-org/agents/pull/42",
+    )
+
+
+def test_run_onboarding_is_idempotent_when_bundle_is_current(
+    tmp_path: Path,
+) -> None:
+    class CurrentWriter:
+        def prevalidate(self, repository_root, contents):
+            return tuple(
+                OnboardingChange(
+                    path,
+                    content,
+                    ChangeStatus.UNCHANGED,
+                    base_commit="a" * 40,
+                )
+                for path, content in contents.items()
+            )
+
+        def write(self, repository_root, contents):
+            raise AssertionError("unchanged files must not be rewritten")
+
+    class UnexpectedProbe(FakeDraftProbe):
+        def probe(self, request, agent, source):
+            raise AssertionError("unchanged onboarding must not probe drafts")
+
+    class UnexpectedPublisher:
+        def publish(self, request, discovery, changes, draft_pull_request):
+            raise AssertionError("unchanged onboarding must not open a PR")
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=UnexpectedProbe(),
+            publisher=UnexpectedPublisher(),
+            change_writer=CurrentWriter(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.READY
+    assert result.published_pull_request is None
+    assert {change.status for change in result.changes} == {
+        ChangeStatus.UNCHANGED
+    }
+    assert result.guidance == (
+        "Generated onboarding files are already current.",
     )
 
 
@@ -468,6 +632,35 @@ def test_run_onboarding_rejects_unpinned_multiline_install_before_discovery(
     assert result.status is OnboardingStatus.BLOCKED
     assert result.blockers == (
         "The product install must be pinned to a version or commit.",
+    )
+
+
+def test_run_onboarding_rejects_identifier_command_injection_before_discovery(
+    tmp_path: Path,
+) -> None:
+    class UnexpectedDiscovery:
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            raise AssertionError("unsafe request reached discovery")
+
+    unsafe = OnboardingRequest(
+        **{
+            **_request(tmp_path).__dict__,
+            "environment_name": "prod\nrun: echo owned",
+        }
+    )
+
+    result = run_onboarding(
+        unsafe,
+        OnboardingDependencies(
+            discovery=UnexpectedDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.blockers == (
+        "Onboarding identifiers contain unsafe characters.",
     )
 
 
@@ -643,6 +836,39 @@ def test_run_onboarding_reports_destination_race_as_conflict(
     ).status is ChangeStatus.CONFLICT
 
 
+def test_run_onboarding_reports_preserved_obsolete_user_file_conflict(
+    tmp_path: Path,
+) -> None:
+    obsolete = Path(
+        ".github/workflows/foundry-optimization-control.yml"
+    )
+
+    class ObsoleteConflictWriter:
+        def prevalidate(self, repository_root, contents):
+            raise ChangeSetConflictError((obsolete,))
+
+        def write(self, repository_root, contents):
+            raise AssertionError("conflicts must stop before writing")
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=FakeDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+            change_writer=ObsoleteConflictWriter(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.CONFLICT
+    conflict = next(
+        change for change in result.changes if change.path == obsolete
+    )
+    assert conflict.status is ChangeStatus.CONFLICT
+    assert conflict.content == ""
+    assert conflict.detail == "Existing path was preserved."
+
+
 @pytest.mark.parametrize(
     ("field", "value", "expected"),
     [
@@ -730,6 +956,45 @@ def test_run_onboarding_blocks_ambiguous_discovered_roles(
 
     assert result.status is OnboardingStatus.BLOCKED
     assert expected in result.blockers
+
+
+def test_run_onboarding_requires_deployment_workflow_oidc_separation(
+    tmp_path: Path,
+) -> None:
+    class SharedIdentityDiscovery(FakeDiscovery):
+        def discover(self, request: OnboardingRequest) -> RepositoryDiscovery:
+            discovered = super().discover(request)
+            workflow = discovered.deployment_workflows[0]
+            return RepositoryDiscovery(
+                **{
+                    **discovered.__dict__,
+                    "deployment_workflows": (
+                        DeploymentWorkflowDiscovery(
+                            path=workflow.path,
+                            trigger=workflow.trigger,
+                            role=workflow.role,
+                            name=workflow.name,
+                            deployment_identity_verified=False,
+                        ),
+                    ),
+                }
+            )
+
+    result = run_onboarding(
+        _request(tmp_path),
+        OnboardingDependencies(
+            discovery=SharedIdentityDiscovery(),
+            oidc=FakeOidc(),
+            draft_probe=FakeDraftProbe(),
+        ),
+    )
+
+    assert result.status is OnboardingStatus.BLOCKED
+    assert result.blockers == (
+        "The deployment job must use pinned azure/login with "
+        "AZURE_DEPLOYMENT_CLIENT_ID before deployment and upload the "
+        "foundry-optimization-deployment-result artifact afterward.",
+    )
 
 
 def test_run_onboarding_surfaces_residual_change_set_state(

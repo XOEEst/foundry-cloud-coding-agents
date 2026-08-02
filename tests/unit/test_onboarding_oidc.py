@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from foundry_opt.adapters.oidc import (
     CommandOidcVerifier,
     OidcVerificationError,
 )
+from foundry_opt.deployment import DEPLOYMENT_OIDC_CLIENT_ID
 from foundry_opt.onboarding import OnboardingRequest, RepositoryDiscovery
 from foundry_opt.preflight.interfaces import CommandResult
 
@@ -22,6 +24,7 @@ class FakeCommands:
         user_name: str = "operator@example.com",
         accessible_subscription: str = "subscription",
         application_id: str = "client",
+        deployment_federated_subject: str | None = None,
     ) -> None:
         self.invocations: list[tuple[str, ...]] = []
         self.responses = {
@@ -92,6 +95,37 @@ class FakeCommands:
                 f'"subject":"{federated_subject}",'
                 '"audiences":["api://AzureADTokenExchange"]}]'
             ),
+            (
+                "az",
+                "ad",
+                "app",
+                "show",
+                "--id",
+                DEPLOYMENT_OIDC_CLIENT_ID,
+                "--query",
+                "{appId:appId,id:id}",
+                "-o",
+                "json",
+            ): (
+                f'{{"appId":"{DEPLOYMENT_OIDC_CLIENT_ID}",'
+                '"id":"00000000-0000-0000-0000-000000000002"}'
+            ),
+            (
+                "az",
+                "ad",
+                "app",
+                "federated-credential",
+                "list",
+                "--id",
+                "00000000-0000-0000-0000-000000000002",
+                "-o",
+                "json",
+            ): (
+                '[{"issuer":"https://token.actions.githubusercontent.com",'
+                '"subject":"'
+                f'{deployment_federated_subject or federated_subject}",'
+                '"audiences":["api://AzureADTokenExchange"]}]'
+            ),
         }
 
     def run(
@@ -156,6 +190,18 @@ def test_oidc_verifier_requires_exact_immutable_repository_id_trust(
         "secret" not in argument.casefold()
         for invocation in commands.invocations
         for argument in invocation
+    )
+    assert any(
+        invocation[:6]
+        == (
+            "az",
+            "ad",
+            "app",
+            "show",
+            "--id",
+            DEPLOYMENT_OIDC_CLIENT_ID,
+        )
+        for invocation in commands.invocations
     )
 
 
@@ -252,3 +298,47 @@ def test_oidc_verifier_rejects_a_different_target_application(
         match="target Entra application",
     ):
         verifier.verify(_request(tmp_path), _discovery())
+
+
+def test_oidc_verifier_uses_selected_deployment_environment_subject(
+    tmp_path: Path,
+) -> None:
+    optimizer_subject = (
+        "repo:octo-org@42/agents@123456:environment:acceptance"
+    )
+    deployment_subject = (
+        "repo:octo-org@42/agents@123456:environment:production"
+    )
+    request = replace(
+        _request(tmp_path),
+        set_github_variables=True,
+        mirror_actions_environment="production",
+    )
+    verifier = CommandOidcVerifier(
+        FakeCommands(
+            federated_subject=optimizer_subject,
+            deployment_federated_subject=deployment_subject,
+            use_default=True,
+        )
+    )
+
+    result = verifier.verify(request, _discovery())
+
+    assert result.verified is True
+
+
+def test_oidc_verifier_requires_distinct_optimizer_and_deployment_apps(
+    tmp_path: Path,
+) -> None:
+    subject = (
+        "repo:octo-org@42/agents@123456:repository_id:123456"
+    )
+    request = replace(
+        _request(tmp_path),
+        deployment_client_id="client",
+    )
+
+    with pytest.raises(OidcVerificationError, match="must be distinct"):
+        CommandOidcVerifier(
+            FakeCommands(federated_subject=subject)
+        ).verify(request, _discovery())
