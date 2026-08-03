@@ -145,8 +145,6 @@ class AutomationPolicy(ConfigModel):
             raise ValueError(
                 "required_checks are required when merge is enabled"
             )
-        if self.allow_deployment and not self.allow_merge:
-            raise ValueError("automated deployment requires merge")
         if self.merge_actor is not None and not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
             self.merge_actor,

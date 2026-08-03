@@ -335,8 +335,7 @@ def test_automation_policy_requires_explicit_merge_actor_and_ordering() -> None:
             merge_actor="foundry-opt-merge-app",
         )
 
-    with pytest.raises(ValidationError, match="deployment requires merge"):
-        AutomationPolicy(allow_deployment=True)
+    human_merge_policy = AutomationPolicy(allow_deployment=True)
 
     policy = AutomationPolicy(
         allow_candidate_auto_selection=True,
@@ -347,6 +346,9 @@ def test_automation_policy_requires_explicit_merge_actor_and_ordering() -> None:
     )
 
     assert policy.merge_actor == "foundry-opt-merge-app"
+    assert human_merge_policy.allow_merge is False
+    assert human_merge_policy.allow_candidate_auto_selection is False
+    assert human_merge_policy.allow_deployment is True
     assert policy.trace_requires_human_review is True
 
 
