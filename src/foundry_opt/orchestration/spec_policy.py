@@ -228,6 +228,23 @@ class OptimizationSpecPolicy:
             request.issue_number,
         )
         if isinstance(resolved, UnresolvedSpecification):
+            if resolved.reason == "invalid_specification":
+                event = CampaignEvent(
+                    event_id=(
+                        f"spec-blocked-{request.state.generation}-"
+                        "invalid-specification"
+                    ),
+                    kind=EventKind.SPEC_POLICY_BLOCKED,
+                    generation=request.state.generation,
+                    occurred_at=self._clock(),
+                    payload={"reason": resolved.reason},
+                )
+                return SpecPolicyDecision(
+                    classification=SpecClassification.HUMAN_REVIEW,
+                    reason=resolved.reason,
+                    event=event,
+                    disposition=AdvanceDisposition.BLOCKED,
+                )
             return self._human_decision(
                 request,
                 reason=resolved.reason,
@@ -925,6 +942,194 @@ class GhMergedSpecApprovalReader:
             return OptimizationSpec.model_validate(yaml.safe_load(content))
         except Exception:
             return None
+
+
+class GitTransportMergedSpecApprovalReader(GhMergedSpecApprovalReader):
+    """Verify a trusted merged-spec event using only immutable Git data."""
+
+    def __init__(
+        self,
+        commands: CommandRunner,
+        *,
+        default_branch: Callable[[Path], str],
+    ) -> None:
+        super().__init__(commands)
+        self._default_branch = default_branch
+
+    def merged_approval(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        *,
+        expected: CampaignState,
+    ) -> MergedSpecApproval | None:
+        from foundry_opt.orchestration.issue_intake import (
+            GitIssueEventInbox,
+        )
+
+        if (
+            expected.spec_sha256 is None
+            or expected.spec_base_ref_name is None
+            or expected.spec_head_commit is None
+            or expected.spec_tree_sha is None
+            or not expected.spec_files
+        ):
+            return None
+        try:
+            default_branch = self._default_branch(repository_root)
+        except Exception:
+            return None
+        if (
+            default_branch != expected.spec_base_ref_name
+            or not _BRANCH.fullmatch(default_branch)
+        ):
+            return None
+        merged = next(
+            (
+                event
+                for event in reversed(
+                    GitIssueEventInbox(repository_root).events(
+                        issue_number
+                    )
+                )
+                if (
+                    event.kind is EventKind.SPEC_PR_MERGED
+                    and event.generation == expected.generation
+                    and event.payload.get("spec_sha256")
+                    == expected.spec_sha256
+                    and event.payload.get("head_commit")
+                    == expected.spec_head_commit
+                )
+            ),
+            None,
+        )
+        if merged is None:
+            return None
+        number = merged.payload.get("pull_request_number")
+        merge_commit = merged.payload.get("merge_commit")
+        if (
+            type(number) is not int
+            or not isinstance(merge_commit, str)
+            or not _COMMIT.fullmatch(merge_commit)
+        ):
+            return None
+        try:
+            self._commands.run(
+                (
+                    "git",
+                    "fetch",
+                    "--quiet",
+                    "origin",
+                    f"refs/heads/{default_branch}",
+                ),
+                cwd=repository_root,
+            )
+            remote_default_tip = self._commands.run(
+                ("git", "rev-parse", "FETCH_HEAD^{commit}"),
+                cwd=repository_root,
+            ).stdout.strip()
+            head_commit = expected.spec_head_commit
+            try:
+                self._commands.run(
+                    (
+                        "git",
+                        "cat-file",
+                        "-e",
+                        f"{head_commit}^{{commit}}",
+                    ),
+                    cwd=repository_root,
+                )
+            except Exception:
+                self._commands.run(
+                    (
+                        "git",
+                        "fetch",
+                        "--quiet",
+                        "origin",
+                        f"pull/{number}/head",
+                    ),
+                    cwd=repository_root,
+                )
+                fetched_head = self._commands.run(
+                    ("git", "rev-parse", "FETCH_HEAD^{commit}"),
+                    cwd=repository_root,
+                ).stdout.strip()
+                if fetched_head != head_commit:
+                    return None
+            head_tree = self._commands.run(
+                ("git", "rev-parse", f"{head_commit}^{{tree}}"),
+                cwd=repository_root,
+            ).stdout.strip()
+            merge_tree = self._commands.run(
+                ("git", "rev-parse", f"{merge_commit}^{{tree}}"),
+                cwd=repository_root,
+            ).stdout.strip()
+            expected_files = tuple(
+                PreparedSpecFile(Path(value.path), value.sha256)
+                for value in expected.spec_files
+            )
+            head_files = self._read_files(
+                repository_root,
+                head_commit,
+                expected_files,
+            )
+            merged_files = self._read_files(
+                repository_root,
+                merge_commit,
+                expected_files,
+            )
+            from foundry_opt.optimization.specification import (
+                spec_file_path,
+            )
+
+            path = spec_file_path(issue_number).as_posix()
+            head_spec = self._read_spec(
+                repository_root,
+                f"{head_commit}:{path}",
+            )
+            merged_spec = self._read_spec(
+                repository_root,
+                f"{merge_commit}:{path}",
+            )
+            self._commands.run(
+                (
+                    "git",
+                    "merge-base",
+                    "--is-ancestor",
+                    merge_commit,
+                    remote_default_tip,
+                ),
+                cwd=repository_root,
+            )
+        except Exception:
+            return None
+        if (
+            not _COMMIT.fullmatch(remote_default_tip)
+            or head_tree != expected.spec_tree_sha
+            or not _COMMIT.fullmatch(merge_tree)
+            or head_files != expected_files
+            or merged_files != expected_files
+            or head_spec is None
+            or merged_spec is None
+            or head_spec.sha256 != expected.spec_sha256
+            or merged_spec.sha256 != expected.spec_sha256
+        ):
+            return None
+        return MergedSpecApproval(
+            generation=expected.generation,
+            pull_request_number=number,
+            base_ref_name=default_branch,
+            head_commit=head_commit,
+            head_tree_sha=head_tree,
+            head_files=head_files,
+            head_spec_sha256=head_spec.sha256,
+            merge_commit=merge_commit,
+            merge_tree_sha=merge_tree,
+            merged_files=merged_files,
+            merged_spec_sha256=merged_spec.sha256,
+            remote_default_tip=remote_default_tip,
+            merge_reachable_from_default=True,
+        )
 
 
 class RepositorySpecPolicy:

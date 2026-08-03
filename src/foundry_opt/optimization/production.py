@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import re
 import shlex
 import subprocess
 from typing import Any
@@ -76,7 +77,12 @@ from foundry_opt.config.loader import ConfigLoadError
 from foundry_opt.config.models import AgentTarget, OptimizerConfig
 from foundry_opt.drafts import DraftRecord, DraftRequest
 from foundry_opt.evidence.writer import write_redacted_evidence
-from foundry_opt.github_workflow.models import GitHubCapabilities
+from foundry_opt.github_workflow.models import (
+    GitHubCapabilities,
+    GitHubPermissionReport,
+    IssueReference,
+    RepositoryState,
+)
 from foundry_opt.optimization.assets import (
     BuiltinEvaluatorProvider,
     CustomEvaluatorAssetProvider,
@@ -104,12 +110,15 @@ from foundry_opt.orchestration.steward import (
     StewardAdvanceService,
 )
 from foundry_opt.orchestration.git_state import GitStateRef, StateRefError
+from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
+from foundry_opt.orchestration.models import EventKind
 from foundry_opt.orchestration.spec_policy import (
-    GhMergedSpecApprovalReader,
+    GitTransportMergedSpecApprovalReader,
     GitPinnedAssetReader,
     OptimizationSpecPolicy,
     OptimizationSpecServiceResolver,
     RepositorySpecPolicy,
+    UnresolvedSpecification,
 )
 from foundry_opt.optimization.models import (
     AssetKind,
@@ -1022,6 +1031,199 @@ def build_optimization_command_service() -> OptimizationCommandService:
     return ProductionOptimizationCommandService()
 
 
+def _git_remote_default_branch(repository_root: Path) -> str:
+    completed = subprocess.run(
+        ("git", "ls-remote", "--symref", "origin", "HEAD"),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode == 0:
+        for line in completed.stdout.splitlines():
+            match = re.fullmatch(
+                r"ref: refs/heads/(.+)\s+HEAD",
+                line,
+            )
+            if match is not None:
+                return match.group(1)
+    completed = subprocess.run(
+        (
+            "git",
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    value = completed.stdout.strip()
+    if completed.returncode == 0 and value.startswith("origin/"):
+        return value.removeprefix("origin/")
+    completed = subprocess.run(
+        (
+            "git",
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    value = completed.stdout.strip()
+    if completed.returncode == 0 and value.startswith("origin/"):
+        return value.removeprefix("origin/")
+    raise ValueError("remote default branch is unavailable")
+
+
+class _TrustedIssueOptimizationGateway:
+    def __init__(
+        self,
+        issue: Any,
+        pinned: Any,
+    ) -> None:
+        self._issue = issue
+        self._pinned = pinned
+
+    def verify_permissions(
+        self,
+        required: GitHubCapabilities,
+    ) -> GitHubPermissionReport:
+        return GitHubPermissionReport(
+            required & GitHubCapabilities.METADATA_READ
+        )
+
+    def repository_state(self, repository_root: Path) -> RepositoryState:
+        return RepositoryState(
+            self._issue.repository,
+            self._pinned.default_branch,
+            self._pinned.commit,
+        )
+
+    def get_issue(
+        self,
+        repository_root: Path,
+        issue_number: int,
+    ) -> IssueReference | None:
+        if issue_number != self._issue.issue_number:
+            return None
+        return IssueReference(
+            issue_number,
+            (
+                f"https://github.com/{self._issue.repository}/issues/"
+                f"{issue_number}"
+            ),
+            self._issue.title,
+            self._issue.body,
+        )
+
+    def find_spec_pull_request(
+        self,
+        repository_root: Path,
+        issue_number: int,
+    ) -> None:
+        return None
+
+    def comment_issue(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        body: str,
+    ) -> None:
+        return None
+
+    def has_issue_comment(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        marker: str,
+    ) -> bool:
+        return True
+
+    def add_labels(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        labels: tuple[str, ...],
+    ) -> None:
+        return None
+
+    def remove_labels(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        labels: tuple[str, ...],
+    ) -> None:
+        return None
+
+
+class _TrustedInboxSpecResolver:
+    def __init__(
+        self,
+        config: OptimizerConfig,
+        *,
+        registry: EvaluationAssetProviderRegistry,
+        publisher: GitSpecPublisher,
+    ) -> None:
+        self._config = config
+        self._registry = registry
+        self._publisher = publisher
+
+    def resolve(
+        self,
+        repository_root: Path,
+        issue_number: int,
+    ) -> Any:
+        inbox = GitIssueEventInbox(repository_root)
+        current = None
+        reason = "issue_content_unavailable"
+        for event in inbox.events(issue_number):
+            if event.kind in {
+                EventKind.ISSUE_CREATED,
+                EventKind.ISSUE_EDITED,
+                EventKind.ISSUE_REOPENED,
+            }:
+                current = event
+                reason = str(
+                    event.payload.get(
+                        "issue_error",
+                        "issue_content_unavailable",
+                    )
+                )
+            elif event.kind is EventKind.ISSUE_DECLASSIFIED:
+                current = None
+                reason = "issue_declassified"
+            elif event.kind is EventKind.ISSUE_CLOSED:
+                current = None
+                reason = "issue_closed"
+        if current is None:
+            return UnresolvedSpecification(reason)
+        sha256 = current.payload.get("issue_sha256")
+        if not isinstance(sha256, str):
+            return UnresolvedSpecification(reason)
+        issue = inbox.issue_content(issue_number, sha256)
+        pinned = CampaignGit(
+            default_branch=_git_remote_default_branch
+        ).pin_default_branch(repository_root)
+        service = OptimizationSpecService(
+            self._config,
+            registry=self._registry,
+            gateway=_TrustedIssueOptimizationGateway(issue, pinned),
+            publisher=self._publisher,
+            require_issue_label=False,
+        )
+        return OptimizationSpecServiceResolver(service).resolve(
+            repository_root,
+            issue_number,
+        )
+
+
 def build_production_steward_spec_policy(
     *,
     config_path: Path = _DEFAULT_CONFIG_PATH,
@@ -1033,30 +1235,23 @@ def build_production_steward_spec_policy(
     credential = _default_credential_provider(environment)
     resolution_factory = _default_resolution_gateway_factory(credential)
     pinned_assets = GitPinnedAssetReader(commands)
-    approvals = GhMergedSpecApprovalReader(commands)
-    state = GitStateRef()
-
-    def generation(repository_root: Path, issue_number: int) -> int | None:
-        snapshot = state.load(repository_root, issue_number)
-        return snapshot.state.generation if snapshot is not None else None
+    approvals = GitTransportMergedSpecApprovalReader(
+        commands,
+        default_branch=_git_remote_default_branch,
+    )
 
     def factory(repository_root: Path) -> OptimizationSpecPolicy:
         config = load_config(repository_root / config_path)
-        service = OptimizationSpecService(
+        resolver = _TrustedInboxSpecResolver(
             config,
             registry=build_specification_asset_registry(
                 resolution_gateway_factory=resolution_factory
             ),
-            gateway=GhOptimizationGateway(
-                commands,
-                granted_capabilities=_SPEC_CAPABILITIES,
-            ),
             publisher=GitSpecPublisher(commands),
-            generation_provider=generation,
         )
         return OptimizationSpecPolicy(
             config.automation_policy,
-            resolver=OptimizationSpecServiceResolver(service),
+            resolver=resolver,
             pinned_assets=pinned_assets,
             approvals=approvals,
         )
@@ -1782,30 +1977,8 @@ class _ProductionCandidateSlatePlanResolver:
             or spec.sha256 != state.spec_sha256
         ):
             raise ValueError("approved candidate slate specification changed")
-        repository_document = _production_json(
-            self._commands,
-            (
-                "gh",
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner,defaultBranchRef",
-            ),
-            root,
-        )
-        repository = repository_document.get("nameWithOwner")
-        default_ref = repository_document.get("defaultBranchRef")
-        default_branch = (
-            default_ref.get("name")
-            if isinstance(default_ref, Mapping)
-            else None
-        )
-        if (
-            not isinstance(repository, str)
-            or not isinstance(default_branch, str)
-            or repository != spec.repository
-        ):
-            raise ValueError("candidate repository identity is unavailable")
+        repository = spec.repository
+        default_branch = _git_remote_default_branch(root)
         pinned = CampaignGit(
             default_branch=lambda repository_root: default_branch
         ).pin_default_branch(root)
@@ -1970,7 +2143,9 @@ def build_production_steward_candidate_workers(
         config_path=config_path,
         registration_gateway_factory=registration,
     )
-    campaign_repository = repository or CampaignGit()
+    campaign_repository = repository or CampaignGit(
+        default_branch=_git_remote_default_branch
+    )
     return CandidateWorkerService(
         ledger=GitStateRef(),
         resolver=_ProductionCandidateWorkerPlanResolver(source),

@@ -171,6 +171,7 @@ from foundry_opt.orchestration.issue_intake import (
 from foundry_opt.orchestration.spec_policy import (
     GhMergedSpecApprovalReader,
     GitPinnedAssetReader,
+    GitTransportMergedSpecApprovalReader,
     MergedSpecApproval,
     OptimizationSpecPolicy,
     OptimizationSpecServiceResolver,
@@ -295,6 +296,7 @@ __all__ = [
     "GhCandidateSupersessionGateway",
     "GhMergedSpecApprovalReader",
     "GitPinnedAssetReader",
+    "GitTransportMergedSpecApprovalReader",
     "GitStateRef",
     "InvalidCampaignTransition",
     "OptimizationCampaign",

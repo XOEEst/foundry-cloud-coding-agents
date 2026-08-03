@@ -281,12 +281,14 @@ class OptimizationSpecService:
         gateway: OptimizationSpecGateway,
         publisher: SpecPublisher,
         generation_provider: Callable[[Path, int], int | None] | None = None,
+        require_issue_label: bool = True,
     ) -> None:
         self._config = config
         self._registry = registry
         self._gateway = gateway
         self._publisher = publisher
         self._generation_provider = generation_provider
+        self._require_issue_label = require_issue_label
 
     def prepare_specification(
         self,
@@ -339,7 +341,10 @@ class OptimizationSpecService:
                 "issue_closed",
                 "the issue must be open to prepare a specification",
             )
-        if not (_CANONICAL_LABELS & set(issue.labels)):
+        if (
+            self._require_issue_label
+            and not (_CANONICAL_LABELS & set(issue.labels))
+        ):
             return self._blocked(
                 repository_root,
                 issue_number,

@@ -271,6 +271,7 @@ class StewardAdvanceService:
                 and event.kind
                 in {
                     EventKind.SPEC_POLICY_APPROVED,
+                    EventKind.SPEC_POLICY_BLOCKED,
                     EventKind.SPEC_REVIEW_REQUIRED,
                     EventKind.SPEC_HUMAN_APPROVED,
                 }

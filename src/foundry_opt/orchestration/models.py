@@ -36,6 +36,7 @@ class EventKind(StrEnum):
     ISSUE_REOPENED = "issue_reopened"
     ISSUE_CLOSED = "issue_closed"
     SPEC_POLICY_APPROVED = "spec_policy_approved"
+    SPEC_POLICY_BLOCKED = "spec_policy_blocked"
     SPEC_REVIEW_REQUIRED = "spec_review_required"
     SPEC_HUMAN_APPROVED = "spec_human_approved"
     SPEC_PR_OPENED = "spec_pr_opened"

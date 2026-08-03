@@ -48,6 +48,59 @@ def _payload(action: str, *, state: str = "open") -> dict[str, object]:
     }
 
 
+def _optimization_body(
+    goal: str = "Improve support response quality safely.",
+) -> str:
+    return f"""### Configured target
+
+support-agent
+
+### Optimization goal
+
+{goal}
+
+### Dataset requests
+
+- asset_id: development
+  source: repository
+  role: development
+  path: data/development.jsonl
+- asset_id: validation
+  source: repository
+  role: validation
+  path: data/validation.jsonl
+
+### Evaluator requests
+
+- asset_id: task-quality
+  source: builtin
+  name: task-quality
+  version: v1
+  metrics: [quality]
+
+### Metric policies
+
+quality:
+  direction: maximize
+  threshold: 0.8
+  materiality: 0.05
+  hard_guardrail: false
+  undefined_behavior: fail
+
+### Allowed mutations
+
+- system_instructions
+
+### Candidate decision
+
+human
+
+### Deployment decision
+
+human
+"""
+
+
 def _context(delivery: str, *, event_name: str = "issues"):
     return TrustedEventContext(
         event_name=event_name,
@@ -64,7 +117,7 @@ class FakeInbox:
     def events(self, issue_number: int):
         return tuple(self.recorded.get(issue_number, ()))
 
-    def append(self, issue_number: int, event):
+    def append(self, issue_number: int, event, *, issue=None):
         events = self.recorded.setdefault(issue_number, [])
         if event.event_id in {item.event_id for item in events}:
             return False
@@ -208,9 +261,16 @@ def test_duplicate_delivery_is_idempotent() -> None:
     projection = FakeProjection()
     intake = IssueEventIntake(inbox, assignments, projection)
     context = _context("11111111-1111-4111-8111-111111111111")
+    payload = {
+        **_payload("opened"),
+        "issue": {
+            **_payload("opened")["issue"],
+            "body": _optimization_body(),
+        },
+    }
 
-    first = intake.ingest(_payload("opened"), context)
-    duplicate = intake.ingest(_payload("opened"), context)
+    first = intake.ingest(payload, context)
+    duplicate = intake.ingest(payload, context)
 
     assert first.recorded is True
     assert duplicate.recorded is False
@@ -219,6 +279,21 @@ def test_duplicate_delivery_is_idempotent() -> None:
         (31, "github-11111111-1111-4111-8111-111111111111")
     ]
     assert projection.projected == [31, 31]
+
+    changed = {
+        **payload,
+        "issue": {
+            **payload["issue"],
+            "body": _optimization_body(
+                "Improve edited support response quality safely."
+            ),
+        },
+    }
+    with pytest.raises(
+        TrustedIssueEventError,
+        match="reused for different issue content",
+    ):
+        intake.ingest(changed, context)
 
 
 def test_new_event_preserves_active_steward_lease() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -11,12 +12,18 @@ from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
 from foundry_opt.adapters.commands import SubprocessCommandRunner
+from foundry_opt.optimization.issues import (
+    IssueSpecificationError,
+    parse_optimization_issue_request,
+    privacy_safe_optimization_issue_body,
+)
 from foundry_opt.orchestration.models import (
     CampaignEvent,
     CampaignPhase,
     EventKind,
 )
 from foundry_opt.preflight.interfaces import CommandRunner
+from foundry_opt.security import reject_secret_content
 
 
 _DELIVERY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,126}$")
@@ -57,6 +64,14 @@ _PR_EVENT_KINDS = frozenset(
 _WORKFLOW_EVENT_KINDS = frozenset(
     {EventKind.DEPLOYMENT_WORKFLOW_OBSERVED}
 )
+_ISSUE_CONTENT_KINDS = frozenset(
+    {
+        EventKind.ISSUE_CREATED,
+        EventKind.ISSUE_EDITED,
+        EventKind.ISSUE_REOPENED,
+    }
+)
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class TrustedIssueEventError(ValueError):
@@ -100,6 +115,65 @@ class IntakeResult:
     recorded: bool
 
 
+@dataclass(frozen=True)
+class TrustedIssueContent:
+    issue_number: int
+    repository: str
+    title: str
+    body: str
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("trusted issue content schema is invalid")
+        if type(self.issue_number) is not int or self.issue_number < 1:
+            raise ValueError("trusted issue number is invalid")
+        if not _REPOSITORY.fullmatch(self.repository):
+            raise ValueError("trusted issue repository is invalid")
+        if (
+            not isinstance(self.title, str)
+            or not self.title.startswith("[Optimize] ")
+            or len(self.title) > 256
+        ):
+            raise ValueError("trusted optimization title is invalid")
+        if not isinstance(self.body, str) or len(self.body) > 262_144:
+            raise ValueError("trusted optimization body is invalid")
+        reject_secret_content(self.title)
+        parse_optimization_issue_request(
+            issue_number=self.issue_number,
+            repository=self.repository,
+            body=self.body,
+        )
+        object.__setattr__(
+            self,
+            "body",
+            privacy_safe_optimization_issue_body(self.body),
+        )
+
+    @property
+    def content(self) -> bytes:
+        return (
+            json.dumps(
+                {
+                    "body": self.body,
+                    "issue_number": self.issue_number,
+                    "repository": self.repository,
+                    "schema_version": self.schema_version,
+                    "title": self.title,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.content).hexdigest()
+
+
 class IssueEventInbox(Protocol):
     def events(self, issue_number: int) -> tuple[CampaignEvent, ...]: ...
 
@@ -107,6 +181,8 @@ class IssueEventInbox(Protocol):
         self,
         issue_number: int,
         event: CampaignEvent,
+        *,
+        issue: TrustedIssueContent | None = None,
     ) -> bool: ...
 
     def issue_numbers(self) -> tuple[int, ...]: ...
@@ -199,7 +275,7 @@ class IssueEventIntake:
         payload: Mapping[str, Any],
         context: TrustedEventContext,
     ) -> IntakeResult:
-        issue_number, action, title, occurred_at = _validate_payload(
+        issue_number, action, title, body, occurred_at = _validate_payload(
             payload,
             context,
         )
@@ -227,14 +303,25 @@ class IssueEventIntake:
                     "issue event is older than the durable inbox"
                 )
             kind = _event_kind(action, title, existing)
+            issue, event_payload = _trusted_issue_event_payload(
+                kind=kind,
+                issue_number=issue_number,
+                repository=context.repository,
+                title=title,
+                body=body,
+            )
             duplicate = next(
                 (item for item in existing if item.event_id == event_id),
                 None,
             )
             if duplicate is not None:
-                if duplicate.kind is not kind:
+                if (
+                    duplicate.kind is not kind
+                    or duplicate.occurred_at != occurred_at
+                    or dict(duplicate.payload) != event_payload
+                ):
                     raise TrustedIssueEventError(
-                        "delivery ID was reused for another action"
+                        "delivery ID was reused for different issue content"
                     )
                 _wake_steward(
                     self._assignments,
@@ -249,9 +336,17 @@ class IssueEventIntake:
                 kind=kind,
                 generation=_generation(kind, existing),
                 occurred_at=occurred_at,
+                payload=event_payload,
             )
             try:
-                recorded = self._inbox.append(issue_number, event)
+                if issue is None:
+                    recorded = self._inbox.append(issue_number, event)
+                else:
+                    recorded = self._inbox.append(
+                        issue_number,
+                        event,
+                        issue=issue,
+                    )
             except IssueInboxConcurrencyError as error:
                 conflict = error
                 continue
@@ -494,11 +589,17 @@ class GitIssueEventInbox:
         self,
         issue_number: int,
         event: CampaignEvent,
+        *,
+        issue: TrustedIssueContent | None = None,
     ) -> bool:
         conflict: _IssueInboxPushConflict | None = None
         for _ in range(5):
             try:
-                return self._append_once(issue_number, event)
+                return self._append_once(
+                    issue_number,
+                    event,
+                    issue=issue,
+                )
             except _IssueInboxPushConflict as error:
                 conflict = error
             except IssueInboxError as error:
@@ -516,7 +617,10 @@ class GitIssueEventInbox:
         self,
         issue_number: int,
         event: CampaignEvent,
+        *,
+        issue: TrustedIssueContent | None = None,
     ) -> bool:
+        _validate_issue_content_binding(issue_number, event, issue)
         ref = _inbox_ref(issue_number)
         revision, events = self._load(issue_number)
         duplicate = next(
@@ -576,6 +680,24 @@ class GitIssueEventInbox:
                 path,
                 environment=environment,
             )
+            if issue is not None:
+                issue_blob = _git(
+                    self._root,
+                    "hash-object",
+                    "-w",
+                    "--stdin",
+                    input_bytes=issue.content,
+                ).decode("ascii").strip()
+                _git(
+                    self._root,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    "100644",
+                    issue_blob,
+                    f"issues/{issue.sha256}.json",
+                    environment=environment,
+                )
             tree = _git_text(
                 self._root,
                 "write-tree",
@@ -615,6 +737,30 @@ class GitIssueEventInbox:
                 "Git issue inbox changed while appending"
             ) from error
         return True
+
+    def issue_content(
+        self,
+        issue_number: int,
+        sha256: str,
+    ) -> TrustedIssueContent:
+        if not _SHA256.fullmatch(sha256):
+            raise ValueError("trusted issue content hash is invalid")
+        revision, events = self._load(issue_number)
+        if revision is None or not any(
+            event.payload.get("issue_sha256") == sha256
+            for event in events
+        ):
+            raise IssueInboxError(
+                "trusted issue content is not referenced by the inbox"
+            )
+        return _issue_content_from_bytes(
+            _git(
+                self._root,
+                "show",
+                f"{revision}:issues/{sha256}.json",
+            ),
+            expected_sha256=sha256,
+        )
 
     def issue_numbers(self) -> tuple[int, ...]:
         prefix = "refs/heads/foundry-opt/inbox/issue-"
@@ -686,14 +832,28 @@ class GitIssueEventInbox:
             if line
         )
         if any(
-            re.fullmatch(
-                r"events/[0-9]{8}-[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json",
-                path,
+            (
+                re.fullmatch(
+                    r"events/[0-9]{8}-"
+                    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json",
+                    path,
+                )
+                is None
+                and re.fullmatch(
+                    r"issues/[0-9a-f]{64}\.json",
+                    path,
+                )
+                is None
             )
-            is None
             for path in paths
         ):
             raise IssueInboxError("inbox contains an unexpected path")
+        event_paths = tuple(
+            path for path in paths if path.startswith("events/")
+        )
+        issue_paths = tuple(
+            path for path in paths if path.startswith("issues/")
+        )
         events = tuple(
             _event_from_bytes(
                 _git(
@@ -702,13 +862,32 @@ class GitIssueEventInbox:
                     f"{revision}:{path}",
                 )
             )
-            for path in sorted(paths)
+            for path in sorted(event_paths)
         )
-        for index, path in enumerate(sorted(paths), 1):
+        for index, path in enumerate(sorted(event_paths), 1):
             if not path.startswith(f"events/{index:08d}-"):
                 raise IssueInboxError("inbox event sequence is invalid")
         if len({event.event_id for event in events}) != len(events):
             raise IssueInboxError("inbox event IDs are not unique")
+        issue_hashes = {
+            path.removeprefix("issues/").removesuffix(".json")
+            for path in issue_paths
+        }
+        for path in issue_paths:
+            expected = path.removeprefix("issues/").removesuffix(".json")
+            _issue_content_from_bytes(
+                _git(self._root, "show", f"{revision}:{path}"),
+                expected_sha256=expected,
+            )
+        referenced = {
+            str(event.payload["issue_sha256"])
+            for event in events
+            if "issue_sha256" in event.payload
+        }
+        if referenced != issue_hashes:
+            raise IssueInboxError(
+                "inbox trusted issue content references are invalid"
+            )
         _validate_transport_sequence(events)
         return revision, events
 
@@ -998,7 +1177,7 @@ class GhStewardAssignments:
 def _validate_payload(
     payload: Mapping[str, Any],
     context: TrustedEventContext,
-) -> tuple[int, str, str, datetime]:
+) -> tuple[int, str, str, str | None, datetime]:
     if context.event_name != "issues":
         raise TrustedIssueEventError("event name must be issues")
     if not isinstance(payload, Mapping):
@@ -1023,6 +1202,9 @@ def _validate_payload(
     title = issue.get("title")
     if not isinstance(title, str):
         raise TrustedIssueEventError("issue title is invalid")
+    body = issue.get("body")
+    if body is not None and not isinstance(body, str):
+        raise TrustedIssueEventError("issue body is invalid")
     state = issue.get("state")
     expected_state = "closed" if action == "closed" else "open"
     if state != expected_state:
@@ -1040,7 +1222,31 @@ def _validate_payload(
         ) from error
     if occurred_at.tzinfo is None:
         raise TrustedIssueEventError("issue timestamp is invalid")
-    return issue_number, action, title, occurred_at
+    return issue_number, action, title, body, occurred_at
+
+
+def _trusted_issue_event_payload(
+    *,
+    kind: EventKind,
+    issue_number: int,
+    repository: str,
+    title: str,
+    body: str | None,
+) -> tuple[TrustedIssueContent | None, dict[str, str]]:
+    if kind not in _ISSUE_CONTENT_KINDS:
+        return None, {}
+    if body is None:
+        return None, {"issue_error": "invalid_specification"}
+    try:
+        issue = TrustedIssueContent(
+            issue_number=issue_number,
+            repository=repository,
+            title=title,
+            body=body,
+        )
+    except (IssueSpecificationError, ValueError):
+        return None, {"issue_error": "invalid_specification"}
+    return issue, {"issue_sha256": issue.sha256}
 
 
 def specification_pull_request_issue_from_payload(
@@ -1317,11 +1523,28 @@ def _inbox_ref(issue_number: int) -> str:
 
 def _require_transport_event(event: CampaignEvent) -> None:
     if event.kind in _ISSUE_EVENT_KINDS:
-        if event.payload:
-            raise IssueInboxError(
-                "Git issue transport event payload must be empty"
+        payload = event.payload
+        if not payload:
+            return
+        if (
+            event.kind in _ISSUE_CONTENT_KINDS
+            and (
+                (
+                    set(payload) == {"issue_sha256"}
+                    and isinstance(payload["issue_sha256"], str)
+                    and _SHA256.fullmatch(payload["issue_sha256"])
+                )
+                or (
+                    set(payload) == {"issue_error"}
+                    and payload["issue_error"] == "invalid_specification"
+                )
             )
-        return
+        ):
+            return
+        if payload:
+            raise IssueInboxError(
+                "Git issue transport event payload is invalid"
+            )
     if event.kind in _WORKFLOW_EVENT_KINDS:
         try:
             from foundry_opt.orchestration.deployment import (
@@ -1499,6 +1722,60 @@ def _event_from_bytes(content: bytes) -> CampaignEvent:
         return event
     except (KeyError, TypeError, ValueError) as error:
         raise IssueInboxError("inbox event is invalid") from error
+
+
+def _validate_issue_content_binding(
+    issue_number: int,
+    event: CampaignEvent,
+    issue: TrustedIssueContent | None,
+) -> None:
+    expected = event.payload.get("issue_sha256")
+    if issue is None:
+        if expected is not None:
+            raise IssueInboxError(
+                "trusted issue content is required by the event"
+            )
+        return
+    if (
+        issue.issue_number != issue_number
+        or event.kind not in _ISSUE_CONTENT_KINDS
+        or expected != issue.sha256
+    ):
+        raise IssueInboxError("trusted issue content binding is invalid")
+
+
+def _issue_content_from_bytes(
+    content: bytes,
+    *,
+    expected_sha256: str,
+) -> TrustedIssueContent:
+    try:
+        document = json.loads(content)
+        if type(document) is not dict or set(document) != {
+            "body",
+            "issue_number",
+            "repository",
+            "schema_version",
+            "title",
+        }:
+            raise ValueError
+        issue = TrustedIssueContent(**document)
+        if (
+            issue.sha256 != expected_sha256
+            or issue.content != content
+        ):
+            raise ValueError
+        return issue
+    except (
+        IssueSpecificationError,
+        KeyError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+    ) as error:
+        raise IssueInboxError(
+            "trusted issue content is invalid"
+        ) from error
 
 
 def _git_text(
@@ -1728,7 +2005,7 @@ def main() -> None:
             recorded.event.event_id,
         )
         return
-    issue_number, action, _, _ = _validate_payload(payload, context)
+    issue_number, action, _, _, _ = _validate_payload(payload, context)
     if action != "opened" and not inbox.events(issue_number):
         return
     intake.ingest(payload, context)

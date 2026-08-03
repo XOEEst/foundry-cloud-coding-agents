@@ -188,6 +188,14 @@ class OptimizationCampaign:
                 phase=CampaignPhase.BASELINE,
                 spec_sha256=_sha(event.payload, "spec_sha256"),
             )
+        if event.kind is EventKind.SPEC_POLICY_BLOCKED:
+            self._require_phase(state, CampaignPhase.SPECIFICATION, event)
+            return self._next(
+                state,
+                event,
+                phase=CampaignPhase.BLOCKED,
+                block_reason=_identifier(event.payload, "reason"),
+            )
         if event.kind is EventKind.SPEC_REVIEW_REQUIRED:
             recovering_legacy_review = (
                 state.phase is CampaignPhase.AWAITING_SPEC_APPROVAL

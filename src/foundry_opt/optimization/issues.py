@@ -202,6 +202,20 @@ def parse_optimization_issue_request(
         ) from error
 
 
+def privacy_safe_optimization_issue_body(markdown: str) -> str:
+    """Retain only the exact allowlisted issue-form sections."""
+
+    _reject_secrets("issue body", markdown)
+    fields = _validate_structure(_split_sections(markdown))
+    return (
+        "\n\n".join(
+            f"### {heading}\n\n{fields[heading]}"
+            for heading in REQUIRED_HEADINGS
+        )
+        + "\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Markdown structure
 # ---------------------------------------------------------------------------

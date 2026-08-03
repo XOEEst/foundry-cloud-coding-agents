@@ -41,6 +41,7 @@ _EVENT_PAYLOAD_FIELDS = {
     EventKind.ISSUE_REOPENED: frozenset(),
     EventKind.ISSUE_CLOSED: frozenset(),
     EventKind.SPEC_POLICY_APPROVED: frozenset({"spec_sha256"}),
+    EventKind.SPEC_POLICY_BLOCKED: frozenset({"reason"}),
     EventKind.SPEC_REVIEW_REQUIRED: frozenset(
         {
             "base_ref_name",
@@ -284,6 +285,7 @@ _HASH_FIELDS = frozenset(
         "bundle_sha256",
         "goal_sha256",
         "idempotency_key",
+        "issue_sha256",
         "lineage_sha256",
         "patch_sha256",
         "spec_sha256",
@@ -1359,6 +1361,27 @@ def _validate_event_payload(
     kind: EventKind,
     payload: Mapping[str, Any],
 ) -> None:
+    if kind in {
+        EventKind.ISSUE_CREATED,
+        EventKind.ISSUE_EDITED,
+        EventKind.ISSUE_REOPENED,
+    }:
+        if not payload:
+            return
+        if set(payload) == {"issue_sha256"}:
+            _validate_payload_value(
+                "issue_sha256",
+                payload["issue_sha256"],
+            )
+            return
+        if (
+            set(payload) == {"issue_error"}
+            and payload["issue_error"] == "invalid_specification"
+        ):
+            return
+        raise StateRefPrivacyError(
+            f"{kind.value} payload violates the privacy allowlist"
+        )
     expected = _EVENT_PAYLOAD_FIELDS[kind]
     if (
         kind is EventKind.SPEC_REVIEW_REQUIRED
