@@ -15,6 +15,7 @@ from foundry_opt.onboarding import (
     DraftPullRequestPublication,
     EvaluatorDiscovery,
     FoundryAgentDiscovery,
+    GitHubActionsSecretRequirement,
     MetricDiscovery,
     OidcTrustResult,
     OnboardingChange,
@@ -200,7 +201,7 @@ def _request(repository_root: Path) -> OnboardingRequest:
     )
 
 
-def test_run_onboarding_generates_secretless_draft_change_set(
+def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requirement(
     tmp_path: Path,
 ) -> None:
     probe = FakeDraftProbe()
@@ -249,6 +250,24 @@ def test_run_onboarding_generates_secretless_draft_change_set(
     assert probe.deleted == [
         ("support-agent", "draft-onboarding-probe")
     ]
+    assert result.secret_requirements == (
+        GitHubActionsSecretRequirement(
+            name="COPILOT_ASSIGNMENT_TOKEN",
+            credential_types=(
+                "fine-grained personal access token",
+                "GitHub App user-to-server token",
+                "OAuth app token",
+            ),
+            repository_permissions=(
+                "metadata: read",
+                "actions: read/write",
+                "contents: read/write",
+                "issues: read/write",
+                "pull requests: read/write",
+            ),
+            automatic_configuration_supported=False,
+        ),
+    )
 
     generated = "\n".join(
         change.content for change in result.changes
@@ -308,7 +327,6 @@ def test_run_onboarding_generates_secretless_draft_change_set(
         in generated
     )
     assert "AZURE_CLIENT_SECRET" not in generated
-    assert "gh secret" not in generated
     assert "client-secret" not in generated.casefold()
     assert all(
         (tmp_path / change.path).read_text(encoding="utf-8")
@@ -325,6 +343,16 @@ def test_run_onboarding_generates_secretless_draft_change_set(
         "generated [Optimize] issue" in guidance
         for guidance in result.guidance
     )
+    assignment_guidance = next(
+        guidance
+        for guidance in result.guidance
+        if "COPILOT_ASSIGNMENT_TOKEN" in guidance
+    )
+    assert "foundry-opt init cannot create Actions secrets" in (
+        assignment_guidance
+    )
+    assert "installation token" in assignment_guidance
+    assert "Do not commit" in assignment_guidance
 
 
 def test_generated_change_set_has_content_addressed_ownership_manifest(
@@ -484,9 +512,10 @@ def test_run_onboarding_is_idempotent_when_bundle_is_current(
     assert {change.status for change in result.changes} == {
         ChangeStatus.UNCHANGED
     }
-    assert result.guidance == (
-        "Generated onboarding files are already current.",
+    assert result.guidance[0] == (
+        "Generated onboarding files are already current."
     )
+    assert "COPILOT_ASSIGNMENT_TOKEN" in result.guidance[1]
 
 
 def test_run_onboarding_preserves_existing_files_and_reports_conflicts(

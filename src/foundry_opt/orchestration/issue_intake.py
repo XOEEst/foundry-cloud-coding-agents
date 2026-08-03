@@ -712,13 +712,17 @@ class GhStewardAssignments:
         repository_root: Path,
         repository: str,
         *,
+        assignment_token: str,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if not _REPOSITORY.fullmatch(repository):
             raise ValueError("repository is invalid")
+        if not assignment_token:
+            raise ValueError("Copilot assignment token is required")
         self._commands = commands
         self._root = repository_root
         self._repository = repository
+        self._assignment_environment = {"GH_TOKEN": assignment_token}
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def has_live_lease(self, issue_number: int) -> bool:
@@ -853,6 +857,7 @@ class GhStewardAssignments:
                 "-",
             ),
             cwd=self._root,
+            environment=self._assignment_environment,
             input_text=json.dumps(
                 assignees,
                 separators=(",", ":"),
@@ -881,6 +886,7 @@ class GhStewardAssignments:
                 "-",
             ),
             cwd=self._root,
+            environment=self._assignment_environment,
             input_text=json.dumps(
                 body,
                 separators=(",", ":"),
@@ -1497,6 +1503,7 @@ def _git(
 
 
 def main() -> None:
+    assignment_token = _required_assignment_token()
     event_name = _required_environment("TRUSTED_EVENT_NAME")
     repository = _required_environment("TRUSTED_REPOSITORY")
     repository_id_text = _required_environment(
@@ -1512,6 +1519,7 @@ def main() -> None:
         commands,
         root,
         repository,
+        assignment_token=assignment_token,
     )
     from foundry_opt.orchestration.projection import (
         DashboardProjection,
@@ -1554,6 +1562,7 @@ def main() -> None:
                 issue_number,
                 commands,
                 repository,
+                assignment_token=assignment_token,
             )
             reconcile_deployment_cleanup_effects(
                 root,
@@ -1738,6 +1747,16 @@ def _required_environment(name: str) -> str:
     if not value:
         raise TrustedIssueEventError(
             f"required trusted environment is missing: {name}"
+        )
+    return value
+
+
+def _required_assignment_token() -> str:
+    value = os.environ.pop("COPILOT_ASSIGNMENT_TOKEN", None)
+    if not value:
+        raise TrustedIssueEventError(
+            "required Actions secret is missing: "
+            "COPILOT_ASSIGNMENT_TOKEN"
         )
     return value
 

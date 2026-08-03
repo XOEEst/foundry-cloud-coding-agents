@@ -38,6 +38,19 @@ from foundry_opt.onboarding.repository import (
 )
 
 
+_COPILOT_ASSIGNMENT_GUIDANCE = (
+    "Create the repository Actions secret COPILOT_ASSIGNMENT_TOKEN "
+    "manually; foundry-opt init cannot create Actions secrets. Use a "
+    "user-to-server credential for an eligible Copilot user, not an "
+    "installation token: preferably a fine-grained personal access token "
+    "scoped only to this repository, or a GitHub App user-to-server token "
+    "or OAuth app token. Grant the documented minimum of metadata read plus "
+    "actions, contents, issues, and pull requests read/write, including "
+    "permission to assign Copilot and the selected custom agents. Do not "
+    "commit the token."
+)
+
+
 @dataclass(frozen=True)
 class OnboardingDependencies:
     discovery: DiscoveryGateway
@@ -174,6 +187,7 @@ def run_onboarding(
             variable_changes=variable_changes,
             guidance=(
                 "Generated onboarding files are already current.",
+                _COPILOT_ASSIGNMENT_GUIDANCE,
             ),
         )
     foundry_agent = next(
@@ -376,7 +390,9 @@ def run_onboarding(
                     f"{request.environment_name}.",
                 )
             ),
-            "Azure OIDC does not require GitHub Agents or Actions secrets.",
+            "Azure OIDC itself uses no stored credential; Copilot "
+            "assignment separately requires the Actions secret below.",
+            _COPILOT_ASSIGNMENT_GUIDANCE,
             "Create the generated [Optimize] issue to start a campaign; "
             "workflow dispatch is retry-only.",
             f"Draft onboarding pull request created: {publication.url}",

@@ -26,6 +26,7 @@ from foundry_opt.orchestration.issue_intake import (
     TrustedIssueEventError,
     specification_pull_request_event_from_payload,
     specification_pull_request_issue_from_payload,
+    main as issue_intake_main,
 )
 from foundry_opt.preflight.interfaces import CommandResult
 
@@ -125,6 +126,7 @@ class FakeCommands:
             {
                 "arguments": tuple(arguments),
                 "cwd": cwd,
+                "environment": environment,
                 "input_text": input_text,
             }
         )
@@ -176,6 +178,27 @@ def test_trusted_issue_events_are_recorded_without_domain_decisions() -> None:
         (31, "github-44444444-4444-4444-8444-444444444444"),
     ]
     assert projection.projected == [31, 31, 31, 31]
+
+
+def test_issue_intake_fails_early_without_assignment_secret(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TRUSTED_EVENT_NAME", "schedule")
+    monkeypatch.setenv("TRUSTED_REPOSITORY", "octo-org/optimizer")
+    monkeypatch.setenv("TRUSTED_REPOSITORY_ID", "123")
+    monkeypatch.setenv("TRUSTED_RUN_ID", "42")
+    monkeypatch.delenv("COPILOT_ASSIGNMENT_TOKEN", raising=False)
+
+    with pytest.raises(
+        TrustedIssueEventError,
+        match=(
+            "required Actions secret is missing: "
+            "COPILOT_ASSIGNMENT_TOKEN"
+        ),
+    ):
+        issue_intake_main()
 
 
 def test_duplicate_delivery_is_idempotent() -> None:
@@ -715,6 +738,7 @@ def test_steward_assignment_uses_fixed_custom_agent_request() -> None:
         commands,
         Path("repository"),
         "octo-org/optimizer",
+        assignment_token="assignment-token",
     )
 
     assert assignments.assign(31, "github-run-42") is True
@@ -752,11 +776,30 @@ def test_steward_assignment_uses_fixed_custom_agent_request() -> None:
     assert json.loads(str(remove["input_text"])) == {
         "assignees": ["copilot-swe-agent[bot]"]
     }
+    assignment_calls = [
+        item
+        for item in commands.calls
+        if item["arguments"][2:4]
+        in {("--method", "DELETE"), ("--method", "POST")}
+        and item["arguments"][-3].endswith("/assignees")
+    ]
+    assert assignment_calls
+    assert all(
+        item["environment"] == {"GH_TOKEN": "assignment-token"}
+        for item in assignment_calls
+    )
     marker = "<!-- foundry-opt:steward-trigger:github-run-42 -->"
-    assert any(
-        json.loads(str(item["input_text"])) == {"body": marker}
+    marker_call = next(
+        item
         for item in commands.calls
         if item["input_text"] is not None
+        and json.loads(str(item["input_text"])) == {"body": marker}
+    )
+    assert marker_call["environment"] is None
+    assert all(
+        "assignment-token" not in " ".join(item["arguments"])
+        and "assignment-token" not in str(item["input_text"])
+        for item in commands.calls
     )
 
 
@@ -800,6 +843,7 @@ def test_steward_live_lease_uses_assignee_not_mutable_labels() -> None:
         commands,
         Path("repository"),
         "octo-org/optimizer",
+        assignment_token="assignment-token",
         clock=lambda: datetime(2026, 8, 1, 10, 0, tzinfo=UTC),
     )
 
@@ -849,6 +893,7 @@ def test_steward_lease_expires_even_when_bot_remains_assigned() -> None:
         commands,
         Path("repository"),
         "octo-org/optimizer",
+        assignment_token="assignment-token",
         clock=lambda: datetime(2026, 8, 1, 10, 0, tzinfo=UTC),
     )
 
@@ -880,6 +925,7 @@ def test_steward_retrigger_marker_is_idempotent() -> None:
         commands,
         Path("repository"),
         "octo-org/optimizer",
+        assignment_token="assignment-token",
     )
 
     assert assignments.assign(31, "github-run-42") is False

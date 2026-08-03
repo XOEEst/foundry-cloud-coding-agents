@@ -41,6 +41,11 @@ def generate_repository_agent_bundle(
         "repository-level Agents variables.\n"
         "- Deployment uses only the separate "
         "`AZURE_DEPLOYMENT_CLIENT_ID` Actions-environment variable.\n"
+        "- Copilot session assignment uses the repository Actions secret "
+        "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
+        "user-to-server token; an installation token is not supported.\n"
+        "- foundry-opt init cannot create Actions secrets; configure the "
+        "assignment secret manually and never commit its value.\n"
         "- Create the generated `[Optimize]` issue to start; workflow "
         "dispatch is retry-only.\n"
         "- `.github/foundry-optimizer.yaml` is durable repository policy; "
@@ -416,6 +421,15 @@ jobs:
       GH_TOKEN: ${{{{ github.token }}}}
       OPTIMIZER_PACKAGE: {install}
     steps:
+      - name: Require Copilot assignment token
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+        shell: bash
+        run: |
+          if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then
+            echo "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN" >&2
+            exit 1
+          fi
       - uses: {_CHECKOUT_ACTION} # v7.0.1
         with:
           fetch-depth: 0
@@ -423,6 +437,7 @@ jobs:
       - uses: {_SETUP_UV_ACTION} # v9.0.0
       - name: Record trusted event and recover projections
         env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
@@ -467,6 +482,15 @@ jobs:
       GH_TOKEN: ${{{{ github.token }}}}
       OPTIMIZER_PACKAGE: {install}
     steps:
+      - name: Require Copilot assignment token
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+        shell: bash
+        run: |
+          if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then
+            echo "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN" >&2
+            exit 1
+          fi
       - uses: {_CHECKOUT_ACTION} # v7.0.1
         with:
           fetch-depth: 0
@@ -474,6 +498,7 @@ jobs:
       - uses: {_SETUP_UV_ACTION} # v9.0.0
       - name: Reconcile trusted transport effects
         env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
           TRUSTED_ISSUE_NUMBER: ${{{{ inputs.issue }}}}

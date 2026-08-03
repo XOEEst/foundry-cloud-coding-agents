@@ -32,12 +32,17 @@ class GhSpecialistWorkerGateway:
         commands: CommandRunner,
         repository_root: Path,
         repository: str,
+        *,
+        assignment_token: str,
     ) -> None:
         if not _REPOSITORY.fullmatch(repository):
             raise ValueError("repository is invalid")
+        if not assignment_token:
+            raise ValueError("Copilot assignment token is required")
         self._commands = commands
         self._root = repository_root
         self._repository = repository
+        self._assignment_environment = {"GH_TOKEN": assignment_token}
 
     def find_issue(self, marker: str) -> int | None:
         pages = self._json(
@@ -161,7 +166,12 @@ class GhSpecialistWorkerGateway:
             f"{issue_number}/assignees"
         )
         assignees = {"assignees": ["copilot-swe-agent[bot]"]}
-        self._write("DELETE", endpoint, assignees)
+        self._write(
+            "DELETE",
+            endpoint,
+            assignees,
+            assignment=True,
+        )
         self._write(
             "POST",
             endpoint,
@@ -176,6 +186,7 @@ class GhSpecialistWorkerGateway:
                     "target_repo": self._repository,
                 },
             },
+            assignment=True,
         )
 
     def record_assignment_marker(
@@ -206,6 +217,8 @@ class GhSpecialistWorkerGateway:
         method: str,
         endpoint: str,
         body: dict[str, object],
+        *,
+        assignment: bool = False,
     ) -> Any:
         result = self._commands.run(
             (
@@ -218,6 +231,11 @@ class GhSpecialistWorkerGateway:
                 "-",
             ),
             cwd=self._root,
+            environment=(
+                self._assignment_environment
+                if assignment
+                else None
+            ),
             input_text=json.dumps(
                 body,
                 separators=(",", ":"),
@@ -734,6 +752,8 @@ def reconcile_github_transport_effects(
     issue_number: int,
     commands: CommandRunner,
     repository: str,
+    *,
+    assignment_token: str,
 ) -> TransportEffectReconcileResult:
     from foundry_opt.orchestration.candidate_bridge import (
         GhApplierWorkerGateway,
@@ -752,6 +772,7 @@ def reconcile_github_transport_effects(
                 commands,
                 repository_root,
                 repository,
+                assignment_token=assignment_token,
             )
         ),
         applier=ApplierWorkerBridge(
@@ -759,6 +780,7 @@ def reconcile_github_transport_effects(
                 commands,
                 repository_root,
                 repository,
+                assignment_token=assignment_token,
             )
         ),
         supersession=CandidateSupersessionBridge(

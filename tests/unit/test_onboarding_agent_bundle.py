@@ -231,6 +231,9 @@ def test_bundle_copies_tenzing_snapshot_license_and_context() -> None:
     assert "merge exactly one eligible candidate PR" in context
     assert "Exceptional action" in context
     assert "refs/heads/foundry-opt/state/issue-<N>" in context
+    assert "COPILOT_ASSIGNMENT_TOKEN" in context
+    assert "foundry-opt init cannot create Actions secrets" in context
+    assert "installation token" in context
 
 
 def test_generated_skill_documents_issue_only_orchestration() -> None:
@@ -252,6 +255,14 @@ def test_generated_skill_documents_issue_only_orchestration() -> None:
     assert "The only exceptional human gate" in skill
     assert "Foundry exact candidate check" in skill
     assert "deployment identity" in skill
+    assert "`COPILOT_ASSIGNMENT_TOKEN`" in skill
+    assert "fine-grained personal access token" in skill
+    assert "GitHub App user-to-server token" in normalized
+    assert "installation tokens are not supported" in normalized
+    assert "Metadata: read" in skill
+    assert "Actions, Contents, Issues, and Pull requests: read/write" in skill
+    assert "`foundry-opt init` cannot create Actions secrets" in normalized
+    assert "Never commit the token" in skill
 
 
 def test_generated_issue_form_explains_normal_and_exceptional_user_actions() -> None:
@@ -294,6 +305,55 @@ def test_bundle_generates_transport_and_verification_workflows() -> None:
         assert "GH_TOKEN: ${{ github.token }}" in text
         assert "@main" not in text
         assert "@master" not in text
+
+
+def test_assignment_workflows_require_dedicated_user_token_secret() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    assignment_paths = (
+        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
+        Path(".github/workflows/foundry-optimization-reconcile.yml"),
+    )
+
+    for path in assignment_paths:
+        workflow = yaml.safe_load(files[path])
+        job = next(iter(workflow["jobs"].values()))
+        assert job["env"]["GH_TOKEN"] == "${{ github.token }}"
+        assert job["steps"][0] == {
+            "name": "Require Copilot assignment token",
+            "env": {
+                "COPILOT_ASSIGNMENT_TOKEN": (
+                    "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+                ),
+            },
+            "shell": "bash",
+            "run": (
+                'if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then\n'
+                "  echo \"Missing required Actions secret: "
+                'COPILOT_ASSIGNMENT_TOKEN" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+            ),
+        }
+        transport_step = job["steps"][-1]
+        assert transport_step["env"]["COPILOT_ASSIGNMENT_TOKEN"] == (
+            "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+        )
+        assert (
+            "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+            not in files[path]
+        )
+
+    for path in (
+        Path(
+            ".github/workflows/"
+            "foundry-optimization-deployment-bridge.yml"
+        ),
+        Path(".github/workflows/foundry-exact-candidate-check.yml"),
+    ):
+        assert "COPILOT_ASSIGNMENT_TOKEN" not in files[path]
 
 
 def test_generated_bundle_contains_no_azure_secret_contract() -> None:

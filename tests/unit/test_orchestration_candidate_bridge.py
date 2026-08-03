@@ -27,6 +27,7 @@ class Commands:
         self.calls.append(
             {
                 "arguments": tuple(arguments),
+                "environment": environment,
                 "input_text": input_text,
             }
         )
@@ -52,6 +53,7 @@ def test_github_bridge_creates_and_assigns_exact_patch_worker_issue() -> None:
         commands,
         Path("repository"),
         "octo-org/optimizer",
+        assignment_token="assignment-token",
     )
     marker = (
         "<!-- foundry-opt:candidate-pr:"
@@ -86,6 +88,28 @@ def test_github_bridge_creates_and_assigns_exact_patch_worker_issue() -> None:
     } in payloads
     assert all(
         "pulls" not in str(call["arguments"])
+        for call in commands.calls
+    )
+    assignment_calls = [
+        call
+        for call in commands.calls
+        if call["arguments"][2:4]
+        in {("--method", "DELETE"), ("--method", "POST")}
+        and call["arguments"][-3].endswith("/assignees")
+    ]
+    assert assignment_calls
+    assert all(
+        call["environment"] == {"GH_TOKEN": "assignment-token"}
+        for call in assignment_calls
+    )
+    assert all(
+        call["environment"] is None
+        for call in commands.calls
+        if call not in assignment_calls
+    )
+    assert all(
+        "assignment-token" not in " ".join(call["arguments"])
+        and "assignment-token" not in str(call["input_text"])
         for call in commands.calls
     )
 

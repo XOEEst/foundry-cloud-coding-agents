@@ -45,6 +45,26 @@ supersedes competing candidates, updates the final dashboard, and closes the roo
 The private `refs/heads/foundry-opt/state/issue-<number>` ref is the canonical hash-chained history
 and recovery source. The completed issue and candidate PRs are its user-facing projection.
 
+## Required GitHub assignment credential
+
+Before issue intake or reconciliation can start or reassign a Copilot session, create the
+repository Actions secret `COPILOT_ASSIGNMENT_TOKEN`. Use a user-to-server credential for a user
+who is eligible to use Copilot cloud agent and assign the selected custom agents. Prefer a
+fine-grained personal access token scoped only to this repository. Alternatively, use a GitHub App
+user-to-server token or OAuth app token. GitHub App installation tokens are not supported for
+Copilot assignment.
+
+Grant the minimum permissions documented by GitHub for assigning Copilot:
+
+- Metadata: read
+- Actions, Contents, Issues, and Pull requests: read/write
+
+`foundry-opt init` cannot create Actions secrets, so add the secret manually in repository
+settings before merging or running the generated workflows. Never commit the token or place it in
+workflow output, comments, durable state, issue bodies, or logs. The generated workflows retain
+`github.token` for ordinary transport operations and expose the dedicated credential only to the
+Copilot assignment API calls.
+
 This adaptation keeps an unmodified Tenzing snapshot under `references/tenzing/`. Read
 `references/tenzing/README.md`, `references/tenzing/climb.md`, and `ADAPTER_MAPPING.md`; never edit
 the vendored snapshot.

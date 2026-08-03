@@ -35,6 +35,32 @@ class GitHubVariableChangeStatus(StrEnum):
 
 
 @dataclass(frozen=True)
+class GitHubActionsSecretRequirement:
+    name: str
+    credential_types: tuple[str, ...]
+    repository_permissions: tuple[str, ...]
+    automatic_configuration_supported: bool
+
+
+COPILOT_ASSIGNMENT_SECRET_REQUIREMENT = GitHubActionsSecretRequirement(
+    name="COPILOT_ASSIGNMENT_TOKEN",
+    credential_types=(
+        "fine-grained personal access token",
+        "GitHub App user-to-server token",
+        "OAuth app token",
+    ),
+    repository_permissions=(
+        "metadata: read",
+        "actions: read/write",
+        "contents: read/write",
+        "issues: read/write",
+        "pull requests: read/write",
+    ),
+    automatic_configuration_supported=False,
+)
+
+
+@dataclass(frozen=True)
 class PythonAgentCandidate:
     name: str
     source_path: Path
@@ -206,6 +232,9 @@ class OnboardingResult:
     draft_probe: DraftProbeResult | None = None
     published_pull_request: DraftPullRequestPublication | None = None
     variable_changes: tuple[GitHubVariableChange, ...] = ()
+    secret_requirements: tuple[GitHubActionsSecretRequirement, ...] = (
+        COPILOT_ASSIGNMENT_SECRET_REQUIREMENT,
+    )
     blockers: tuple[str, ...] = ()
     residual_state: tuple[str, ...] = ()
     guidance: tuple[str, ...] = field(default_factory=tuple)

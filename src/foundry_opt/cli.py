@@ -731,7 +731,7 @@ def init_command(
         ),
     ] = False,
 ) -> None:
-    """Discover and draft secretless repository onboarding."""
+    """Discover and draft OIDC-based repository onboarding."""
     try:
         request = OnboardingRequest(
             repository_root=Path.cwd(),

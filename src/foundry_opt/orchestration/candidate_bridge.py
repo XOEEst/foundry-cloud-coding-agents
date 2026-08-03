@@ -47,12 +47,21 @@ class GhApplierWorkerGateway:
         commands: CommandRunner,
         repository_root: Path,
         repository: str,
+        *,
+        assignment_token: str | None = None,
     ) -> None:
         if not _REPOSITORY.fullmatch(repository):
             raise ValueError("repository is invalid")
+        if assignment_token == "":
+            raise ValueError("Copilot assignment token is required")
         self._commands = commands
         self._root = repository_root
         self._repository = repository
+        self._assignment_environment = (
+            {"GH_TOKEN": assignment_token}
+            if assignment_token is not None
+            else None
+        )
 
     def find_issue(self, marker: str) -> int | None:
         _marker(marker)
@@ -137,8 +146,17 @@ class GhApplierWorkerGateway:
             f"repos/{self._repository}/issues/"
             f"{issue_number}/assignees"
         )
+        if self._assignment_environment is None:
+            raise CandidateBridgeError(
+                "Copilot assignment token is required"
+            )
         assignees = {"assignees": ["copilot-swe-agent[bot]"]}
-        self._write("DELETE", endpoint, assignees)
+        self._write(
+            "DELETE",
+            endpoint,
+            assignees,
+            assignment=True,
+        )
         self._write(
             "POST",
             endpoint,
@@ -154,6 +172,7 @@ class GhApplierWorkerGateway:
                     "target_repo": self._repository,
                 },
             },
+            assignment=True,
         )
 
     def has_assignment_marker(
@@ -244,6 +263,8 @@ class GhApplierWorkerGateway:
         method: str,
         endpoint: str,
         document: dict[str, object],
+        *,
+        assignment: bool = False,
     ) -> Any:
         result = self._commands.run(
             (
@@ -256,6 +277,11 @@ class GhApplierWorkerGateway:
                 "-",
             ),
             cwd=self._root,
+            environment=(
+                self._assignment_environment
+                if assignment
+                else None
+            ),
             input_text=json.dumps(
                 document,
                 ensure_ascii=False,

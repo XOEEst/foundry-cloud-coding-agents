@@ -32,6 +32,28 @@ The optimizer and deployment client IDs must be different. Copilot receives
 only the optimizer identity. Deployment runs only through the Actions
 environment and its deployment identity. No Azure client secret is required.
 
+Before merging or running the generated workflows, manually create the
+repository Actions secret `COPILOT_ASSIGNMENT_TOKEN`. `foundry-opt init`
+cannot create Actions secrets. The value must be a user-to-server credential
+for a user who can use Copilot cloud agent and assign the generated custom
+agents; GitHub Actions `github.token` and GitHub App installation tokens are
+not supported for this assignment API.
+
+Prefer a fine-grained personal access token scoped only to the target
+repository, or use a GitHub App user-to-server token or OAuth app token.
+GitHub documents these minimum fine-grained repository permissions for
+assigning Copilot:
+
+- Metadata: read
+- Actions, Contents, Issues, and Pull requests: read/write
+
+Store the credential only as the Actions secret. Never commit it, put it in a
+workflow variable, print it, or persist it in issue content or optimizer
+state. Issue intake and scheduled/manual reconciliation fail before checkout
+with a non-secret error when the secret is absent. Generated workflows retain
+`github.token` for ordinary GitHub transport and use the dedicated credential
+only for the remove/reassign calls that create Copilot sessions.
+
 ### 2. Create one optimization issue
 
 Create one issue from the generated `[Optimize]` form. That is the sole normal
