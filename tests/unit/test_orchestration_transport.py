@@ -7,11 +7,14 @@ from pathlib import Path
 from foundry_opt.orchestration import (
     CampaignPhase,
     CampaignState,
+    CandidateRecord,
     OutboxRecord,
+    SpecFileHash,
     StateRefSnapshot,
 )
 from foundry_opt.orchestration.transport import (
     GhSpecialistWorkerGateway,
+    awaiting_specialist_result,
     SpecialistEffectResultRecorder,
     TransportEffectReconciler,
     SpecialistWorkBridge,
@@ -36,6 +39,36 @@ def _planned() -> OutboxRecord:
             "spec_classification": "human_review",
             "specialist": "foundry-optimization-planner",
             "work_kind": "prepare_specification_pr",
+        },
+    )
+
+
+def _designer_planned() -> OutboxRecord:
+    return OutboxRecord(
+        record_id="design-31-2-1-worker",
+        kind="specialist_work_request",
+        generation=GENERATION,
+        sequence=4,
+        payload={
+            "allowed_mutations": ["system_instructions"],
+            "allowed_paths": ["agent"],
+            "base_commit": "b" * 40,
+            "baseline_metrics": {"quality": 0.5},
+            "branch": "foundry-opt/issue-31-g2/candidate-1",
+            "candidate_feedback": [],
+            "candidate_id": "candidate-1",
+            "effect_id": "design-31-2-1",
+            "goal": (
+                "Improve grounded support answers without weakening safety."
+            ),
+            "issue_number": ISSUE,
+            "reason": "candidate_design_pending",
+            "restricted_opt_ins": {},
+            "slot": 1,
+            "spec_sha256": "a" * 64,
+            "specialist": "foundry-candidate-designer",
+            "target": "support",
+            "work_kind": "design_candidate",
         },
     )
 
@@ -65,6 +98,7 @@ class Gateway:
         issue_number: int,
         *,
         specialist: str,
+        custom_instructions: str,
     ) -> None:
         self.assigned.append((issue_number, specialist))
 
@@ -155,6 +189,29 @@ def test_specialist_transport_creates_assigns_and_records_once() -> None:
     assert duplicate.status is SpecialistWorkBridgeStatus.ALREADY_APPLIED
 
 
+def test_candidate_designer_transport_projects_the_typed_intent() -> None:
+    class DesignerGateway(Gateway):
+        def create_issue(self, *, title: str, body: str, marker: str) -> int:
+            assert marker in body
+            assert "foundry-candidate-designer" in body
+            assert "design_candidate" in body
+            assert "design-31-2-1" in body
+            assert "Improve grounded support answers" in body
+            assert '"allowed_paths":["agent"]' in body
+            assert "CandidateDesignResult" in body
+            self.issue_number = 85
+            return 85
+
+    gateway = DesignerGateway()
+
+    result = SpecialistWorkBridge(gateway).apply(_designer_planned())
+
+    assert result.status is SpecialistWorkBridgeStatus.APPLIED
+    assert result.result is not None
+    assert result.result.worker_issue_number == 85
+    assert gateway.assigned == [(85, "foundry-candidate-designer")]
+
+
 def test_github_specialist_gateway_uses_remove_reassign_without_pr_api() -> None:
     commands = Commands()
     gateway = GhSpecialistWorkerGateway(
@@ -215,6 +272,49 @@ def test_github_specialist_gateway_uses_remove_reassign_without_pr_api() -> None
     )
 
 
+def test_github_specialist_gateway_assigns_candidate_designer() -> None:
+    commands = Commands()
+    gateway = GhSpecialistWorkerGateway(
+        commands,
+        Path("repository"),
+        "octo-org/optimizer",
+        assignment_token="assignment-token",
+    )
+
+    result = SpecialistWorkBridge(gateway).apply(_designer_planned())
+
+    assert result.status is SpecialistWorkBridgeStatus.APPLIED
+    payloads = [
+        json.loads(str(call["input_text"]))
+        for call in commands.calls
+        if call["input_text"] is not None
+    ]
+    assignment = next(
+        payload
+        for payload in payloads
+        if "agent_assignment" in payload
+    )
+    assert assignment["agent_assignment"]["custom_agent"] == (
+        "foundry-candidate-designer"
+    )
+    assert "design-31-2-1" in assignment["agent_assignment"][
+        "custom_instructions"
+    ]
+    assert "candidate-design-result" in assignment["agent_assignment"][
+        "custom_instructions"
+    ]
+    assert "--worker-issue 84" in assignment["agent_assignment"][
+        "custom_instructions"
+    ]
+    assert "then stop" in assignment["agent_assignment"][
+        "custom_instructions"
+    ]
+    assert all(
+        "/pulls" not in " ".join(call["arguments"])
+        for call in commands.calls
+    )
+
+
 def test_transport_reconciler_applies_only_persisted_specialist_intent() -> None:
     planned = _planned()
     ledger = Ledger(planned)
@@ -230,8 +330,64 @@ def test_transport_reconciler_applies_only_persisted_specialist_intent() -> None
     assert first.specialist_statuses == (
         SpecialistWorkBridgeStatus.APPLIED,
     )
+    assert first.release_steward is True
     assert second.specialist_statuses == ()
     assert gateway.assigned == [(84, "foundry-optimization-planner")]
+
+
+def test_transport_waits_for_planner_and_applier_specialists() -> None:
+    planner = StateRefSnapshot(
+        "a" * 40,
+        CampaignState(
+            ISSUE,
+            GENERATION,
+            4,
+            CampaignPhase.AWAITING_SPEC_APPROVAL,
+            spec_sha256="a" * 64,
+            spec_base_ref_name="main",
+            spec_head_commit="b" * 40,
+            spec_tree_sha="c" * 40,
+            spec_files=(
+                SpecFileHash(
+                    ".foundry-optimizer/specs/issue-31/"
+                    "optimization-spec.yaml",
+                    "d" * 64,
+                ),
+            ),
+        ),
+        (),
+        (_planned(),),
+    )
+    applier = StateRefSnapshot(
+        "b" * 40,
+        CampaignState(
+            ISSUE,
+            GENERATION,
+            8,
+            CampaignPhase.AWAITING_SELECTION,
+            spec_sha256="a" * 64,
+            baseline_evaluation_id="eval-baseline",
+            candidates=(
+                CandidateRecord(
+                    "candidate-1",
+                    True,
+                    "e" * 64,
+                ),
+            ),
+        ),
+        (),
+        (
+            OutboxRecord(
+                "applier-2-candidate-1",
+                "applier_worker_issue_planned",
+                GENERATION,
+                8,
+            ),
+        ),
+    )
+
+    assert awaiting_specialist_result(planner) is True
+    assert awaiting_specialist_result(applier) is True
 
 
 def test_specialist_acknowledgement_is_idempotent_after_state_advances() -> None:

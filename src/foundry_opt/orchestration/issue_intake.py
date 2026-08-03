@@ -121,6 +121,8 @@ class StewardAssignments(Protocol):
         idempotency_key: str,
     ) -> bool: ...
 
+    def release(self, issue_number: int) -> None: ...
+
 
 class IssueProjection(Protocol):
     def project(self, issue_number: int) -> None: ...
@@ -163,6 +165,12 @@ class GitStateCampaignRecovery:
         consumed = {event.event_id for event in snapshot.inbox}
         if any(event.event_id not in consumed for event in events):
             return True
+        from foundry_opt.orchestration.transport import (
+            awaiting_specialist_result,
+        )
+
+        if awaiting_specialist_result(snapshot):
+            return False
         return snapshot.state.phase not in {
             CampaignPhase.BLOCKED,
             CampaignPhase.CANCELLED,
@@ -870,8 +878,11 @@ class GhStewardAssignments:
                 "target_repo": self._repository,
                 "custom_agent": "foundry-optimization-steward",
                 "custom_instructions": (
-                    "Advance this campaign only from its trusted "
-                    "Git-state inbox."
+                    "Run `foundry-opt steward advance --issue "
+                    f"{issue_number} --json` exactly once, report only its "
+                    "persisted result, then stop. Do not inspect or edit "
+                    "source, tests, configuration, or the session pull "
+                    "request."
                 ),
             },
         }
@@ -914,6 +925,31 @@ class GhStewardAssignments:
             ),
         )
         return True
+
+    def release(self, issue_number: int) -> None:
+        if type(issue_number) is not int or issue_number < 1:
+            raise ValueError("issue number must be positive")
+        self._commands.run(
+            (
+                "gh",
+                "api",
+                "--method",
+                "DELETE",
+                (
+                    f"repos/{self._repository}/issues/"
+                    f"{issue_number}/assignees"
+                ),
+                "--input",
+                "-",
+            ),
+            cwd=self._root,
+            environment=self._assignment_environment,
+            input_text=json.dumps(
+                {"assignees": ["copilot-swe-agent[bot]"]},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
 
     def _has_marker(self, issue_number: int, marker: str) -> bool:
         result = self._commands.run(
@@ -1557,13 +1593,15 @@ def main() -> None:
             tracked=inbox.issue_numbers(),
         )
         for issue_number in issue_numbers:
-            reconcile_github_transport_effects(
+            transport = reconcile_github_transport_effects(
                 root,
                 issue_number,
                 commands,
                 repository,
                 assignment_token=assignment_token,
             )
+            if transport.release_steward:
+                assignments.release(issue_number)
             reconcile_deployment_cleanup_effects(
                 root,
                 issue_number,

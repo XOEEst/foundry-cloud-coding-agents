@@ -94,7 +94,14 @@ def _goal_text(value: str) -> None:
     if (
         not isinstance(value, str)
         or not 20 <= len(value) <= 4000
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or any(
+            (
+                ord(character) < 32
+                and character not in {"\n", "\t"}
+            )
+            or ord(character) == 127
+            for character in value
+        )
     ):
         raise ValueError("goal must be bounded redacted text")
     if any(
@@ -314,6 +321,238 @@ class CandidateDesignResult:
 
 
 @dataclass(frozen=True)
+class CandidateDesignArtifact:
+    ref: str
+    head_commit: str
+    tree_sha: str
+    changed_paths: tuple[Path, ...]
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(
+            r"refs/heads/foundry-opt/design/issue-[1-9][0-9]*/"
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            self.ref,
+        ) is None:
+            raise ValueError("candidate design ref is invalid")
+        if not _COMMIT.fullmatch(self.head_commit):
+            raise ValueError("candidate design head_commit is invalid")
+        if not _COMMIT.fullmatch(self.tree_sha):
+            raise ValueError("candidate design tree_sha is invalid")
+        paths = tuple(
+            _repository_path(path, "changed_path")
+            for path in self.changed_paths
+        )
+        if not paths or len(set(paths)) != len(paths):
+            raise ValueError(
+                "candidate design changed_paths must be non-empty and unique"
+            )
+        object.__setattr__(self, "changed_paths", paths)
+
+
+@dataclass(frozen=True)
+class CandidateDesignSubmissionRequest:
+    repository_root: Path
+    issue_number: int
+    effect_id: str
+    worker_issue_number: int
+    result_file: Path
+
+    def __post_init__(self) -> None:
+        if self.issue_number < 1:
+            raise ValueError("issue_number must be positive")
+        if self.worker_issue_number < 1:
+            raise ValueError("worker_issue_number must be positive")
+        _identifier(self.effect_id, "effect_id")
+        if not self.result_file.is_absolute():
+            raise ValueError("result_file must be absolute")
+
+
+class CandidateDesignSubmissionStatus(StrEnum):
+    RECORDED = "recorded"
+    ALREADY_RECORDED = "already_recorded"
+    CONFLICT = "conflict"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class CandidateDesignSubmissionResult:
+    status: CandidateDesignSubmissionStatus
+    snapshot: StateRefSnapshot
+    code: str | None = None
+
+
+class CandidateDesignRepository(Protocol):
+    def capture(
+        self,
+        request: CandidateDesignSubmissionRequest,
+        intent: CandidateDesignIntent,
+        result: CandidateDesignResult,
+    ) -> CandidateDesignArtifact: ...
+
+    def cleanup(
+        self,
+        request: CandidateDesignSubmissionRequest,
+        intent: CandidateDesignIntent,
+    ) -> None: ...
+
+
+class CandidateDesignSubmissionService:
+    """Persist one typed designer result and its exact remote Git artifact."""
+
+    def __init__(
+        self,
+        *,
+        ledger: CandidateWorkerLedger,
+        repository: CandidateDesignRepository,
+    ) -> None:
+        self._ledger = ledger
+        self._repository = repository
+
+    def submit(
+        self,
+        request: CandidateDesignSubmissionRequest,
+    ) -> CandidateDesignSubmissionResult:
+        snapshot = self._ledger.load(
+            request.repository_root,
+            request.issue_number,
+        )
+        if snapshot is None:
+            raise ValueError("candidate design requires campaign state")
+        planned = tuple(
+            record
+            for record in snapshot.outbox
+            if (
+                record.kind == "specialist_work_request"
+                and record.generation == snapshot.state.generation
+                and record.payload.get("effect_id") == request.effect_id
+                and record.payload.get("issue_number")
+                == request.issue_number
+                and record.payload.get("specialist")
+                == "foundry-candidate-designer"
+                and record.payload.get("work_kind") == "design_candidate"
+            )
+        )
+        if len(planned) != 1:
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.FAILED,
+                snapshot,
+                "candidate_design_intent_unavailable",
+            )
+        intent = _candidate_design_intent(
+            request.repository_root,
+            planned[0],
+        )
+        try:
+            result = _candidate_design_result(request.result_file)
+            result.require_matches(intent)
+        except (OSError, TypeError, ValueError):
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.FAILED,
+                snapshot,
+                "candidate_design_result_invalid",
+            )
+        assignments = tuple(
+            record
+            for record in snapshot.outbox
+            if (
+                record.kind == "specialist_work_succeeded"
+                and record.generation == snapshot.state.generation
+                and record.payload.get("effect_id")
+                == planned[0].record_id
+                and record.payload.get("specialist")
+                == "foundry-candidate-designer"
+                and record.payload.get("work_kind") == "design_candidate"
+            )
+        )
+        if len(assignments) > 1:
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.FAILED,
+                snapshot,
+                "candidate_design_assignment_invalid",
+            )
+        acknowledged_issue = (
+            assignments[0].payload.get("worker_issue_number")
+            if assignments
+            else request.worker_issue_number
+        )
+        if (
+            type(acknowledged_issue) is not int
+            or acknowledged_issue != request.worker_issue_number
+        ):
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.FAILED,
+                snapshot,
+                "candidate_design_assignment_invalid",
+            )
+        worker_issue_number = request.worker_issue_number
+        record_id = f"{request.effect_id}-submitted"
+        existing = _record(snapshot, record_id)
+        if existing is not None:
+            if not _submitted_design_matches(
+                existing,
+                result,
+                worker_issue_number,
+            ):
+                return CandidateDesignSubmissionResult(
+                    CandidateDesignSubmissionStatus.FAILED,
+                    snapshot,
+                    "candidate_design_result_conflict",
+                )
+            try:
+                self._repository.cleanup(request, intent)
+            except Exception:
+                return CandidateDesignSubmissionResult(
+                    CandidateDesignSubmissionStatus.FAILED,
+                    snapshot,
+                    "candidate_design_cleanup_failed",
+                )
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.ALREADY_RECORDED,
+                snapshot,
+            )
+        try:
+            artifact = self._repository.capture(request, intent, result)
+            submitted = _candidate_design_submission_record(
+                snapshot,
+                record_id,
+                result,
+                artifact,
+                worker_issue_number,
+            )
+            persisted = self._ledger.commit(
+                request.repository_root,
+                issue_number=request.issue_number,
+                expected_revision=snapshot.revision,
+                state=snapshot.state,
+                outbox=(submitted,),
+            )
+        except StateRefConflictError:
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.CONFLICT,
+                snapshot,
+                "state_ref_conflict",
+            )
+        except Exception:
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.FAILED,
+                snapshot,
+                "candidate_design_capture_failed",
+            )
+        try:
+            self._repository.cleanup(request, intent)
+        except Exception:
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.FAILED,
+                persisted,
+                "candidate_design_cleanup_failed",
+            )
+        return CandidateDesignSubmissionResult(
+            CandidateDesignSubmissionStatus.RECORDED,
+            persisted,
+        )
+
+
+@dataclass(frozen=True)
 class CandidateWorkerPlan:
     """Immutable, transient campaign inputs resolved by the steward."""
 
@@ -464,6 +703,10 @@ class CandidateDesigner(Protocol):
     def invoke(self, intent: CandidateDesignIntent) -> CandidateDesignResult: ...
 
 
+class CandidateDesignPending(RuntimeError):
+    """Signal that a durable designer assignment must complete first."""
+
+
 class CandidateDraftEffects(Protocol):
     def reconcile(
         self,
@@ -558,6 +801,12 @@ class _CandidateSessionTimeout(RuntimeError):
     def __init__(self, snapshot: StateRefSnapshot) -> None:
         self.snapshot = snapshot
         super().__init__("candidate worker session timed out")
+
+
+class _CandidateDesignDeferred(RuntimeError):
+    def __init__(self, snapshot: StateRefSnapshot) -> None:
+        self.snapshot = snapshot
+        super().__init__("candidate design is awaiting a specialist")
 
 
 class _CandidateRecoveryFailure(RuntimeError):
@@ -675,6 +924,13 @@ class CandidateWorkerService:
                 timeout.snapshot,
                 "The steward session ended before the next effect.",
                 "session_timeout",
+            )
+        except _CandidateDesignDeferred as deferred:
+            return CandidateWorkerResult(
+                CandidateWorkerStatus.WAITING,
+                deferred.snapshot,
+                "Candidate design is awaiting its assigned specialist.",
+                "candidate_design_pending",
             )
         except _CandidateRecoveryFailure as failure:
             return CandidateWorkerResult(
@@ -929,38 +1185,45 @@ class CandidateWorkerService:
             baseline_metrics=_aggregate_metrics(baseline),
             feedback=_feedback(snapshot, plan, slot),
         )
-        snapshot = self._plan_effect(
+        snapshot = self._plan_design_effect(
             request,
             snapshot,
-            intent.effect_id,
-            "candidate_design",
-            candidate_id,
-            slot,
+            intent,
             plan,
+            worktree,
         )
         design_success_id = f"{intent.effect_id}-succeeded"
         persisted_design = _record(snapshot, design_success_id)
+        results = _matching_design_results(
+            intent,
+            self._deps.designer.reconcile(intent),
+        )
         if persisted_design is not None:
             design = _design_from_record(
                 snapshot,
                 intent,
                 persisted_design,
             )
+            if results and results[0] != design:
+                raise _CandidateRecoveryFailure(
+                    snapshot,
+                    "designer_reconciliation_mismatch",
+                    "The reconciled candidate design changed.",
+                )
         else:
-            results = _matching_design_results(
-                intent,
-                self._deps.designer.reconcile(intent),
-            )
             if not results and _session_expired(
                 request,
                 self._deps.clock,
             ):
                 raise _CandidateSessionTimeout(snapshot)
-            design = (
-                results[0]
-                if results
-                else self._deps.designer.invoke(intent)
-            )
+            try:
+                design = (
+                    results[0]
+                    if results
+                    else self._deps.designer.invoke(intent)
+                )
+            except CandidateDesignPending:
+                raise _CandidateDesignDeferred(snapshot) from None
             design.require_matches(intent)
             snapshot = self._append(
                 request,
@@ -1857,6 +2120,81 @@ class CandidateWorkerService:
             ),
         )
 
+    def _plan_design_effect(
+        self,
+        request: CandidateWorkerRequest,
+        snapshot: StateRefSnapshot,
+        intent: CandidateDesignIntent,
+        plan: CandidateWorkerPlan,
+        worktree: CampaignWorktree,
+    ) -> StateRefSnapshot:
+        snapshot = self._plan_effect(
+            request,
+            snapshot,
+            intent.effect_id,
+            "candidate_design",
+            intent.candidate_id,
+            intent.slot,
+            plan,
+        )
+        record_id = f"{intent.effect_id}-worker"
+        payload: dict[str, object] = {
+            "allowed_mutations": sorted(intent.allowed_mutations),
+            "allowed_paths": [
+                path.as_posix() for path in intent.edit_paths
+            ],
+            "base_commit": intent.base_commit,
+            "baseline_metrics": dict(intent.baseline_metrics),
+            "branch": worktree.branch,
+            "candidate_feedback": [
+                {
+                    "candidate_id": item.candidate_id,
+                    "complexity": item.complexity,
+                    "eligible": item.eligible,
+                    "idea_id": item.idea_id,
+                    "lessons": list(item.lessons),
+                    "metrics": dict(item.metrics),
+                    "result": item.result,
+                }
+                for item in intent.feedback
+            ],
+            "candidate_id": intent.candidate_id,
+            "effect_id": intent.effect_id,
+            "goal": intent.goal,
+            "issue_number": intent.issue_number,
+            "reason": "candidate_design_pending",
+            "restricted_opt_ins": dict(intent.restricted_opt_ins),
+            "slot": intent.slot,
+            "spec_sha256": intent.spec_sha256,
+            "specialist": "foundry-candidate-designer",
+            "target": intent.target,
+            "work_kind": "design_candidate",
+        }
+        existing = _record(snapshot, record_id)
+        if existing is not None:
+            if (
+                existing.kind != "specialist_work_request"
+                or dict(existing.payload) != payload
+            ):
+                raise _CandidateRecoveryFailure(
+                    snapshot,
+                    "designer_intent_mismatch",
+                    "The persisted candidate designer intent changed.",
+                )
+            return snapshot
+        return self._append(
+            request,
+            snapshot,
+            (
+                _outbox(
+                    snapshot,
+                    record_id,
+                    "specialist_work_request",
+                    payload,
+                ),
+            ),
+        )
+
     def _baseline_evaluation(
         self,
         snapshot: StateRefSnapshot,
@@ -2456,6 +2794,156 @@ def _design_from_record(
             "The persisted candidate design is invalid.",
         ) from error
     return result
+
+
+def _candidate_design_intent(
+    repository_root: Path,
+    record: OutboxRecord,
+) -> CandidateDesignIntent:
+    try:
+        feedback = tuple(
+            CandidateIterationFeedback(
+                candidate_id=str(item["candidate_id"]),
+                idea_id=str(item["idea_id"]),
+                result=str(item["result"]),
+                metrics=dict(item["metrics"]),
+                eligible=bool(item["eligible"]),
+                lessons=tuple(item["lessons"]),
+                complexity=str(item["complexity"]),
+            )
+            for item in record.payload["candidate_feedback"]
+        )
+        return CandidateDesignIntent(
+            effect_id=str(record.payload["effect_id"]),
+            issue_number=int(record.payload["issue_number"]),
+            generation=record.generation,
+            spec_sha256=str(record.payload["spec_sha256"]),
+            base_commit=str(record.payload["base_commit"]),
+            target=str(record.payload["target"]),
+            candidate_id=str(record.payload["candidate_id"]),
+            slot=int(record.payload["slot"]),
+            worktree=repository_root.expanduser().resolve(),
+            goal=str(record.payload["goal"]),
+            edit_paths=tuple(
+                Path(path) for path in record.payload["allowed_paths"]
+            ),
+            allowed_mutations=frozenset(
+                record.payload["allowed_mutations"]
+            ),
+            restricted_opt_ins=dict(
+                record.payload["restricted_opt_ins"]
+            ),
+            baseline_metrics=dict(record.payload["baseline_metrics"]),
+            feedback=feedback,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("candidate design intent is invalid") from error
+
+
+def _candidate_design_result(path: Path) -> CandidateDesignResult:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    expected = {
+        "base_commit",
+        "candidate_id",
+        "complexity",
+        "effect_id",
+        "generation",
+        "idea_id",
+        "issue_number",
+        "lessons",
+        "motivation",
+        "mutation_class",
+        "parent_idea_ids",
+        "required_opt_ins",
+        "result_id",
+        "slot",
+        "spec_sha256",
+    }
+    if not isinstance(document, dict) or set(document) != expected:
+        raise ValueError("candidate design result fields are invalid")
+    return CandidateDesignResult(
+        effect_id=document["effect_id"],
+        result_id=document["result_id"],
+        issue_number=document["issue_number"],
+        generation=document["generation"],
+        spec_sha256=document["spec_sha256"],
+        base_commit=document["base_commit"],
+        candidate_id=document["candidate_id"],
+        slot=document["slot"],
+        idea_id=document["idea_id"],
+        mutation_class=document["mutation_class"],
+        parent_idea_ids=tuple(document["parent_idea_ids"]),
+        required_opt_ins=frozenset(document["required_opt_ins"]),
+        motivation=document["motivation"],
+        lessons=tuple(document["lessons"]),
+        complexity=document["complexity"],
+    )
+
+
+def _candidate_design_submission_record(
+    snapshot: StateRefSnapshot,
+    record_id: str,
+    result: CandidateDesignResult,
+    artifact: CandidateDesignArtifact,
+    worker_issue_number: int,
+) -> OutboxRecord:
+    return _outbox(
+        snapshot,
+        record_id,
+        "candidate_design_submitted",
+        {
+            "base_commit": result.base_commit,
+            "candidate_id": result.candidate_id,
+            "changed_paths": [
+                path.as_posix() for path in artifact.changed_paths
+            ],
+            "complexity": result.complexity,
+            "effect_id": result.effect_id,
+            "head_commit": artifact.head_commit,
+            "idea_id": result.idea_id,
+            "issue_number": result.issue_number,
+            "lessons": list(result.lessons),
+            "motivation": result.motivation,
+            "mutation_class": result.mutation_class,
+            "parent_idea_ids": list(result.parent_idea_ids),
+            "ref": artifact.ref,
+            "required_opt_ins": sorted(result.required_opt_ins),
+            "result_id": result.result_id,
+            "slot": result.slot,
+            "spec_sha256": result.spec_sha256,
+            "tree_sha": artifact.tree_sha,
+            "worker_issue_number": worker_issue_number,
+        },
+    )
+
+
+def _submitted_design_matches(
+    record: OutboxRecord,
+    result: CandidateDesignResult,
+    worker_issue_number: int,
+) -> bool:
+    return (
+        record.kind == "candidate_design_submitted"
+        and record.generation == result.generation
+        and record.payload.get("effect_id") == result.effect_id
+        and record.payload.get("result_id") == result.result_id
+        and record.payload.get("issue_number") == result.issue_number
+        and record.payload.get("spec_sha256") == result.spec_sha256
+        and record.payload.get("base_commit") == result.base_commit
+        and record.payload.get("candidate_id") == result.candidate_id
+        and record.payload.get("slot") == result.slot
+        and record.payload.get("idea_id") == result.idea_id
+        and record.payload.get("mutation_class") == result.mutation_class
+        and tuple(record.payload.get("parent_idea_ids", ()))
+        == result.parent_idea_ids
+        and frozenset(record.payload.get("required_opt_ins", ()))
+        == result.required_opt_ins
+        and record.payload.get("motivation") == result.motivation
+        and tuple(record.payload.get("lessons", ())) == result.lessons
+        and record.payload.get("complexity") == result.complexity
+        and record.payload.get("worker_issue_number")
+        == worker_issue_number
+    )
 
 
 def _enforce_design(

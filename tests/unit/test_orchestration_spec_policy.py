@@ -219,6 +219,16 @@ def test_existing_pinned_assets_are_policy_approved_without_planner_pr(
     assert decision.event.kind is EventKind.SPEC_POLICY_APPROVED
     assert decision.event.payload["spec_sha256"] == spec.sha256
     assert decision.intents == ()
+    assert len(decision.objects) == 1
+    assert decision.objects[0].path == "objects/specifications/g1.json"
+    persisted = json.loads(decision.objects[0].content)
+    assert persisted["spec"]["base_commit"] == BASE_COMMIT
+    assert persisted["spec"]["goal"] == spec.goal
+    assert persisted["asset_paths"] == {
+        "dev": "eval/dev.jsonl",
+        "quality": None,
+        "validation": "eval/validation.jsonl",
+    }
 
 
 def test_changed_repository_asset_requires_specialist_spec_pr(

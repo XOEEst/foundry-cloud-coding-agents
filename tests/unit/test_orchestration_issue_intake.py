@@ -14,6 +14,7 @@ from foundry_opt.orchestration import (
     CampaignState,
     EventKind,
     OptimizationCampaign,
+    OutboxRecord,
     StateRefSnapshot,
 )
 from foundry_opt.orchestration.issue_intake import (
@@ -530,6 +531,104 @@ def test_durable_recovery_uses_state_and_unprocessed_inbox_not_labels() -> None:
     assert recovery.should_recover(31) is True
 
 
+def test_recovery_waits_for_candidate_designer_then_resumes_submission() -> None:
+    created = CampaignEvent(
+        event_id="github-opened",
+        kind=EventKind.ISSUE_CREATED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    inbox = FakeInbox(recorded={31: [created]})
+    planned = OutboxRecord(
+        "design-31-1-1-worker",
+        "specialist_work_request",
+        1,
+        2,
+        {
+            "allowed_mutations": ["system_instructions"],
+            "allowed_paths": ["agent"],
+            "base_commit": "b" * 40,
+            "baseline_metrics": {"quality": 0.5},
+            "branch": "foundry-opt/issue-31-g1/candidate-1",
+            "candidate_feedback": [],
+            "candidate_id": "candidate-1",
+            "effect_id": "design-31-1-1",
+            "goal": (
+                "Improve grounded support answers without weakening safety."
+            ),
+            "issue_number": 31,
+            "reason": "candidate_design_pending",
+            "restricted_opt_ins": {},
+            "slot": 1,
+            "spec_sha256": "a" * 64,
+            "specialist": "foundry-candidate-designer",
+            "target": "support",
+            "work_kind": "design_candidate",
+        },
+    )
+
+    class Ledger:
+        snapshot = StateRefSnapshot(
+            "a" * 40,
+            CampaignState(
+                31,
+                1,
+                2,
+                CampaignPhase.CANDIDATES,
+                processed_event_ids=(created.event_id,),
+                spec_sha256="a" * 64,
+                baseline_evaluation_id="eval-baseline",
+            ),
+            (created,),
+            (planned,),
+        )
+
+        def load(self, repository_root: Path, issue_number: int):
+            return self.snapshot
+
+    ledger = Ledger()
+    recovery = GitStateCampaignRecovery(Path("."), inbox, ledger)
+
+    assert recovery.should_recover(31) is False
+
+    submitted = OutboxRecord(
+        "design-31-1-1-submitted",
+        "candidate_design_submitted",
+        1,
+        2,
+        {
+            "base_commit": "b" * 40,
+            "candidate_id": "candidate-1",
+            "changed_paths": ["agent/instructions.md"],
+            "complexity": "small",
+            "effect_id": "design-31-1-1",
+            "head_commit": "c" * 40,
+            "idea_id": "idea-1",
+            "issue_number": 31,
+            "lessons": ["The baseline omits an escalation rule."],
+            "motivation": "Clarify the escalation rule.",
+            "mutation_class": "system_instructions",
+            "parent_idea_ids": [],
+            "ref": (
+                "refs/heads/foundry-opt/design/"
+                "issue-31/design-31-1-1"
+            ),
+            "required_opt_ins": [],
+            "result_id": "designer-result-1",
+            "slot": 1,
+            "spec_sha256": "a" * 64,
+            "tree_sha": "d" * 40,
+            "worker_issue_number": 84,
+        },
+    )
+    ledger.snapshot = replace(
+        ledger.snapshot,
+        outbox=(*ledger.snapshot.outbox, submitted),
+    )
+
+    assert recovery.should_recover(31) is True
+
+
 def test_recovery_retry_scope_validates_issue_and_state_ref() -> None:
     assert recovery_issue_numbers(
         requested_issue="31",
@@ -764,7 +863,10 @@ def test_steward_assignment_uses_fixed_custom_agent_request() -> None:
             "target_repo": "octo-org/optimizer",
             "custom_agent": "foundry-optimization-steward",
             "custom_instructions": (
-                "Advance this campaign only from its trusted Git-state inbox."
+                "Run `foundry-opt steward advance --issue 31 --json` "
+                "exactly once, report only its persisted result, then stop. "
+                "Do not inspect or edit source, tests, configuration, or "
+                "the session pull request."
             ),
         },
     }
@@ -801,6 +903,35 @@ def test_steward_assignment_uses_fixed_custom_agent_request() -> None:
         and "assignment-token" not in str(item["input_text"])
         for item in commands.calls
     )
+
+
+def test_steward_assignment_can_release_a_delegated_session() -> None:
+    commands = FakeCommands()
+    assignments = GhStewardAssignments(
+        commands,
+        Path("repository"),
+        "octo-org/optimizer",
+        assignment_token="assignment-token",
+    )
+
+    assignments.release(31)
+
+    assert commands.calls == [
+        {
+            "arguments": (
+                "gh",
+                "api",
+                "--method",
+                "DELETE",
+                "repos/octo-org/optimizer/issues/31/assignees",
+                "--input",
+                "-",
+            ),
+            "cwd": Path("repository"),
+            "environment": {"GH_TOKEN": "assignment-token"},
+            "input_text": '{"assignees":["copilot-swe-agent[bot]"]}',
+        }
+    ]
 
 
 def test_steward_live_lease_uses_assignee_not_mutable_labels() -> None:

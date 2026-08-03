@@ -158,9 +158,15 @@ class GhSpecialistWorkerGateway:
         issue_number: int,
         *,
         specialist: str,
+        custom_instructions: str,
     ) -> None:
-        if specialist != "foundry-optimization-planner":
+        if specialist not in {
+            "foundry-optimization-planner",
+            "foundry-candidate-designer",
+        }:
             raise ValueError("specialist is invalid")
+        if not custom_instructions.strip():
+            raise ValueError("custom instructions are required")
         endpoint = (
             f"repos/{self._repository}/issues/"
             f"{issue_number}/assignees"
@@ -179,10 +185,7 @@ class GhSpecialistWorkerGateway:
                 **assignees,
                 "agent_assignment": {
                     "custom_agent": specialist,
-                    "custom_instructions": (
-                        "Fulfil only the persisted "
-                        "prepare_specification_pr intent."
-                    ),
+                    "custom_instructions": custom_instructions,
                     "target_repo": self._repository,
                 },
             },
@@ -274,6 +277,7 @@ class SpecialistWorkerGateway(Protocol):
         issue_number: int,
         *,
         specialist: str,
+        custom_instructions: str,
     ) -> None: ...
 
     def record_assignment_marker(
@@ -330,18 +334,12 @@ class SpecialistWorkBridge:
             if worker_issue is None:
                 worker_issue = self._gateway.create_issue(
                     title=f"[foundry-opt] {work_kind} for #{issue_number}",
-                    body="\n".join(
-                        (
-                            marker,
-                            f"Root optimization issue: #{issue_number}",
-                            "State ref: "
-                            "`refs/heads/foundry-opt/state/"
-                            f"issue-{issue_number}`",
-                            f"Specialist: `{specialist}`",
-                            f"Work kind: `{work_kind}`",
-                            f"Reason: `{record.payload['reason']}`",
-                            "",
-                        )
+                    body=_specialist_issue_body(
+                        record,
+                        marker,
+                        issue_number,
+                        specialist,
+                        work_kind,
                     ),
                     marker=marker,
                 )
@@ -361,6 +359,12 @@ class SpecialistWorkBridge:
             self._gateway.assign_specialist(
                 worker_issue,
                 specialist=specialist,
+                custom_instructions=_specialist_custom_instructions(
+                    record,
+                    worker_issue,
+                    specialist,
+                    work_kind,
+                ),
             )
             self._gateway.record_assignment_marker(
                 worker_issue,
@@ -524,6 +528,7 @@ class TransportEffectReconcileResult:
     specialist_statuses: tuple[SpecialistWorkBridgeStatus, ...] = ()
     applier_statuses: tuple[str, ...] = ()
     supersession_statuses: tuple[str, ...] = ()
+    release_steward: bool = False
 
 
 class TransportEffectReconciler:
@@ -695,6 +700,10 @@ class TransportEffectReconciler:
             tuple(statuses),
             tuple(applier_statuses),
             tuple(supersession_statuses),
+            bool(statuses or applier_statuses)
+            or awaiting_specialist_result(
+                self._ledger.load(repository_root, issue_number)
+            ),
         )
 
     def _claim(
@@ -793,6 +802,49 @@ def reconcile_github_transport_effects(
     ).reconcile(repository_root, issue_number)
 
 
+def awaiting_specialist_result(
+    snapshot: StateRefSnapshot | None,
+) -> bool:
+    if snapshot is None:
+        return False
+    submitted = {
+        str(record.payload["effect_id"])
+        for record in snapshot.outbox
+        if (
+            record.kind
+            in {
+                "candidate_design_submitted",
+                "candidate_design_succeeded",
+            }
+            and isinstance(record.payload.get("effect_id"), str)
+        )
+    }
+    for record in snapshot.outbox:
+        if (
+            record.generation != snapshot.state.generation
+            or record.kind != "specialist_work_request"
+        ):
+            continue
+        work_kind = record.payload.get("work_kind")
+        if work_kind == "design_candidate":
+            effect_id = record.payload.get("effect_id")
+            if isinstance(effect_id, str) and effect_id not in submitted:
+                return True
+        if (
+            work_kind == "prepare_specification_pr"
+            and snapshot.state.phase.value == "awaiting_spec_approval"
+        ):
+            return True
+    if snapshot.state.phase.value == "awaiting_selection":
+        if any(
+            record.generation == snapshot.state.generation
+            and record.kind == "applier_worker_issue_planned"
+            for record in snapshot.outbox
+        ):
+            return True
+    return False
+
+
 def _specialist_intent(record: OutboxRecord) -> tuple[int, str, str]:
     if record.kind != "specialist_work_request":
         raise ValueError("specialist work kind is invalid")
@@ -803,14 +855,138 @@ def _specialist_intent(record: OutboxRecord) -> tuple[int, str, str]:
     if (
         type(issue_number) is not int
         or issue_number < 1
-        or specialist != "foundry-optimization-planner"
-        or work_kind != "prepare_specification_pr"
         or not isinstance(reason, str)
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", reason)
         is None
     ):
         raise ValueError("specialist work binding is invalid")
-    return issue_number, specialist, work_kind
+    if (
+        specialist == "foundry-optimization-planner"
+        and work_kind == "prepare_specification_pr"
+    ):
+        return issue_number, specialist, work_kind
+    if (
+        specialist == "foundry-candidate-designer"
+        and work_kind == "design_candidate"
+    ):
+        _candidate_design_intent(record, issue_number)
+        return issue_number, specialist, work_kind
+    raise ValueError("specialist work binding is invalid")
+
+
+def _candidate_design_intent(
+    record: OutboxRecord,
+    issue_number: int,
+) -> dict[str, object]:
+    payload = dict(record.payload)
+    expected = {
+        "allowed_mutations",
+        "allowed_paths",
+        "base_commit",
+        "baseline_metrics",
+        "branch",
+        "candidate_feedback",
+        "candidate_id",
+        "effect_id",
+        "goal",
+        "issue_number",
+        "reason",
+        "restricted_opt_ins",
+        "slot",
+        "spec_sha256",
+        "specialist",
+        "target",
+        "work_kind",
+    }
+    if set(payload) != expected or payload["issue_number"] != issue_number:
+        raise ValueError("candidate design binding is invalid")
+    effect_id = payload["effect_id"]
+    candidate_id = payload["candidate_id"]
+    target = payload["target"]
+    branch = payload["branch"]
+    if (
+        not isinstance(effect_id, str)
+        or not effect_id.startswith(f"design-{issue_number}-")
+        or not isinstance(candidate_id, str)
+        or not isinstance(target, str)
+        or not isinstance(branch, str)
+        or not branch.endswith(f"/{candidate_id}")
+    ):
+        raise ValueError("candidate design binding is invalid")
+    return payload
+
+
+def _specialist_issue_body(
+    record: OutboxRecord,
+    marker: str,
+    issue_number: int,
+    specialist: str,
+    work_kind: str,
+) -> str:
+    lines = [
+        marker,
+        f"Root optimization issue: #{issue_number}",
+        "State ref: "
+        "`refs/heads/foundry-opt/state/"
+        f"issue-{issue_number}`",
+        f"Specialist: `{specialist}`",
+        f"Work kind: `{work_kind}`",
+        f"Reason: `{record.payload['reason']}`",
+    ]
+    if work_kind == "design_candidate":
+        intent = _candidate_design_intent(record, issue_number)
+        lines.extend(
+            (
+                "",
+                "Canonical `CandidateDesignIntent`:",
+                "```json",
+                json.dumps(
+                    intent,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                "```",
+                "",
+                "Return a matching `CandidateDesignResult` at "
+                "`.foundry-optimizer/design-results/"
+                f"{intent['effect_id']}.json`.",
+                "The JSON must contain exactly: `effect_id`, `result_id`, "
+                "`issue_number`, `generation`, `spec_sha256`, `base_commit`, "
+                "`candidate_id`, `slot`, `idea_id`, `mutation_class`, "
+                "`parent_idea_ids`, `required_opt_ins`, `motivation`, "
+                "`lessons`, and `complexity`.",
+            )
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _specialist_custom_instructions(
+    record: OutboxRecord,
+    worker_issue_number: int,
+    specialist: str,
+    work_kind: str,
+) -> str:
+    if (
+        specialist == "foundry-optimization-planner"
+        and work_kind == "prepare_specification_pr"
+    ):
+        return "Fulfil only the persisted prepare_specification_pr intent."
+    intent = _candidate_design_intent(
+        record,
+        int(record.payload["issue_number"]),
+    )
+    return (
+        "Fulfil only persisted CandidateDesignIntent "
+        f"`{intent['effect_id']}`. Edit only its allowed candidate paths, "
+        "write the matching CandidateDesignResult control file, run "
+        "`foundry-opt steward candidate-design-result --issue "
+        f"{intent['issue_number']} --effect {intent['effect_id']} "
+        f"--worker-issue {worker_issue_number} "
+        "--result-file .foundry-optimizer/design-results/"
+        f"{intent['effect_id']}.json --json` exactly once, then stop."
+    )
 
 
 def _specialist_result(

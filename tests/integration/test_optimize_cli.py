@@ -16,6 +16,15 @@ from foundry_opt.orchestration.steward import (
     StewardAdvanceResult,
     StewardAdvanceStatus,
 )
+from foundry_opt.orchestration import (
+    CampaignPhase,
+    CampaignState,
+    StateRefSnapshot,
+)
+from foundry_opt.orchestration.candidate_workers import (
+    CandidateDesignSubmissionResult,
+    CandidateDesignSubmissionStatus,
+)
 
 
 class Service:
@@ -392,3 +401,67 @@ def test_steward_advance_strict_failure_returns_one(
 
     assert result.exit_code == 1
     assert "state_ref_conflict" in result.stdout
+
+
+def test_candidate_designer_submits_typed_result_through_cli(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class CandidateDesignService:
+        requests = []
+
+        def submit(self, request):
+            self.requests.append(request)
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.RECORDED,
+                StateRefSnapshot(
+                    "a" * 40,
+                    CampaignState(
+                        42,
+                        1,
+                        1,
+                        CampaignPhase.SPECIFICATION,
+                    ),
+                    (),
+                    (),
+                ),
+            )
+
+    service = CandidateDesignService()
+    monkeypatch.setattr(
+        cli,
+        "build_candidate_design_submission_service",
+        lambda: service,
+    )
+    monkeypatch.chdir(tmp_path)
+    result_file = tmp_path / "design-result.json"
+    result_file.write_text("{}", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "steward",
+            "candidate-design-result",
+            "--issue",
+            "42",
+            "--effect",
+            "design-42-1-1",
+            "--worker-issue",
+            "84",
+            "--result-file",
+            str(result_file),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "code": None,
+        "issue_number": 42,
+        "revision": "a" * 40,
+        "status": "recorded",
+    }
+    assert service.requests[0].repository_root == tmp_path
+    assert service.requests[0].effect_id == "design-42-1-1"
+    assert service.requests[0].worker_issue_number == 84
+    assert service.requests[0].result_file == result_file

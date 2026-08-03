@@ -28,6 +28,7 @@ from foundry_opt.orchestration.git_state import (
     StateRefConflictError,
     StateRefError,
     StateRefSnapshot,
+    StateObject,
 )
 from foundry_opt.orchestration.deployment import (
     DeploymentOrchestrationRequest,
@@ -164,6 +165,7 @@ class CampaignLedger(Protocol):
         state: CampaignState,
         inbox: tuple[CampaignEvent, ...] = (),
         outbox: tuple[OutboxRecord, ...] = (),
+        objects: tuple[StateObject, ...] = (),
     ) -> StateRefSnapshot: ...
 
 
@@ -474,6 +476,11 @@ class StewardAdvanceService:
                 state=state,
                 inbox=tuple(pending),
                 outbox=outbox,
+                objects=(
+                    policy_decision.objects
+                    if policy_decision is not None
+                    else ()
+                ),
             )
         except StateRefConflictError:
             return self._failure(

@@ -20,6 +20,7 @@ from foundry_opt.optimization.models import (
     OptimizationSpec,
 )
 from foundry_opt.optimization.specification import PreparedSpecFile
+from foundry_opt.orchestration.git_state import StateObject
 from foundry_opt.orchestration.models import (
     AdvanceDisposition,
     CampaignEvent,
@@ -182,6 +183,7 @@ class SpecPolicyDecision:
     spec_sha256: str | None = None
     event: CampaignEvent | None = None
     intents: tuple[SpecPolicyIntent, ...] = ()
+    objects: tuple[StateObject, ...] = ()
     disposition: AdvanceDisposition = AdvanceDisposition.WAIT
 
     @property
@@ -234,6 +236,12 @@ class OptimizationSpecPolicy:
             )
 
         digest = resolved.spec.sha256
+        objects = (
+            _specification_object(
+                resolved,
+                request.state.generation,
+            ),
+        )
         reason = self._human_reason(request.repository_root, resolved)
         if reason is None:
             event = CampaignEvent(
@@ -251,6 +259,7 @@ class OptimizationSpecPolicy:
                 reason="existing_immutable_assets",
                 spec_sha256=digest,
                 event=event,
+                objects=objects,
                 disposition=AdvanceDisposition.ADVANCE,
             )
         if (
@@ -287,6 +296,7 @@ class OptimizationSpecPolicy:
             reason=reason,
             digest=digest,
             event=event,
+            objects=objects,
         )
 
     def _human_reason(
@@ -352,6 +362,7 @@ class OptimizationSpecPolicy:
         digest: str | None,
         event: CampaignEvent | None,
         intent_identity: str | None = None,
+        objects: tuple[StateObject, ...] = (),
     ) -> SpecPolicyDecision:
         identity = intent_identity or (
             digest[:16] if digest is not None else reason
@@ -387,6 +398,7 @@ class OptimizationSpecPolicy:
                     payload=payload,
                 ),
             ),
+            objects=objects,
             disposition=AdvanceDisposition.DELEGATE,
         )
 
@@ -597,6 +609,32 @@ class OptimizationSpecServiceResolver:
             tree_sha=result.tree_sha,
             prepared_files=result.prepared_files,
         )
+
+
+def _specification_object(
+    resolved: ResolvedSpecification,
+    generation: int,
+) -> StateObject:
+    document = {
+        "asset_paths": {
+            asset_id: (
+                path.as_posix() if path is not None else None
+            )
+            for asset_id, path in sorted(resolved.asset_paths.items())
+        },
+        "spec": resolved.spec.model_dump(mode="json"),
+    }
+    return StateObject(
+        f"objects/specifications/g{generation}.json",
+        json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n",
+    )
 
 
 class GitPinnedAssetReader:

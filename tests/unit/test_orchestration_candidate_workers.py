@@ -43,8 +43,13 @@ from foundry_opt.orchestration import (
     StateRefSnapshot,
 )
 from foundry_opt.orchestration.candidate_workers import (
+    CandidateDesignPending,
+    CandidateDesignArtifact,
     CandidateDesignIntent,
     CandidateDesignResult,
+    CandidateDesignSubmissionRequest,
+    CandidateDesignSubmissionService,
+    CandidateDesignSubmissionStatus,
     CandidateDraftEffects,
     CandidateEvaluationEffects,
     CandidateWorkerDependencies,
@@ -115,6 +120,30 @@ def test_candidate_designer_result_is_bound_to_the_exact_reservation() -> None:
                 "edit_paths": (Path("../outside"),),
             }
         )
+
+
+def test_candidate_design_intent_accepts_multiline_issue_goal() -> None:
+    intent = CandidateDesignIntent(
+        effect_id="design-31-2-1",
+        issue_number=31,
+        generation=2,
+        spec_sha256="a" * 64,
+        base_commit="b" * 40,
+        target="support",
+        candidate_id="candidate-1",
+        slot=1,
+        worktree=Path("Q:/repo/.foundry-optimizer/worktrees/candidate-1"),
+        goal=(
+            "Improve grounded support answers.\n"
+            "Preserve every configured safety guardrail."
+        ),
+        edit_paths=(Path("agent"),),
+        allowed_mutations=frozenset({"system_instructions"}),
+        restricted_opt_ins={},
+        baseline_metrics={"quality": 0.5},
+    )
+
+    assert "\n" in intent.goal
 
 
 class Ledger:
@@ -343,6 +372,17 @@ class Designer:
         )
         self.results[intent.effect_id] = result
         return result
+
+
+class DeferredDesigner:
+    def reconcile(
+        self,
+        intent: CandidateDesignIntent,
+    ) -> tuple[CandidateDesignResult, ...]:
+        return ()
+
+    def invoke(self, intent: CandidateDesignIntent) -> CandidateDesignResult:
+        raise CandidateDesignPending()
 
 
 class Drafts(CandidateDraftEffects):
@@ -636,6 +676,194 @@ def test_steward_candidate_worker_completes_baseline_and_one_candidate(
     assert designer.invocations == 1
     assert drafts.creates == 2
     assert evaluations.runs == 2
+
+
+def test_candidate_design_delegates_a_typed_specialist_intent(
+    tmp_path: Path,
+) -> None:
+    ledger = Ledger(_seed_snapshot())
+    repository = Repository(tmp_path)
+    drafts = Drafts()
+    evaluations = Evaluations()
+
+    def build_bundle(root: Path, output: Path) -> BundleArtifact:
+        return BundleArtifact(
+            output,
+            "e" * 64,
+            ("agent/instructions.md",),
+            (),
+            1,
+            output.with_suffix(".manifest.json"),
+        )
+
+    service = CandidateWorkerService(
+        ledger=ledger,
+        resolver=PlanResolver(_plan()),
+        dependencies=CandidateWorkerDependencies(
+            repository=repository,
+            designer=DeferredDesigner(),
+            validate=lambda path: ValidationReport((), False),
+            build_bundle=build_bundle,
+            drafts=drafts,
+            evaluations=evaluations,
+            write_evidence=lambda request: EvidenceManifest(
+                request.output_path,
+                "f" * 64,
+                10,
+                (),
+                (),
+                "9" * 64,
+                request.spec_sha256,
+            ),
+            clock=Clock(),
+        ),
+    )
+
+    result = service.advance(CandidateWorkerRequest(tmp_path, 31))
+
+    assert result.status is CandidateWorkerStatus.WAITING
+    assert result.code == "candidate_design_pending"
+    assert result.snapshot.state.phase is CampaignPhase.CANDIDATES
+    assert repository.designed == set()
+    assert drafts.creates == 1
+    assert evaluations.runs == 1
+    design = next(
+        record
+        for record in result.snapshot.outbox
+        if record.kind == "specialist_work_request"
+        and record.payload.get("work_kind") == "design_candidate"
+    )
+    assert design.payload["specialist"] == "foundry-candidate-designer"
+    assert design.payload["effect_id"] == "design-31-1-1"
+    assert design.payload["candidate_id"] == "candidate-1"
+    assert design.payload["branch"].endswith("/candidate-1")
+    assert design.payload["goal"] == _plan().goal
+    assert design.payload["allowed_paths"] == ["agent"]
+    assert design.payload["allowed_mutations"] == ["system_instructions"]
+    assert design.payload["baseline_metrics"] == {"quality": 0.5}
+    assert design.payload["restricted_opt_ins"] == {}
+    assert design.payload["candidate_feedback"] == []
+
+    duplicate = service.advance(CandidateWorkerRequest(tmp_path, 31))
+
+    assert duplicate.status is CandidateWorkerStatus.WAITING
+    assert duplicate.snapshot == result.snapshot
+    assert sum(
+        record.kind == "specialist_work_request"
+        for record in duplicate.snapshot.outbox
+    ) == 1
+    assert drafts.creates == 1
+    assert evaluations.runs == 1
+
+
+def test_candidate_designer_records_a_typed_remote_result(
+    tmp_path: Path,
+) -> None:
+    planned = OutboxRecord(
+        "design-31-1-1-worker",
+        "specialist_work_request",
+        1,
+        2,
+        {
+            "allowed_mutations": ["system_instructions"],
+            "allowed_paths": ["agent"],
+            "base_commit": BASE_COMMIT,
+            "baseline_metrics": {"quality": 0.5},
+            "branch": "foundry-opt/issue-31-g1/candidate-1",
+            "candidate_feedback": [],
+            "candidate_id": "candidate-1",
+            "effect_id": "design-31-1-1",
+            "goal": _plan().goal,
+            "issue_number": 31,
+            "reason": "candidate_design_pending",
+            "restricted_opt_ins": {},
+            "slot": 1,
+            "spec_sha256": SPEC_SHA256,
+            "specialist": "foundry-candidate-designer",
+            "target": "support",
+            "work_kind": "design_candidate",
+        },
+    )
+    initial = _seed_snapshot()
+    ledger = Ledger(
+        replace(initial, outbox=(planned,))
+    )
+    result_file = tmp_path / "design-result.json"
+    result_file.write_text(
+        json.dumps(
+            {
+                "effect_id": "design-31-1-1",
+                "result_id": "designer-result-1",
+                "issue_number": 31,
+                "generation": 1,
+                "spec_sha256": SPEC_SHA256,
+                "base_commit": BASE_COMMIT,
+                "candidate_id": "candidate-1",
+                "slot": 1,
+                "idea_id": "idea-1",
+                "mutation_class": "system_instructions",
+                "parent_idea_ids": [],
+                "required_opt_ins": [],
+                "motivation": "Clarify the escalation rule.",
+                "lessons": ["The baseline omits a required escalation."],
+                "complexity": "small",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Capture:
+        cleaned = False
+
+        def capture(self, request, intent, result):
+            assert request.result_file == result_file
+            result.require_matches(intent)
+            return CandidateDesignArtifact(
+                ref="refs/heads/foundry-opt/design/issue-31/design-31-1-1",
+                head_commit="c" * 40,
+                tree_sha="d" * 40,
+                changed_paths=(Path("agent/instructions.md"),),
+            )
+
+        def cleanup(self, request, intent):
+            self.cleaned = True
+
+    capture = Capture()
+    service = CandidateDesignSubmissionService(
+        ledger=ledger,
+        repository=capture,
+    )
+
+    result = service.submit(
+        CandidateDesignSubmissionRequest(
+            repository_root=tmp_path,
+            issue_number=31,
+            effect_id="design-31-1-1",
+            worker_issue_number=84,
+            result_file=result_file,
+        )
+    )
+    duplicate = service.submit(
+        CandidateDesignSubmissionRequest(
+            repository_root=tmp_path,
+            issue_number=31,
+            effect_id="design-31-1-1",
+            worker_issue_number=84,
+            result_file=result_file,
+        )
+    )
+
+    assert result.status is CandidateDesignSubmissionStatus.RECORDED
+    assert duplicate.status is CandidateDesignSubmissionStatus.ALREADY_RECORDED
+    submitted = result.snapshot.outbox[-1]
+    assert submitted.kind == "candidate_design_submitted"
+    assert submitted.payload["head_commit"] == "c" * 40
+    assert submitted.payload["tree_sha"] == "d" * 40
+    assert submitted.payload["changed_paths"] == [
+        "agent/instructions.md"
+    ]
+    assert submitted.payload["worker_issue_number"] == 84
+    assert capture.cleaned is True
 
 
 def test_baseline_cleanup_failure_preserves_evaluation_and_resumes(
@@ -1187,7 +1415,11 @@ def test_resume_after_draft_effect_ack_loss_does_not_duplicate_foundry(
             return record
 
     class LostDesignerReconciliation:
+        def __init__(self) -> None:
+            self.calls = 0
+
         def reconcile(self, intent):
+            self.calls += 1
             return ()
 
         def invoke(self, intent):
@@ -1247,17 +1479,19 @@ def test_resume_after_draft_effect_ack_loss_does_not_duplicate_foundry(
     with pytest.raises(SessionCrash):
         service.advance(CandidateWorkerRequest(tmp_path, 31))
 
+    recovered_designer = LostDesignerReconciliation()
     resumed = CandidateWorkerService(
         ledger=ledger,
         resolver=PlanResolver(_plan()),
         dependencies=replace(
             dependencies,
-            designer=LostDesignerReconciliation(),
+            designer=recovered_designer,
         ),
     ).advance(CandidateWorkerRequest(tmp_path, 31))
 
     assert resumed.status is CandidateWorkerStatus.COMPLETE
     assert designer.invocations == 1
+    assert recovered_designer.calls == 1
     assert drafts.creates == 2
     assert evaluations.runs == 2
 

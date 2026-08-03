@@ -140,7 +140,16 @@ def test_bundle_uses_issue_only_entry_and_canonical_specialists() -> None:
         Path(".github/agents/foundry-candidate-applier.agent.md")
     ]
 
-    assert "foundry-opt steward advance --issue <number>" in steward
+    command = "foundry-opt steward advance --issue <number> --json"
+    assert steward.count(command) == 1
+    assert "exactly once per assignment" in steward
+    assert "stop immediately" in steward
+    assert "blocked`, `delegate`, or `wait" in steward
+    assert "Never inspect or edit agent source, tests, or configuration" in (
+        steward
+    )
+    assert "Never create or update the session pull request" in steward
+    assert "Never improvise specialist work" in steward
     assert "refs/heads/foundry-opt/state/issue-<number>" in steward
     assert "canonical steward interfaces" in steward
     assert "raw evidence" in steward
@@ -155,6 +164,12 @@ def test_bundle_uses_issue_only_entry_and_canonical_specialists() -> None:
 
     assert "CandidateDesignIntent" in designer
     assert "CandidateDesignResult" in designer
+    assert (
+        "foundry-opt steward candidate-design-result "
+        "--issue <number> --effect <effect-id> "
+        "--worker-issue <worker-issue-number>"
+    ) in designer
+    assert "Do not create or update a pull request" in designer
     assert "only the reserved worktree" in designer
     assert "raw evidence" in designer
     assert 'tools: ["read", "search", "edit", "execute"]' in designer
@@ -194,10 +209,12 @@ def test_issue_form_matches_strict_parser_and_configured_target() -> None:
         else:
             value = attributes["placeholder"]
         sections.append(f"### {heading}\n\n{value}\n")
+    rendered_body = "\n".join(sections)
+    assert "```" not in rendered_body
     parsed = parse_optimization_issue_request(
         issue_number=42,
         repository="octo-org/agents",
-        body="\n".join(sections),
+        body=rendered_body,
     )
 
     assert parsed.target == "claims-agent"
@@ -731,5 +748,6 @@ def test_bundle_generates_copilot_steward_domain_instructions() -> None:
     assert "canonical steward interfaces" in steward
     assert "foundry-opt steward advance" in steward
     assert "raw evidence" in steward
-    assert "root issue dashboard" in steward
+    assert "transport workflows own GitHub" in steward
+    assert "stop immediately" in steward
     assert "retained-improvement evaluation" in steward

@@ -176,6 +176,7 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
     {
         "assignee",
         "assigned",
+        "allowed_mutations",
         "allowed_paths",
         "attestation_sha256",
         "attestation_path",
@@ -187,6 +188,7 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "binding_sha256",
         "campaign_id",
         "candidate_id",
+        "candidate_feedback",
         "candidate_issue_number",
         "candidate_pull_request_number",
         "changed_paths",
@@ -215,6 +217,7 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "evidence_sha256",
         "evidence_url",
         "goal_sha256",
+        "goal",
         "idempotency_key",
         "idea_id",
         "issue_number",
@@ -240,6 +243,7 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "ref",
         "required_opt_ins",
         "required_checks",
+        "restricted_opt_ins",
         "result",
         "result_commit",
         "result_id",
@@ -322,6 +326,7 @@ _COMMIT_FIELDS = frozenset(
 _IDENTIFIER_LIST_FIELDS = frozenset(
     {
         "depends_on_effect_ids",
+        "allowed_mutations",
         "parent_idea_ids",
         "required_checks",
         "required_opt_ins",
@@ -398,6 +403,7 @@ class StateObject:
             r"objects/(?:"
             r"candidates/g[1-9][0-9]*-[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
             r"\.json|"
+            r"specifications/g[1-9][0-9]*\.json|"
             r"evidence/[0-9a-f]{64}\.json|"
             r"patches/[0-9a-f]{64}\.patch"
             r")",
@@ -419,7 +425,12 @@ class StateObject:
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ValueError("state JSON object is invalid") from error
             if (
-                self.path.startswith("objects/candidates/")
+                self.path.startswith(
+                    (
+                        "objects/candidates/",
+                        "objects/specifications/",
+                    )
+                )
                 and self.content != _canonical_json(document)
             ):
                 raise ValueError("state JSON object must be canonical")
@@ -1469,6 +1480,68 @@ def _validate_candidate_slate(value: Any) -> None:
         )
 
 
+def _validate_candidate_feedback(value: Any) -> None:
+    if not isinstance(value, list):
+        raise StateRefPrivacyError("candidate feedback must be a list")
+    candidate_ids: list[str] = []
+    for row in value:
+        if type(row) is not dict or set(row) != {
+            "candidate_id",
+            "complexity",
+            "eligible",
+            "idea_id",
+            "lessons",
+            "metrics",
+            "result",
+        }:
+            raise StateRefPrivacyError("candidate feedback row is invalid")
+        try:
+            _identifier(row["candidate_id"], "candidate_id")
+            _identifier(row["idea_id"], "idea_id")
+            _identifier(row["result"], "result")
+        except (TypeError, ValueError) as error:
+            raise StateRefPrivacyError(
+                "candidate feedback identity is invalid"
+            ) from error
+        if type(row["eligible"]) is not bool:
+            raise StateRefPrivacyError(
+                "candidate feedback eligibility is invalid"
+            )
+        _validate_redacted_text(row["complexity"], "complexity")
+        lessons = row["lessons"]
+        if not isinstance(lessons, list) or not lessons:
+            raise StateRefPrivacyError(
+                "candidate feedback lessons are invalid"
+            )
+        for lesson in lessons:
+            _validate_redacted_text(lesson, "lesson")
+        metrics = row["metrics"]
+        if not isinstance(metrics, dict):
+            raise StateRefPrivacyError(
+                "candidate feedback metrics are invalid"
+            )
+        for name, metric in metrics.items():
+            try:
+                _identifier(name, "metric")
+            except ValueError as error:
+                raise StateRefPrivacyError(
+                    "candidate feedback metric is invalid"
+                ) from error
+            if (
+                not isinstance(metric, (int, float))
+                or isinstance(metric, bool)
+                or not isfinite(metric)
+            ):
+                raise StateRefPrivacyError(
+                    "candidate feedback aggregate is invalid"
+                )
+        candidate_ids.append(row["candidate_id"])
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise StateRefPrivacyError(
+            "candidate feedback candidates must be unique"
+        )
+
+
 def _validate_payload_value(key: str, value: Any) -> None:
     if key in {
         "attestation_path",
@@ -1545,6 +1618,49 @@ def _validate_payload_value(key: str, value: Any) -> None:
         return
     if key == "candidate_slate":
         _validate_candidate_slate(value)
+        return
+    if key == "candidate_feedback":
+        _validate_candidate_feedback(value)
+        return
+    if key == "goal":
+        if (
+            not isinstance(value, str)
+            or not 20 <= len(value) <= 4000
+            or any(
+                (
+                    ord(character) < 32
+                    and character not in {"\n", "\t"}
+                )
+                or ord(character) == 127
+                for character in value
+            )
+        ):
+            raise StateRefPrivacyError(
+                "goal must be bounded redacted text"
+            )
+        try:
+            reject_secret_content(value)
+        except ValueError as error:
+            raise StateRefPrivacyError(
+                "goal contains sensitive content"
+            ) from error
+        return
+    if key == "restricted_opt_ins":
+        if not isinstance(value, dict):
+            raise StateRefPrivacyError(
+                "restricted opt-ins must be a mapping"
+            )
+        for name, enabled in value.items():
+            try:
+                _identifier(name, "restricted opt-in")
+            except (TypeError, ValueError) as error:
+                raise StateRefPrivacyError(
+                    "restricted opt-in identity is invalid"
+                ) from error
+            if type(enabled) is not bool:
+                raise StateRefPrivacyError(
+                    "restricted opt-ins must be boolean"
+                )
         return
     if key == "marker":
         if (

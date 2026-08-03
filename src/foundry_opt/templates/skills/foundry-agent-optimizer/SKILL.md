@@ -21,7 +21,8 @@ content, unpinned assets, human-gated assets, or policy that disables auto-appro
 immutable policy-approved assets advance without a spec PR.
 
 The assigned `foundry-optimization-steward` must run
-`foundry-opt steward advance --issue <number>` and resume from the issue's durable Git-state ref.
+`foundry-opt steward advance --issue <number> --json` exactly once, then stop and resume only from
+the issue's durable Git-state ref on a later assignment.
 Comments and labels are projections, never authority. Transport workflows record trusted events,
 apply only persisted outbox effects, and reassign Copilot; they never classify assets, design or
 evaluate candidates, select a winner, or declare completion.
@@ -97,11 +98,12 @@ does not brainstorm or evaluate candidate ideas.
 ### Candidate designer
 
 The steward invokes `foundry-candidate-designer` only through the canonical
-`CandidateDesignIntent` / `CandidateDesignResult` boundary. The designer edits only the reserved
-worktree and allowed paths, using the approved goal, mutation policy, baseline aggregates, and
-redacted prior feedback. It is the only specialist that generates ideas or writes candidate code,
-and it stays within the campaign's bounded candidate limits. Foundry draft creation, evaluation,
-eligibility, and selection remain deterministic steward responsibilities.
+`CandidateDesignIntent` / `CandidateDesignResult` boundary and its persisted transport effect. The
+designer edits only the reserved worktree and allowed paths, writes the typed result file, and runs
+`foundry-opt steward candidate-design-result` exactly once. It is the only specialist that
+generates ideas or writes candidate code, and it stays within the campaign's bounded candidate
+limits. Foundry draft creation, evaluation, eligibility, and selection remain deterministic steward
+responsibilities.
 
 ### Exact-patch applier
 

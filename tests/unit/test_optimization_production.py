@@ -49,6 +49,9 @@ from foundry_opt.optimization.production import (
     _RegistrationGateway,
     build_issue_optimization_dependencies,
     build_optimization_command_service,
+    build_production_steward_candidate_selection,
+    build_production_steward_candidate_slate,
+    build_production_steward_candidate_workers,
     build_specification_asset_registry,
 )
 from foundry_opt.orchestration import StateRefError
@@ -414,10 +417,19 @@ def _fake_credential_provider() -> Any:
 def test_build_optimization_command_service_is_available() -> None:
     service = build_optimization_command_service()
     assert isinstance(service, ProductionOptimizationCommandService)
+    assert service._steward._candidate_workers is not None
+    assert service._steward._candidate_slate is not None
+    assert service._steward._candidate_selection is not None
     assert service._steward._deployment is not None
 
 
-def test_cli_steward_builder_wires_canonical_deployment() -> None:
+def test_production_candidate_builders_are_available() -> None:
+    assert build_production_steward_candidate_workers() is not None
+    assert build_production_steward_candidate_slate() is not None
+    assert build_production_steward_candidate_selection() is not None
+
+
+def test_cli_steward_builder_wires_all_canonical_phases() -> None:
     from foundry_opt.cli import build_steward_advance_service
     from foundry_opt.optimization.production import (
         DeploymentIdentityCredentialProvider,
@@ -425,6 +437,9 @@ def test_cli_steward_builder_wires_canonical_deployment() -> None:
 
     service = build_steward_advance_service()
 
+    assert service._candidate_workers is not None
+    assert service._candidate_slate is not None
+    assert service._candidate_selection is not None
     assert service._deployment is not None
     assert not isinstance(
         service._deployment._credential,

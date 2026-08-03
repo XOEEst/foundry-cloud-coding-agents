@@ -38,8 +38,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 import hashlib
+import json
 from pathlib import Path
 import shlex
+import subprocess
 from typing import Any
 from urllib.parse import quote
 
@@ -1062,6 +1064,1024 @@ def build_production_steward_spec_policy(
     return RepositorySpecPolicy(factory)
 
 
+def _production_approved_spec(
+    repository_root: Path,
+    issue_number: int,
+    generation: int,
+    expected_spec_sha256: str,
+) -> tuple[OptimizationSpec, Mapping[str, Path | None]]:
+    snapshot = GitStateRef().load(repository_root, issue_number)
+    if (
+        snapshot is None
+        or snapshot.state.generation != generation
+        or snapshot.state.spec_sha256 != expected_spec_sha256
+    ):
+        raise ValueError("approved candidate state changed")
+    path = f"objects/specifications/g{generation}.json"
+    objects = tuple(
+        item for item in snapshot.objects if item.path == path
+    )
+    if not objects:
+        return _production_merged_spec(
+            repository_root,
+            issue_number,
+            expected_spec_sha256,
+        )
+    if len(objects) != 1:
+        raise ValueError("approved candidate specification is ambiguous")
+    try:
+        document = json.loads(objects[0].content)
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"asset_paths", "spec"}
+            or not isinstance(document["asset_paths"], dict)
+        ):
+            raise ValueError
+        spec = OptimizationSpec.model_validate(document["spec"])
+        asset_paths = {
+            str(asset_id): (
+                Path(raw_path) if raw_path is not None else None
+            )
+            for asset_id, raw_path in document["asset_paths"].items()
+        }
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "approved candidate specification is invalid"
+        ) from error
+    expected_assets = {
+        asset.asset_id for asset in (*spec.datasets, *spec.evaluators)
+    }
+    if (
+        spec.issue_number != issue_number
+        or spec.sha256 != expected_spec_sha256
+        or set(asset_paths) != expected_assets
+        or any(
+            path is not None
+            and (
+                path.is_absolute()
+                or ".." in path.parts
+                or not str(path)
+            )
+            for path in asset_paths.values()
+        )
+    ):
+        raise ValueError("approved candidate specification changed")
+    return spec, asset_paths
+
+
+def _production_merged_spec(
+    repository_root: Path,
+    issue_number: int,
+    expected_spec_sha256: str,
+) -> tuple[OptimizationSpec, Mapping[str, Path | None]]:
+    try:
+        spec = OptimizationSpec.model_validate(
+            yaml.safe_load(
+                (
+                    repository_root / spec_file_path(issue_number)
+                ).read_text(encoding="utf-8")
+            )
+        )
+        provenance = json.loads(
+            (
+                repository_root / provenance_file_path(issue_number)
+            ).read_text(encoding="utf-8")
+        )
+        if (
+            not isinstance(provenance, dict)
+            or provenance.get("issue_number") != issue_number
+            or provenance.get("base_commit") != spec.base_commit
+            or provenance.get("spec_sha256") != spec.sha256
+        ):
+            raise ValueError
+        paths = {
+            str(entry["asset_id"]): (
+                Path(entry["path"])
+                if entry.get("path") is not None
+                else None
+            )
+            for entry in (
+                *provenance.get("datasets", ()),
+                *provenance.get("evaluators", ()),
+            )
+            if isinstance(entry, dict)
+        }
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        yaml.YAMLError,
+    ) as error:
+        raise ValueError(
+            "approved candidate specification is unavailable"
+        ) from error
+    expected_assets = {
+        asset.asset_id for asset in (*spec.datasets, *spec.evaluators)
+    }
+    if (
+        spec.issue_number != issue_number
+        or spec.sha256 != expected_spec_sha256
+        or set(paths) != expected_assets
+    ):
+        raise ValueError("approved candidate specification changed")
+    return spec, paths
+
+
+def _production_git_bytes(
+    repository_root: Path,
+    commit: str,
+    path: Path,
+) -> bytes:
+    completed = subprocess.run(
+        ("git", "show", f"{commit}:{path.as_posix()}"),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise ValueError("approved candidate asset is unavailable")
+    return completed.stdout
+
+
+class _ProductionCandidatePlanSource:
+    """Resolve exact approved campaign inputs for the canonical workers."""
+
+    def __init__(
+        self,
+        *,
+        config_path: Path,
+        registration_gateway_factory: RegistrationGatewayFactory,
+    ) -> None:
+        self._config_path = config_path
+        self._registration_gateway_factory = registration_gateway_factory
+        self._resolved: dict[
+            tuple[int, int, str],
+            tuple[Path, OptimizerConfig, OptimizationSpec, tuple[Any, ...]],
+        ] = {}
+
+    def resolve(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        generation: int,
+        expected_spec_sha256: str,
+    ) -> tuple[OptimizerConfig, OptimizationSpec, tuple[Any, ...]]:
+        root = repository_root.expanduser().resolve()
+        config = load_config(root / self._config_path)
+        spec, asset_paths = _production_approved_spec(
+            root,
+            issue_number,
+            generation,
+            expected_spec_sha256,
+        )
+        if (
+            spec.issue_number != issue_number
+            or spec.sha256 != expected_spec_sha256
+        ):
+            raise ValueError("approved candidate specification changed")
+        target = config.targets.get(spec.target)
+        if (
+            target is None
+            or target.environment != spec.environment
+            or target.base_agent_version != spec.base_agent_version
+        ):
+            raise ValueError("approved candidate target changed")
+        assets = self._materialize_assets(
+            root,
+            config,
+            spec,
+            asset_paths,
+        )
+        self._resolved[(issue_number, generation, spec.sha256)] = (
+            root,
+            config,
+            spec,
+            assets,
+        )
+        return config, spec, assets
+
+    def resolved_for(
+        self,
+        issue_number: int,
+        generation: int,
+        spec_sha256: str,
+    ) -> tuple[Path, OptimizerConfig, OptimizationSpec, tuple[Any, ...]]:
+        try:
+            return self._resolved[(issue_number, generation, spec_sha256)]
+        except KeyError as error:
+            raise ValueError(
+                "candidate production inputs have not been resolved"
+            ) from error
+
+    def _materialize_assets(
+        self,
+        root: Path,
+        config: OptimizerConfig,
+        spec: OptimizationSpec,
+        paths: Mapping[str, Path | None],
+    ) -> tuple[Any, ...]:
+        from foundry_opt.optimization.assets import (
+            canonicalize_repository_asset_content,
+            materialize_prepared_asset,
+        )
+        from foundry_opt.optimization.models import PreparedEvaluationAsset
+        from foundry_opt.optimization.runner import _asset_reference
+
+        registration = _RegistrationGateway(
+            config,
+            spec.environment,
+            self._registration_gateway_factory,
+        )
+        references: list[Any] = []
+        for asset in (*spec.datasets, *spec.evaluators):
+            path = paths.get(asset.asset_id)
+            materialized = asset
+            if path is not None:
+                absolute = (root / path).resolve()
+                if not absolute.is_relative_to(root):
+                    raise ValueError(
+                        "approved candidate asset path is invalid"
+                    )
+                content = canonicalize_repository_asset_content(
+                    _production_git_bytes(
+                        root,
+                        spec.base_commit,
+                        path,
+                    )
+                )
+                if (
+                    asset.content_sha256 is not None
+                    and hashlib.sha256(content).hexdigest()
+                    != asset.content_sha256
+                ):
+                    raise ValueError(
+                        "approved candidate asset content changed"
+                    )
+                materialized = materialize_prepared_asset(
+                    PreparedEvaluationAsset(
+                        provenance=asset,
+                        files={path: content},
+                    ),
+                    registration,
+                )
+            elif asset.remote_id is None:
+                raise ValueError(
+                    "approved candidate asset has no remote identity"
+                )
+            references.append(_asset_reference(materialized))
+        return tuple(references)
+
+
+class _ProductionCandidateWorkerPlanResolver:
+    def __init__(self, source: _ProductionCandidatePlanSource) -> None:
+        self._source = source
+
+    def resolve(self, request: Any, state: Any) -> Any:
+        from foundry_opt.optimization.runner import (
+            _campaign_limits,
+            _evaluation_policy,
+            _restricted_opt_ins,
+        )
+        from foundry_opt.orchestration.candidate_workers import (
+            CandidateWorkerPlan,
+        )
+
+        if state.spec_sha256 is None:
+            raise ValueError("candidate workers require an approved spec")
+        config, spec, assets = self._source.resolve(
+            request.repository_root,
+            request.issue_number,
+            state.generation,
+            state.spec_sha256,
+        )
+        target = config.targets[spec.target]
+        return CandidateWorkerPlan(
+            issue_number=request.issue_number,
+            generation=state.generation,
+            spec_sha256=spec.sha256,
+            base_commit=spec.base_commit,
+            target=spec.target,
+            base_agent_version=int(spec.base_agent_version),
+            goal=spec.goal,
+            limits=_campaign_limits(config, target),
+            edit_paths=tuple(Path(str(path)) for path in target.edit_paths),
+            allowed_mutations=frozenset(
+                mutation.value for mutation in spec.allowed_mutations
+            ),
+            restricted_opt_ins=_restricted_opt_ins(spec),
+            evaluation_policy=_evaluation_policy(spec),
+            assets=assets,
+            evidence_root=Path(str(config.campaign.evidence_path)),
+        )
+
+
+class _ProductionCandidateDraftEffects:
+    def __init__(
+        self,
+        source: _ProductionCandidatePlanSource,
+        credential: AzureCredentialProvider,
+        draft_gateway: Any | None = None,
+    ) -> None:
+        self._source = source
+        self._gateway = draft_gateway or DraftGateway(credential)
+
+    def reconcile(self, intent: Any) -> DraftRecord | None:
+        return self.create(intent)
+
+    def create(self, intent: Any) -> DraftRecord:
+        _, config, _, _ = self._source.resolved_for(
+            intent.issue_number,
+            intent.generation,
+            intent.spec_sha256,
+        )
+        return _DraftCreator(config, self._gateway)(
+            intent.target,
+            intent.subject_id,
+            intent.idempotency_key,
+            intent.bundle,
+        )
+
+
+class _ProductionCandidateEvaluationEffects:
+    def __init__(
+        self,
+        source: _ProductionCandidatePlanSource,
+        credential: AzureCredentialProvider,
+        binder_factory: BinderFactory | None,
+    ) -> None:
+        self._source = source
+        self._credential = credential
+        self._binder_factory = binder_factory
+
+    def reconcile(self, intent: Any) -> Any | None:
+        return self.run(intent)
+
+    def run(self, intent: Any) -> Any:
+        from foundry_opt.evaluation import evaluate_with_repeat
+
+        _, config, spec, assets = self._source.resolved_for(
+            intent.issue_number,
+            intent.generation,
+            intent.spec_sha256,
+        )
+        factory = self._binder_factory or _default_binder_factory(
+            self._credential,
+            config,
+        )
+        evaluate = _EvaluationBinder(config, factory)(
+            spec,
+            assets,
+        )
+        return evaluate_with_repeat(
+            intent.subject,
+            intent.split,
+            intent.policy,
+            evaluate,
+        )
+
+
+class _ProductionCandidateDesignRepository:
+    """Capture specialist edits on a deterministic remote result ref."""
+
+    def __init__(self, commands: CommandRunner) -> None:
+        self._commands = commands
+
+    def capture(self, request: Any, intent: Any, result: Any) -> Any:
+        from foundry_opt.orchestration.candidate_workers import (
+            CandidateDesignArtifact,
+        )
+
+        root = request.repository_root.expanduser().resolve()
+        expected_result = (
+            root
+            / ".foundry-optimizer"
+            / "design-results"
+            / f"{intent.effect_id}.json"
+        ).resolve()
+        if request.result_file.resolve() != expected_result:
+            raise ValueError("candidate design result path is invalid")
+        result.require_matches(intent)
+        head = self._commands.run(
+            ("git", "rev-parse", "HEAD^{commit}"),
+            cwd=root,
+        ).stdout.strip()
+        if head != intent.base_commit:
+            raise ValueError("candidate designer checkout base changed")
+        result_path = expected_result.relative_to(root)
+        changed = _production_changed_paths(self._commands, root, intent)
+        candidate_paths = tuple(
+            path for path in changed if path != result_path
+        )
+        if (
+            not candidate_paths
+            or any(
+                not _path_is_allowed(path, intent.edit_paths)
+                for path in candidate_paths
+            )
+            or any(
+                path != result_path
+                and not _path_is_allowed(path, intent.edit_paths)
+                for path in changed
+            )
+        ):
+            raise ValueError("candidate design changed forbidden paths")
+        index = (
+            root
+            / ".foundry-optimizer"
+            / "design-indexes"
+            / f"{intent.effect_id}.index"
+        )
+        index.parent.mkdir(parents=True, exist_ok=True)
+        index.unlink(missing_ok=True)
+        environment = {
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+            "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
+            "GIT_AUTHOR_NAME": "Foundry Candidate Designer",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+            "GIT_COMMITTER_EMAIL": "foundry-opt@example.invalid",
+            "GIT_COMMITTER_NAME": "Foundry Candidate Designer",
+            "GIT_INDEX_FILE": str(index),
+        }
+        try:
+            self._commands.run(
+                ("git", "read-tree", intent.base_commit),
+                cwd=root,
+                environment=environment,
+            )
+            self._commands.run(
+                (
+                    "git",
+                    "add",
+                    "-A",
+                    "--",
+                    *(path.as_posix() for path in intent.edit_paths),
+                ),
+                cwd=root,
+                environment=environment,
+            )
+            tree = self._commands.run(
+                ("git", "write-tree"),
+                cwd=root,
+                environment=environment,
+            ).stdout.strip()
+            commit = self._commands.run(
+                (
+                    "git",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    intent.base_commit,
+                ),
+                cwd=root,
+                environment=environment,
+                input_text=(
+                    "Capture candidate design "
+                    f"{intent.effect_id}\n"
+                ),
+            ).stdout.strip()
+            ref = (
+                "refs/heads/foundry-opt/design/"
+                f"issue-{intent.issue_number}/{intent.effect_id}"
+            )
+            existing = self._commands.run(
+                ("git", "ls-remote", "--heads", "origin", ref),
+                cwd=root,
+            ).stdout.strip()
+            if existing:
+                remote_commit = existing.split()[0]
+                if remote_commit != commit:
+                    raise ValueError("candidate design ref changed")
+            else:
+                self._commands.run(
+                    ("git", "push", "--quiet", "origin", f"{commit}:{ref}"),
+                    cwd=root,
+                )
+        finally:
+            index.unlink(missing_ok=True)
+            try:
+                index.parent.rmdir()
+            except OSError:
+                pass
+        return CandidateDesignArtifact(
+            ref=ref,
+            head_commit=commit,
+            tree_sha=tree,
+            changed_paths=candidate_paths,
+        )
+
+    def cleanup(self, request: Any, intent: Any) -> None:
+        root = request.repository_root.expanduser().resolve()
+        request.result_file.unlink(missing_ok=True)
+        paths = tuple(path.as_posix() for path in intent.edit_paths)
+        self._commands.run(
+            (
+                "git",
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                *paths,
+            ),
+            cwd=root,
+        )
+        self._commands.run(
+            ("git", "clean", "-fd", "--", *paths),
+            cwd=root,
+        )
+
+
+class _ProductionCandidateDesigner:
+    """Reconcile only typed results captured by the designer specialist."""
+
+    def __init__(
+        self,
+        *,
+        ledger: Any | None = None,
+        commands: CommandRunner | None = None,
+    ) -> None:
+        self._ledger = ledger or GitStateRef()
+        self._commands = commands or SubprocessCommandRunner()
+
+    def reconcile(self, intent: Any) -> tuple[Any, ...]:
+        root = _repository_root_from_worktree(
+            intent.worktree,
+            self._commands,
+        )
+        snapshot = self._ledger.load(root, intent.issue_number)
+        if snapshot is None:
+            raise ValueError("candidate design state is unavailable")
+        records = tuple(
+            record
+            for record in snapshot.outbox
+            if record.record_id == f"{intent.effect_id}-submitted"
+        )
+        if not records:
+            return ()
+        if len(records) != 1:
+            raise ValueError("candidate design result is ambiguous")
+        record = records[0]
+        result = _production_candidate_design_result(intent, record)
+        ref = record.payload.get("ref")
+        head_commit = record.payload.get("head_commit")
+        tree_sha = record.payload.get("tree_sha")
+        if not all(isinstance(value, str) for value in (ref, head_commit, tree_sha)):
+            raise ValueError("candidate design Git binding is invalid")
+        self._commands.run(
+            ("git", "fetch", "--quiet", "origin", ref),
+            cwd=root,
+        )
+        fetched = self._commands.run(
+            ("git", "rev-parse", "FETCH_HEAD^{commit}"),
+            cwd=root,
+        ).stdout.strip()
+        parent = self._commands.run(
+            ("git", "rev-parse", f"{fetched}^"),
+            cwd=root,
+        ).stdout.strip()
+        fetched_tree = self._commands.run(
+            ("git", "rev-parse", f"{fetched}^{{tree}}"),
+            cwd=root,
+        ).stdout.strip()
+        if (
+            fetched != head_commit
+            or parent != intent.base_commit
+            or fetched_tree != tree_sha
+        ):
+            raise ValueError("candidate design Git binding changed")
+        raw_changed = record.payload.get("changed_paths")
+        if not isinstance(raw_changed, list):
+            raise ValueError("candidate design changed paths are invalid")
+        expected_changed = tuple(
+            Path(path) for path in raw_changed
+        )
+        observed_changed = tuple(
+            sorted(
+                Path(value)
+                for value in self._commands.run(
+                    (
+                        "git",
+                        "diff",
+                        "--name-only",
+                        "-z",
+                        intent.base_commit,
+                        fetched,
+                        "--",
+                    ),
+                    cwd=root,
+                ).stdout.split("\0")
+                if value
+            )
+        )
+        if (
+            observed_changed != expected_changed
+            or any(
+                not _path_is_allowed(path, intent.edit_paths)
+                for path in observed_changed
+            )
+        ):
+            raise ValueError("candidate design changed paths are invalid")
+        remote_patch = self._commands.run(
+            (
+                "git",
+                "diff",
+                "--binary",
+                "--full-index",
+                intent.base_commit,
+                fetched,
+                "--",
+            ),
+            cwd=root,
+        ).stdout
+        current_patch = self._commands.run(
+            (
+                "git",
+                "diff",
+                "--binary",
+                "--full-index",
+                intent.base_commit,
+                "--",
+            ),
+            cwd=intent.worktree,
+        ).stdout
+        if current_patch == remote_patch:
+            return (result,)
+        if current_patch:
+            raise ValueError("candidate design worktree changed")
+        self._commands.run(
+            (
+                "git",
+                "apply",
+                "--index",
+                "--binary",
+                "--whitespace=nowarn",
+                "-",
+            ),
+            cwd=intent.worktree,
+            input_bytes=remote_patch.encode("utf-8"),
+        )
+        applied = self._commands.run(
+            (
+                "git",
+                "diff",
+                "--binary",
+                "--full-index",
+                intent.base_commit,
+                "--",
+            ),
+            cwd=intent.worktree,
+        ).stdout
+        if applied != remote_patch:
+            raise ValueError("candidate design patch changed during apply")
+        return (result,)
+
+    def invoke(self, intent: Any) -> Any:
+        from foundry_opt.orchestration.candidate_workers import (
+            CandidateDesignPending,
+        )
+
+        raise CandidateDesignPending()
+
+
+class _ProductionCandidateSlatePlanResolver:
+    def __init__(
+        self,
+        commands: CommandRunner,
+        config_path: Path,
+    ) -> None:
+        self._commands = commands
+        self._config_path = config_path
+
+    def resolve(self, request: Any, state: Any) -> Any:
+        from foundry_opt.optimization.runner import _evaluation_policy
+        from foundry_opt.orchestration.candidate_slate import (
+            CandidateSlatePlan,
+        )
+
+        root = request.repository_root
+        config = load_config(root / self._config_path)
+        if state.spec_sha256 is None:
+            raise ValueError("candidate slate requires an approved spec")
+        spec, _ = _production_approved_spec(
+            root,
+            request.issue_number,
+            state.generation,
+            state.spec_sha256,
+        )
+        target = config.targets.get(spec.target)
+        if (
+            target is None
+            or target.environment != spec.environment
+            or target.base_agent_version != spec.base_agent_version
+        ):
+            raise ValueError("approved candidate slate target changed")
+        if (
+            state.spec_sha256 is None
+            or spec.issue_number != request.issue_number
+            or spec.sha256 != state.spec_sha256
+        ):
+            raise ValueError("approved candidate slate specification changed")
+        repository_document = _production_json(
+            self._commands,
+            (
+                "gh",
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner,defaultBranchRef",
+            ),
+            root,
+        )
+        repository = repository_document.get("nameWithOwner")
+        default_ref = repository_document.get("defaultBranchRef")
+        default_branch = (
+            default_ref.get("name")
+            if isinstance(default_ref, Mapping)
+            else None
+        )
+        if (
+            not isinstance(repository, str)
+            or not isinstance(default_branch, str)
+            or repository != spec.repository
+        ):
+            raise ValueError("candidate repository identity is unavailable")
+        pinned = CampaignGit(
+            default_branch=lambda repository_root: default_branch
+        ).pin_default_branch(root)
+        if pinned.commit != spec.base_commit:
+            raise ValueError("candidate slate base commit changed")
+        required_checks = tuple(
+            dict.fromkeys(
+                (
+                    "Foundry exact candidate check",
+                    *config.automation_policy.required_checks,
+                )
+            )
+        )
+        return CandidateSlatePlan(
+            issue_number=request.issue_number,
+            generation=state.generation,
+            repository=repository,
+            default_branch=default_branch,
+            spec_sha256=spec.sha256,
+            base_commit=spec.base_commit,
+            evaluation_policy=_evaluation_policy(spec),
+            required_checks=required_checks,
+        )
+
+
+class _ProductionCandidatePullRequestReader:
+    def __init__(self, commands: CommandRunner) -> None:
+        self._commands = commands
+
+    def snapshots_for(self, request: Any, bindings: tuple[Any, ...]) -> Any:
+        from foundry_opt.orchestration.candidate_bridge import (
+            GhCandidatePullRequestReader,
+        )
+
+        repository = _production_json(
+            self._commands,
+            (
+                "gh",
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+            ),
+            request.repository_root,
+        ).get("nameWithOwner")
+        if not isinstance(repository, str):
+            raise ValueError("candidate repository identity is unavailable")
+        return GhCandidatePullRequestReader(
+            self._commands,
+            request.repository_root,
+            repository,
+        ).snapshots_for(request, bindings)
+
+
+def _production_changed_paths(
+    commands: CommandRunner,
+    root: Path,
+    intent: Any,
+) -> tuple[Path, ...]:
+    tracked = commands.run(
+        (
+            "git",
+            "diff",
+            "--name-only",
+            "-z",
+            intent.base_commit,
+            "--",
+        ),
+        cwd=root,
+    ).stdout
+    untracked = commands.run(
+        (
+            "git",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ),
+        cwd=root,
+    ).stdout
+    return tuple(
+        Path(value)
+        for value in sorted(
+            {
+                value
+                for document in (tracked, untracked)
+                for value in document.split("\0")
+                if value
+            }
+        )
+    )
+
+
+def _path_is_allowed(path: Path, allowed: tuple[Path, ...]) -> bool:
+    return any(path == root or root in path.parents for root in allowed)
+
+
+def _production_candidate_design_result(
+    intent: Any,
+    record: Any,
+) -> Any:
+    from foundry_opt.orchestration.candidate_workers import (
+        CandidateDesignResult,
+    )
+
+    if (
+        record.kind != "candidate_design_submitted"
+        or record.generation != intent.generation
+        or record.payload.get("effect_id") != intent.effect_id
+    ):
+        raise ValueError("candidate design result binding is invalid")
+    try:
+        result = CandidateDesignResult(
+            effect_id=str(record.payload["effect_id"]),
+            result_id=str(record.payload["result_id"]),
+            issue_number=int(record.payload["issue_number"]),
+            generation=record.generation,
+            spec_sha256=str(record.payload["spec_sha256"]),
+            base_commit=str(record.payload["base_commit"]),
+            candidate_id=str(record.payload["candidate_id"]),
+            slot=int(record.payload["slot"]),
+            idea_id=str(record.payload["idea_id"]),
+            mutation_class=str(record.payload["mutation_class"]),
+            parent_idea_ids=tuple(record.payload["parent_idea_ids"]),
+            required_opt_ins=frozenset(
+                record.payload["required_opt_ins"]
+            ),
+            motivation=str(record.payload["motivation"]),
+            lessons=tuple(record.payload["lessons"]),
+            complexity=str(record.payload["complexity"]),
+        )
+        result.require_matches(intent)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("candidate design result is invalid") from error
+    return result
+
+
+def build_production_steward_candidate_workers(
+    *,
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+    command_runner: CommandRunner | None = None,
+    environment: EnvironmentReader | None = None,
+    credential_provider: AzureCredentialProvider | None = None,
+    registration_gateway_factory: RegistrationGatewayFactory | None = None,
+    binder_factory: BinderFactory | None = None,
+    repository: Any | None = None,
+    draft_gateway: Any | None = None,
+) -> Any:
+    from foundry_opt.orchestration.candidate_workers import (
+        CandidateWorkerDependencies,
+        CandidateWorkerService,
+    )
+
+    commands = command_runner or SubprocessCommandRunner()
+    reader = environment or OsEnvironmentReader()
+    credential = credential_provider or _default_credential_provider(reader)
+    registration = (
+        registration_gateway_factory
+        or _default_registration_gateway_factory(credential)
+    )
+    source = _ProductionCandidatePlanSource(
+        config_path=config_path,
+        registration_gateway_factory=registration,
+    )
+    campaign_repository = repository or CampaignGit()
+    return CandidateWorkerService(
+        ledger=GitStateRef(),
+        resolver=_ProductionCandidateWorkerPlanResolver(source),
+        dependencies=CandidateWorkerDependencies(
+            repository=campaign_repository,
+            designer=_ProductionCandidateDesigner(
+                ledger=GitStateRef(),
+                commands=commands,
+            ),
+            validate=lambda path: run_validation(
+                _validation_request(
+                    load_config(
+                        _repository_root_from_worktree(path) / config_path
+                    ),
+                    path,
+                ),
+                commands,
+            ),
+            build_bundle=lambda root_path, output: build_source_bundle(
+                _bundle_request(
+                    load_config(
+                        _repository_root_from_worktree(root_path)
+                        / config_path
+                    ),
+                    root_path,
+                    output,
+                )
+            ),
+            drafts=_ProductionCandidateDraftEffects(
+                source,
+                credential,
+                draft_gateway,
+            ),
+            evaluations=_ProductionCandidateEvaluationEffects(
+                source,
+                credential,
+                binder_factory,
+            ),
+            write_evidence=write_redacted_evidence,
+            clock=UtcClock(),
+        ),
+    )
+
+
+def build_production_candidate_design_submission_service(
+    *,
+    command_runner: CommandRunner | None = None,
+) -> Any:
+    from foundry_opt.orchestration.candidate_workers import (
+        CandidateDesignSubmissionService,
+    )
+
+    commands = command_runner or SubprocessCommandRunner()
+    return CandidateDesignSubmissionService(
+        ledger=GitStateRef(),
+        repository=_ProductionCandidateDesignRepository(commands),
+    )
+
+
+def build_production_steward_candidate_slate(
+    *,
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+    command_runner: CommandRunner | None = None,
+) -> Any:
+    from foundry_opt.orchestration.candidate_slate import (
+        CandidateSlateService,
+    )
+
+    commands = command_runner or SubprocessCommandRunner()
+    return CandidateSlateService(
+        ledger=GitStateRef(),
+        resolver=_ProductionCandidateSlatePlanResolver(
+            commands,
+            config_path,
+        ),
+    )
+
+
+def build_production_steward_candidate_selection(
+    *,
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+    command_runner: CommandRunner | None = None,
+) -> Any:
+    from foundry_opt.orchestration.candidate_slate import (
+        CandidateSelectionService,
+    )
+
+    commands = command_runner or SubprocessCommandRunner()
+    return CandidateSelectionService(
+        ledger=GitStateRef(),
+        reader=_ProductionCandidatePullRequestReader(commands),
+        resolver=_ProductionCandidateSlatePlanResolver(
+            commands,
+            config_path,
+        ),
+    )
+
+
+def _repository_root_from_worktree(
+    path: Path,
+    commands: CommandRunner | None = None,
+) -> Path:
+    common = (commands or SubprocessCommandRunner()).run(
+        ("git", "rev-parse", "--path-format=absolute", "--git-common-dir"),
+        cwd=path,
+    ).stdout.strip()
+    if not common:
+        raise ValueError("candidate worktree repository is unavailable")
+    return Path(common).resolve().parent
+
+
 class _ProductionDeploymentPlanResolver:
     def __init__(
         self,
@@ -1086,13 +2106,21 @@ class _ProductionDeploymentPlanResolver:
 
         root = request.repository_root
         config = load_config(root / self._config_path)
-        spec = OptimizationSpec.model_validate(
-            yaml.safe_load(
-                (root / spec_file_path(request.issue_number)).read_text(
-                    encoding="utf-8"
-                )
-            )
+        if state.spec_sha256 is None:
+            raise ValueError("deployment requires an approved spec")
+        spec, _ = _production_approved_spec(
+            root,
+            request.issue_number,
+            state.generation,
+            state.spec_sha256,
         )
+        target = config.targets.get(spec.target)
+        if (
+            target is None
+            or target.environment != spec.environment
+            or target.base_agent_version != spec.base_agent_version
+        ):
+            raise ValueError("approved deployment target changed")
         if spec.sha256 != state.spec_sha256:
             raise ValueError("approved deployment specification changed")
         environment = config.environments[spec.environment]
@@ -1496,22 +2524,18 @@ class _ProductionPostDeploymentEvaluationEffects:
         from foundry_opt.optimization.lifecycle import PostDeployRequest
 
         config = load_config(self._root / self._config_path)
-        spec = OptimizationSpec.model_validate(
-            yaml.safe_load(
-                (
-                    self._root
-                    / spec_file_path(intent.binding.issue_number)
-                ).read_text(encoding="utf-8")
-            )
-        )
-        if spec.sha256 != intent.binding.spec_sha256:
-            raise ValueError("post-deployment specification changed")
         snapshot = GitStateRef().load(
             self._root,
             intent.binding.issue_number,
         )
         if snapshot is None:
             raise ValueError("campaign state is unavailable")
+        spec, _ = _production_approved_spec(
+            self._root,
+            intent.binding.issue_number,
+            intent.binding.generation,
+            intent.binding.spec_sha256,
+        )
         plans = tuple(
             record
             for record in snapshot.outbox
@@ -1625,6 +2649,31 @@ def build_production_steward_deployment(
     return ProductionDeploymentOrchestration(config_path=config_path)
 
 
+def build_production_steward_advance_service(
+    *,
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+) -> StewardAdvanceService:
+    """Assemble every canonical phase behind the production steward."""
+    return StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        spec_policy=build_production_steward_spec_policy(
+            config_path=config_path
+        ),
+        candidate_workers=build_production_steward_candidate_workers(
+            config_path=config_path
+        ),
+        candidate_slate=build_production_steward_candidate_slate(
+            config_path=config_path
+        ),
+        candidate_selection=build_production_steward_candidate_selection(
+            config_path=config_path
+        ),
+        deployment=build_production_steward_deployment(
+            config_path=config_path
+        ),
+    )
+
+
 def _production_json(
     commands: CommandRunner,
     arguments: tuple[str, ...],
@@ -1651,14 +2700,8 @@ class ProductionOptimizationCommandService(
         )
         super().__init__(
             legacy=legacy,
-            steward=StewardAdvanceService(
-                inbox=GitCampaignInbox(),
-                spec_policy=build_production_steward_spec_policy(
-                    config_path=config_path
-                ),
-                deployment=build_production_steward_deployment(
-                    config_path=config_path
-                ),
+            steward=build_production_steward_advance_service(
+                config_path=config_path
             ),
             projector=LegacyCampaignEventProjector(
                 artifact_generation=fence.generation,

@@ -24,7 +24,6 @@ from foundry_opt.preflight.redaction import redact
 from foundry_opt.preflight.rendering import render_human, render_json
 from foundry_opt.preflight.runner import PreflightRunner
 from foundry_opt.orchestration.steward import (
-    GitCampaignInbox,
     StewardAdvanceRequest,
     StewardAdvanceService,
 )
@@ -104,15 +103,19 @@ def build_optimization_command_service() -> OptimizationCommandService:
 def build_steward_advance_service() -> StewardAdvanceService:
     """Return the durable Copilot steward advance service."""
     from foundry_opt.optimization.production import (
-        build_production_steward_deployment,
-        build_production_steward_spec_policy,
+        build_production_steward_advance_service,
     )
 
-    return StewardAdvanceService(
-        inbox=GitCampaignInbox(),
-        spec_policy=build_production_steward_spec_policy(),
-        deployment=build_production_steward_deployment(),
+    return build_production_steward_advance_service()
+
+
+def build_candidate_design_submission_service():
+    """Return the durable candidate designer result service."""
+    from foundry_opt.optimization.production import (
+        build_production_candidate_design_submission_service,
     )
+
+    return build_production_candidate_design_submission_service()
 
 
 def _render_onboarding(result: OnboardingResult) -> str:
@@ -222,6 +225,86 @@ def steward_advance(
         if result.revision is not None:
             typer.echo(f"- revision: {result.revision}")
     raise typer.Exit(result.exit_code)
+
+
+@steward_app.command("candidate-design-result", hidden=True)
+def steward_candidate_design_result(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    effect_id: Annotated[
+        str,
+        typer.Option("--effect", help="Persisted candidate design effect ID."),
+    ],
+    worker_issue_number: Annotated[
+        int,
+        typer.Option(
+            "--worker-issue",
+            min=1,
+            help="Assigned candidate designer worker issue number.",
+        ),
+    ],
+    result_file: Annotated[
+        Path,
+        typer.Option(
+            "--result-file",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="Typed CandidateDesignResult JSON file.",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Persist one separately assigned candidate designer result."""
+    from foundry_opt.orchestration.candidate_workers import (
+        CandidateDesignSubmissionRequest,
+        CandidateDesignSubmissionStatus,
+    )
+
+    result = build_candidate_design_submission_service().submit(
+        CandidateDesignSubmissionRequest(
+            repository_root=Path.cwd(),
+            issue_number=issue_number,
+            effect_id=effect_id,
+            worker_issue_number=worker_issue_number,
+            result_file=result_file,
+        )
+    )
+    payload = {
+        "code": result.code,
+        "issue_number": issue_number,
+        "revision": result.snapshot.revision,
+        "status": result.status.value,
+    }
+    if json_output:
+        typer.echo(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            "Candidate design "
+            f"{result.status.value}: {redact(result.code or 'recorded')}"
+        )
+    raise typer.Exit(
+        0
+        if result.status
+        in {
+            CandidateDesignSubmissionStatus.RECORDED,
+            CandidateDesignSubmissionStatus.ALREADY_RECORDED,
+        }
+        else 1
+    )
 
 
 @steward_app.command("deployment-bridge", hidden=True)

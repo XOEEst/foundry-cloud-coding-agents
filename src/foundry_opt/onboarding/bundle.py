@@ -315,9 +315,22 @@ Edit only the reserved worktree and only its declared edit paths. Follow the
 pinned goal, mutation allowlist, restricted opt-ins, baseline aggregates, and
 redacted prior feedback. Return only the matching privacy-safe
 `CandidateDesignResult`; never claim evaluation status, eligibility, or
-selection. The campaign budget and cutoff are authoritative and must not be
+selection. Write that typed result to
+`.foundry-optimizer/design-results/<effect-id>.json`, then invoke exactly once:
+
+`foundry-opt steward candidate-design-result --issue <number> --effect <effect-id> --worker-issue <worker-issue-number> --result-file .foundry-optimizer/design-results/<effect-id>.json --json`
+
+The JSON must contain exactly the canonical result fields: `effect_id`,
+`result_id`, `issue_number`, `generation`, `spec_sha256`, `base_commit`,
+`candidate_id`, `slot`, `idea_id`, `mutation_class`, `parent_idea_ids`,
+`required_opt_ins`, `motivation`, `lessons`, and `complexity`.
+
+The command captures only the allowed candidate edits on the durable design
+result ref and restores the session checkout. Stop immediately after it
+returns. The campaign budget and cutoff are authoritative and must not be
 extended. Never read held-out rows or raw evidence, call GitHub APIs, create a
-branch or pull request, merge, or deploy.
+branch, merge, or deploy. Do not create or update a pull request; the later
+`foundry-candidate-applier` native session owns the candidate pull request.
 """
 
 
@@ -355,20 +368,21 @@ disable-model-invocation: true
 Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
 `REPOSITORY_CONTEXT.md`, the assigned issue, and its trusted Git-state inbox.
 
-On every assignment invoke `foundry-opt steward advance --issue <number>`.
+Run `foundry-opt steward advance --issue <number> --json` exactly once per assignment.
 Resume exclusively from
 `refs/heads/foundry-opt/state/issue-<number>` and its trusted inbox; never
 reconstruct campaign state from comments, labels, or conversation history.
 Execute domain logic only through canonical steward interfaces, never by
 reproducing transitions in instructions, workflows, or shell.
 
-Maintain the root issue dashboard as the user-facing projection: specification
-classification/digest, bounded experiment progress, baseline and eligible
-candidate aggregates with redacted-evidence links, selected merge lineage,
-deployment workflow/run and Foundry version, retained improvement, and final
-closure. The user normally does nothing until merging exactly one eligible
-candidate PR. Delegate a specification PR only for the exceptional immutable
-asset gate described by policy.
+The command is the only campaign action. Report and project only through the
+persisted state and outbox effects it returns; transport workflows own GitHub
+projection and reassignment. Never inspect or edit agent source, tests, or configuration.
+Never create or update the session pull request. Never improvise specialist work,
+direct code changes, state transitions, comments, labels, merges, deployment,
+or other GitHub effects.
+The canonical command, not this model, owns retained-improvement evaluation
+and final campaign closure.
 
 Never expose raw evidence, traces, held-out rows, credentials, or private
 dataset content. Treat only privacy-allowlisted aggregates and durable
@@ -386,10 +400,11 @@ Handle persisted specialist intents exactly as designed:
 
 Do not create pull requests, merge, deploy, or apply GitHub effects directly.
 Native Copilot specialist sessions create their own pull requests; transport
-workflows apply only effects already persisted in the outbox. After one
-eligible candidate merge, automatically advance persisted deployment,
-retained-improvement evaluation, competing-candidate supersession, final
-dashboard projection, and root issue closure.
+workflows apply only effects already persisted in the outbox.
+
+After the single command returns, stop immediately. A `blocked`, `delegate`, or `wait`
+disposition, or a `waiting` status, means stop and await transport
+or a new assignment. Do not continue investigating or attempt a workaround.
 """
 
 

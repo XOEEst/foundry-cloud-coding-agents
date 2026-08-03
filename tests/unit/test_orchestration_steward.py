@@ -14,6 +14,7 @@ from foundry_opt.orchestration import (
     EventKind,
     OptimizationCampaign,
     StateRefConflictError,
+    StateObject,
 )
 from foundry_opt.orchestration.steward import (
     GitCampaignInbox,
@@ -136,6 +137,12 @@ def test_steward_runs_spec_policy_and_persists_digest_classification(
             "existing_immutable_assets",
             spec_sha256=digest,
             event=policy_event,
+            objects=(
+                StateObject(
+                    "objects/specifications/g1.json",
+                    b'{"asset_paths":{},"spec":{"goal":"durable"}}\n',
+                ),
+            ),
         )
     )
     ledger = Ledger()
@@ -156,6 +163,9 @@ def test_steward_runs_spec_policy_and_persists_digest_classification(
     assert dashboard.payload["spec_sha256"] == digest
     assert dashboard.payload["spec_classification"] == "policy_approved"
     assert dashboard.payload["reason"] == "existing_immutable_assets"
+    assert ledger.commits[0]["objects"][0].path == (
+        "objects/specifications/g1.json"
+    )
 
 
 def test_steward_persists_specialist_intent_without_duplicate_dispatch(
