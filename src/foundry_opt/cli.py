@@ -302,6 +302,7 @@ def steward_candidate_design_result(
         in {
             CandidateDesignSubmissionStatus.RECORDED,
             CandidateDesignSubmissionStatus.ALREADY_RECORDED,
+            CandidateDesignSubmissionStatus.WAITING,
         }
         else 1
     )

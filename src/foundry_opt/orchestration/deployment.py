@@ -29,6 +29,7 @@ from foundry_opt.orchestration.git_state import (
     OutboxRecord,
     StateRefConflictError,
     StateRefError,
+    StateRefPushUnacknowledgedError,
     StateRefSnapshot,
 )
 from foundry_opt.orchestration.models import (
@@ -1270,6 +1271,8 @@ class DeploymentDispatchClaimRecorder:
                 state=snapshot.state,
                 outbox=(claim,),
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except (StateRefConflictError, StateRefError, ValueError) as error:
             raise RuntimeError(
                 "deployment dispatch claim could not persist"
@@ -1911,6 +1914,8 @@ class DeploymentOrchestrationService:
                 "deployment_selection_invalid",
                 "The selected deployment lineage could not be verified.",
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except StateRefError:
             return DeploymentOrchestrationResult(
                 DeploymentOrchestrationStatus.FAILED,
@@ -2094,6 +2099,8 @@ class DeploymentOrchestrationService:
                 "deployment_result_mismatch",
                 "The deployment result did not match its exact intent.",
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except StateRefError:
             return DeploymentOrchestrationResult(
                 DeploymentOrchestrationStatus.FAILED,
@@ -2245,6 +2252,8 @@ class DeploymentOrchestrationService:
                 "post_deploy_result_mismatch",
                 "The held-out evaluation result did not match its intent.",
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except StateRefError:
             return DeploymentOrchestrationResult(
                 DeploymentOrchestrationStatus.FAILED,
@@ -2318,6 +2327,8 @@ class DeploymentOrchestrationService:
                 "Deployment state changed concurrently.",
                 "state_ref_conflict",
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except (StateRefError, TypeError, ValueError):
             return DeploymentOrchestrationResult(
                 DeploymentOrchestrationStatus.FAILED,
@@ -2385,6 +2396,8 @@ class DeploymentOrchestrationService:
                 "Deployment state changed concurrently.",
                 "state_ref_conflict",
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except (StateRefError, TypeError, ValueError):
             return DeploymentOrchestrationResult(
                 DeploymentOrchestrationStatus.FAILED,

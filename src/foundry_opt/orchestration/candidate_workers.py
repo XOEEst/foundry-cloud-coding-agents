@@ -36,6 +36,7 @@ from foundry_opt.orchestration.git_state import (
     OutboxRecord,
     StateObject,
     StateRefConflictError,
+    StateRefPushUnacknowledgedError,
     StateRefSnapshot,
 )
 from foundry_opt.orchestration.models import (
@@ -349,6 +350,14 @@ class CandidateDesignArtifact:
         object.__setattr__(self, "changed_paths", paths)
 
 
+class CandidateDesignPushUnacknowledgedError(RuntimeError):
+    def __init__(self, artifact: CandidateDesignArtifact) -> None:
+        self.artifact = artifact
+        super().__init__(
+            "candidate design ref push was not acknowledged"
+        )
+
+
 @dataclass(frozen=True)
 class CandidateDesignSubmissionRequest:
     repository_root: Path
@@ -370,6 +379,7 @@ class CandidateDesignSubmissionRequest:
 class CandidateDesignSubmissionStatus(StrEnum):
     RECORDED = "recorded"
     ALREADY_RECORDED = "already_recorded"
+    WAITING = "waiting"
     CONFLICT = "conflict"
     FAILED = "failed"
 
@@ -396,6 +406,18 @@ class CandidateDesignRepository(Protocol):
     ) -> None: ...
 
 
+class CandidateDesignHandoffs(Protocol):
+    def persist_candidate_design(
+        self,
+        repository_root: Path,
+        *,
+        snapshot: StateRefSnapshot,
+        request: CandidateDesignSubmissionRequest,
+        intent: CandidateDesignIntent,
+        result: CandidateDesignResult,
+        artifact: CandidateDesignArtifact,
+    ) -> object: ...
+
 class CandidateDesignSubmissionService:
     """Persist one typed designer result and its exact remote Git artifact."""
 
@@ -404,9 +426,11 @@ class CandidateDesignSubmissionService:
         *,
         ledger: CandidateWorkerLedger,
         repository: CandidateDesignRepository,
+        handoffs: CandidateDesignHandoffs | None = None,
     ) -> None:
         self._ledger = ledger
         self._repository = repository
+        self._handoffs = handoffs
 
     def submit(
         self,
@@ -525,6 +549,56 @@ class CandidateDesignSubmissionService:
                 expected_revision=snapshot.revision,
                 state=snapshot.state,
                 outbox=(submitted,),
+            )
+        except CandidateDesignPushUnacknowledgedError as error:
+            try:
+                self._repository.cleanup(request, intent)
+                if self._handoffs is None:
+                    raise RuntimeError("candidate design handoff unavailable")
+                self._handoffs.persist_candidate_design(
+                    request.repository_root,
+                    snapshot=snapshot,
+                    request=request,
+                    intent=intent,
+                    result=result,
+                    artifact=error.artifact,
+                )
+            except Exception:
+                return CandidateDesignSubmissionResult(
+                    CandidateDesignSubmissionStatus.FAILED,
+                    snapshot,
+                    "candidate_design_handoff_failed",
+                )
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.WAITING,
+                snapshot,
+                "candidate_design_handoff_created",
+            )
+        except StateRefPushUnacknowledgedError:
+            try:
+                self._repository.cleanup(request, intent)
+                if self._handoffs is None:
+                    raise RuntimeError(
+                        "candidate design handoff unavailable"
+                    )
+                self._handoffs.persist_candidate_design(
+                    request.repository_root,
+                    snapshot=snapshot,
+                    request=request,
+                    intent=intent,
+                    result=result,
+                    artifact=artifact,
+                )
+            except Exception:
+                return CandidateDesignSubmissionResult(
+                    CandidateDesignSubmissionStatus.FAILED,
+                    snapshot,
+                    "candidate_design_handoff_failed",
+                )
+            return CandidateDesignSubmissionResult(
+                CandidateDesignSubmissionStatus.WAITING,
+                snapshot,
+                "candidate_design_handoff_created",
             )
         except StateRefConflictError:
             return CandidateDesignSubmissionResult(

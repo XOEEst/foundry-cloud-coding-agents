@@ -352,8 +352,10 @@ _SENSITIVE_TEXT_MARKERS = (
     "&sig=",
 )
 _COMMIT_ENVIRONMENT = {
+    "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
     "GIT_AUTHOR_NAME": "Foundry Optimizer Steward",
     "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
+    "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
     "GIT_COMMITTER_NAME": "Foundry Optimizer Steward",
     "GIT_COMMITTER_EMAIL": "foundry-opt@example.invalid",
 }
@@ -365,6 +367,26 @@ class StateRefError(RuntimeError):
 
 class StateRefConflictError(StateRefError):
     pass
+
+
+class StateRefPushUnacknowledgedError(StateRefError):
+    def __init__(
+        self,
+        *,
+        ref: str,
+        expected_revision: str | None,
+        proposed_revision: str,
+        proposed_tree: str,
+        proposal: StateRefProposal | None = None,
+    ) -> None:
+        self.ref = ref
+        self.expected_revision = expected_revision
+        self.proposed_revision = proposed_revision
+        self.proposed_tree = proposed_tree
+        self.proposal = proposal
+        super().__init__(
+            "state ref push did not acknowledge the proposed revision"
+        )
 
 
 class StateRefCorruptionError(StateRefError):
@@ -453,6 +475,19 @@ class StateRefSnapshot:
 
 
 @dataclass(frozen=True)
+class StateRefProposal:
+    ref: str
+    issue_number: int
+    expected_revision: str | None
+    proposed_revision: str
+    proposed_tree: str
+    snapshot: StateRefSnapshot
+    event_ids: tuple[str, ...]
+    outbox_record_ids: tuple[str, ...]
+    object_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _LoadedRef:
     snapshot: StateRefSnapshot
     journal: tuple[dict[str, Any], ...]
@@ -477,6 +512,88 @@ class GitStateRef:
             return None
         self._fetch(root, ref, revision)
         return self._load_revision(root, issue_number, revision).snapshot
+
+    def inspect_revision(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        revision: str,
+    ) -> StateRefSnapshot:
+        root = _repository_root(repository_root)
+        _commit(revision, "state proposal revision")
+        return self._load_revision(root, issue_number, revision).snapshot
+
+    def publish_revision(
+        self,
+        repository_root: Path,
+        *,
+        issue_number: int,
+        expected_revision: str | None,
+        proposed_revision: str,
+    ) -> StateRefSnapshot:
+        root = _repository_root(repository_root)
+        ref = _state_ref(issue_number)
+        if expected_revision is not None:
+            _commit(expected_revision, "expected_revision")
+        _commit(proposed_revision, "proposed_revision")
+        snapshot = self._load_revision(
+            root,
+            issue_number,
+            proposed_revision,
+        ).snapshot
+        parent_line = _git_text(
+            root,
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            proposed_revision,
+        ).split()
+        expected_parents = (
+            [] if expected_revision is None else [expected_revision]
+        )
+        if parent_line != [proposed_revision, *expected_parents]:
+            raise StateRefCorruptionError(
+                "state proposal parent is invalid"
+            )
+        current = self._remote_revision(root, ref)
+        if current == proposed_revision:
+            return snapshot
+        if current != expected_revision:
+            raise StateRefConflictError(
+                "state ref changed before handoff publication"
+            )
+        lease = f"--force-with-lease={ref}:{expected_revision or ''}"
+        result = _run(
+            root,
+            "git",
+            "push",
+            lease,
+            self._remote,
+            f"{proposed_revision}:{ref}",
+            check=False,
+        )
+        if result.returncode != 0:
+            raise StateRefConflictError(
+                "state handoff compare-and-swap failed"
+            )
+        acknowledged = self._remote_revision(root, ref)
+        if acknowledged != proposed_revision:
+            if acknowledged != expected_revision:
+                raise StateRefConflictError(
+                    "state ref changed while handoff was acknowledged"
+                )
+            raise StateRefPushUnacknowledgedError(
+                ref=ref,
+                expected_revision=expected_revision,
+                proposed_revision=proposed_revision,
+                proposed_tree=_git_text(
+                    root,
+                    "rev-parse",
+                    f"{proposed_revision}^{{tree}}",
+                ),
+            )
+        return snapshot
 
     def commit(
         self,
@@ -624,20 +741,53 @@ class GitStateRef:
             },
             **{item.path: item.content for item in all_objects},
         }
-        revision = self._write_commit(
-            root,
-            ref,
-            current_revision,
-            files,
-            issue_number,
-        )
-        return StateRefSnapshot(
-            revision=revision,
+        pending = StateRefSnapshot(
+            revision="0" * 40,
             state=state,
             inbox=all_inbox,
             outbox=all_outbox,
             objects=all_objects,
         )
+        try:
+            revision = self._write_commit(
+                root,
+                ref,
+                current_revision,
+                files,
+                issue_number,
+            )
+        except StateRefPushUnacknowledgedError as error:
+            proposed = replace(
+                pending,
+                revision=error.proposed_revision,
+            )
+            proposal = StateRefProposal(
+                ref=ref,
+                issue_number=issue_number,
+                expected_revision=current_revision,
+                proposed_revision=error.proposed_revision,
+                proposed_tree=error.proposed_tree,
+                snapshot=proposed,
+                event_ids=tuple(event.event_id for event in inbox),
+                outbox_record_ids=tuple(
+                    record.record_id for record in outbox
+                ),
+                object_paths=tuple(
+                    item.path
+                    for item in sorted(
+                        objects,
+                        key=lambda value: value.path,
+                    )
+                ),
+            )
+            raise StateRefPushUnacknowledgedError(
+                ref=ref,
+                expected_revision=current_revision,
+                proposed_revision=error.proposed_revision,
+                proposed_tree=error.proposed_tree,
+                proposal=proposal,
+            ) from error
+        return replace(pending, revision=revision)
 
     def _remote_revision(self, root: Path, ref: str) -> str | None:
         result = _run(
@@ -820,6 +970,18 @@ class GitStateRef:
         if result.returncode != 0:
             raise StateRefConflictError(
                 "state ref compare-and-swap failed"
+            )
+        acknowledged = self._remote_revision(root, ref)
+        if acknowledged != commit_sha:
+            if acknowledged != parent:
+                raise StateRefConflictError(
+                    "state ref changed while push acknowledgement was verified"
+                )
+            raise StateRefPushUnacknowledgedError(
+                ref=ref,
+                expected_revision=parent,
+                proposed_revision=commit_sha,
+                proposed_tree=tree,
             )
         return commit_sha
 

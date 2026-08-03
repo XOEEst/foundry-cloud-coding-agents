@@ -14,6 +14,9 @@ from foundry_opt.orchestration import (
     EventKind,
     OptimizationCampaign,
     StateRefConflictError,
+    StateRefProposal,
+    StateRefPushUnacknowledgedError,
+    StateRefSnapshot,
     StateObject,
 )
 from foundry_opt.orchestration.steward import (
@@ -118,6 +121,74 @@ def test_steward_advances_events_and_persists_state_and_outbox(
     assert commit["state"] == result.state
     assert commit["inbox"][0].event_id == "event-1"
     assert commit["outbox"][0].kind == "campaign_advanced"
+
+
+def test_steward_hands_off_nested_phase_state_push_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    created = _event("event-1", EventKind.ISSUE_CREATED)
+    baseline = CampaignState(
+        31,
+        1,
+        2,
+        CampaignPhase.BASELINE,
+        processed_event_ids=("event-1",),
+        spec_sha256="a" * 64,
+    )
+    current = StateRefSnapshot(
+        "a" * 40,
+        baseline,
+        (created,),
+        (),
+    )
+    proposed = StateRefSnapshot(
+        "b" * 40,
+        baseline,
+        (created,),
+        (),
+    )
+    proposal = StateRefProposal(
+        ref="refs/heads/foundry-opt/state/issue-31",
+        issue_number=31,
+        expected_revision=current.revision,
+        proposed_revision=proposed.revision,
+        proposed_tree="c" * 40,
+        snapshot=proposed,
+        event_ids=(),
+        outbox_record_ids=("workers-1-started",),
+        object_paths=(),
+    )
+    error = StateRefPushUnacknowledgedError(
+        ref=proposal.ref,
+        expected_revision=proposal.expected_revision,
+        proposed_revision=proposal.proposed_revision,
+        proposed_tree=proposal.proposed_tree,
+        proposal=proposal,
+    )
+
+    class Workers:
+        def advance(self, request):
+            raise error
+
+    class Handoffs:
+        def __init__(self) -> None:
+            self.errors = []
+
+        def persist_state(self, repository_root, raised):
+            self.errors.append(raised)
+
+    handoffs = Handoffs()
+    result = StewardAdvanceService(
+        ledger=Ledger(current),
+        inbox=Inbox(()),
+        candidate_workers=Workers(),
+        handoffs=handoffs,
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.status is StewardAdvanceStatus.WAITING
+    assert result.code == "state_handoff_created"
+    assert result.disposition == "delegate"
+    assert handoffs.errors == [error]
 
 
 def test_steward_runs_spec_policy_and_persists_digest_classification(

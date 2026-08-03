@@ -148,7 +148,9 @@ def test_bundle_uses_issue_only_entry_and_canonical_specialists() -> None:
     assert "Never inspect or edit agent source, tests, or configuration" in (
         steward
     )
-    assert "Never create or update the session pull request" in steward
+    assert "internal handoff pull request artifact" in steward
+    assert "only the reserved handoff path" in steward
+    assert "never any other edit" in steward
     assert "Never improvise specialist work" in steward
     assert "refs/heads/foundry-opt/state/issue-<number>" in steward
     assert "canonical steward interfaces" in steward
@@ -170,6 +172,9 @@ def test_bundle_uses_issue_only_entry_and_canonical_specialists() -> None:
         "--worker-issue <worker-issue-number>"
     ) in designer
     assert "Do not create or update a pull request" in designer
+    assert "internal handoff pull request artifact" in designer
+    assert "only the reserved handoff path" in designer
+    assert "never any other edit" in designer
     assert "only the reserved worktree" in designer
     assert "raw evidence" in designer
     assert 'tools: ["read", "search", "edit", "execute"]' in designer
@@ -179,6 +184,21 @@ def test_bundle_uses_issue_only_entry_and_canonical_specialists() -> None:
     assert "applier_worker_issue_planned" in applier
     assert "native Copilot session" in applier
     assert 'tools: ["read", "execute"]' in applier
+
+
+def test_skill_keeps_actions_as_verifying_transport_not_decision_owner() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    skill = files[
+        Path(".github/skills/foundry-agent-optimizer/SKILL.md")
+    ]
+
+    assert "Actions may replay canonical interfaces only to verify" in skill
+    assert "cannot choose a different transition" in skill
+    assert "internal handoff pull requests" in skill
+    assert "auto-closed" in skill
 
 
 def test_issue_form_matches_strict_parser_and_configured_target() -> None:
@@ -311,6 +331,7 @@ def test_bundle_generates_transport_and_verification_workflows() -> None:
             ".github/workflows/"
             "foundry-optimization-deployment-bridge.yml"
         ),
+        Path(".github/workflows/foundry-optimization-handoff.yml"),
         Path(".github/workflows/foundry-exact-candidate-check.yml"),
     }
     assert workflow_paths <= set(files)
@@ -556,6 +577,72 @@ def test_bundle_generates_transport_only_issue_intake_workflow() -> None:
     assert "optimize run" not in text
     assert "optimize apply" not in text
     assert "optimize reconcile" not in text
+
+
+def test_bundle_generates_base_context_handoff_transport_workflow() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    path = Path(
+        ".github/workflows/foundry-optimization-handoff.yml"
+    )
+
+    assert path in files
+    text = files[path]
+    workflow = yaml.safe_load(text)
+    assert workflow[True] == {
+        "pull_request_target": {
+            "types": ["opened", "synchronize", "reopened"],
+            "paths": [".foundry-optimizer/handoffs/**"],
+        }
+    }
+    assert workflow["permissions"] == {
+        "contents": "write",
+        "issues": "write",
+        "pull-requests": "write",
+    }
+    job = workflow["jobs"]["apply-handoff"]
+    assert "environment" not in job
+    checkout = next(
+        step
+        for step in job["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    assert checkout["with"]["ref"] == (
+        "${{ github.event.pull_request.base.sha }}"
+    )
+    assert checkout["with"]["fetch-depth"] == 0
+    assert "github.event.pull_request.head.sha" not in str(checkout)
+    assert "python -m foundry_opt.orchestration.handoff" in text
+    assert "TRUSTED_EVENT_PATH: ${{ github.event_path }}" in text
+    assert "TRUSTED_EVENT_NAME: ${{ github.event_name }}" in text
+    assert "TRUSTED_REPOSITORY: ${{ github.repository }}" in text
+    assert "TRUSTED_REPOSITORY_ID: ${{ github.repository_id }}" in text
+    assert "TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}" in (
+        text
+    )
+    assert "COPILOT_ASSIGNMENT_TOKEN" in text
+    assert "pull_request.head.ref }}" not in text
+    assert "pull_request.head.sha }}" not in text
+    assert "source " not in text
+    assert "id-token" not in workflow["permissions"]
+    assert "actions" not in workflow["permissions"]
+
+
+def test_pull_request_workflows_skip_internal_handoff_only_changes() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    for path in (
+        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
+        Path(".github/workflows/foundry-exact-candidate-check.yml"),
+    ):
+        workflow = yaml.safe_load(files[path])
+        assert workflow[True]["pull_request"]["paths-ignore"] == [
+            ".foundry-optimizer/handoffs/**"
+        ]
 
 
 def test_bundle_generates_transport_recovery_and_deployment_workflows() -> None:

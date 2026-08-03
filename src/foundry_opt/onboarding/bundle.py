@@ -86,6 +86,9 @@ def generate_repository_agent_bundle(
                 ".github/workflows/foundry-optimization-reconcile.yml"
             ): _reconciliation_workflow(request),
             Path(
+                ".github/workflows/foundry-optimization-handoff.yml"
+            ): _handoff_workflow(request),
+            Path(
                 ".github/workflows/"
                 "foundry-optimization-deployment-bridge.yml"
             ): _deployment_bridge_workflow(
@@ -326,11 +329,19 @@ The JSON must contain exactly the canonical result fields: `effect_id`,
 `required_opt_ins`, `motivation`, `lessons`, and `complexity`.
 
 The command captures only the allowed candidate edits on the durable design
-result ref and restores the session checkout. Stop immediately after it
-returns. The campaign budget and cutoff are authoritative and must not be
-extended. Never read held-out rows or raw evidence, call GitHub APIs, create a
-branch, merge, or deploy. Do not create or update a pull request; the later
-`foundry-candidate-applier` native session owns the candidate pull request.
+result ref and restores the session checkout. If that ref push is not
+acknowledged in a Copilot cloud session, the command may create or update the
+internal handoff pull request artifact at only the reserved handoff path and
+never any other edit. Do not edit, annotate, or continue work in that internal
+pull request; trusted transport auto-closes it. Stop immediately after the
+command returns.
+
+The campaign budget and cutoff are authoritative and must not be extended.
+Never read held-out rows or raw evidence, call GitHub APIs, create a branch,
+merge, or deploy. Do not create or update a pull request yourself; the internal
+handoff is command-owned transport, while the later
+`foundry-candidate-applier` native session owns the visible candidate pull
+request.
 """
 
 
@@ -378,9 +389,13 @@ reproducing transitions in instructions, workflows, or shell.
 The command is the only campaign action. Report and project only through the
 persisted state and outbox effects it returns; transport workflows own GitHub
 projection and reassignment. Never inspect or edit agent source, tests, or configuration.
-Never create or update the session pull request. Never improvise specialist work,
-direct code changes, state transitions, comments, labels, merges, deployment,
-or other GitHub effects.
+If a state-ref push is not acknowledged in a Copilot cloud
+session, the command may create or update the internal handoff pull request artifact
+at only the reserved handoff path and never any other edit. Do not
+edit, annotate, or continue work in that internal pull request; trusted
+transport auto-closes it. Never create or update any pull request yourself.
+Never improvise specialist work, direct code changes, state transitions,
+comments, labels, merges, deployment, or other GitHub effects.
 The canonical command, not this model, owns retained-improvement evaluation
 and final campaign closure.
 
@@ -419,6 +434,8 @@ on:
     types: [opened, edited, reopened, closed]
   pull_request:
     types: [opened, synchronize, reopened, edited, closed]
+    paths-ignore:
+      - .foundry-optimizer/handoffs/**
 
 permissions:
   contents: write
@@ -461,6 +478,64 @@ jobs:
         run: >-
           uv run --no-project --with "$OPTIMIZER_PACKAGE"
           python -m foundry_opt.orchestration.issue_intake
+"""
+
+
+def _handoff_workflow(request: OnboardingRequest) -> str:
+    install = json.dumps(request.product_install)
+    return f"""name: Foundry internal handoff transport
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .foundry-optimizer/handoffs/**
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: foundry-internal-handoff-${{{{ github.event.pull_request.number }}}}
+  cancel-in-progress: false
+
+jobs:
+  apply-handoff:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == 'copilot-swe-agent[bot]'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - name: Require Copilot assignment token
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+        shell: bash
+        run: |
+          if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then
+            echo "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN" >&2
+            exit 1
+          fi
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.pull_request.base.sha }}}}
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Validate and apply exact internal handoff
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          TRUSTED_DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
+        run: >-
+          uv run --no-project --with "$OPTIMIZER_PACKAGE"
+          python -m foundry_opt.orchestration.handoff
 """
 
 
@@ -659,6 +734,8 @@ def _candidate_check_workflow(request: OnboardingRequest) -> str:
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
+    paths-ignore:
+      - .foundry-optimizer/handoffs/**
 
 permissions:
   contents: read

@@ -27,6 +27,7 @@ from foundry_opt.orchestration.git_state import (
     OutboxRecord,
     StateRefConflictError,
     StateRefError,
+    StateRefPushUnacknowledgedError,
     StateRefSnapshot,
     StateObject,
 )
@@ -169,6 +170,14 @@ class CampaignLedger(Protocol):
     ) -> StateRefSnapshot: ...
 
 
+class StewardStateHandoffs(Protocol):
+    def persist_state(
+        self,
+        repository_root: Path,
+        error: StateRefPushUnacknowledgedError,
+    ) -> Any: ...
+
+
 class StewardSpecPolicy(Protocol):
     def evaluate(
         self,
@@ -218,6 +227,7 @@ class StewardAdvanceService:
         candidate_slate: StewardCandidateSlate | None = None,
         candidate_selection: StewardCandidateSelection | None = None,
         deployment: StewardDeployment | None = None,
+        handoffs: StewardStateHandoffs | None = None,
     ) -> None:
         self._ledger = ledger or GitStateRef()
         self._inbox = inbox or EmptyCampaignInbox()
@@ -227,6 +237,7 @@ class StewardAdvanceService:
         self._candidate_slate = candidate_slate
         self._candidate_selection = candidate_selection
         self._deployment = deployment
+        self._handoffs = handoffs
 
     def advance(
         self,
@@ -483,6 +494,8 @@ class StewardAdvanceService:
                     else ()
                 ),
             )
+        except StateRefPushUnacknowledgedError as error:
+            return self._state_handoff(request, error, snapshot)
         except StateRefConflictError:
             return self._failure(
                 request,
@@ -544,6 +557,44 @@ class StewardAdvanceService:
             return self._advance_candidate_slate(request, persisted)
         return result
 
+    def _state_handoff(
+        self,
+        request: StewardAdvanceRequest,
+        error: StateRefPushUnacknowledgedError,
+        snapshot: StateRefSnapshot | None,
+    ) -> StewardAdvanceResult:
+        if self._handoffs is None or error.proposal is None:
+            return self._failure(
+                request,
+                StewardAdvanceStatus.FAILED,
+                "The advanced campaign state could not be persisted.",
+                "state_ref_push_unacknowledged",
+                snapshot,
+            )
+        try:
+            self._handoffs.persist_state(request.repository_root, error)
+        except Exception:
+            return self._failure(
+                request,
+                StewardAdvanceStatus.FAILED,
+                "The campaign state handoff could not be persisted.",
+                "state_handoff_failed",
+                snapshot,
+            )
+        proposed = error.proposal.snapshot
+        return StewardAdvanceResult(
+            status=StewardAdvanceStatus.WAITING,
+            issue_number=request.issue_number,
+            summary=(
+                "Campaign state is awaiting trusted handoff transport."
+            ),
+            phase=proposed.state.phase.value,
+            disposition=AdvanceDisposition.DELEGATE.value,
+            revision=error.expected_revision,
+            code="state_handoff_created",
+            state=proposed.state,
+        )
+
     def _advance_candidate_workers(
         self,
         request: StewardAdvanceRequest,
@@ -558,6 +609,8 @@ class StewardAdvanceService:
                     request.session_deadline,
                 )
             )
+        except StateRefPushUnacknowledgedError as error:
+            return self._state_handoff(request, error, snapshot)
         except Exception:
             return self._failure(
                 request,
@@ -627,6 +680,8 @@ class StewardAdvanceService:
                     request.issue_number,
                 )
             )
+        except StateRefPushUnacknowledgedError as error:
+            return self._state_handoff(request, error, snapshot)
         except Exception:
             return self._failure(
                 request,
@@ -692,6 +747,8 @@ class StewardAdvanceService:
                     request.issue_number,
                 )
             )
+        except StateRefPushUnacknowledgedError as error:
+            return self._state_handoff(request, error, snapshot)
         except Exception:
             return self._failure(
                 request,
@@ -764,6 +821,8 @@ class StewardAdvanceService:
                     request.issue_number,
                 )
             )
+        except StateRefPushUnacknowledgedError as error:
+            return self._state_handoff(request, error, snapshot)
         except Exception:
             return self._failure(
                 request,

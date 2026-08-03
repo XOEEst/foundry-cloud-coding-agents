@@ -111,7 +111,11 @@ from foundry_opt.orchestration.steward import (
     GitCampaignInbox,
     StewardAdvanceService,
 )
-from foundry_opt.orchestration.git_state import GitStateRef, StateRefError
+from foundry_opt.orchestration.git_state import (
+    GitStateRef,
+    StateRefError,
+    StateRefPushUnacknowledgedError,
+)
 from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 from foundry_opt.orchestration.models import EventKind
 from foundry_opt.orchestration.spec_policy import (
@@ -1600,6 +1604,7 @@ class _ProductionCandidateDesignRepository:
     def capture(self, request: Any, intent: Any, result: Any) -> Any:
         from foundry_opt.orchestration.candidate_workers import (
             CandidateDesignArtifact,
+            CandidateDesignPushUnacknowledgedError,
         )
 
         root = request.repository_root.expanduser().resolve()
@@ -1694,6 +1699,12 @@ class _ProductionCandidateDesignRepository:
                 "refs/heads/foundry-opt/design/"
                 f"issue-{intent.issue_number}/{intent.effect_id}"
             )
+            artifact = CandidateDesignArtifact(
+                ref=ref,
+                head_commit=commit,
+                tree_sha=tree,
+                changed_paths=candidate_paths,
+            )
             existing = self._commands.run(
                 ("git", "ls-remote", "--heads", "origin", ref),
                 cwd=root,
@@ -1707,18 +1718,26 @@ class _ProductionCandidateDesignRepository:
                     ("git", "push", "--quiet", "origin", f"{commit}:{ref}"),
                     cwd=root,
                 )
+                acknowledged = self._commands.run(
+                    ("git", "ls-remote", "--heads", "origin", ref),
+                    cwd=root,
+                ).stdout.strip()
+                if not acknowledged:
+                    raise CandidateDesignPushUnacknowledgedError(
+                        artifact
+                    )
+                fields = acknowledged.split()
+                if len(fields) != 2 or fields[0] != commit or fields[1] != ref:
+                    raise ValueError(
+                        "candidate design ref acknowledgement changed"
+                    )
         finally:
             index.unlink(missing_ok=True)
             try:
                 index.parent.rmdir()
             except OSError:
                 pass
-        return CandidateDesignArtifact(
-            ref=ref,
-            head_commit=commit,
-            tree_sha=tree,
-            changed_paths=candidate_paths,
-        )
+        return artifact
 
     def cleanup(self, request: Any, intent: Any) -> None:
         root = request.repository_root.expanduser().resolve()
@@ -2151,11 +2170,13 @@ def build_production_candidate_design_submission_service(
     from foundry_opt.orchestration.candidate_workers import (
         CandidateDesignSubmissionService,
     )
+    from foundry_opt.orchestration.handoff import CloudHandoffStore
 
     commands = command_runner or SubprocessCommandRunner()
     return CandidateDesignSubmissionService(
         ledger=GitStateRef(),
         repository=_ProductionCandidateDesignRepository(commands),
+        handoffs=CloudHandoffStore(),
     )
 
 
@@ -2611,6 +2632,8 @@ class _ProductionPostDeploymentEvaluationEffects:
                     state=latest.state,
                     outbox=(observation,),
                 )
+            except StateRefPushUnacknowledgedError:
+                raise
             except StateRefError:
                 recovered = self.reconcile(intent)
                 if recovered is not None:
@@ -2640,6 +2663,8 @@ class _ProductionPostDeploymentEvaluationEffects:
                 state=snapshot.state,
                 outbox=(claim,),
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except StateRefError:
             return PostDeploymentEvaluationResult(
                 result_id=f"{intent.effect_id}-pending",
@@ -2783,6 +2808,8 @@ def build_production_steward_advance_service(
     config_path: Path = _DEFAULT_CONFIG_PATH,
 ) -> StewardAdvanceService:
     """Assemble every canonical phase behind the production steward."""
+    from foundry_opt.orchestration.handoff import CloudHandoffStore
+
     return StewardAdvanceService(
         inbox=GitCampaignInbox(),
         spec_policy=build_production_steward_spec_policy(
@@ -2800,6 +2827,7 @@ def build_production_steward_advance_service(
         deployment=build_production_steward_deployment(
             config_path=config_path
         ),
+        handoffs=CloudHandoffStore(),
     )
 
 

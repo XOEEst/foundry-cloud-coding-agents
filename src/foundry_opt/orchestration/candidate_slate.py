@@ -17,6 +17,7 @@ from foundry_opt.orchestration.git_state import (
     StateObject,
     StateRefConflictError,
     StateRefError,
+    StateRefPushUnacknowledgedError,
     StateRefSnapshot,
 )
 from foundry_opt.orchestration.models import CampaignEvent, EventKind
@@ -520,6 +521,8 @@ class CandidateEffectResultRecorder:
                 snapshot,
                 "state_ref_conflict",
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except (StateRefError, TypeError, ValueError):
             return CandidateEffectRecordResult(
                 CandidateEffectRecordStatus.FAILED,
@@ -778,6 +781,8 @@ class CandidateSlateService:
                 "Candidate slate state changed concurrently.",
                 "state_ref_conflict",
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except (KeyError, OSError, StateRefError, TypeError, ValueError):
             return CandidateSlateResult(
                 CandidateSlateStatus.FAILED,
@@ -1487,6 +1492,8 @@ class CandidateSelectionService:
                 "Candidate worker acknowledgement is still pending.",
                 "candidate_worker_ack_pending",
             )
+        except StateRefPushUnacknowledgedError:
+            raise
         except (KeyError, StateRefError, TypeError, ValueError):
             return CandidateSelectionResult(
                 CandidateSelectionStatus.FAILED,

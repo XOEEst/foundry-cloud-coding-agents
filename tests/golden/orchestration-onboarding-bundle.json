@@ -1,13 +1,14 @@
 {
   ".github/ISSUE_TEMPLATE/foundry-optimization.yml": "49c6d2768c8a2fa816f841d05fc217f0d7045d513a9ec4724fb8d9df62ac74b8",
   ".github/agents/foundry-candidate-applier.agent.md": "a127df3c121eebbfcb5038a6da6b34c9ad3909d0ca22798bacae003857dd2e31",
-  ".github/agents/foundry-candidate-designer.agent.md": "58cb4d29a242ed562eba383cb76c4527171eeb4e9a7d4151ca49f8f53101d2b9",
+  ".github/agents/foundry-candidate-designer.agent.md": "c76b56aea14b25fa98f9385116af74e5ae31b621bf51fa6990e1a2709c8a4432",
   ".github/agents/foundry-optimization-planner.agent.md": "4c801d47aafab4dfbd30f3c2b6f0bb5abf105dc63b738e1708dad752098feec0",
-  ".github/agents/foundry-optimization-steward.agent.md": "ca0b76b613cbfa730cda0b725e13aea39e2ca3f5784be14f378209a4938e5a3a",
+  ".github/agents/foundry-optimization-steward.agent.md": "e39090795ee23b4b40254bcf662948399abf35f1dbda90407110156de6b20525",
   ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md": "cb31eb6aa2f6f3d725c5cc950f7316b29de513c7873f8e509930492b38f60353",
-  ".github/skills/foundry-agent-optimizer/SKILL.md": "cf3c617ba861c91ab49d8d4b13b7b44331824a0237f5ef90a9cee2230cfdc7af",
-  ".github/workflows/foundry-exact-candidate-check.yml": "62f88d0f6f57a788b916caf39020510fe89a24f6516a94e265b9383893cf252a",
+  ".github/skills/foundry-agent-optimizer/SKILL.md": "9ae2ec4ba19bfbbdc2a06109b17c1c1abcf4356db443a27107ecf8ccc550fae7",
+  ".github/workflows/foundry-exact-candidate-check.yml": "6a42e7d3b526541e27da46da42e254ce2e95f0c0b12c716be126d6abefb50000",
   ".github/workflows/foundry-optimization-deployment-bridge.yml": "a2e642df51078b7e8f01675b8d1d53234a46379ba846ec28ce9fc75e16588692",
-  ".github/workflows/foundry-optimization-issue-intake.yml": "63336ca09e9a2f87a96d54e356f2b4effcc8830afe528030012b4dd0ee509c98",
+  ".github/workflows/foundry-optimization-handoff.yml": "26aa85ecfbc04132e9ce1604ea64c12320cb960d412b03564001f1e9b76e2b5f",
+  ".github/workflows/foundry-optimization-issue-intake.yml": "bf21d39daefedf7c5dd4a62c3560ca92ba44f7f34b1f4ebc4e43931091fccbe3",
   ".github/workflows/foundry-optimization-reconcile.yml": "d312227496e0ac752a239ca580474bec68c67407d231522b11dfb0d5ab790f33"
 }

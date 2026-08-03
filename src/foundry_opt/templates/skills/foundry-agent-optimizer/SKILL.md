@@ -87,6 +87,17 @@ GitHub Actions are transport/capability only. Pull requests must be opened nativ
 planner and applier sessions, not by Actions or direct PR APIs, because enterprise policy reserves
 PR authorship to Copilot.
 
+When the Copilot Git proxy acknowledges a canonical state or designer-result push without creating
+the ref, the command may commit one privacy-validated, content-addressed envelope at the reserved
+handoff path on the native session branch. Those internal handoff pull requests are transport
+artifacts, never specification or candidate pull requests, and are auto-closed after handling.
+Generated `pull_request` workflows skip handoff-only changes.
+
+Actions may replay canonical interfaces only to verify the exact proposed transition and persisted
+effects. Actions cannot choose a different transition, add an effect, reinterpret the model's
+decision, or perform domain work. After verification, Actions provides only the missing Git/GitHub
+transport capability: compare-and-swap the private ref and apply the already-persisted outbox.
+
 ### Specification planner
 
 When a persisted `specialist_work_request` has `work_kind: prepare_specification_pr`, the transport
@@ -120,6 +131,8 @@ request; merging is the selection signal.
   interfaces. Never reproduce their decisions in YAML, shell, comments, or agent prose.
 - Never request, store, or emit secrets, raw traces, private dataset rows, or held-out evidence.
 - Never source pull-request-controlled scripts or interpolate untrusted event text into commands.
+- A handoff workflow may fetch and inspect only the exact validated head object; it never checks out
+  or executes pull-request code and installs the optimizer only from the pinned base workflow.
 - Candidate work stays in its reserved code-only worktree; no dataset content is staged there.
   Dataset content never enters a pull request.
 - Actions may create and update issues, comments, labels, assignments, durable refs, and persisted

@@ -144,7 +144,14 @@ either `policy_approved` or `human_review`.
   outbox, replay, and session replacement.
 - GitHub Actions are transport and capability only: they record trusted events,
   project persisted effects, reconcile inactivity, and dispatch already
-  authorized deployment intents.
+  authorized deployment intents. Actions may replay canonical interfaces to
+  verify a proposed handoff exactly, but cannot choose another transition or
+  invent an effect.
+- If Copilot's local Git proxy acknowledges a private state/design ref push
+  without publishing it, the canonical command commits one privacy-validated,
+  content-addressed envelope on the native session branch. A base-context
+  workflow reads only that exact object, CAS-publishes the private ref, applies
+  persisted outbox effects, and auto-closes the internal handoff PR.
 - Pull requests are opened natively by Copilot planner and applier sessions,
   not by Actions or direct GitHub API calls, to comply with enterprise policy.
 - The planner materializes exceptional immutable spec PRs; the designer edits
@@ -153,7 +160,9 @@ either `policy_approved` or `human_review`.
 
 Scheduled reconciliation and assignment recovery can resume an interrupted
 campaign from its private ref without trusting chat history. Force-with-lease
-updates and idempotent effects prevent duplicate or conflicting transitions.
+updates, remote acknowledgement checks, and idempotent handoff application
+prevent duplicate or conflicting transitions. Competing valid handoffs fail
+closed and trigger fresh assignment rather than overwriting state.
 
 Privacy and least privilege are fail-closed: no raw held-out rows, private
 dataset content, prompts, responses, traces, or credentials enter candidate

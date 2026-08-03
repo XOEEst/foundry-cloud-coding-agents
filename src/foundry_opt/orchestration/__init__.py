@@ -9,6 +9,8 @@ from foundry_opt.orchestration.git_state import (
     StateRefCorruptionError,
     StateRefError,
     StateRefPrivacyError,
+    StateRefProposal,
+    StateRefPushUnacknowledgedError,
     StateRefSnapshot,
     StateObject,
 )
@@ -315,6 +317,8 @@ __all__ = [
     "StateRefCorruptionError",
     "StateRefError",
     "StateRefPrivacyError",
+    "StateRefProposal",
+    "StateRefPushUnacknowledgedError",
     "StateRefSnapshot",
     "StateObject",
     "MergedSpecApproval",

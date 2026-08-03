@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from threading import Barrier
@@ -22,6 +23,7 @@ from foundry_opt.orchestration import (
     StateRefConflictError,
     StateRefCorruptionError,
     StateRefPrivacyError,
+    StateRefPushUnacknowledgedError,
     StateObject,
 )
 from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
@@ -68,6 +70,24 @@ def _repository(tmp_path: Path) -> tuple[Path, Path]:
     _run(("git", "remote", "add", "origin", str(origin)), repository)
     _run(("git", "push", "-u", "origin", "main"), repository)
     return repository, origin
+
+
+def _silently_drop_state_pushes(origin: Path) -> None:
+    hook = origin / "hooks" / "post-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        'git_dir="${GIT_DIR:-.}"\n'
+        "while read old new ref; do\n"
+        '  case "$ref" in\n'
+        "    refs/heads/foundry-opt/state/*)\n"
+        '      git --git-dir="$git_dir" update-ref -d "$ref" "$new"\n'
+        "      ;;\n"
+        "  esac\n"
+        "done\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    hook.chmod(0o755)
 
 
 def _event(
@@ -288,6 +308,51 @@ def test_state_ref_creates_and_loads_atomic_snapshot_inbox_and_outbox(
             tmp_path,
         )
         == "refs/heads/foundry-opt/state/issue-31\n"
+    )
+
+
+def test_state_ref_rejects_silent_success_when_remote_ref_is_not_updated(
+    tmp_path: Path,
+) -> None:
+    repository, origin = _repository(tmp_path)
+    _silently_drop_state_pushes(origin)
+    event = _event("event-1", EventKind.ISSUE_CREATED)
+    state = OptimizationCampaign().advance(
+        AdvanceRequest(31, None, (event,))
+    ).state
+
+    with pytest.raises(
+        StateRefPushUnacknowledgedError,
+        match="did not acknowledge",
+    ) as raised:
+        GitStateRef().commit(
+            repository,
+            issue_number=31,
+            expected_revision=None,
+            state=state,
+            inbox=(event,),
+        )
+
+    assert raised.value.ref == (
+        "refs/heads/foundry-opt/state/issue-31"
+    )
+    assert raised.value.expected_revision is None
+    assert re.fullmatch(
+        r"[0-9a-f]{40}",
+        raised.value.proposed_revision,
+    )
+    assert (
+        _run(
+            (
+                "git",
+                f"--git-dir={origin}",
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/foundry-opt/state",
+            ),
+            tmp_path,
+        )
+        == ""
     )
 
 

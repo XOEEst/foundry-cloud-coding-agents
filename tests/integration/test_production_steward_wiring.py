@@ -41,6 +41,12 @@ from foundry_opt.orchestration import (
     EventKind,
     GitStateRef,
 )
+from foundry_opt.orchestration.handoff import (
+    CloudHandoffStore,
+    HandoffApplyService,
+    HandoffApplyStatus,
+    TrustedHandoffRequest,
+)
 from foundry_opt.orchestration.issue_intake import (
     GitIssueEventInbox,
     IssueEventIntake,
@@ -438,6 +444,140 @@ def test_actual_cli_progresses_policy_issue_into_candidate_delegation(
             f"refs/heads/foundry-opt/state/issue-{ISSUE}",
         )
     )
+
+
+def test_production_issue_created_advances_through_state_handoff(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git(remote, "init", "--bare")
+    root = tmp_path / "repository"
+    root.mkdir()
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.name", "Test")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "core.longpaths", "true")
+    _write_config(root)
+    (root / "agent").mkdir()
+    (root / "agent" / "main.py").write_text(
+        "VALUE = 'baseline'\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "baseline repository")
+    base_commit = _git(root, "rev-parse", "HEAD")
+    _git(root, "remote", "add", "origin", str(remote))
+    _git(root, "push", "-u", "origin", "main")
+    _git(root, "checkout", "-b", "copilot/steward-issue-46")
+    _git(root, "push", "-u", "origin", "copilot/steward-issue-46")
+    GitIssueEventInbox(root).append(
+        ISSUE,
+        CampaignEvent(
+            "github-created-46",
+            EventKind.ISSUE_CREATED,
+            1,
+            datetime(2026, 8, 3, 12, 0, tzinfo=UTC),
+        ),
+    )
+    hook = remote / "hooks" / "post-receive"
+    hook.write_text(
+        "#!/bin/sh\n"
+        'git_dir="${GIT_DIR:-.}"\n'
+        "while read old new ref; do\n"
+        '  case "$ref" in\n'
+        "    refs/heads/foundry-opt/state/*)\n"
+        '      git --git-dir="$git_dir" update-ref -d "$ref" "$new"\n'
+        "      ;;\n"
+        "  esac\n"
+        "done\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    hook.chmod(0o755)
+    monkeypatch.setenv(
+        "COPILOT_AGENT_SESSION_ID",
+        "11111111-2222-4333-8444-555555555555",
+    )
+    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
+    monkeypatch.delenv("COPILOT_CLI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    policy = OptimizationSpecPolicy(
+        AutomationPolicy(
+            allowed_dataset_sources={"foundry"},
+            allowed_evaluator_sources={"builtin"},
+            allow_spec_auto_approval=True,
+        ),
+        resolver=Resolver(base_commit),
+        pinned_assets=object(),
+        approvals=NoApprovals(),
+    )
+    service = StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        spec_policy=policy,
+        handoffs=CloudHandoffStore(),
+    )
+
+    delegated = service.advance(
+        __import__(
+            "foundry_opt.orchestration.steward",
+            fromlist=["StewardAdvanceRequest"],
+        ).StewardAdvanceRequest(root, ISSUE)
+    )
+
+    assert delegated.status.value == "waiting"
+    assert delegated.disposition == "delegate"
+    assert delegated.code == "state_handoff_created"
+    assert delegated.phase == "baseline"
+    head = _git(root, "rev-parse", "HEAD")
+    path = _git(
+        root,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        f"{head}^1",
+        head,
+    )
+    blob = _git(root, "ls-tree", head, "--", path).split()[2]
+    hook.unlink()
+    applied = HandoffApplyService().apply(
+        TrustedHandoffRequest(
+            repository_root=root,
+            repository="octo-org/optimizer",
+            repository_id=123,
+            pull_request_number=90,
+            author_login="copilot-swe-agent[bot]",
+            base_repository="octo-org/optimizer",
+            base_ref="main",
+            base_revision=base_commit,
+            head_repository="octo-org/optimizer",
+            head_ref="copilot/steward-issue-46",
+            head_revision=head,
+            handoff_path=path,
+            handoff_blob=blob,
+        )
+    )
+
+    assert applied.status is HandoffApplyStatus.APPLIED
+    assert applied.snapshot is not None
+    assert applied.snapshot.state.phase.value == "baseline"
+    assert any(
+        item.path == "objects/specifications/g1.json"
+        for item in applied.snapshot.objects
+    )
+    resumed = StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        spec_policy=policy,
+    ).advance(
+        __import__(
+            "foundry_opt.orchestration.steward",
+            fromlist=["StewardAdvanceRequest"],
+        ).StewardAdvanceRequest(root, ISSUE)
+    )
+    assert resumed.status.value == "waiting"
+    assert resumed.phase == "baseline"
 
 
 def test_production_cli_resolves_trusted_issue_without_github_api(
