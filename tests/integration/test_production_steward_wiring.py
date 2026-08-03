@@ -483,8 +483,24 @@ def test_production_cli_resolves_trusted_issue_without_github_api(
     )
     _git(root, "add", ".")
     _git(root, "commit", "-m", "baseline repository")
+    remote_main_commit = _git(root, "rev-parse", "HEAD")
     _git(root, "remote", "add", "origin", str(remote))
     _git(root, "push", "-u", "origin", "main")
+    _git(
+        root,
+        f"--git-dir={remote}",
+        "symbolic-ref",
+        "HEAD",
+        "refs/heads/main",
+    )
+    _git(root, "checkout", "-b", "copilot/issue-46")
+    (root / "copilot-plan.md").write_text(
+        "initial Copilot plan\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", "copilot-plan.md")
+    _git(root, "commit", "-m", "Initial plan")
+    session_commit = _git(root, "rev-parse", "HEAD")
     body = _issue_body().replace(
         """- asset_id: development
   source: foundry
@@ -565,6 +581,16 @@ def test_production_cli_resolves_trusted_issue_without_github_api(
     snapshot = GitStateRef().load(root, ISSUE)
     assert snapshot is not None
     assert snapshot.state.spec_sha256
+    specification = next(
+        item
+        for item in snapshot.objects
+        if item.path == "objects/specifications/g1.json"
+    )
+    assert json.loads(specification.content)["spec"]["base_commit"] == (
+        remote_main_commit
+    )
+    assert _git(root, "branch", "--show-current") == "copilot/issue-46"
+    assert _git(root, "rev-parse", "HEAD") == session_commit
     created_event = next(
         event
         for event in snapshot.inbox

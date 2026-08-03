@@ -40,7 +40,6 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
-import re
 import shlex
 import subprocess
 from typing import Any
@@ -48,7 +47,10 @@ from urllib.parse import quote
 
 import yaml
 
-from foundry_opt.adapters.campaign_git import CampaignGit
+from foundry_opt.adapters.campaign_git import (
+    CampaignGit,
+    remote_default_branch,
+)
 from foundry_opt.adapters.commands import SubprocessCommandRunner
 from foundry_opt.adapters.drafts import DraftError, DraftGateway
 from foundry_opt.adapters.environment import OsEnvironmentReader
@@ -1032,54 +1034,7 @@ def build_optimization_command_service() -> OptimizationCommandService:
 
 
 def _git_remote_default_branch(repository_root: Path) -> str:
-    completed = subprocess.run(
-        ("git", "ls-remote", "--symref", "origin", "HEAD"),
-        cwd=repository_root,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode == 0:
-        for line in completed.stdout.splitlines():
-            match = re.fullmatch(
-                r"ref: refs/heads/(.+)\s+HEAD",
-                line,
-            )
-            if match is not None:
-                return match.group(1)
-    completed = subprocess.run(
-        (
-            "git",
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ),
-        cwd=repository_root,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    value = completed.stdout.strip()
-    if completed.returncode == 0 and value.startswith("origin/"):
-        return value.removeprefix("origin/")
-    completed = subprocess.run(
-        (
-            "git",
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ),
-        cwd=repository_root,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    value = completed.stdout.strip()
-    if completed.returncode == 0 and value.startswith("origin/"):
-        return value.removeprefix("origin/")
-    raise ValueError("remote default branch is unavailable")
+    return remote_default_branch(repository_root)
 
 
 class _TrustedIssueOptimizationGateway:
@@ -1978,9 +1933,8 @@ class _ProductionCandidateSlatePlanResolver:
         ):
             raise ValueError("approved candidate slate specification changed")
         repository = spec.repository
-        default_branch = _git_remote_default_branch(root)
         pinned = CampaignGit(
-            default_branch=lambda repository_root: default_branch
+            default_branch=_git_remote_default_branch
         ).pin_default_branch(root)
         if pinned.commit != spec.base_commit:
             raise ValueError("candidate slate base commit changed")
@@ -1996,7 +1950,7 @@ class _ProductionCandidateSlatePlanResolver:
             issue_number=request.issue_number,
             generation=state.generation,
             repository=repository,
-            default_branch=default_branch,
+            default_branch=pinned.default_branch,
             spec_sha256=spec.sha256,
             base_commit=spec.base_commit,
             evaluation_policy=_evaluation_policy(spec),

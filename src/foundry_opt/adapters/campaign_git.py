@@ -33,7 +33,7 @@ class CampaignGit:
         *,
         default_branch: Callable[[Path], str] | None = None,
     ) -> None:
-        self._default_branch = default_branch or _github_default_branch
+        self._default_branch = default_branch or remote_default_branch
         self._worktrees: dict[Path, CampaignWorktree] = {}
 
     def pin_default_branch(self, repository_root: Path) -> PinnedRepository:
@@ -51,23 +51,26 @@ class CampaignGit:
             raise ValueError("campaign repository must be clean")
         branch = self._default_branch(root).strip()
         _validate_branch(root, branch)
+        commit = self._remote_branch_tip(root, branch)
         self._git(
             root,
             "fetch",
             "--quiet",
+            "--no-tags",
             "origin",
-            f"{branch}:refs/remotes/origin/{branch}",
+            commit,
         )
-        commit = self._git_text(
-            root,
-            "rev-parse",
-            f"refs/remotes/origin/{branch}^{{commit}}",
-        )
-        head = self._git_text(root, "rev-parse", "HEAD^{commit}")
-        if head != commit:
-            raise ValueError(
-                "campaign must start from the exact GitHub default-branch commit"
-            )
+        fetched = self._git_text(root, "rev-parse", "FETCH_HEAD^{commit}")
+        if fetched != commit:
+            raise ValueError("fetched default-branch commit changed")
+        self._git(root, "cat-file", "-e", f"{commit}^{{commit}}")
+        self._git(root, "cat-file", "-e", f"{commit}^{{tree}}")
+        current_branch = self._default_branch(root).strip()
+        _validate_branch(root, current_branch)
+        if current_branch != branch:
+            raise ValueError("remote default branch changed while pinning")
+        if self._remote_branch_tip(root, branch) != commit:
+            raise ValueError("remote default branch advanced while pinning")
         return PinnedRepository(branch, commit)
 
     def acquire_lock(
@@ -459,28 +462,59 @@ class CampaignGit:
     def _git_text(self, cwd: Path, *arguments: str) -> str:
         return self._git(cwd, *arguments).decode("ascii").strip()
 
+    def _remote_branch_tip(self, root: Path, branch: str) -> str:
+        output = self._git(
+            root,
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+        )
+        expected_ref = f"refs/heads/{branch}".encode("utf-8")
+        matches: list[str] = []
+        for line in output.splitlines():
+            fields = line.split(b"\t")
+            if len(fields) != 2 or fields[1] != expected_ref:
+                continue
+            try:
+                commit = fields[0].decode("ascii")
+            except UnicodeDecodeError as error:
+                raise ValueError(
+                    "remote default-branch tip is invalid"
+                ) from error
+            _commit(commit)
+            matches.append(commit)
+        if len(matches) != 1:
+            raise ValueError("remote default-branch tip is unavailable")
+        return matches[0]
 
-def _github_default_branch(repository_root: Path) -> str:
+
+def remote_default_branch(repository_root: Path) -> str:
     result = subprocess.run(
         (
-            "gh",
-            "repo",
-            "view",
-            "--json",
-            "defaultBranchRef",
-            "--jq",
-            ".defaultBranchRef.name",
+            "git",
+            "ls-remote",
+            "--symref",
+            "origin",
+            "HEAD",
         ),
         cwd=repository_root,
         check=False,
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0 or not result.stdout.strip():
+    if result.returncode != 0:
         raise RuntimeError(
-            result.stderr.strip() or "could not resolve GitHub default branch"
+            result.stderr.strip() or "could not resolve remote default branch"
         )
-    return result.stdout.strip()
+    branches = []
+    for line in result.stdout.splitlines():
+        match = re.fullmatch(r"ref: refs/heads/(.+)\s+HEAD", line)
+        if match is not None:
+            branches.append(match.group(1))
+    if len(branches) != 1:
+        raise ValueError("remote default branch is unavailable")
+    return branches[0]
 
 
 def _repository_root(path: Path) -> Path:
