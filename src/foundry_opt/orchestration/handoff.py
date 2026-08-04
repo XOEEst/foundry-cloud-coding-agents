@@ -10,12 +10,12 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Any, Mapping, Protocol
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 from foundry_opt import __version__
 from foundry_opt.orchestration.git_state import (
     GitStateRef,
+    is_verified_copilot_git_proxy,
     StateRefConflictError,
     StateRefError,
     StateRefProposal,
@@ -2024,19 +2024,13 @@ def _cloud_session(root: Path, remote: str) -> _CloudSession:
         raise HandoffError("Copilot cloud session marker is unavailable")
     if os.environ.get("GITHUB_ACTIONS", "").casefold() == "true":
         raise HandoffError("GitHub Actions cannot create a session handoff")
+    if not is_verified_copilot_git_proxy(root, remote):
+        raise HandoffError("verified Copilot git proxy is unavailable")
     branch = _git_text(root, "symbolic-ref", "--short", "HEAD")
     if _BRANCH.fullmatch(branch) is None:
         raise HandoffError("native Copilot session branch is invalid")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
-    remote_url = _git_text(root, "remote", "get-url", remote)
-    parsed = urlsplit(remote_url)
-    local_proxy = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-    if (
-        os.environ.get("COPILOT_CLI", "").casefold() in {"1", "true"}
-        and not local_proxy
-    ):
-        raise HandoffError("local Copilot CLI is not a cloud agent session")
-    if _REPOSITORY.fullmatch(repository) is None and not local_proxy:
+    if _REPOSITORY.fullmatch(repository) is None:
         raise HandoffError("Copilot cloud repository marker is unavailable")
     return _CloudSession(
         branch=branch,

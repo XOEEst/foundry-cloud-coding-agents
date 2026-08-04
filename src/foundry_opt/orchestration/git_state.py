@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import hashlib
+from ipaddress import ip_address
 import json
 from math import isfinite
 import os
@@ -34,6 +35,14 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_COPILOT_SESSION_ID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+_GITHUB_REPOSITORY = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
+    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
+)
 _EVENT_PAYLOAD_FIELDS = {
     EventKind.ISSUE_CREATED: frozenset(),
     EventKind.ISSUE_EDITED: frozenset(),
@@ -541,6 +550,7 @@ class GitStateRef:
             issue_number,
             proposed_revision,
         ).snapshot
+        proxy_context = _verified_copilot_git_proxy(root, self._remote)
         parent_line = _git_text(
             root,
             "rev-list",
@@ -576,6 +586,17 @@ class GitStateRef:
         if result.returncode != 0:
             raise StateRefConflictError(
                 "state handoff compare-and-swap failed"
+            )
+        if proxy_context:
+            raise StateRefPushUnacknowledgedError(
+                ref=ref,
+                expected_revision=expected_revision,
+                proposed_revision=proposed_revision,
+                proposed_tree=_git_text(
+                    root,
+                    "rev-parse",
+                    f"{proposed_revision}^{{tree}}",
+                ),
             )
         acknowledged = self._remote_revision(root, ref)
         if acknowledged != proposed_revision:
@@ -958,6 +979,7 @@ class GitStateRef:
             Path(f"{index_path}.lock").unlink(missing_ok=True)
 
         lease = f"--force-with-lease={ref}:{parent or ''}"
+        proxy_context = _verified_copilot_git_proxy(root, self._remote)
         result = _run(
             root,
             "git",
@@ -970,6 +992,13 @@ class GitStateRef:
         if result.returncode != 0:
             raise StateRefConflictError(
                 "state ref compare-and-swap failed"
+            )
+        if proxy_context:
+            raise StateRefPushUnacknowledgedError(
+                ref=ref,
+                expected_revision=parent,
+                proposed_revision=commit_sha,
+                proposed_tree=tree,
             )
         acknowledged = self._remote_revision(root, ref)
         if acknowledged != commit_sha:
@@ -2149,6 +2178,67 @@ def _record_id(path: str, directory: str) -> str:
 def _state_ref(issue_number: int) -> str:
     _positive_integer(issue_number, "issue_number")
     return f"refs/heads/foundry-opt/state/issue-{issue_number}"
+
+
+def is_verified_copilot_git_proxy(
+    repository_root: Path,
+    remote: str = "origin",
+) -> bool:
+    try:
+        root = _repository_root(repository_root)
+        _identifier(remote, "remote")
+    except (StateRefError, ValueError):
+        return False
+    return _verified_copilot_git_proxy(root, remote)
+
+
+def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
+    session_id = os.environ.get("COPILOT_AGENT_SESSION_ID", "")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    trusted_markers = (
+        _COPILOT_SESSION_ID.fullmatch(session_id) is not None
+        and _GITHUB_REPOSITORY.fullmatch(repository) is not None
+        and os.environ.get("GITHUB_ACTIONS", "").casefold() != "true"
+        and os.environ.get("COPILOT_CLI", "").casefold()
+        not in {"1", "true"}
+    )
+    if not trusted_markers:
+        return False
+    result = _run(
+        root,
+        "git",
+        "config",
+        "--get",
+        f"remote.{remote}.url",
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    remote_url = result.stdout.decode("utf-8").strip()
+    try:
+        parsed = urlsplit(remote_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    try:
+        loopback = hostname == "localhost" or (
+            hostname is not None and ip_address(hostname).is_loopback
+        )
+    except ValueError:
+        loopback = False
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or not loopback
+        or port is None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    expected_path = f"/{repository}".casefold().rstrip("/")
+    return parsed.path.casefold().rstrip("/") == expected_path
 
 
 def _repository_root(path: Path) -> Path:

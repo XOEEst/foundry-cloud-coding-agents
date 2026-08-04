@@ -449,6 +449,7 @@ def test_actual_cli_progresses_policy_issue_into_candidate_delegation(
 def test_production_issue_created_advances_through_state_handoff(
     monkeypatch,
     tmp_path: Path,
+    copilot_git_proxy,
 ) -> None:
     remote = tmp_path / "remote.git"
     remote.mkdir()
@@ -481,21 +482,11 @@ def test_production_issue_created_advances_through_state_handoff(
             datetime(2026, 8, 3, 12, 0, tzinfo=UTC),
         ),
     )
-    hook = remote / "hooks" / "post-receive"
-    hook.write_text(
-        "#!/bin/sh\n"
-        'git_dir="${GIT_DIR:-.}"\n'
-        "while read old new ref; do\n"
-        '  case "$ref" in\n'
-        "    refs/heads/foundry-opt/state/*)\n"
-        '      git --git-dir="$git_dir" update-ref -d "$ref" "$new"\n'
-        "      ;;\n"
-        "  esac\n"
-        "done\n",
-        encoding="utf-8",
-        newline="\n",
+    proxy = copilot_git_proxy.install(
+        root,
+        remote,
+        acknowledgement="unrelated",
     )
-    hook.chmod(0o755)
     monkeypatch.setenv(
         "COPILOT_AGENT_SESSION_ID",
         "11111111-2222-4333-8444-555555555555",
@@ -531,6 +522,9 @@ def test_production_issue_created_advances_through_state_handoff(
     assert delegated.code == "state_handoff_created"
     assert delegated.phase == "baseline"
     head = _git(root, "rev-parse", "HEAD")
+    assert proxy.real_revision(
+        "refs/heads/copilot/steward-issue-46"
+    ) == head
     path = _git(
         root,
         "diff-tree",
@@ -541,7 +535,11 @@ def test_production_issue_created_advances_through_state_handoff(
         head,
     )
     blob = _git(root, "ls-tree", head, "--", path).split()[2]
-    hook.unlink()
+    assert path.startswith(
+        ".foundry-optimizer/handoffs/steward/issue-46/"
+    )
+    proxy.disable()
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
     applied = HandoffApplyService().apply(
         TrustedHandoffRequest(
             repository_root=root,

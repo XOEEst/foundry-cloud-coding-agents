@@ -113,6 +113,7 @@ from foundry_opt.orchestration.steward import (
 )
 from foundry_opt.orchestration.git_state import (
     GitStateRef,
+    is_verified_copilot_git_proxy,
     StateRefError,
     StateRefPushUnacknowledgedError,
 )
@@ -1705,6 +1706,7 @@ class _ProductionCandidateDesignRepository:
                 tree_sha=tree,
                 changed_paths=candidate_paths,
             )
+            proxy_context = is_verified_copilot_git_proxy(root)
             existing = self._commands.run(
                 ("git", "ls-remote", "--heads", "origin", ref),
                 cwd=root,
@@ -1718,6 +1720,10 @@ class _ProductionCandidateDesignRepository:
                     ("git", "push", "--quiet", "origin", f"{commit}:{ref}"),
                     cwd=root,
                 )
+                if proxy_context:
+                    raise CandidateDesignPushUnacknowledgedError(
+                        artifact
+                    )
                 acknowledged = self._commands.run(
                     ("git", "ls-remote", "--heads", "origin", ref),
                     cwd=root,

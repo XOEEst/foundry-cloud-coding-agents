@@ -343,6 +343,13 @@ def test_bundle_generates_transport_and_verification_workflows() -> None:
         assert "GH_TOKEN: ${{ github.token }}" in text
         assert "@main" not in text
         assert "@master" not in text
+    handoff = yaml.safe_load(
+        files[Path(".github/workflows/foundry-optimization-handoff.yml")]
+    )
+    assert handoff[True]["pull_request_target"] == {
+        "types": ["opened", "synchronize", "reopened"],
+        "paths": [".foundry-optimizer/handoffs/**"],
+    }
 
 
 def test_assignment_workflows_require_dedicated_user_token_secret() -> None:
