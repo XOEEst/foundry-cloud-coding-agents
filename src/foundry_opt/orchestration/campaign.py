@@ -483,6 +483,7 @@ class OptimizationCampaign:
                 CampaignPhase.RETENTION,
                 CampaignPhase.COMPLETED,
                 CampaignPhase.BLOCKED,
+                CampaignPhase.CANCELLED,
             }:
                 raise InvalidCampaignTransition(
                     "deployment workflow observation requires deployment"

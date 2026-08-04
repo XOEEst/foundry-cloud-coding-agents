@@ -376,6 +376,15 @@ class GitStateCampaignRecovery:
             is CampaignPhase.DEPLOYMENT
         )
 
+    def can_reconcile_cleanup(self, issue_number: int) -> bool:
+        inspection = self._inspect_issue_numbers((issue_number,))[0]
+        return (
+            inspection.snapshot is not None
+            and inspection.snapshot.state.phase
+            is CampaignPhase.COMPLETED
+            and self._can_reconcile_persisted_effects(inspection)
+        )
+
     def _inspect_issue_numbers(
         self,
         issue_numbers: tuple[int, ...],
@@ -567,8 +576,7 @@ class IssueEventIntake:
                     raise TrustedIssueEventError(
                         "delivery ID was reused for different issue content"
                     )
-                _wake_steward(
-                    self._assignments,
+                self._wake_if_recoverable(
                     issue_number,
                     duplicate.event_id,
                 )
@@ -596,8 +604,7 @@ class IssueEventIntake:
                 continue
             if not recorded:
                 return IntakeResult(event, False)
-            _wake_steward(
-                self._assignments,
+            self._wake_if_recoverable(
                 issue_number,
                 event.event_id,
             )
@@ -605,6 +612,18 @@ class IssueEventIntake:
             return IntakeResult(event, True)
         assert conflict is not None
         raise conflict
+
+    def _wake_if_recoverable(
+        self,
+        issue_number: int,
+        idempotency_key: str,
+    ) -> bool:
+        return _wake_steward_if_recoverable(
+            self._assignments,
+            self._recovery,
+            issue_number,
+            idempotency_key,
+        )
 
     def recover(
         self,
@@ -662,11 +681,15 @@ class DeploymentWorkflowEventRouter:
         inbox: IssueEventInbox,
         assignments: StewardAssignments,
         projection: IssueProjection,
+        recovery: CampaignRecovery | None = None,
     ) -> None:
         self._root = repository_root
         self._inbox = inbox
         self._assignments = assignments
         self._projection = projection
+        self._recovery = recovery or _TrustedLifecycleCampaignRecovery(
+            inbox
+        )
 
     def ingest(
         self,
@@ -813,8 +836,9 @@ class DeploymentWorkflowEventRouter:
             event.result,
         )
         result = DeploymentWorkflowEventIntake(self._inbox).ingest(event)
-        _wake_steward(
+        _wake_steward_if_recoverable(
             self._assignments,
+            self._recovery,
             issue_number,
             result.event.event_id,
         )
@@ -2235,6 +2259,7 @@ def main() -> None:
             inbox,
             assignments,
             deferred_projection,
+            recovery,
         ).ingest(payload, context)
         return
     if event_name == "pull_request":
@@ -2251,8 +2276,9 @@ def main() -> None:
                     )
                 )
                 inbox.append(spec_issue, spec_event)
-                _wake_steward(
+                _wake_steward_if_recoverable(
                     assignments,
+                    recovery,
                     spec_issue,
                     spec_event.event_id,
                 )
@@ -2319,8 +2345,9 @@ def main() -> None:
             bindings,
         )
         recorded = CandidatePullRequestEventIntake(inbox).ingest(event)
-        _wake_steward(
+        _wake_steward_if_recoverable(
             assignments,
+            recovery,
             issue_number,
             recorded.event.event_id,
         )
@@ -2375,6 +2402,21 @@ def _wake_steward(
     if assignments.has_live_lease(issue_number):
         return False
     return assignments.assign(issue_number, idempotency_key)
+
+
+def _wake_steward_if_recoverable(
+    assignments: StewardAssignments,
+    recovery: CampaignRecovery,
+    issue_number: int,
+    idempotency_key: str,
+) -> bool:
+    if not recovery.should_recover(issue_number):
+        return False
+    return _wake_steward(
+        assignments,
+        issue_number,
+        idempotency_key,
+    )
 
 
 def _required_environment(name: str) -> str:

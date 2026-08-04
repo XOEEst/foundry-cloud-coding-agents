@@ -538,3 +538,80 @@ def test_transport_revalidates_phase_before_specialist_side_effect() -> None:
 
     assert result.specialist_statuses == ()
     assert gateway.assigned == []
+
+
+def test_transport_revalidates_trusted_lifecycle_before_side_effect() -> None:
+    class InactiveLifecycle:
+        def can_reconcile_transport(self, issue_number: int) -> bool:
+            return False
+
+    planned = _planned()
+    claimed = OutboxRecord(
+        "spec-planner-2-immutable-asset-claimed",
+        "specialist_work_claimed",
+        GENERATION,
+        4,
+        {"effect_id": planned.record_id},
+    )
+    ledger = Ledger(planned)
+    ledger.snapshot = replace(
+        ledger.snapshot,
+        outbox=(planned, claimed),
+    )
+    gateway = Gateway()
+    TransportEffectReconciler(
+        ledger=ledger,
+        specialist=SpecialistWorkBridge(gateway),
+        activity=InactiveLifecycle(),
+    ).reconcile(Path("."), ISSUE)
+
+    assert gateway.assigned == []
+
+
+def test_transport_revalidates_phase_before_supersession_side_effect() -> None:
+    planned = OutboxRecord(
+        "supersede-candidate-1",
+        "candidate_issue_supersede_planned",
+        GENERATION,
+        4,
+    )
+
+    class CancellingLedger(Ledger):
+        def __init__(self, record: OutboxRecord) -> None:
+            super().__init__(record)
+            self.loads = 0
+
+        def load(self, repository_root: Path, issue_number: int):
+            self.loads += 1
+            if self.loads >= 2:
+                self.snapshot = replace(
+                    self.snapshot,
+                    state=replace(
+                        self.snapshot.state,
+                        phase=CampaignPhase.CANCELLED,
+                    ),
+                )
+            return self.snapshot
+
+    class Supersession:
+        def __init__(self) -> None:
+            self.applied: list[OutboxRecord] = []
+
+        def apply(self, record: OutboxRecord):
+            self.applied.append(record)
+            return type("Result", (), {"status": type("Status", (), {"value": "applied"})()})()
+
+    supersession = Supersession()
+
+    class InactiveLifecycle:
+        def can_reconcile_transport(self, issue_number: int) -> bool:
+            return False
+
+    TransportEffectReconciler(
+        ledger=CancellingLedger(planned),
+        specialist=SpecialistWorkBridge(Gateway()),
+        supersession=supersession,
+        activity=InactiveLifecycle(),
+    ).reconcile(Path("."), ISSUE)
+
+    assert supersession.applied == []

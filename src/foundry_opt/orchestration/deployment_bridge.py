@@ -288,6 +288,18 @@ def reconcile_deployment_cleanup_effects(
     issue_number: int,
     commands: CommandRunner,
 ) -> DeploymentBridgeReconcileResult:
+    from foundry_opt.orchestration.issue_intake import (
+        GitIssueEventInbox,
+        GitStateCampaignRecovery,
+    )
+
+    recovery = GitStateCampaignRecovery(
+        repository_root,
+        GitIssueEventInbox(repository_root),
+        GitStateRef(),
+    )
+    if not recovery.can_reconcile_cleanup(issue_number):
+        return DeploymentBridgeReconcileResult(issue_number, ())
     snapshot = GitStateRef().load(repository_root, issue_number)
     if snapshot is None:
         return DeploymentBridgeReconcileResult(issue_number, ())
@@ -322,9 +334,12 @@ def reconcile_deployment_cleanup_effects(
             issue_number,
         )
         cleanup_bridge = DeploymentCleanupBridge(cleanup_gateway)
-        cleanup_results = tuple(
-            cleanup_bridge.apply(record) for record in cleanup_records
-        )
+        results: list[DeploymentCleanupBridgeResult] = []
+        for record in cleanup_records:
+            if not recovery.can_reconcile_cleanup(issue_number):
+                break
+            results.append(cleanup_bridge.apply(record))
+        cleanup_results = tuple(results)
     else:
         cleanup_results = ()
     return DeploymentBridgeReconcileResult(

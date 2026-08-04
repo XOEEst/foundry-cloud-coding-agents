@@ -549,11 +549,13 @@ class TransportEffectReconciler:
         specialist: SpecialistWorkBridge,
         applier: Any | None = None,
         supersession: Any | None = None,
+        activity: Any | None = None,
     ) -> None:
         self._ledger = ledger
         self._specialist = specialist
         self._applier = applier
         self._supersession = supersession
+        self._activity = activity
 
     def reconcile(
         self,
@@ -707,6 +709,12 @@ class TransportEffectReconciler:
                         "candidate_pr_reject_planned",
                     }
                 ):
+                    if not self._is_current_active_record(
+                        repository_root,
+                        issue_number,
+                        record,
+                    ):
+                        continue
                     applied = self._supersession.apply(record)
                     supersession_statuses.append(applied.status.value)
         return TransportEffectReconcileResult(
@@ -727,6 +735,11 @@ class TransportEffectReconciler:
         record: OutboxRecord,
         kind: str,
     ) -> bool:
+        if (
+            self._activity is not None
+            and not self._activity.can_reconcile_transport(issue_number)
+        ):
+            return False
         snapshot = self._ledger.load(repository_root, issue_number)
         if snapshot is None:
             return False
@@ -778,6 +791,11 @@ class TransportEffectReconciler:
         issue_number: int,
         record: OutboxRecord,
     ) -> bool:
+        if (
+            self._activity is not None
+            and not self._activity.can_reconcile_transport(issue_number)
+        ):
+            return False
         snapshot = self._ledger.load(repository_root, issue_number)
         return (
             snapshot is not None
@@ -802,10 +820,19 @@ def reconcile_github_transport_effects(
         ApplierWorkerBridge,
         CandidateSupersessionBridge,
     )
+    from foundry_opt.orchestration.issue_intake import (
+        GitIssueEventInbox,
+        GitStateCampaignRecovery,
+    )
 
     ledger = GitStateRef()
     return TransportEffectReconciler(
         ledger=ledger,
+        activity=GitStateCampaignRecovery(
+            repository_root,
+            GitIssueEventInbox(repository_root),
+            ledger,
+        ),
         specialist=SpecialistWorkBridge(
             GhSpecialistWorkerGateway(
                 commands,

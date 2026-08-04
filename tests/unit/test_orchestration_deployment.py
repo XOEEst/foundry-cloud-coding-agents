@@ -1626,10 +1626,17 @@ def test_root_closure_ignores_cleanup_from_prior_generations() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("lifecycle_checks", "applied_count"),
+    (((True, True), 1), ((True, False), 0)),
+)
 def test_completed_terminal_edit_preserves_prior_cleanup_generation(
     monkeypatch,
+    lifecycle_checks: tuple[bool, ...],
+    applied_count: int,
 ) -> None:
     import foundry_opt.orchestration.deployment_bridge as deployment_bridge
+    import foundry_opt.orchestration.issue_intake as issue_intake
 
     cleanup = OutboxRecord(
         record_id="root-close-1",
@@ -1669,6 +1676,13 @@ def test_completed_terminal_edit_preserves_prior_cleanup_generation(
             applied.append(record)
             return record.record_id
 
+    class Recovery:
+        def __init__(self, *args) -> None:
+            self.checks = iter(lifecycle_checks)
+
+        def can_reconcile_cleanup(self, issue_number: int) -> bool:
+            return next(self.checks)
+
     monkeypatch.setattr(deployment_bridge, "GitStateRef", lambda: Ledger())
     monkeypatch.setattr(
         deployment_bridge,
@@ -1685,6 +1699,16 @@ def test_completed_terminal_edit_preserves_prior_cleanup_generation(
         "DeploymentCleanupBridge",
         Bridge,
     )
+    monkeypatch.setattr(
+        issue_intake,
+        "GitIssueEventInbox",
+        lambda root: object(),
+    )
+    monkeypatch.setattr(
+        issue_intake,
+        "GitStateCampaignRecovery",
+        Recovery,
+    )
 
     deployment_bridge.reconcile_deployment_cleanup_effects(
         Path("."),
@@ -1692,7 +1716,7 @@ def test_completed_terminal_edit_preserves_prior_cleanup_generation(
         object(),
     )
 
-    assert applied == [cleanup]
+    assert applied == [cleanup] * applied_count
 
 
 @pytest.mark.parametrize(("active", "expected"), ((False, []), (True, [1])))

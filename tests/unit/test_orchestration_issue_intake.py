@@ -231,7 +231,6 @@ def test_trusted_issue_events_are_recorded_without_domain_decisions() -> None:
     assert assignments.assigned == [
         (31, "github-11111111-1111-4111-8111-111111111111"),
         (31, "github-22222222-2222-4222-8222-222222222222"),
-        (31, "github-33333333-3333-4333-8333-333333333333"),
         (31, "github-44444444-4444-4444-8444-444444444444"),
     ]
     assert projection.projected == [31, 31, 31, 31]

@@ -95,6 +95,49 @@ def test_terminal_edit_waits_for_explicit_reopen_generation() -> None:
     )
 
 
+def test_cancelled_workflow_observation_does_not_block_reopen() -> None:
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=7,
+        phase=CampaignPhase.DEPLOYMENT,
+        processed_event_ids=("event-1",),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+        selected_candidate_id="candidate-1",
+        merge_commit="c" * 40,
+    )
+
+    result = OptimizationCampaign().advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(
+                _event("event-2", EventKind.ISSUE_CLOSED),
+                _event(
+                    "event-3",
+                    EventKind.DEPLOYMENT_WORKFLOW_OBSERVED,
+                ),
+                _event(
+                    "event-4",
+                    EventKind.ISSUE_REOPENED,
+                    generation=2,
+                ),
+            ),
+        )
+    )
+
+    assert result.state.generation == 2
+    assert result.state.phase is CampaignPhase.SPECIFICATION
+
+
 def test_policy_spec_baseline_candidates_and_slate_progress() -> None:
     campaign = OptimizationCampaign()
     state = campaign.advance(
