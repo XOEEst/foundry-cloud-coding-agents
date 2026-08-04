@@ -35,14 +35,16 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_COPILOT_SESSION_ID = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
-    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
-)
 _GITHUB_REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
 )
+_COPILOT_AGENT_SOURCE_ENVIRONMENTS = frozenset({"production"})
+_COPILOT_AGENT_START_TIME_SEC = re.compile(r"^[0-9]{10}$")
+_COPILOT_AGENT_TIMEOUT_MIN = re.compile(r"^[0-9]{1,4}$")
+_MIN_COPILOT_AGENT_START_TIME_SEC = 1_577_836_800
+_MAX_COPILOT_AGENT_START_TIME_SEC = 4_102_444_799
+_MAX_COPILOT_AGENT_TIMEOUT_MIN = 24 * 60
 _EVENT_PAYLOAD_FIELDS = {
     EventKind.ISSUE_CREATED: frozenset(),
     EventKind.ISSUE_EDITED: frozenset(),
@@ -2193,14 +2195,19 @@ def is_verified_copilot_git_proxy(
 
 
 def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
-    session_id = os.environ.get("COPILOT_AGENT_SESSION_ID", "")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     trusted_markers = (
-        _COPILOT_SESSION_ID.fullmatch(session_id) is not None
+        os.environ.get("GITHUB_ACTIONS") == "true"
         and _GITHUB_REPOSITORY.fullmatch(repository) is not None
-        and os.environ.get("GITHUB_ACTIONS", "").casefold() != "true"
-        and os.environ.get("COPILOT_CLI", "").casefold()
-        not in {"1", "true"}
+        and os.environ.get("COPILOT_AGENT_SOURCE_ENVIRONMENT")
+        in _COPILOT_AGENT_SOURCE_ENVIRONMENTS
+        and _sane_copilot_agent_start_time()
+        and _sane_copilot_agent_timeout()
+        and _nonempty_environment_marker("GITHUB_COPILOT_API_TOKEN")
+        and _nonempty_environment_marker(
+            "GITHUB_COPILOT_ACTION_DOWNLOAD_URL"
+        )
+        and "COPILOT_CLI" not in os.environ
     )
     if not trusted_markers:
         return False
@@ -2233,12 +2240,35 @@ def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
         or parsed.password is not None
         or not loopback
         or port is None
+        or port < 1
         or parsed.query
         or parsed.fragment
     ):
         return False
-    expected_path = f"/{repository}".casefold().rstrip("/")
-    return parsed.path.casefold().rstrip("/") == expected_path
+    return parsed.path == f"/{repository}"
+
+
+def _sane_copilot_agent_start_time() -> bool:
+    value = os.environ.get("COPILOT_AGENT_START_TIME_SEC", "")
+    return (
+        _COPILOT_AGENT_START_TIME_SEC.fullmatch(value) is not None
+        and _MIN_COPILOT_AGENT_START_TIME_SEC
+        <= int(value)
+        <= _MAX_COPILOT_AGENT_START_TIME_SEC
+    )
+
+
+def _sane_copilot_agent_timeout() -> bool:
+    value = os.environ.get("COPILOT_AGENT_TIMEOUT_MIN", "")
+    return (
+        _COPILOT_AGENT_TIMEOUT_MIN.fullmatch(value) is not None
+        and 1 <= int(value) <= _MAX_COPILOT_AGENT_TIMEOUT_MIN
+    )
+
+
+def _nonempty_environment_marker(name: str) -> bool:
+    value = os.environ.get(name)
+    return value is not None and bool(value.strip())
 
 
 def _repository_root(path: Path) -> Path:

@@ -63,6 +63,35 @@ from foundry_opt.orchestration.steward import (
 
 
 ISSUE = 46
+LIVE_COPILOT_ENVIRONMENT = {
+    "GITHUB_ACTIONS": "true",
+    "GITHUB_REPOSITORY": "octo-org/optimizer",
+    "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
+    "COPILOT_AGENT_START_TIME_SEC": "1785872107",
+    "COPILOT_AGENT_TIMEOUT_MIN": "60",
+    "GITHUB_COPILOT_API_TOKEN": "live-fixture-api-token",
+    "GITHUB_COPILOT_ACTION_DOWNLOAD_URL": (
+        "https://example.invalid/copilot-action-download"
+    ),
+}
+
+
+def _set_live_copilot_environment(monkeypatch) -> None:
+    monkeypatch.delenv("COPILOT_AGENT_SESSION_ID", raising=False)
+    monkeypatch.delenv("COPILOT_CLI", raising=False)
+    for name, value in LIVE_COPILOT_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+
+
+def _set_normal_github_actions_environment(monkeypatch) -> None:
+    for name in (
+        "COPILOT_AGENT_SESSION_ID",
+        "COPILOT_CLI",
+        *LIVE_COPILOT_ENVIRONMENT,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -487,13 +516,7 @@ def test_production_issue_created_advances_through_state_handoff(
         remote,
         acknowledgement="unrelated",
     )
-    monkeypatch.setenv(
-        "COPILOT_AGENT_SESSION_ID",
-        "11111111-2222-4333-8444-555555555555",
-    )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    _set_live_copilot_environment(monkeypatch)
     policy = OptimizationSpecPolicy(
         AutomationPolicy(
             allowed_dataset_sources={"foundry"},
@@ -539,7 +562,7 @@ def test_production_issue_created_advances_through_state_handoff(
         ".foundry-optimizer/handoffs/steward/issue-46/"
     )
     proxy.disable()
-    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    _set_normal_github_actions_environment(monkeypatch)
     applied = HandoffApplyService().apply(
         TrustedHandoffRequest(
             repository_root=root,

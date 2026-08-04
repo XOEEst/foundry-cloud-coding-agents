@@ -43,10 +43,6 @@ _REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
 )
-_SESSION_ID = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
-    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
-)
 _HANDOFF_COMMIT_ENVIRONMENT = {
     "GIT_AUTHOR_NAME": "Foundry Optimizer Handoff",
     "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
@@ -2019,11 +2015,6 @@ class CloudHandoffStore:
 
 
 def _cloud_session(root: Path, remote: str) -> _CloudSession:
-    session_id = os.environ.get("COPILOT_AGENT_SESSION_ID", "")
-    if _SESSION_ID.fullmatch(session_id) is None:
-        raise HandoffError("Copilot cloud session marker is unavailable")
-    if os.environ.get("GITHUB_ACTIONS", "").casefold() == "true":
-        raise HandoffError("GitHub Actions cannot create a session handoff")
     if not is_verified_copilot_git_proxy(root, remote):
         raise HandoffError("verified Copilot git proxy is unavailable")
     branch = _git_text(root, "symbolic-ref", "--short", "HEAD")

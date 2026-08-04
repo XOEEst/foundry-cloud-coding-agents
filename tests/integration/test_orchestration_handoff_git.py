@@ -16,6 +16,7 @@ from foundry_opt.orchestration import (
     GitStateRef,
     OptimizationCampaign,
     OutboxRecord,
+    StateRefPushUnacknowledgedError,
 )
 from foundry_opt.orchestration.candidate_workers import (
     CandidateDesignSubmissionRequest,
@@ -31,6 +32,9 @@ from foundry_opt.orchestration.handoff import (
     TrustedHandoffRequest,
 )
 from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
+from foundry_opt.orchestration.git_state import (
+    is_verified_copilot_git_proxy,
+)
 from foundry_opt.orchestration.steward import (
     GitCampaignInbox,
     StewardAdvanceRequest,
@@ -43,6 +47,35 @@ from foundry_opt.optimization.production import (
 
 
 NOW = datetime(2026, 8, 3, tzinfo=UTC)
+LIVE_COPILOT_ENVIRONMENT = {
+    "GITHUB_ACTIONS": "true",
+    "GITHUB_REPOSITORY": "octo-org/optimizer",
+    "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
+    "COPILOT_AGENT_START_TIME_SEC": "1785872107",
+    "COPILOT_AGENT_TIMEOUT_MIN": "60",
+    "GITHUB_COPILOT_API_TOKEN": "live-fixture-api-token",
+    "GITHUB_COPILOT_ACTION_DOWNLOAD_URL": (
+        "https://example.invalid/copilot-action-download"
+    ),
+}
+
+
+def _set_live_copilot_environment(monkeypatch) -> None:
+    monkeypatch.delenv("COPILOT_AGENT_SESSION_ID", raising=False)
+    monkeypatch.delenv("COPILOT_CLI", raising=False)
+    for name, value in LIVE_COPILOT_ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+
+
+def _set_normal_github_actions_environment(monkeypatch) -> None:
+    for name in (
+        "COPILOT_AGENT_SESSION_ID",
+        "COPILOT_CLI",
+        *LIVE_COPILOT_ENVIRONMENT,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -116,13 +149,7 @@ def test_cloud_steward_persists_one_content_addressed_handoff(
         origin,
         acknowledgement="absent",
     )
-    monkeypatch.setenv(
-        "COPILOT_AGENT_SESSION_ID",
-        "11111111-2222-4333-8444-555555555555",
-    )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    _set_live_copilot_environment(monkeypatch)
     event = CampaignEvent(
         "github-run-1",
         EventKind.ISSUE_CREATED,
@@ -209,6 +236,8 @@ def test_cloud_steward_persists_one_content_addressed_handoff(
     assert "secret" not in handoff.content.decode("utf-8").casefold()
     assert "trace" not in handoff.content.decode("utf-8").casefold()
     assert "dataset_row" not in handoff.content.decode("utf-8").casefold()
+    assert b"live-fixture-api-token" not in handoff.content
+    assert b"copilot-action-download" not in handoff.content
 
     retry = StewardAdvanceService(
         inbox=GitCampaignInbox(),
@@ -227,6 +256,140 @@ def test_cloud_steward_persists_one_content_addressed_handoff(
         ).split()[0]
         == head
     )
+
+
+def test_live_cloud_proxy_push_is_reported_as_unacknowledged(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    proxy = copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    event = CampaignEvent(
+        "github-run-1",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    state = OptimizationCampaign().advance(
+        AdvanceRequest(31, None, (event,))
+    ).state
+
+    with pytest.raises(StateRefPushUnacknowledgedError) as raised:
+        GitStateRef().commit(
+            repository,
+            issue_number=31,
+            expected_revision=None,
+            state=state,
+            inbox=(event,),
+        )
+
+    assert raised.value.proposal is not None
+    assert raised.value.proposal.event_ids == ("github-run-1",)
+    assert proxy.real_revision(
+        "refs/heads/foundry-opt/state/issue-31"
+    ) is None
+
+
+def test_copilot_proxy_rejects_spoofed_marker_subsets(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    assert is_verified_copilot_git_proxy(repository) is True
+
+    for marker in LIVE_COPILOT_ENVIRONMENT:
+        monkeypatch.delenv(marker)
+        assert is_verified_copilot_git_proxy(repository) is False, marker
+        monkeypatch.setenv(marker, LIVE_COPILOT_ENVIRONMENT[marker])
+
+
+def test_copilot_proxy_rejects_malformed_live_markers(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    malformed = (
+        ("GITHUB_ACTIONS", "TRUE"),
+        ("GITHUB_ACTIONS", "false"),
+        ("GITHUB_REPOSITORY", "octo-org/optimizer/extra"),
+        ("GITHUB_REPOSITORY", "octo org/optimizer"),
+        ("COPILOT_AGENT_SOURCE_ENVIRONMENT", "Production"),
+        ("COPILOT_AGENT_SOURCE_ENVIRONMENT", "staging"),
+        ("COPILOT_AGENT_START_TIME_SEC", "0"),
+        ("COPILOT_AGENT_START_TIME_SEC", "1785872107.0"),
+        ("COPILOT_AGENT_START_TIME_SEC", "4102444800"),
+        ("COPILOT_AGENT_TIMEOUT_MIN", "0"),
+        ("COPILOT_AGENT_TIMEOUT_MIN", "60.0"),
+        ("COPILOT_AGENT_TIMEOUT_MIN", "1441"),
+        ("GITHUB_COPILOT_API_TOKEN", ""),
+        ("GITHUB_COPILOT_API_TOKEN", "   "),
+        ("GITHUB_COPILOT_ACTION_DOWNLOAD_URL", ""),
+        ("GITHUB_COPILOT_ACTION_DOWNLOAD_URL", "   "),
+    )
+
+    for name, value in malformed:
+        _set_live_copilot_environment(monkeypatch)
+        monkeypatch.setenv(name, value)
+        assert is_verified_copilot_git_proxy(repository) is False, (
+            name,
+            value,
+        )
+
+
+def test_copilot_proxy_requires_exact_loopback_repository_path(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    remote_url = _git(
+        repository,
+        "config",
+        "--get",
+        "remote.origin.url",
+    )
+    assert is_verified_copilot_git_proxy(repository) is True
+
+    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/other")
+    assert is_verified_copilot_git_proxy(repository) is False
+    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
+
+    invalid_urls = (
+        f"{remote_url}/",
+        re.sub(r":\d+/", "/", remote_url, count=1),
+        re.sub(r":\d+/", ":0/", remote_url, count=1),
+        f"{remote_url}?transport=proxy",
+    )
+    for invalid_url in invalid_urls:
+        _git(repository, "remote", "set-url", "origin", invalid_url)
+        assert is_verified_copilot_git_proxy(repository) is False, (
+            invalid_url
+        )
 
 
 @pytest.mark.parametrize(
@@ -271,13 +434,7 @@ def test_verified_copilot_proxy_always_creates_state_handoff(
         origin,
         acknowledgement=acknowledgement,
     )
-    monkeypatch.setenv(
-        "COPILOT_AGENT_SESSION_ID",
-        "11111111-2222-4333-8444-555555555555",
-    )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    _set_live_copilot_environment(monkeypatch)
 
     result = StewardAdvanceService(
         inbox=GitCampaignInbox(),
@@ -322,7 +479,7 @@ def test_verified_copilot_proxy_always_creates_state_handoff(
     assert handoff.event_ids == ("github-run-2",)
 
     proxy.disable()
-    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    _set_normal_github_actions_environment(monkeypatch)
     applied = HandoffApplyService().apply(
         TrustedHandoffRequest(
             repository_root=repository,
@@ -357,13 +514,8 @@ def test_local_copilot_cli_marker_does_not_enable_cloud_handoff(
         origin,
         acknowledgement="absent",
     )
-    monkeypatch.setenv(
-        "COPILOT_AGENT_SESSION_ID",
-        "11111111-2222-4333-8444-555555555555",
-    )
+    _set_live_copilot_environment(monkeypatch)
     monkeypatch.setenv("COPILOT_CLI", "1")
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     event = CampaignEvent(
         "github-run-1",
         EventKind.ISSUE_CREATED,
@@ -412,13 +564,7 @@ def test_loopback_origin_without_copilot_markers_keeps_conflict_semantics(
         origin,
         acknowledgement="unrelated",
     )
-    for marker in (
-        "COPILOT_AGENT_SESSION_ID",
-        "COPILOT_CLI",
-        "GITHUB_ACTIONS",
-        "GITHUB_REPOSITORY",
-    ):
-        monkeypatch.delenv(marker, raising=False)
+    _set_normal_github_actions_environment(monkeypatch)
 
     result = StewardAdvanceService(
         inbox=GitCampaignInbox(),
@@ -454,13 +600,7 @@ def test_copilot_markers_without_loopback_keep_conflict_semantics(
         acknowledgement="unrelated",
         loopback_origin=False,
     )
-    monkeypatch.setenv(
-        "COPILOT_AGENT_SESSION_ID",
-        "11111111-2222-4333-8444-555555555555",
-    )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    _set_live_copilot_environment(monkeypatch)
 
     result = StewardAdvanceService(
         inbox=GitCampaignInbox(),
@@ -488,13 +628,7 @@ def test_trusted_transport_cas_applies_handoff_once(
         origin,
         acknowledgement="absent",
     )
-    monkeypatch.setenv(
-        "COPILOT_AGENT_SESSION_ID",
-        "11111111-2222-4333-8444-555555555555",
-    )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    _set_live_copilot_environment(monkeypatch)
     event = CampaignEvent(
         "github-run-1",
         EventKind.ISSUE_CREATED,
@@ -541,7 +675,7 @@ def test_trusted_transport_cas_applies_handoff_once(
     assert GitIssueEventInbox(repository).append(31, edited) is True
     proxy.disable()
     (origin / "hooks" / "post-receive").unlink()
-    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    _set_normal_github_actions_environment(monkeypatch)
     request = TrustedHandoffRequest(
         repository_root=repository,
         repository="octo-org/optimizer",
@@ -598,13 +732,7 @@ def test_competing_valid_state_handoff_fails_closed(
         origin,
         acknowledgement="unrelated",
     )
-    monkeypatch.setenv(
-        "COPILOT_AGENT_SESSION_ID",
-        "11111111-2222-4333-8444-555555555555",
-    )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    _set_live_copilot_environment(monkeypatch)
     created = CampaignEvent(
         "github-run-1",
         EventKind.ISSUE_CREATED,
@@ -651,7 +779,7 @@ def test_competing_valid_state_handoff_fails_closed(
     assert GitIssueEventInbox(repository).append(31, edited) is True
     proxy.disable()
     (origin / "hooks" / "post-receive").unlink()
-    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    _set_normal_github_actions_environment(monkeypatch)
     competing_state = OptimizationCampaign().advance(
         AdvanceRequest(31, None, (created, edited))
     ).state
@@ -765,13 +893,7 @@ def test_cloud_candidate_designer_persists_result_handoff(
         origin,
         acknowledgement=acknowledgement,
     )
-    monkeypatch.setenv(
-        "COPILOT_AGENT_SESSION_ID",
-        "11111111-2222-4333-8444-555555555555",
-    )
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
-    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    _set_live_copilot_environment(monkeypatch)
     (repository / "agent" / "instructions.md").write_text(
         "candidate\n",
         encoding="utf-8",
@@ -879,7 +1001,7 @@ def test_cloud_candidate_designer_persists_result_handoff(
         path,
     ).split()[2]
     proxy.disable()
-    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    _set_normal_github_actions_environment(monkeypatch)
     _git(
         repository,
         "push",
