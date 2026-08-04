@@ -52,6 +52,49 @@ def test_issue_creation_starts_steward_specification() -> None:
     assert result.disposition is AdvanceDisposition.ADVANCE
 
 
+def test_terminal_edit_waits_for_explicit_reopen_generation() -> None:
+    campaign = OptimizationCampaign()
+    state = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=2,
+        phase=CampaignPhase.CANCELLED,
+        processed_event_ids=("event-1", "event-2"),
+    )
+
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=state,
+            events=(
+                _event(
+                    "event-3",
+                    EventKind.ISSUE_EDITED,
+                    generation=2,
+                ),
+                _event(
+                    "event-4",
+                    EventKind.ISSUE_CLOSED,
+                    generation=2,
+                ),
+                _event(
+                    "event-5",
+                    EventKind.ISSUE_REOPENED,
+                    generation=3,
+                ),
+            ),
+        )
+    )
+
+    assert result.state.generation == 3
+    assert result.state.phase is CampaignPhase.SPECIFICATION
+    assert result.state.processed_event_ids[-3:] == (
+        "event-3",
+        "event-4",
+        "event-5",
+    )
+
+
 def test_policy_spec_baseline_candidates_and_slate_progress() -> None:
     campaign = OptimizationCampaign()
     state = campaign.advance(
@@ -465,14 +508,24 @@ def test_terminal_campaign_cannot_be_resurrected_by_edit() -> None:
         deployment_version=5,
     )
 
-    with pytest.raises(InvalidCampaignTransition):
-        campaign.advance(
-            AdvanceRequest(
-                issue_number=31,
-                state=completed,
-                events=(_event("event-2", EventKind.ISSUE_EDITED),),
-            )
+    result = campaign.advance(
+        AdvanceRequest(
+            issue_number=31,
+            state=completed,
+            events=(
+                _event(
+                    "event-2",
+                    EventKind.ISSUE_EDITED,
+                    generation=2,
+                ),
+            ),
         )
+    )
+
+    assert result.state.generation == 2
+    assert result.state.phase is CampaignPhase.COMPLETED
+    assert result.state.spec_sha256 == completed.spec_sha256
+    assert result.state.selected_candidate_id == completed.selected_candidate_id
 
 
 def test_issue_closure_preserves_completed_outcome() -> None:

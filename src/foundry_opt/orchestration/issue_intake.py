@@ -71,6 +71,13 @@ _ISSUE_CONTENT_KINDS = frozenset(
         EventKind.ISSUE_REOPENED,
     }
 )
+_TERMINAL_CAMPAIGN_PHASES = frozenset(
+    {
+        CampaignPhase.BLOCKED,
+        CampaignPhase.CANCELLED,
+        CampaignPhase.COMPLETED,
+    }
+)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -213,9 +220,56 @@ class CampaignRecovery(Protocol):
     def should_recover(self, issue_number: int) -> bool: ...
 
 
-class _AllTrackedCampaigns:
+class _TrustedLifecycleCampaignRecovery:
+    def __init__(self, inbox: IssueEventInbox) -> None:
+        self._inbox = inbox
+
     def should_recover(self, issue_number: int) -> bool:
-        return True
+        lifecycle = _trusted_lifecycle_projection(
+            self._inbox.events(issue_number),
+        )
+        return lifecycle is not None and lifecycle.is_active
+
+    def recoverable_issue_numbers(
+        self,
+        issue_numbers: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        projected = tuple(
+            (
+                issue_number,
+                _trusted_lifecycle_projection(
+                    self._inbox.events(issue_number),
+                ),
+            )
+            for issue_number in issue_numbers
+        )
+        return tuple(
+            issue_number
+            for issue_number, lifecycle in projected
+            if lifecycle is not None and lifecycle.is_active
+        )
+
+
+@dataclass(frozen=True)
+class _TrustedIssueLifecycle:
+    generation: int
+    is_active: bool
+    is_declassified: bool
+    reopened_generations: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _RecoveryInspection:
+    issue_number: int
+    events: tuple[CampaignEvent, ...]
+    lifecycle: _TrustedIssueLifecycle | None
+    snapshot: Any
+
+
+@dataclass(frozen=True)
+class CampaignEffectCandidates:
+    transport: tuple[int, ...]
+    persisted: tuple[int, ...]
 
 
 class GitStateCampaignRecovery:
@@ -231,15 +285,143 @@ class GitStateCampaignRecovery:
         self._inbox = inbox
         self._ledger = ledger
 
+    def active_issue_numbers(
+        self,
+        issue_numbers: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        return tuple(
+            inspection.issue_number
+            for inspection in self._inspect_issue_numbers(issue_numbers)
+            if inspection.lifecycle is not None
+            and self._is_active(
+                inspection.lifecycle,
+                inspection.snapshot,
+            )
+        )
+
+    def recoverable_issue_numbers(
+        self,
+        issue_numbers: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        return tuple(
+            inspection.issue_number
+            for inspection in self._inspect_issue_numbers(issue_numbers)
+            if self._should_recover(inspection)
+        )
+
+    def transport_issue_numbers(
+        self,
+        issue_numbers: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        return self.effect_candidates(issue_numbers).transport
+
+    def persisted_effect_issue_numbers(
+        self,
+        issue_numbers: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        return self.effect_candidates(issue_numbers).persisted
+
+    def effect_candidates(
+        self,
+        issue_numbers: tuple[int, ...],
+    ) -> CampaignEffectCandidates:
+        inspections = self._inspect_issue_numbers(issue_numbers)
+        return CampaignEffectCandidates(
+            transport=tuple(
+                inspection.issue_number
+                for inspection in inspections
+                if self._can_reconcile_transport(inspection)
+            ),
+            persisted=tuple(
+                inspection.issue_number
+                for inspection in inspections
+                if self._can_reconcile_persisted_effects(inspection)
+            ),
+        )
+
+    def is_active(self, issue_number: int) -> bool:
+        inspection = self._inspect_issue_numbers((issue_number,))[0]
+        return (
+            inspection.lifecycle is not None
+            and self._is_active(
+                inspection.lifecycle,
+                inspection.snapshot,
+            )
+        )
+
     def should_recover(self, issue_number: int) -> bool:
-        events = self._inbox.events(issue_number)
-        if not events:
+        return self._should_recover(
+            self._inspect_issue_numbers((issue_number,))[0]
+        )
+
+    def can_reconcile_transport(self, issue_number: int) -> bool:
+        return self._can_reconcile_transport(
+            self._inspect_issue_numbers((issue_number,))[0]
+        )
+
+    def can_reconcile_persisted_effects(
+        self,
+        issue_number: int,
+    ) -> bool:
+        return self._can_reconcile_persisted_effects(
+            self._inspect_issue_numbers((issue_number,))[0]
+        )
+
+    def can_dispatch_deployment(self, issue_number: int) -> bool:
+        inspection = self._inspect_issue_numbers((issue_number,))[0]
+        return (
+            self._has_current_state(inspection)
+            and inspection.lifecycle.is_active
+            and inspection.snapshot.state.phase
+            is CampaignPhase.DEPLOYMENT
+        )
+
+    def _inspect_issue_numbers(
+        self,
+        issue_numbers: tuple[int, ...],
+    ) -> tuple[_RecoveryInspection, ...]:
+        projected = tuple(
+            (
+                issue_number,
+                events,
+                _trusted_lifecycle_projection(events),
+            )
+            for issue_number in issue_numbers
+            for events in (self._inbox.events(issue_number),)
+        )
+        return tuple(
+            _RecoveryInspection(
+                issue_number=issue_number,
+                events=events,
+                lifecycle=lifecycle,
+                snapshot=(
+                    self._ledger.load(self._root, issue_number)
+                    if lifecycle is not None
+                    else None
+                ),
+            )
+            for issue_number, events, lifecycle in projected
+        )
+
+    def _should_recover(
+        self,
+        inspection: _RecoveryInspection,
+    ) -> bool:
+        lifecycle = inspection.lifecycle
+        snapshot = inspection.snapshot
+        if lifecycle is None or not lifecycle.is_active:
             return False
-        snapshot = self._ledger.load(self._root, issue_number)
+        if not self._is_active(lifecycle, snapshot):
+            return False
         if snapshot is None:
             return True
+        if lifecycle.generation > snapshot.state.generation:
+            return True
         consumed = {event.event_id for event in snapshot.inbox}
-        if any(event.event_id not in consumed for event in events):
+        if any(
+            event.event_id not in consumed
+            for event in inspection.events
+        ):
             return True
         from foundry_opt.orchestration.transport import (
             awaiting_specialist_result,
@@ -247,11 +429,71 @@ class GitStateCampaignRecovery:
 
         if awaiting_specialist_result(snapshot):
             return False
-        return snapshot.state.phase not in {
-            CampaignPhase.BLOCKED,
-            CampaignPhase.CANCELLED,
-            CampaignPhase.COMPLETED,
-        }
+        return snapshot.state.phase not in _TERMINAL_CAMPAIGN_PHASES
+
+    @staticmethod
+    def _can_reconcile_transport(
+        inspection: _RecoveryInspection,
+    ) -> bool:
+        return (
+            GitStateCampaignRecovery._has_current_state(inspection)
+            and inspection.lifecycle.is_active
+            and inspection.snapshot.state.phase
+            not in _TERMINAL_CAMPAIGN_PHASES
+        )
+
+    @staticmethod
+    def _can_reconcile_persisted_effects(
+        inspection: _RecoveryInspection,
+    ) -> bool:
+        lifecycle = inspection.lifecycle
+        snapshot = inspection.snapshot
+        if lifecycle is None or snapshot is None:
+            return False
+        if snapshot.state.phase is CampaignPhase.COMPLETED:
+            return (
+                snapshot.state.generation <= lifecycle.generation
+                and not lifecycle.is_declassified
+                and not any(
+                    generation > snapshot.state.generation
+                    for generation in lifecycle.reopened_generations
+                )
+            )
+        return (
+            snapshot.state.phase is not CampaignPhase.CANCELLED
+            and lifecycle.is_active
+            and snapshot.state.generation == lifecycle.generation
+        )
+
+    @staticmethod
+    def _has_current_state(
+        inspection: _RecoveryInspection,
+    ) -> bool:
+        lifecycle = inspection.lifecycle
+        snapshot = inspection.snapshot
+        return (
+            lifecycle is not None
+            and snapshot is not None
+            and snapshot.state.generation == lifecycle.generation
+        )
+
+    @staticmethod
+    def _is_active(
+        lifecycle: _TrustedIssueLifecycle,
+        snapshot: Any,
+    ) -> bool:
+        if not lifecycle.is_active:
+            return False
+        if snapshot is None:
+            return True
+        if snapshot.state.generation > lifecycle.generation:
+            return False
+        if snapshot.state.phase not in _TERMINAL_CAMPAIGN_PHASES:
+            return True
+        return any(
+            generation > snapshot.state.generation
+            for generation in lifecycle.reopened_generations
+        )
 
 
 class IssueEventIntake:
@@ -268,7 +510,9 @@ class IssueEventIntake:
         self._inbox = inbox
         self._assignments = assignments
         self._projection = projection
-        self._recovery = recovery or _AllTrackedCampaigns()
+        self._recovery = recovery or _TrustedLifecycleCampaignRecovery(
+            inbox
+        )
 
     def ingest(
         self,
@@ -379,13 +623,28 @@ class IssueEventIntake:
             raise TrustedIssueEventError(
                 "recovery issue number is not tracked"
             )
+        recoverable_issue_numbers = getattr(
+            self._recovery,
+            "recoverable_issue_numbers",
+            None,
+        )
+        if callable(recoverable_issue_numbers):
+            selected = recoverable_issue_numbers(selected)
+        else:
+            loaded = tuple(
+                (issue_number, self._inbox.events(issue_number))
+                for issue_number in selected
+            )
+            selected = tuple(
+                issue_number
+                for issue_number, events in loaded
+                if events
+                and self._recovery.should_recover(issue_number)
+            )
         for issue_number in selected:
-            events = self._inbox.events(issue_number)
-            if not events:
+            if self._assignments.has_live_lease(issue_number):
                 continue
             if not self._recovery.should_recover(issue_number):
-                continue
-            if self._assignments.has_live_lease(issue_number):
                 continue
             self._assignments.assign(
                 issue_number,
@@ -1480,6 +1739,56 @@ def _generation(
     return latest.generation + 1
 
 
+def _trusted_lifecycle_projection(
+    events: tuple[CampaignEvent, ...],
+) -> _TrustedIssueLifecycle | None:
+    if not events:
+        return None
+    if len({event.event_id for event in events}) != len(events):
+        raise IssueInboxError("inbox event IDs are not unique")
+    _validate_transport_sequence(events)
+    lifecycle_events = tuple(
+        event
+        for event in events
+        if event.kind in _ISSUE_EVENT_KINDS
+    )
+    if not lifecycle_events:
+        return None
+    if any(
+        current.occurred_at < previous.occurred_at
+        for previous, current in zip(
+            lifecycle_events,
+            lifecycle_events[1:],
+            strict=False,
+        )
+    ):
+        raise IssueInboxError("inbox lifecycle events are reordered")
+    is_active = False
+    is_declassified = False
+    for event in lifecycle_events:
+        if event.kind in {
+            EventKind.ISSUE_CREATED,
+            EventKind.ISSUE_REOPENED,
+        }:
+            is_active = True
+            is_declassified = False
+        elif event.kind is EventKind.ISSUE_DECLASSIFIED:
+            is_active = False
+            is_declassified = True
+        elif event.kind is EventKind.ISSUE_CLOSED:
+            is_active = False
+    return _TrustedIssueLifecycle(
+        generation=lifecycle_events[-1].generation,
+        is_active=is_active,
+        is_declassified=is_declassified,
+        reopened_generations=tuple(
+            event.generation
+            for event in lifecycle_events
+            if event.kind is EventKind.ISSUE_REOPENED
+        ),
+    )
+
+
 def _event_kind(
     action: str,
     title: str,
@@ -1848,11 +2157,12 @@ def main() -> None:
 
     ledger = GitStateRef()
     deferred_projection = _DeferredProjection()
+    recovery = GitStateCampaignRecovery(root, inbox, ledger)
     intake = IssueEventIntake(
         inbox,
         assignments,
         deferred_projection,
-        recovery=GitStateCampaignRecovery(root, inbox, ledger),
+        recovery=recovery,
     )
     run_id = _required_environment("TRUSTED_RUN_ID")
     _identifier(run_id, "trusted run ID")
@@ -1869,16 +2179,26 @@ def main() -> None:
             state_ref=os.environ.get("TRUSTED_STATE_REF"),
             tracked=inbox.issue_numbers(),
         )
-        for issue_number in issue_numbers:
-            transport = reconcile_github_transport_effects(
-                root,
-                issue_number,
-                commands,
-                repository,
-                assignment_token=assignment_token,
-            )
-            if transport.release_steward:
-                assignments.release(issue_number)
+        effect_candidates = recovery.effect_candidates(issue_numbers)
+        transport_issue_numbers = frozenset(effect_candidates.transport)
+        for issue_number in effect_candidates.persisted:
+            if (
+                issue_number in transport_issue_numbers
+                and recovery.can_reconcile_transport(issue_number)
+            ):
+                transport = reconcile_github_transport_effects(
+                    root,
+                    issue_number,
+                    commands,
+                    repository,
+                    assignment_token=assignment_token,
+                )
+                if transport.release_steward:
+                    assignments.release(issue_number)
+            if not recovery.can_reconcile_persisted_effects(
+                issue_number
+            ):
+                continue
             reconcile_deployment_cleanup_effects(
                 root,
                 issue_number,

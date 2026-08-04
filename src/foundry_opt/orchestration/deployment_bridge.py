@@ -29,6 +29,7 @@ from foundry_opt.orchestration.deployment import (
     deployment_workflow_intent,
 )
 from foundry_opt.orchestration.git_state import GitStateRef, OutboxRecord
+from foundry_opt.orchestration.models import CampaignPhase
 from foundry_opt.preflight.interfaces import CommandRunner
 
 
@@ -219,6 +220,18 @@ def reconcile_deployment_workflow_effects(
     issue_number: int,
     commands: CommandRunner,
 ) -> DeploymentBridgeReconcileResult:
+    from foundry_opt.orchestration.issue_intake import (
+        GitIssueEventInbox,
+        GitStateCampaignRecovery,
+    )
+
+    recovery = GitStateCampaignRecovery(
+        repository_root,
+        GitIssueEventInbox(repository_root),
+        GitStateRef(),
+    )
+    if not recovery.can_dispatch_deployment(issue_number):
+        return DeploymentBridgeReconcileResult(issue_number, ())
     ledger = GitStateRef()
     snapshot = ledger.load(repository_root, issue_number)
     if snapshot is None:
@@ -252,7 +265,10 @@ def reconcile_deployment_workflow_effects(
         else None
     )
     results: list[DeploymentBridgeResult] = []
-    if active is not None:
+    if (
+        active is not None
+        and recovery.can_dispatch_deployment(issue_number)
+    ):
         result = bridge.apply(active)
         results.append(result)
         if result.result is not None:
@@ -275,14 +291,28 @@ def reconcile_deployment_cleanup_effects(
     snapshot = GitStateRef().load(repository_root, issue_number)
     if snapshot is None:
         return DeploymentBridgeReconcileResult(issue_number, ())
-    cleanup_records = tuple(
+    cleanup_kinds = {kind.value for kind in DeploymentCleanupKind}
+    eligible_records = tuple(
         record
         for record in snapshot.outbox
         if (
-            record.generation == snapshot.state.generation
+            record.generation <= snapshot.state.generation
             and record.payload.get("effect_id") == record.record_id
-            and record.kind in {kind.value for kind in DeploymentCleanupKind}
+            and record.kind in cleanup_kinds
         )
+    )
+    cleanup_generation = snapshot.state.generation
+    if (
+        snapshot.state.phase is CampaignPhase.COMPLETED
+        and eligible_records
+    ):
+        cleanup_generation = max(
+            record.generation for record in eligible_records
+        )
+    cleanup_records = tuple(
+        record
+        for record in eligible_records
+        if record.generation == cleanup_generation
     )
     if cleanup_records:
         cleanup_gateway = GhDeploymentCleanupGateway(

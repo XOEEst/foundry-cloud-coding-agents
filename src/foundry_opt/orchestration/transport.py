@@ -15,12 +15,20 @@ from foundry_opt.orchestration.git_state import (
     StateRefError,
     StateRefSnapshot,
 )
+from foundry_opt.orchestration.models import CampaignPhase
 from foundry_opt.preflight.interfaces import CommandRunner
 
 
 _REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
+)
+_TERMINAL_PHASES = frozenset(
+    {
+        CampaignPhase.BLOCKED,
+        CampaignPhase.CANCELLED,
+        CampaignPhase.COMPLETED,
+    }
 )
 
 
@@ -577,10 +585,7 @@ class TransportEffectReconciler:
             if (
                 record.kind == "specialist_work_request"
                 and record.record_id not in acknowledged
-                and (
-                    record.generation == snapshot.state.generation
-                    or record.record_id in claimed
-                )
+                and record.generation == snapshot.state.generation
             )
         )
         statuses: list[SpecialistWorkBridgeStatus] = []
@@ -594,6 +599,12 @@ class TransportEffectReconciler:
                     record,
                     "specialist_work_claimed",
                 )
+            ):
+                continue
+            if not self._is_current_active_record(
+                repository_root,
+                issue_number,
+                record,
             ):
                 continue
             applied = self._specialist.apply(record)
@@ -646,10 +657,7 @@ class TransportEffectReconciler:
                 if (
                     record.kind == "applier_worker_issue_planned"
                     and record.record_id not in candidate_acknowledged
-                    and (
-                        record.generation == snapshot.state.generation
-                        or record.record_id in candidate_claimed
-                    )
+                    and record.generation == snapshot.state.generation
                 )
             )
             candidate_recorder = CandidateEffectResultRecorder(
@@ -664,6 +672,12 @@ class TransportEffectReconciler:
                         record,
                         "applier_worker_issue_claimed",
                     )
+                ):
+                    continue
+                if not self._is_current_active_record(
+                    repository_root,
+                    issue_number,
+                    record,
                 ):
                     continue
                 applied = self._applier.apply(record)
@@ -716,6 +730,11 @@ class TransportEffectReconciler:
         snapshot = self._ledger.load(repository_root, issue_number)
         if snapshot is None:
             return False
+        if (
+            record.generation != snapshot.state.generation
+            or snapshot.state.phase in _TERMINAL_PHASES
+        ):
+            return False
         claim_id = f"{record.record_id}-claimed"
         existing = tuple(
             item
@@ -729,8 +748,6 @@ class TransportEffectReconciler:
                 and existing[0].payload.get("effect_id")
                 == record.record_id
             )
-        if record.generation != snapshot.state.generation:
-            return False
         claim = OutboxRecord(
             record_id=claim_id,
             kind=kind,
@@ -754,6 +771,19 @@ class TransportEffectReconciler:
         except (StateRefError, TypeError, ValueError):
             return False
         return True
+
+    def _is_current_active_record(
+        self,
+        repository_root: Path,
+        issue_number: int,
+        record: OutboxRecord,
+    ) -> bool:
+        snapshot = self._ledger.load(repository_root, issue_number)
+        return (
+            snapshot is not None
+            and record.generation == snapshot.state.generation
+            and snapshot.state.phase not in _TERMINAL_PHASES
+        )
 
 
 def reconcile_github_transport_effects(

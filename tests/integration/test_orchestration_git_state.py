@@ -26,7 +26,11 @@ from foundry_opt.orchestration import (
     StateRefPushUnacknowledgedError,
     StateObject,
 )
-from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
+from foundry_opt.orchestration.issue_intake import (
+    GitIssueEventInbox,
+    GitStateCampaignRecovery,
+    IssueEventIntake,
+)
 
 
 NOW = datetime(2026, 7, 31, tzinfo=UTC)
@@ -765,6 +769,89 @@ def test_issue_event_inbox_appends_idempotent_transport_events(
 
     assert inbox.events(31) == (opened, edited)
     assert inbox.issue_numbers() == (31,)
+
+
+def test_scheduled_recovery_uses_inbox_lifecycle_before_missing_state(
+    tmp_path: Path,
+) -> None:
+    repository, _ = _repository(tmp_path)
+    inbox = GitIssueEventInbox(repository)
+    for issue_number in (31, 32, 33, 40):
+        inbox.append(
+            issue_number,
+            _event(
+                f"github-opened-{issue_number}",
+                EventKind.ISSUE_CREATED,
+            ),
+        )
+    for issue_number in (31, 32, 33):
+        inbox.append(
+            issue_number,
+            _event(
+                f"github-closed-{issue_number}",
+                EventKind.ISSUE_CLOSED,
+            ),
+        )
+
+    class Assignments:
+        def __init__(self) -> None:
+            self.assigned: list[tuple[int, str]] = []
+            self.live_leases: set[int] = set()
+
+        def has_live_lease(self, issue_number: int) -> bool:
+            return issue_number in self.live_leases
+
+        def assign(self, issue_number: int, idempotency_key: str) -> bool:
+            self.assigned.append((issue_number, idempotency_key))
+            self.live_leases.add(issue_number)
+            return True
+
+        def release(self, issue_number: int) -> None:
+            self.live_leases.discard(issue_number)
+
+    class Projection:
+        def __init__(self) -> None:
+            self.projected: list[int] = []
+
+        def project(self, issue_number: int) -> None:
+            self.projected.append(issue_number)
+
+    assignments = Assignments()
+    projection = Projection()
+    recovery = GitStateCampaignRecovery(
+        repository,
+        inbox,
+        GitStateRef(),
+    )
+    intake = IssueEventIntake(
+        inbox,
+        assignments,
+        projection,
+        recovery=recovery,
+    )
+
+    intake.recover("schedule-closed")
+
+    assert assignments.assigned == [
+        (40, "schedule-closed-issue-40")
+    ]
+    assert projection.projected == [40]
+
+    inbox.append(
+        31,
+        _event(
+            "github-reopened-31",
+            EventKind.ISSUE_REOPENED,
+            generation=2,
+        ),
+    )
+    intake.recover("schedule-reopened")
+
+    assert assignments.assigned == [
+        (40, "schedule-closed-issue-40"),
+        (31, "schedule-reopened-issue-31"),
+    ]
+    assert projection.projected == [40, 31]
 
 
 def test_issue_event_inbox_durably_accepts_reordered_candidate_pr_events(

@@ -452,32 +452,47 @@ class StewardAdvanceService:
             )
 
         status = _status(disposition)
-        dashboard_payload: dict[str, object] = {
-            "disposition": disposition.value,
-            "issue_number": request.issue_number,
-            "phase": state.phase.value,
-            "status": status.value,
-        }
-        if policy_decision is not None:
-            dashboard_payload.update(policy_decision.dashboard_payload)
-        dashboard = OutboxRecord(
-            record_id=_outbox_id(
-                state,
-                tuple(pending),
-                extra=tuple(
-                    record.record_id for record in intent_outbox
-                ),
-            ),
-            kind=(
-                "campaign_waiting"
-                if disposition is AdvanceDisposition.WAIT
-                else "campaign_advanced"
-            ),
-            generation=state.generation,
-            sequence=state.sequence,
-            payload=dashboard_payload,
+        preserve_terminal_projection = (
+            snapshot is not None
+            and bool(pending)
+            and not intent_outbox
+            and state.phase is snapshot.state.phase
+            and state.phase
+            in {
+                CampaignPhase.BLOCKED,
+                CampaignPhase.CANCELLED,
+                CampaignPhase.COMPLETED,
+            }
         )
-        outbox = (dashboard, *intent_outbox)
+        if preserve_terminal_projection:
+            outbox = ()
+        else:
+            dashboard_payload: dict[str, object] = {
+                "disposition": disposition.value,
+                "issue_number": request.issue_number,
+                "phase": state.phase.value,
+                "status": status.value,
+            }
+            if policy_decision is not None:
+                dashboard_payload.update(policy_decision.dashboard_payload)
+            dashboard = OutboxRecord(
+                record_id=_outbox_id(
+                    state,
+                    tuple(pending),
+                    extra=tuple(
+                        record.record_id for record in intent_outbox
+                    ),
+                ),
+                kind=(
+                    "campaign_waiting"
+                    if disposition is AdvanceDisposition.WAIT
+                    else "campaign_advanced"
+                ),
+                generation=state.generation,
+                sequence=state.sequence,
+                payload=dashboard_payload,
+            )
+            outbox = (dashboard, *intent_outbox)
         try:
             persisted = self._ledger.commit(
                 request.repository_root,

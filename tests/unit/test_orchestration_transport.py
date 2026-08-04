@@ -475,3 +475,66 @@ def test_claimed_specialist_effect_is_acknowledged_after_supersession() -> None:
         record.kind == "specialist_work_succeeded"
         for record in ledger.snapshot.outbox
     )
+
+
+def test_claimed_prior_generation_work_is_not_replayed_after_reopen() -> None:
+    planned = _planned()
+    claimed = OutboxRecord(
+        "spec-planner-2-immutable-asset-claimed",
+        "specialist_work_claimed",
+        GENERATION,
+        4,
+        {"effect_id": planned.record_id},
+    )
+    ledger = Ledger(planned)
+    ledger.snapshot = replace(
+        ledger.snapshot,
+        state=CampaignState(
+            issue_number=ISSUE,
+            generation=GENERATION + 1,
+            sequence=5,
+            phase=CampaignPhase.SPECIFICATION,
+        ),
+        outbox=(planned, claimed),
+    )
+    gateway = Gateway()
+
+    result = TransportEffectReconciler(
+        ledger=ledger,
+        specialist=SpecialistWorkBridge(gateway),
+    ).reconcile(Path("."), ISSUE)
+
+    assert result.specialist_statuses == ()
+    assert gateway.assigned == []
+
+
+def test_transport_revalidates_phase_before_specialist_side_effect() -> None:
+    planned = _planned()
+
+    class CancellingLedger(Ledger):
+        def __init__(self, record: OutboxRecord) -> None:
+            super().__init__(record)
+            self.loads = 0
+
+        def load(self, repository_root: Path, issue_number: int):
+            self.loads += 1
+            if self.loads >= 2:
+                self.snapshot = replace(
+                    self.snapshot,
+                    state=replace(
+                        self.snapshot.state,
+                        phase=CampaignPhase.CANCELLED,
+                    ),
+                )
+            return self.snapshot
+
+    ledger = CancellingLedger(planned)
+    gateway = Gateway()
+
+    result = TransportEffectReconciler(
+        ledger=ledger,
+        specialist=SpecialistWorkBridge(gateway),
+    ).reconcile(Path("."), ISSUE)
+
+    assert result.specialist_statuses == ()
+    assert gateway.assigned == []

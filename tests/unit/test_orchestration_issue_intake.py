@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from foundry_opt.orchestration import (
     CampaignEvent,
     CampaignPhase,
     CampaignState,
+    CandidateRecord,
     EventKind,
     OptimizationCampaign,
     OutboxRecord,
@@ -20,6 +22,7 @@ from foundry_opt.orchestration import (
 from foundry_opt.orchestration.issue_intake import (
     GhStewardAssignments,
     GitStateCampaignRecovery,
+    IssueInboxError,
     IssueInboxConcurrencyError,
     IssueEventIntake,
     recovery_issue_numbers,
@@ -484,7 +487,7 @@ def test_untrusted_issue_events_fail_closed(payload, context, message) -> None:
         intake.ingest(payload, context)
 
 
-def test_scheduled_recovery_reassigns_open_and_unconsumed_cancellation() -> None:
+def test_scheduled_recovery_default_skips_closed_trusted_lifecycle() -> None:
     inbox = FakeInbox()
     assignments = FakeAssignments()
     projection = FakeProjection()
@@ -512,11 +515,8 @@ def test_scheduled_recovery_reassigns_open_and_unconsumed_cancellation() -> None
 
     intake.recover("schedule-9001")
 
-    assert assignments.assigned == [
-        (31, "schedule-9001-issue-31"),
-        (32, "schedule-9001-issue-32"),
-    ]
-    assert projection.projected == [31, 32]
+    assert assignments.assigned == [(31, "schedule-9001-issue-31")]
+    assert projection.projected == [31]
 
 
 def test_scheduled_recovery_skips_terminal_campaigns_and_live_leases() -> None:
@@ -536,7 +536,665 @@ def test_scheduled_recovery_skips_terminal_campaigns_and_live_leases() -> None:
     assert projection.projected == [31]
 
 
+def test_scheduled_recovery_skips_closed_missing_state_until_reopened() -> None:
+    created = CampaignEvent(
+        event_id="github-opened",
+        kind=EventKind.ISSUE_CREATED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    closed = CampaignEvent(
+        event_id="github-closed",
+        kind=EventKind.ISSUE_CLOSED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    reopened = CampaignEvent(
+        event_id="github-reopened",
+        kind=EventKind.ISSUE_REOPENED,
+        generation=2,
+        occurred_at=datetime(2026, 8, 3, tzinfo=UTC),
+    )
+    inbox = FakeInbox(recorded={31: [created, closed]})
+
+    class Ledger:
+        snapshot = None
+
+        def load(self, repository_root: Path, issue_number: int):
+            return self.snapshot
+
+    ledger = Ledger()
+    assignments = FakeAssignments()
+    projection = FakeProjection()
+    intake = IssueEventIntake(
+        inbox,
+        assignments,
+        projection,
+        recovery=GitStateCampaignRecovery(
+            Path("."),
+            inbox,
+            ledger,
+        ),
+    )
+
+    intake.recover("schedule-closed")
+
+    assert assignments.assigned == []
+    assert projection.projected == []
+
+    ledger.snapshot = StateRefSnapshot(
+        revision="a" * 40,
+        state=CampaignState(
+            issue_number=31,
+            generation=1,
+            sequence=1,
+            phase=CampaignPhase.SPECIFICATION,
+            schema_version=1,
+            processed_event_ids=(created.event_id,),
+        ),
+        inbox=(created,),
+        outbox=(),
+    )
+    intake.recover("schedule-stale-state")
+
+    assert assignments.assigned == []
+    assert projection.projected == []
+
+    inbox.recorded[31].append(reopened)
+    intake.recover("schedule-reopened")
+
+    assert assignments.assigned == [
+        (31, "schedule-reopened-issue-31")
+    ]
+    assert projection.projected == [31]
+
+    assignments.live_leases.add(31)
+    intake.recover("schedule-reopened-again")
+
+    assert assignments.assigned == [
+        (31, "schedule-reopened-issue-31")
+    ]
+    assert projection.projected == [31]
+
+
+def test_recovery_enumerates_only_trusted_active_issue_refs() -> None:
+    def lifecycle(issue_number: int, *, closed: bool):
+        created = CampaignEvent(
+            event_id=f"github-opened-{issue_number}",
+            kind=EventKind.ISSUE_CREATED,
+            generation=1,
+            occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+        if not closed:
+            return [created]
+        return [
+            created,
+            CampaignEvent(
+                event_id=f"github-closed-{issue_number}",
+                kind=EventKind.ISSUE_CLOSED,
+                generation=1,
+                occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+            ),
+        ]
+
+    order: list[str] = []
+
+    class OrderedInbox(FakeInbox):
+        def events(self, issue_number: int):
+            order.append(f"inbox-{issue_number}")
+            return super().events(issue_number)
+
+    inbox = OrderedInbox(
+        recorded={
+            31: lifecycle(31, closed=True),
+            32: lifecycle(32, closed=True),
+            33: lifecycle(33, closed=True),
+            34: [
+                *lifecycle(34, closed=False),
+                CampaignEvent(
+                    event_id="github-declassified-34",
+                    kind=EventKind.ISSUE_DECLASSIFIED,
+                    generation=1,
+                    occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+                ),
+            ],
+            40: lifecycle(40, closed=False),
+        }
+    )
+
+    class MissingLedger:
+        def __init__(self) -> None:
+            self.loaded: list[int] = []
+
+        def load(self, repository_root: Path, issue_number: int):
+            self.loaded.append(issue_number)
+            order.append(f"state-{issue_number}")
+            return None
+
+    ledger = MissingLedger()
+    recovery = GitStateCampaignRecovery(Path("."), inbox, ledger)
+
+    assert recovery.active_issue_numbers((31, 32, 33, 34, 40)) == (40,)
+    assert ledger.loaded == [31, 32, 33, 34, 40]
+    assert order == [
+        "inbox-31",
+        "inbox-32",
+        "inbox-33",
+        "inbox-34",
+        "inbox-40",
+        "state-31",
+        "state-32",
+        "state-33",
+        "state-34",
+        "state-40",
+    ]
+
+
+def test_declassified_issue_requires_close_and_reopen_to_resume() -> None:
+    created = CampaignEvent(
+        event_id="github-opened",
+        kind=EventKind.ISSUE_CREATED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    declassified = CampaignEvent(
+        event_id="github-declassified",
+        kind=EventKind.ISSUE_DECLASSIFIED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    edited = CampaignEvent(
+        event_id="github-edited",
+        kind=EventKind.ISSUE_EDITED,
+        generation=2,
+        occurred_at=datetime(2026, 8, 3, tzinfo=UTC),
+    )
+    closed = CampaignEvent(
+        event_id="github-closed",
+        kind=EventKind.ISSUE_CLOSED,
+        generation=2,
+        occurred_at=datetime(2026, 8, 4, tzinfo=UTC),
+    )
+    reopened = CampaignEvent(
+        event_id="github-reopened",
+        kind=EventKind.ISSUE_REOPENED,
+        generation=3,
+        occurred_at=datetime(2026, 8, 5, tzinfo=UTC),
+    )
+    inbox = FakeInbox(recorded={31: [created, declassified, edited]})
+
+    class MissingLedger:
+        def load(self, repository_root: Path, issue_number: int):
+            return None
+
+    recovery = GitStateCampaignRecovery(
+        Path("."),
+        inbox,
+        MissingLedger(),
+    )
+
+    assert recovery.active_issue_numbers((31,)) == ()
+
+    inbox.recorded[31].extend((closed, reopened))
+
+    assert recovery.active_issue_numbers((31,)) == (31,)
+
+
+def test_completed_effects_survive_inert_edit_until_explicit_reopen() -> None:
+    created = CampaignEvent(
+        event_id="github-opened",
+        kind=EventKind.ISSUE_CREATED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    edited = CampaignEvent(
+        event_id="github-edited",
+        kind=EventKind.ISSUE_EDITED,
+        generation=2,
+        occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    closed = CampaignEvent(
+        event_id="github-closed",
+        kind=EventKind.ISSUE_CLOSED,
+        generation=2,
+        occurred_at=datetime(2026, 8, 3, tzinfo=UTC),
+    )
+    reopened = CampaignEvent(
+        event_id="github-reopened",
+        kind=EventKind.ISSUE_REOPENED,
+        generation=3,
+        occurred_at=datetime(2026, 8, 4, tzinfo=UTC),
+    )
+    inbox = FakeInbox(recorded={31: [created, edited]})
+
+    class Ledger:
+        def load(self, repository_root: Path, issue_number: int):
+            return StateRefSnapshot(
+                revision="a" * 40,
+                state=CampaignState(
+                    issue_number=31,
+                    generation=1,
+                    sequence=9,
+                    phase=CampaignPhase.COMPLETED,
+                    processed_event_ids=(created.event_id,),
+                    spec_sha256="a" * 64,
+                    baseline_evaluation_id="eval-baseline",
+                    candidates=(
+                        CandidateRecord(
+                            "candidate-1",
+                            True,
+                            "b" * 64,
+                        ),
+                    ),
+                    selected_candidate_id="candidate-1",
+                    merge_commit="c" * 40,
+                    deployment_version=2,
+                ),
+                inbox=(created,),
+                outbox=(),
+            )
+
+    recovery = GitStateCampaignRecovery(Path("."), inbox, Ledger())
+
+    assert recovery.effect_candidates((31,)).persisted == (31,)
+
+    inbox.recorded[31].extend((closed, reopened))
+
+    assert recovery.effect_candidates((31,)).persisted == ()
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_reopened_issue_resumes_after_terminal_state_generation(
+    schema_version: int,
+) -> None:
+    created = CampaignEvent(
+        event_id="github-opened",
+        kind=EventKind.ISSUE_CREATED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    closed = CampaignEvent(
+        event_id="github-closed",
+        kind=EventKind.ISSUE_CLOSED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    reopened = CampaignEvent(
+        event_id="github-reopened",
+        kind=EventKind.ISSUE_REOPENED,
+        generation=2,
+        occurred_at=datetime(2026, 8, 3, tzinfo=UTC),
+    )
+    inbox = FakeInbox(recorded={31: [created, closed, reopened]})
+
+    class Ledger:
+        def load(self, repository_root: Path, issue_number: int):
+            return StateRefSnapshot(
+                revision="a" * 40,
+                state=CampaignState(
+                    issue_number=31,
+                    generation=1,
+                    sequence=2,
+                    phase=CampaignPhase.CANCELLED,
+                    schema_version=schema_version,
+                    processed_event_ids=(
+                        created.event_id,
+                        closed.event_id,
+                    ),
+                ),
+                inbox=(created, closed, reopened),
+                outbox=(),
+            )
+
+    recovery = GitStateCampaignRecovery(Path("."), inbox, Ledger())
+
+    assert recovery.is_active(31) is True
+    assert recovery.should_recover(31) is True
+
+
+def test_corrupt_inbox_fails_closed_before_any_recovery_assignment() -> None:
+    created = CampaignEvent(
+        event_id="github-opened",
+        kind=EventKind.ISSUE_CREATED,
+        generation=1,
+        occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    class CorruptInbox(FakeInbox):
+        def events(self, issue_number: int):
+            if issue_number == 32:
+                raise IssueInboxError("inbox event sequence is invalid")
+            return super().events(issue_number)
+
+    inbox = CorruptInbox(recorded={31: [created], 32: [created]})
+
+    class MissingLedger:
+        def load(self, repository_root: Path, issue_number: int):
+            return None
+
+    assignments = FakeAssignments()
+    intake = IssueEventIntake(
+        inbox,
+        assignments,
+        FakeProjection(),
+        recovery=GitStateCampaignRecovery(
+            Path("."),
+            inbox,
+            MissingLedger(),
+        ),
+    )
+
+    with pytest.raises(IssueInboxError, match="sequence"):
+        intake.recover("schedule-corrupt")
+
+    assert assignments.assigned == []
+
+
+def test_recovery_revalidates_lifecycle_after_lease_check() -> None:
+    inbox = FakeInbox(recorded={31: [object()]})
+
+    class ClosingRecovery:
+        def recoverable_issue_numbers(self, issue_numbers):
+            return (31,)
+
+        def should_recover(self, issue_number: int) -> bool:
+            return False
+
+    assignments = FakeAssignments()
+    IssueEventIntake(
+        inbox,
+        assignments,
+        FakeProjection(),
+        recovery=ClosingRecovery(),
+    ).recover("schedule-race")
+
+    assert assignments.assigned == []
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        (
+            CampaignEvent(
+                event_id="github-duplicate",
+                kind=EventKind.ISSUE_CREATED,
+                generation=1,
+                occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+            ),
+            CampaignEvent(
+                event_id="github-duplicate",
+                kind=EventKind.ISSUE_CREATED,
+                generation=1,
+                occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+            ),
+        ),
+        (
+            CampaignEvent(
+                event_id="github-opened",
+                kind=EventKind.ISSUE_CREATED,
+                generation=1,
+                occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+            ),
+            CampaignEvent(
+                event_id="github-edited",
+                kind=EventKind.ISSUE_EDITED,
+                generation=2,
+                occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+            ),
+        ),
+        (
+            CampaignEvent(
+                event_id="github-opened",
+                kind=EventKind.ISSUE_CREATED,
+                generation=1,
+                occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+            ),
+            CampaignEvent(
+                event_id="github-reopened",
+                kind=EventKind.ISSUE_REOPENED,
+                generation=2,
+                occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+            ),
+        ),
+    ],
+)
+def test_recovery_rejects_duplicate_or_reordered_lifecycle_events(
+    events: tuple[CampaignEvent, ...],
+) -> None:
+    inbox = FakeInbox(recorded={31: list(events)})
+
+    class MissingLedger:
+        def __init__(self) -> None:
+            self.loaded = False
+
+        def load(self, repository_root: Path, issue_number: int):
+            self.loaded = True
+            return None
+
+    ledger = MissingLedger()
+    recovery = GitStateCampaignRecovery(Path("."), inbox, ledger)
+
+    with pytest.raises(IssueInboxError):
+        recovery.active_issue_numbers((31,))
+
+    assert ledger.loaded is False
+
+
+def test_scheduled_transport_reconciles_only_trusted_active_lifecycle(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import foundry_opt.orchestration.deployment_bridge as deployment_bridge
+    import foundry_opt.orchestration.git_state as git_state
+    import foundry_opt.orchestration.issue_intake as issue_intake
+    import foundry_opt.orchestration.projection as projection
+    import foundry_opt.orchestration.transport as transport
+
+    def lifecycle(issue_number: int, *, closed: bool):
+        events = [
+            CampaignEvent(
+                event_id=f"github-opened-{issue_number}",
+                kind=EventKind.ISSUE_CREATED,
+                generation=1,
+                occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
+            )
+        ]
+        if closed:
+            events.append(
+                CampaignEvent(
+                    event_id=f"github-closed-{issue_number}",
+                    kind=EventKind.ISSUE_CLOSED,
+                    generation=1,
+                    occurred_at=datetime(2026, 8, 2, tzinfo=UTC),
+                )
+            )
+        return events
+
+    reopened = CampaignEvent(
+        event_id="github-reopened-31",
+        kind=EventKind.ISSUE_REOPENED,
+        generation=2,
+        occurred_at=datetime(2026, 8, 3, tzinfo=UTC),
+    )
+    inbox = FakeInbox(
+        recorded={
+            31: [*lifecycle(31, closed=True), reopened],
+            32: lifecycle(32, closed=True),
+            40: lifecycle(40, closed=False),
+            41: lifecycle(41, closed=False),
+            50: lifecycle(50, closed=False),
+            51: lifecycle(51, closed=True),
+            60: lifecycle(60, closed=False),
+        }
+    )
+
+    class MissingLedger:
+        def load(self, repository_root: Path, issue_number: int):
+            if issue_number == 31:
+                created, closed, _ = inbox.events(31)
+                return StateRefSnapshot(
+                    revision="a" * 40,
+                    state=CampaignState(
+                        issue_number=31,
+                        generation=1,
+                        sequence=2,
+                        phase=CampaignPhase.CANCELLED,
+                        processed_event_ids=(
+                            created.event_id,
+                            closed.event_id,
+                        ),
+                    ),
+                    inbox=(created, closed, reopened),
+                    outbox=(),
+                )
+            if issue_number == 41:
+                created = inbox.events(41)[0]
+                return StateRefSnapshot(
+                    revision="d" * 40,
+                    state=CampaignState(
+                        issue_number=41,
+                        generation=1,
+                        sequence=1,
+                        phase=CampaignPhase.SPECIFICATION,
+                        processed_event_ids=(created.event_id,),
+                    ),
+                    inbox=(created,),
+                    outbox=(),
+                )
+            if issue_number in {50, 51}:
+                events = inbox.events(issue_number)
+                created = events[0]
+                return StateRefSnapshot(
+                    revision=("b" if issue_number == 50 else "f") * 40,
+                    state=CampaignState(
+                        issue_number=issue_number,
+                        generation=1,
+                        sequence=9,
+                        phase=CampaignPhase.COMPLETED,
+                        processed_event_ids=(created.event_id,),
+                        spec_sha256="a" * 64,
+                        baseline_evaluation_id="eval-baseline",
+                        candidates=(
+                            CandidateRecord(
+                                "candidate-1",
+                                True,
+                                "b" * 64,
+                            ),
+                        ),
+                        selected_candidate_id="candidate-1",
+                        merge_commit="c" * 40,
+                        deployment_version=2,
+                    ),
+                    inbox=events,
+                    outbox=(),
+                )
+            if issue_number == 60:
+                created = inbox.events(60)[0]
+                return StateRefSnapshot(
+                    revision="e" * 40,
+                    state=CampaignState(
+                        issue_number=60,
+                        generation=1,
+                        sequence=2,
+                        phase=CampaignPhase.BLOCKED,
+                        processed_event_ids=(created.event_id,),
+                        block_reason="no_eligible_candidates",
+                    ),
+                    inbox=(created,),
+                    outbox=(),
+                )
+            return None
+
+    class Assignments(FakeAssignments):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lease_checks: list[int] = []
+
+        def has_live_lease(self, issue_number: int) -> bool:
+            self.lease_checks.append(issue_number)
+            return super().has_live_lease(issue_number)
+
+    assignments = Assignments()
+    assignments.release = lambda issue_number: None
+    reconciled: list[int] = []
+    cleaned: list[int] = []
+    projected: list[int] = []
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COPILOT_ASSIGNMENT_TOKEN", "assignment-token")
+    monkeypatch.setenv("TRUSTED_EVENT_NAME", "schedule")
+    monkeypatch.setenv("TRUSTED_REPOSITORY", "octo-org/optimizer")
+    monkeypatch.setenv("TRUSTED_REPOSITORY_ID", "123")
+    monkeypatch.setenv("TRUSTED_RUN_ID", "9001")
+    monkeypatch.delenv("TRUSTED_ISSUE_NUMBER", raising=False)
+    monkeypatch.delenv("TRUSTED_STATE_REF", raising=False)
+    monkeypatch.setattr(
+        issue_intake,
+        "SubprocessCommandRunner",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        issue_intake,
+        "GitIssueEventInbox",
+        lambda root: inbox,
+    )
+    monkeypatch.setattr(
+        issue_intake,
+        "GhStewardAssignments",
+        lambda *args, **kwargs: assignments,
+    )
+    monkeypatch.setattr(git_state, "GitStateRef", lambda: MissingLedger())
+    monkeypatch.setattr(
+        projection,
+        "GitStateProjectionOutbox",
+        lambda root: object(),
+    )
+    monkeypatch.setattr(
+        projection,
+        "GhDashboardGateway",
+        lambda *args: object(),
+    )
+    monkeypatch.setattr(
+        projection,
+        "DashboardProjection",
+        lambda *args: SimpleNamespace(
+            project=lambda issue_number: projected.append(issue_number)
+        ),
+    )
+    monkeypatch.setattr(
+        transport,
+        "reconcile_github_transport_effects",
+        lambda root, issue_number, *args, **kwargs: (
+            reconciled.append(issue_number)
+            or SimpleNamespace(release_steward=False)
+        ),
+    )
+    monkeypatch.setattr(
+        deployment_bridge,
+        "reconcile_deployment_cleanup_effects",
+        lambda root, issue_number, *args: cleaned.append(issue_number),
+    )
+
+    issue_intake.main()
+
+    assert reconciled == [41]
+    assert cleaned == [41, 50, 51, 60]
+    assert projected == [41, 50, 51, 60]
+    assert assignments.assigned == [
+        (31, "reconcile-9001-issue-31"),
+        (40, "reconcile-9001-issue-40"),
+        (41, "reconcile-9001-issue-41"),
+    ]
+    assert assignments.lease_checks == [31, 40, 41]
+
+
 def test_durable_recovery_uses_state_and_unprocessed_inbox_not_labels() -> None:
+    created = CampaignEvent(
+        event_id="github-opened",
+        kind=EventKind.ISSUE_CREATED,
+        generation=1,
+        occurred_at=datetime(2026, 7, 30, tzinfo=UTC),
+    )
     closed = CampaignEvent(
         event_id="github-closed",
         kind=EventKind.ISSUE_CLOSED,
@@ -549,7 +1207,7 @@ def test_durable_recovery_uses_state_and_unprocessed_inbox_not_labels() -> None:
         generation=2,
         occurred_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
-    inbox = FakeInbox(recorded={31: [closed]})
+    inbox = FakeInbox(recorded={31: [created]})
 
     class Ledger:
         def __init__(self) -> None:
@@ -559,10 +1217,11 @@ def test_durable_recovery_uses_state_and_unprocessed_inbox_not_labels() -> None:
                     issue_number=31,
                     generation=1,
                     sequence=2,
-                    phase=CampaignPhase.CANCELLED,
-                    processed_event_ids=(closed.event_id,),
+                    phase=CampaignPhase.BLOCKED,
+                    processed_event_ids=(created.event_id,),
+                    block_reason="no_eligible_candidates",
                 ),
-                inbox=(closed,),
+                inbox=(created,),
                 outbox=(),
             )
 
@@ -588,20 +1247,20 @@ def test_durable_recovery_uses_state_and_unprocessed_inbox_not_labels() -> None:
     inbox.recorded[31].append(stale)
     ledger.snapshot = replace(
         ledger.snapshot,
-        inbox=(closed, stale),
+        inbox=(created, stale),
         state=CampaignState(
             issue_number=31,
             generation=1,
             sequence=3,
             phase=CampaignPhase.BLOCKED,
-            processed_event_ids=(closed.event_id,),
+            processed_event_ids=(created.event_id,),
             block_reason="no_eligible_candidates",
         ),
     )
 
     assert recovery.should_recover(31) is False
 
-    inbox.recorded[31].append(reopened)
+    inbox.recorded[31].extend((closed, reopened))
 
     assert recovery.should_recover(31) is True
 

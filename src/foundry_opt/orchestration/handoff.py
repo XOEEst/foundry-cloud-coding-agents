@@ -2491,16 +2491,47 @@ class _ProductionHandoffEffects:
         self._assignment_token = assignment_token
 
     def reconcile(self, issue_number: int) -> None:
+        from foundry_opt.orchestration.git_state import GitStateRef
+        from foundry_opt.orchestration.issue_intake import (
+            GitIssueEventInbox,
+            GitStateCampaignRecovery,
+        )
         from foundry_opt.orchestration.transport import (
             reconcile_github_transport_effects,
         )
 
-        reconcile_github_transport_effects(
+        recovery = GitStateCampaignRecovery(
+            self._root,
+            GitIssueEventInbox(self._root),
+            GitStateRef(),
+        )
+        candidates = recovery.effect_candidates((issue_number,))
+        if (
+            issue_number in candidates.transport
+            and recovery.can_reconcile_transport(issue_number)
+        ):
+            reconcile_github_transport_effects(
+                self._root,
+                issue_number,
+                self._commands,
+                self._repository,
+                assignment_token=self._assignment_token,
+            )
+        if (
+            issue_number not in candidates.persisted
+            or not recovery.can_reconcile_persisted_effects(
+                issue_number
+            )
+        ):
+            return
+        from foundry_opt.orchestration.deployment_bridge import (
+            reconcile_deployment_cleanup_effects,
+        )
+
+        reconcile_deployment_cleanup_effects(
             self._root,
             issue_number,
             self._commands,
-            self._repository,
-            assignment_token=self._assignment_token,
         )
         from foundry_opt.orchestration.projection import (
             DashboardProjection,

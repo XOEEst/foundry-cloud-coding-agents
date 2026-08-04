@@ -43,8 +43,10 @@ metrics. Candidate PRs show the exact patch and the `Foundry exact candidate che
 one eligible PR; the steward then automatically deploys, re-evaluates retained improvement,
 supersedes competing candidates, updates the final dashboard, and closes the root issue.
 
-The private `refs/heads/foundry-opt/state/issue-<number>` ref is the canonical hash-chained history
-and recovery source. The completed issue and candidate PRs are its user-facing projection.
+The private `refs/heads/foundry-opt/state/issue-<number>` ref is the canonical hash-chained
+campaign history. Recovery first replays the append-only
+`refs/heads/foundry-opt/inbox/issue-<number>` lifecycle, then consults state. The completed issue
+and candidate PRs are the user-facing projection.
 
 ## Required GitHub assignment credential
 
@@ -140,7 +142,8 @@ request; merging is the selection signal.
   requests.
 - Deployment runs under the separate deployment OIDC identity and consumes only persisted
   deployment intents, claims, and results.
-- Reconciliation may retry or reassign from the durable ref, but it must not invent state from
-  comments, labels, or conversation history.
+- Reconciliation must project the trusted inbox lifecycle before state, skip closed,
+  declassified, blocked, or terminal campaigns, and resume only after an explicit reopen. It must
+  not invent state from comments, labels, live issue fields, or conversation history.
 - Keep the optimizer identity separate from the deployment identity. Azure tenant, subscription,
   and client IDs are non-secret variables; never request an Azure client secret.

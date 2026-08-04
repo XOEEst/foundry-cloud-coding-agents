@@ -7,6 +7,7 @@ import pytest
 
 from foundry_opt.preflight.interfaces import CommandResult
 from foundry_opt.orchestration.handoff import (
+    _ProductionHandoffEffects,
     GhHandoffPullRequestGateway,
     HandoffApplyResult,
     HandoffApplyStatus,
@@ -239,6 +240,116 @@ def test_github_handoff_gateway_never_checks_out_or_executes_pr_content() -> Non
         "--delete",
         "copilot/steward-issue-31",
     ) in arguments
+
+
+@pytest.mark.parametrize(
+    (
+        "transport_candidates",
+        "effect_candidates",
+        "current_transport",
+        "current_effects",
+        "expected_transport",
+        "expected_effects",
+    ),
+    (
+        ((), (), False, False, [], []),
+        ((31,), (31,), False, False, [], []),
+        ((), (31,), False, True, [], [31]),
+        ((31,), (31,), True, True, [31], [31]),
+    ),
+)
+def test_production_handoff_effects_honor_lifecycle_gate(
+    monkeypatch,
+    transport_candidates,
+    effect_candidates,
+    current_transport,
+    current_effects,
+    expected_transport,
+    expected_effects,
+) -> None:
+    import foundry_opt.orchestration.deployment_bridge as deployment_bridge
+    import foundry_opt.orchestration.git_state as git_state
+    import foundry_opt.orchestration.issue_intake as issue_intake
+    import foundry_opt.orchestration.projection as projection
+    import foundry_opt.orchestration.transport as transport
+
+    reconciled: list[int] = []
+    cleaned: list[int] = []
+    projected: list[int] = []
+
+    class Recovery:
+        def __init__(self, *args) -> None:
+            pass
+
+        def effect_candidates(self, issue_numbers):
+            return type(
+                "Candidates",
+                (),
+                {
+                    "transport": transport_candidates,
+                    "persisted": effect_candidates,
+                },
+            )()
+
+        def can_reconcile_transport(self, issue_number):
+            return current_transport
+
+        def can_reconcile_persisted_effects(self, issue_number):
+            return current_effects
+
+    monkeypatch.setattr(
+        issue_intake,
+        "GitIssueEventInbox",
+        lambda root: object(),
+    )
+    monkeypatch.setattr(
+        issue_intake,
+        "GitStateCampaignRecovery",
+        Recovery,
+    )
+    monkeypatch.setattr(git_state, "GitStateRef", lambda: object())
+    monkeypatch.setattr(
+        transport,
+        "reconcile_github_transport_effects",
+        lambda root, issue_number, *args, **kwargs: reconciled.append(
+            issue_number
+        ),
+    )
+    monkeypatch.setattr(
+        deployment_bridge,
+        "reconcile_deployment_cleanup_effects",
+        lambda root, issue_number, *args: cleaned.append(issue_number),
+    )
+    monkeypatch.setattr(
+        projection,
+        "GitStateProjectionOutbox",
+        lambda root: object(),
+    )
+    monkeypatch.setattr(
+        projection,
+        "GhDashboardGateway",
+        lambda *args: object(),
+    )
+    monkeypatch.setattr(
+        projection,
+        "DashboardProjection",
+        lambda *args: type(
+            "Projection",
+            (),
+            {"project": lambda self, issue: projected.append(issue)},
+        )(),
+    )
+
+    _ProductionHandoffEffects(
+        Path("."),
+        object(),
+        "octo-org/optimizer",
+        "assignment-token",
+    ).reconcile(31)
+
+    assert reconciled == expected_transport
+    assert cleaned == expected_effects
+    assert projected == expected_effects
 
 
 def test_handoff_finalizer_applies_effects_closes_and_reassigns() -> None:

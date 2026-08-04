@@ -94,7 +94,11 @@ class OptimizationCampaign:
                     CampaignPhase.COMPLETED,
                     CampaignPhase.BLOCKED,
                 }
-                or event.generation != state.generation + 1
+                or event.generation
+                not in {
+                    state.generation,
+                    state.generation + 1,
+                }
             ):
                 raise InvalidCampaignTransition(
                     "issue_reopened requires a closed terminal generation"
@@ -119,8 +123,17 @@ class OptimizationCampaign:
                 CampaignPhase.BLOCKED,
                 CampaignPhase.CANCELLED,
             }:
-                raise InvalidCampaignTransition(
-                    "terminal campaigns require an explicit new issue"
+                return replace(
+                    state,
+                    generation=max(
+                        state.generation + 1,
+                        event.generation,
+                    ),
+                    sequence=state.sequence + 1,
+                    processed_event_ids=(
+                        *state.processed_event_ids,
+                        event.event_id,
+                    ),
                 )
             return CampaignState(
                 issue_number=state.issue_number,

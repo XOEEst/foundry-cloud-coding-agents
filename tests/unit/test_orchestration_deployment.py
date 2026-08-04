@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1230,6 +1231,41 @@ def test_claimed_but_unobserved_dispatch_fails_closed_as_unknown() -> None:
     assert result.code == "deployment_dispatch_unknown"
 
 
+def test_deployment_claim_rejects_superseded_generation() -> None:
+    ledger = Ledger(_snapshot())
+    planned = DeploymentOrchestrationService(
+        ledger=ledger,
+        resolver=Resolver(),
+        selection_reader=SelectionReader(),
+        clock=lambda: NOW,
+    ).advance(DeploymentOrchestrationRequest(Path.cwd(), ISSUE))
+    record = next(
+        item
+        for item in planned.snapshot.outbox
+        if item.kind == "deployment_workflow_planned"
+    )
+    from foundry_opt.orchestration.deployment import (
+        deployment_workflow_intent,
+    )
+
+    ledger.snapshot = replace(
+        planned.snapshot,
+        state=CampaignState(
+            issue_number=ISSUE,
+            generation=GENERATION + 1,
+            sequence=planned.snapshot.state.sequence + 1,
+            phase=CampaignPhase.SPECIFICATION,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        DeploymentDispatchClaimRecorder(
+            ledger,
+            Path.cwd(),
+            ISSUE,
+        ).claim(deployment_workflow_intent(record))
+
+
 def _advance_to_retention(
     ledger: Ledger,
     *,
@@ -1588,6 +1624,169 @@ def test_root_closure_ignores_cleanup_from_prior_generations() -> None:
         and record.payload["candidate_id"] == "candidate-1"
         for record in completed.snapshot.outbox
     )
+
+
+def test_completed_terminal_edit_preserves_prior_cleanup_generation(
+    monkeypatch,
+) -> None:
+    import foundry_opt.orchestration.deployment_bridge as deployment_bridge
+
+    cleanup = OutboxRecord(
+        record_id="root-close-1",
+        kind="root_issue_close_planned",
+        generation=1,
+        sequence=9,
+        payload={"effect_id": "root-close-1"},
+    )
+    snapshot = StateRefSnapshot(
+        revision="a" * 40,
+        state=CampaignState(
+            issue_number=ISSUE,
+            generation=2,
+            sequence=10,
+            phase=CampaignPhase.COMPLETED,
+            spec_sha256=SPEC,
+            baseline_evaluation_id="eval-baseline",
+            candidates=(CandidateRecord("candidate-1", True, EVIDENCE),),
+            selected_candidate_id="candidate-1",
+            merge_commit=MERGE,
+            deployment_version=2,
+        ),
+        inbox=(),
+        outbox=(cleanup,),
+    )
+    applied: list[OutboxRecord] = []
+
+    class Ledger:
+        def load(self, repository_root: Path, issue_number: int):
+            return snapshot
+
+    class Bridge:
+        def __init__(self, gateway) -> None:
+            pass
+
+        def apply(self, record: OutboxRecord):
+            applied.append(record)
+            return record.record_id
+
+    monkeypatch.setattr(deployment_bridge, "GitStateRef", lambda: Ledger())
+    monkeypatch.setattr(
+        deployment_bridge,
+        "_repository_name",
+        lambda commands, repository_root: "octo-org/optimizer",
+    )
+    monkeypatch.setattr(
+        deployment_bridge,
+        "GhDeploymentCleanupGateway",
+        lambda *args: object(),
+    )
+    monkeypatch.setattr(
+        deployment_bridge,
+        "DeploymentCleanupBridge",
+        Bridge,
+    )
+
+    deployment_bridge.reconcile_deployment_cleanup_effects(
+        Path("."),
+        ISSUE,
+        object(),
+    )
+
+    assert applied == [cleanup]
+
+
+@pytest.mark.parametrize(("active", "expected"), ((False, []), (True, [1])))
+def test_deployment_dispatch_revalidates_trusted_lifecycle(
+    monkeypatch,
+    active: bool,
+    expected: list[int],
+) -> None:
+    import foundry_opt.orchestration.deployment_bridge as deployment_bridge
+    import foundry_opt.orchestration.issue_intake as issue_intake
+
+    planned = OutboxRecord(
+        "deployment-1",
+        "deployment_workflow_planned",
+        1,
+        4,
+    )
+    snapshot = StateRefSnapshot(
+        revision="a" * 40,
+        state=CampaignState(
+            issue_number=ISSUE,
+            generation=1,
+            sequence=4,
+            phase=CampaignPhase.DEPLOYMENT,
+            spec_sha256=SPEC,
+            baseline_evaluation_id="eval-baseline",
+            candidates=(CandidateRecord("candidate-1", True, EVIDENCE),),
+            selected_candidate_id="candidate-1",
+            merge_commit=MERGE,
+        ),
+        inbox=(),
+        outbox=(planned,),
+    )
+    applied: list[int] = []
+
+    class Ledger:
+        def load(self, repository_root: Path, issue_number: int):
+            return snapshot
+
+    class Recovery:
+        def __init__(self, *args) -> None:
+            pass
+
+        def can_dispatch_deployment(self, issue_number: int) -> bool:
+            return active
+
+    class Bridge:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def apply(self, record: OutboxRecord):
+            applied.append(1)
+            return SimpleNamespace(result=None)
+
+    monkeypatch.setattr(deployment_bridge, "GitStateRef", lambda: Ledger())
+    monkeypatch.setattr(
+        deployment_bridge,
+        "ExistingDeploymentWorkflowGateway",
+        lambda *args: object(),
+    )
+    monkeypatch.setattr(
+        deployment_bridge,
+        "GhWorkflowRunGateway",
+        lambda commands: object(),
+    )
+    monkeypatch.setattr(
+        deployment_bridge,
+        "DeploymentDispatchClaimRecorder",
+        lambda *args: object(),
+    )
+    monkeypatch.setattr(deployment_bridge, "DeploymentWorkflowBridge", Bridge)
+    monkeypatch.setattr(
+        deployment_bridge,
+        "deployment_workflow_intent",
+        lambda record: SimpleNamespace(attempt=1),
+    )
+    monkeypatch.setattr(
+        issue_intake,
+        "GitIssueEventInbox",
+        lambda root: object(),
+    )
+    monkeypatch.setattr(
+        issue_intake,
+        "GitStateCampaignRecovery",
+        Recovery,
+    )
+
+    deployment_bridge.reconcile_deployment_workflow_effects(
+        Path("."),
+        ISSUE,
+        object(),
+    )
+
+    assert applied == expected
 
 
 class StewardDeploymentDelegate:

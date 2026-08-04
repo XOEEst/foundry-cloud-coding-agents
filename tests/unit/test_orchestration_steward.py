@@ -13,6 +13,7 @@ from foundry_opt.orchestration import (
     CampaignState,
     EventKind,
     OptimizationCampaign,
+    OutboxRecord,
     StateRefConflictError,
     StateRefProposal,
     StateRefPushUnacknowledgedError,
@@ -121,6 +122,65 @@ def test_steward_advances_events_and_persists_state_and_outbox(
     assert commit["state"] == result.state
     assert commit["inbox"][0].event_id == "event-1"
     assert commit["outbox"][0].kind == "campaign_advanced"
+
+
+def test_terminal_lifecycle_event_preserves_final_projection(
+    tmp_path: Path,
+) -> None:
+    created = _event("event-1", EventKind.ISSUE_CREATED)
+    completed = CampaignState(
+        issue_number=31,
+        generation=1,
+        sequence=9,
+        phase=CampaignPhase.COMPLETED,
+        processed_event_ids=(created.event_id,),
+        spec_sha256="a" * 64,
+        baseline_evaluation_id="eval-baseline",
+        candidates=(
+            {
+                "candidate_id": "candidate-1",
+                "eligible": True,
+                "evidence_sha256": "b" * 64,
+            },
+        ),
+        selected_candidate_id="candidate-1",
+        merge_commit="c" * 40,
+        deployment_version=2,
+    )
+    final_dashboard = OutboxRecord(
+        "final-dashboard-1",
+        "deployment_final_dashboard",
+        1,
+        9,
+        {"issue_number": 31},
+    )
+    ledger = Ledger(
+        StateRefSnapshot(
+            "a" * 40,
+            completed,
+            (created,),
+            (final_dashboard,),
+        )
+    )
+    service = StewardAdvanceService(
+        ledger=ledger,
+        inbox=Inbox(
+            (
+                _event(
+                    "event-2",
+                    EventKind.ISSUE_EDITED,
+                    generation=2,
+                ),
+            )
+        ),
+    )
+
+    result = service.advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.status is StewardAdvanceStatus.COMPLETE
+    assert result.state is not None
+    assert result.state.generation == 2
+    assert ledger.commits[0]["outbox"] == ()
 
 
 def test_steward_hands_off_nested_phase_state_push_acknowledgement(

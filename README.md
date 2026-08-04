@@ -116,7 +116,9 @@ all hard guardrails pass.
 
 The completed issue and candidate PRs are the user-facing history. The private
 `refs/heads/foundry-opt/state/issue-<N>` ref is the canonical, hash-chained
-campaign history used for replay and recovery; comments, labels, and
+campaign history. The append-only
+`refs/heads/foundry-opt/inbox/issue-<N>` ref is the trusted issue lifecycle
+authority consulted before state during recovery; comments, labels, and
 conversation history are projections rather than authority.
 
 ## Policy versus an issue
@@ -140,8 +142,10 @@ either `policy_approved` or `human_review`.
 
 - The `foundry-optimization-steward` owns the domain state machine and every
   campaign transition.
-- `refs/heads/foundry-opt/state/issue-<N>` is the authority for state, inbox,
-  outbox, replay, and session replacement.
+- `refs/heads/foundry-opt/state/issue-<N>` is the authority for campaign state,
+  outbox, replay, and session replacement. The separate trusted inbox ref is
+  the authority for issue creation, edits, closure, declassification, and
+  reopening.
 - GitHub Actions are transport and capability only: they record trusted events,
   project persisted effects, reconcile inactivity, and dispatch already
   authorized deployment intents. Actions may replay canonical interfaces to
@@ -158,11 +162,13 @@ either `policy_approved` or `human_review`.
   only reserved worktrees; the applier applies one exact patch without repair.
 - Deployment uses a separate OIDC identity and accepts only persisted lineage.
 
-Scheduled reconciliation and assignment recovery can resume an interrupted
-campaign from its private ref without trusting chat history. Force-with-lease
-updates, remote acknowledgement checks, and idempotent handoff application
-prevent duplicate or conflicting transitions. Competing valid handoffs fail
-closed and trigger fresh assignment rather than overwriting state.
+Scheduled reconciliation validates and replays the trusted inbox lifecycle
+before consulting campaign state. Closed, declassified, blocked, and terminal
+campaigns are not reassigned; an explicit reopen starts the allowed new
+generation. Force-with-lease updates, remote acknowledgement checks, and
+idempotent handoff application prevent duplicate or conflicting transitions.
+Competing valid handoffs fail closed and trigger fresh assignment rather than
+overwriting state.
 
 Privacy and least privilege are fail-closed: no raw held-out rows, private
 dataset content, prompts, responses, traces, or credentials enter candidate

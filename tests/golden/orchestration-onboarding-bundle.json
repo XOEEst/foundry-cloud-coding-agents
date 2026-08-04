@@ -5,7 +5,7 @@
   ".github/agents/foundry-optimization-planner.agent.md": "4c801d47aafab4dfbd30f3c2b6f0bb5abf105dc63b738e1708dad752098feec0",
   ".github/agents/foundry-optimization-steward.agent.md": "e39090795ee23b4b40254bcf662948399abf35f1dbda90407110156de6b20525",
   ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md": "cb31eb6aa2f6f3d725c5cc950f7316b29de513c7873f8e509930492b38f60353",
-  ".github/skills/foundry-agent-optimizer/SKILL.md": "9ae2ec4ba19bfbbdc2a06109b17c1c1abcf4356db443a27107ecf8ccc550fae7",
+  ".github/skills/foundry-agent-optimizer/SKILL.md": "ff0c3f9a072d5381bfd5d056efc9a0fbb27d82be319297666502a8142143e9e9",
   ".github/workflows/foundry-exact-candidate-check.yml": "6a42e7d3b526541e27da46da42e254ce2e95f0c0b12c716be126d6abefb50000",
   ".github/workflows/foundry-optimization-deployment-bridge.yml": "a2e642df51078b7e8f01675b8d1d53234a46379ba846ec28ce9fc75e16588692",
   ".github/workflows/foundry-optimization-handoff.yml": "26aa85ecfbc04132e9ce1604ea64c12320cb960d412b03564001f1e9b76e2b5f",

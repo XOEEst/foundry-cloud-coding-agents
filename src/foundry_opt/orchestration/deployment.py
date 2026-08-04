@@ -1227,10 +1227,19 @@ class DeploymentDispatchClaimRecorder:
         snapshot = self._ledger.load(self._root, self._issue_number)
         if snapshot is None:
             raise RuntimeError("deployment dispatch claim has no campaign")
+        if (
+            snapshot.state.phase is not CampaignPhase.DEPLOYMENT
+            or intent.binding.generation != snapshot.state.generation
+        ):
+            raise RuntimeError("deployment intent is unavailable")
         planned = tuple(
             record
             for record in snapshot.outbox
-            if record.record_id == intent.effect_id
+            if (
+                record.record_id == intent.effect_id
+                and record.kind == "deployment_workflow_planned"
+                and record.generation == snapshot.state.generation
+            )
         )
         if len(planned) != 1:
             raise RuntimeError("deployment intent is unavailable")
