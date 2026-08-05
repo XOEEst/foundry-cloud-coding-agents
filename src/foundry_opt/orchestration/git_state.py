@@ -2335,7 +2335,6 @@ def _verified_copilot_git_proxy_session(
             "COPILOT_AGENT_SESSION_ID" not in os.environ
             or _sane_copilot_agent_session_id()
         )
-        and "COPILOT_CLI" not in os.environ
     )
     if not trusted_markers:
         return None

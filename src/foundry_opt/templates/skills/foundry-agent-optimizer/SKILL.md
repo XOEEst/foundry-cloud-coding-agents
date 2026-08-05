@@ -94,7 +94,8 @@ The trusted default-branch Copilot setup workflow exports the static, non-secret
 requires `GITHUB_ACTIONS=true`, the exact repository, an exact loopback HTTP(S) origin with port and
 repository path, and Git plumbing confirmation that HEAD is a native `copilot/` branch. Available
 production/session markers must be sane, hidden token/download markers are not required, and
-`COPILOT_CLI` is rejected. The marker alone grants no state authority: ordinary Actions retain
+`COPILOT_CLI` may be present but grants no authority. The marker alone grants no state authority:
+ordinary Actions retain
 normal Git semantics, while a local spoof can only enter the trusted handoff validator and
 compare-and-swap path.
 

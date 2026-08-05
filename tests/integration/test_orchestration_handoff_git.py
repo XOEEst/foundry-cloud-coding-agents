@@ -53,6 +53,7 @@ LIVE_COPILOT_ENVIRONMENT = {
     "FOUNDRY_OPT_COPILOT_GIT_PROXY": "1",
     "GITHUB_ACTIONS": "true",
     "GITHUB_REPOSITORY": "microsoft-foundry/luffy-test-agents-repo",
+    "COPILOT_CLI": "1",
     "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
     "COPILOT_AGENT_START_TIME_SEC": "1785872107",
     "COPILOT_AGENT_TIMEOUT_MIN": "59",
@@ -354,6 +355,18 @@ def test_copilot_proxy_rejects_spoofed_marker_subsets(
     for value in ("", "0", "01", "true", " 1 "):
         monkeypatch.setenv("FOUNDRY_OPT_COPILOT_GIT_PROXY", value)
         assert is_verified_copilot_git_proxy(repository) is False, value
+
+
+def test_local_copilot_cli_without_trusted_proxy_context_is_not_verified(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repository, _, _ = _repository(tmp_path)
+    for name in LIVE_COPILOT_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("COPILOT_CLI", "1")
+
+    assert is_verified_copilot_git_proxy(repository) is False
 
 
 def test_copilot_proxy_accepts_live_child_without_api_token(
@@ -713,19 +726,18 @@ def test_handoff_transport_ignores_untrusted_push_redirection(
     )
 
 
-def test_local_copilot_cli_marker_does_not_enable_cloud_handoff(
+def test_live_copilot_cli_runtime_enables_cloud_handoff(
     tmp_path: Path,
     monkeypatch,
     copilot_git_proxy,
 ) -> None:
     repository, origin, base = _repository(tmp_path)
-    copilot_git_proxy.install(
+    proxy = copilot_git_proxy.install(
         repository,
         origin,
         acknowledgement="absent",
     )
     _set_live_copilot_environment(monkeypatch)
-    monkeypatch.setenv("COPILOT_CLI", "1")
     event = CampaignEvent(
         "github-run-1",
         EventKind.ISSUE_CREATED,
@@ -733,26 +745,29 @@ def test_local_copilot_cli_marker_does_not_enable_cloud_handoff(
         NOW,
     )
     assert GitIssueEventInbox(repository).append(31, event) is True
+    assert os.environ["COPILOT_CLI"] == "1"
+    assert is_verified_copilot_git_proxy(repository) is True
 
     result = StewardAdvanceService(
         inbox=GitCampaignInbox(),
         handoffs=CloudHandoffStore(),
     ).advance(StewardAdvanceRequest(repository, 31))
 
-    assert result.status is StewardAdvanceStatus.CONFLICT
-    assert result.code == "state_ref_conflict"
-    assert _git(repository, "rev-parse", "HEAD") == base
-    assert (
-        _git(
-            repository,
-            "ls-tree",
-            "-r",
-            "--name-only",
-            "HEAD",
-            "--",
-            ".foundry-optimizer/handoffs",
-        )
-        == ""
+    assert result.status is StewardAdvanceStatus.WAITING
+    assert result.disposition == "delegate"
+    assert result.code == "state_handoff_created"
+    assert _git(repository, "rev-parse", "HEAD") != base
+    assert proxy.real_revision(
+        "refs/heads/copilot/steward-issue-31"
+    ) == _git(repository, "rev-parse", "HEAD")
+    assert _git(
+        repository,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "HEAD",
+        "--",
+        ".foundry-optimizer/handoffs",
     )
 
 

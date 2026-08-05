@@ -161,7 +161,8 @@ either `policy_approved` or `human_review`.
   production/session markers, a valid HEAD commit, and an exact match with the
   proxy branch tip when that branch already exists. Attached wrapper branch
   metadata must match the symbolic ref. Hidden token and download markers are
-  not required; `COPILOT_CLI` is always rejected.
+  not required. `COPILOT_CLI` may be present in the cloud runtime, but it
+  grants no authority and does not bypass any proxy-context check.
 - In a verified Copilot proxy context, the canonical command does not send the
   private state/design ref through the proxy. It commits one privacy-validated,
   content-addressed envelope on the verified wrapper session branch, creating
