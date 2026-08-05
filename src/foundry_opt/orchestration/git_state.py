@@ -42,6 +42,9 @@ _GITHUB_REPOSITORY = re.compile(
 _COPILOT_AGENT_SOURCE_ENVIRONMENTS = frozenset({"production"})
 _COPILOT_AGENT_START_TIME_SEC = re.compile(r"^[0-9]{10}$")
 _COPILOT_AGENT_TIMEOUT_MIN = re.compile(r"^[0-9]{1,4}$")
+_COPILOT_AGENT_SESSION_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$"
+)
 _MIN_COPILOT_AGENT_START_TIME_SEC = 1_577_836_800
 _MAX_COPILOT_AGENT_START_TIME_SEC = 4_102_444_799
 _MAX_COPILOT_AGENT_TIMEOUT_MIN = 24 * 60
@@ -2203,10 +2206,8 @@ def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
         in _COPILOT_AGENT_SOURCE_ENVIRONMENTS
         and _sane_copilot_agent_start_time()
         and _sane_copilot_agent_timeout()
+        and _sane_copilot_agent_session_id()
         and _nonempty_environment_marker("GITHUB_COPILOT_API_TOKEN")
-        and _nonempty_environment_marker(
-            "GITHUB_COPILOT_ACTION_DOWNLOAD_URL"
-        )
         and "COPILOT_CLI" not in os.environ
     )
     if not trusted_markers:
@@ -2264,6 +2265,11 @@ def _sane_copilot_agent_timeout() -> bool:
         _COPILOT_AGENT_TIMEOUT_MIN.fullmatch(value) is not None
         and 1 <= int(value) <= _MAX_COPILOT_AGENT_TIMEOUT_MIN
     )
+
+
+def _sane_copilot_agent_session_id() -> bool:
+    value = os.environ.get("COPILOT_AGENT_SESSION_ID", "")
+    return _COPILOT_AGENT_SESSION_ID.fullmatch(value) is not None
 
 
 def _nonempty_environment_marker(name: str) -> bool:

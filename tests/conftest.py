@@ -74,7 +74,7 @@ class CopilotGitProxy:
         real_origin: Path,
         *,
         acknowledgement: str,
-        repository: str = "octo-org/optimizer",
+        repository: str = "microsoft-foundry/luffy-test-agents-repo",
         loopback_origin: bool = True,
     ) -> CopilotGitProxyInstallation:
         if acknowledgement not in {
@@ -254,9 +254,7 @@ class CopilotGitProxy:
             encoding="utf-8",
         )
         if loopback_origin:
-            endpoint = (
-                f"http://localhost:{43000 + self._counter}/{repository}"
-            )
+            endpoint = f"http://localhost:26831/{repository}"
             self._run(
                 "remote",
                 "set-url",

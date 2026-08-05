@@ -65,20 +65,24 @@ from foundry_opt.orchestration.steward import (
 ISSUE = 46
 LIVE_COPILOT_ENVIRONMENT = {
     "GITHUB_ACTIONS": "true",
-    "GITHUB_REPOSITORY": "octo-org/optimizer",
+    "GITHUB_REPOSITORY": "microsoft-foundry/luffy-test-agents-repo",
     "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
     "COPILOT_AGENT_START_TIME_SEC": "1785872107",
-    "COPILOT_AGENT_TIMEOUT_MIN": "60",
-    "GITHUB_COPILOT_API_TOKEN": "live-fixture-api-token",
-    "GITHUB_COPILOT_ACTION_DOWNLOAD_URL": (
-        "https://example.invalid/copilot-action-download"
+    "COPILOT_AGENT_TIMEOUT_MIN": "59",
+    "COPILOT_AGENT_SESSION_ID": (
+        "11111111-2222-4333-8444-555555555555"
     ),
+    "GITHUB_COPILOT_API_TOKEN": "live-fixture-api-token",
 }
 
 
 def _set_live_copilot_environment(monkeypatch) -> None:
-    monkeypatch.delenv("COPILOT_AGENT_SESSION_ID", raising=False)
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
+    for name in (
+        "COPILOT_CLI",
+        "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
+        "GITHUB_COPILOT_LOG_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
     for name, value in LIVE_COPILOT_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
 
@@ -87,6 +91,8 @@ def _set_normal_github_actions_environment(monkeypatch) -> None:
     for name in (
         "COPILOT_AGENT_SESSION_ID",
         "COPILOT_CLI",
+        "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
+        "GITHUB_COPILOT_LOG_ID",
         *LIVE_COPILOT_ENVIRONMENT,
     ):
         monkeypatch.delenv(name, raising=False)
@@ -561,6 +567,15 @@ def test_production_issue_created_advances_through_state_handoff(
     assert path.startswith(
         ".foundry-optimizer/handoffs/steward/issue-46/"
     )
+    handoff_content = subprocess.run(
+        ("git", "show", f"{head}:{path}"),
+        cwd=root,
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert LIVE_COPILOT_ENVIRONMENT[
+        "COPILOT_AGENT_SESSION_ID"
+    ].encode() not in handoff_content
     proxy.disable()
     _set_normal_github_actions_environment(monkeypatch)
     applied = HandoffApplyService().apply(

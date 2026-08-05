@@ -49,20 +49,24 @@ from foundry_opt.optimization.production import (
 NOW = datetime(2026, 8, 3, tzinfo=UTC)
 LIVE_COPILOT_ENVIRONMENT = {
     "GITHUB_ACTIONS": "true",
-    "GITHUB_REPOSITORY": "octo-org/optimizer",
+    "GITHUB_REPOSITORY": "microsoft-foundry/luffy-test-agents-repo",
     "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
     "COPILOT_AGENT_START_TIME_SEC": "1785872107",
-    "COPILOT_AGENT_TIMEOUT_MIN": "60",
-    "GITHUB_COPILOT_API_TOKEN": "live-fixture-api-token",
-    "GITHUB_COPILOT_ACTION_DOWNLOAD_URL": (
-        "https://example.invalid/copilot-action-download"
+    "COPILOT_AGENT_TIMEOUT_MIN": "59",
+    "COPILOT_AGENT_SESSION_ID": (
+        "11111111-2222-4333-8444-555555555555"
     ),
+    "GITHUB_COPILOT_API_TOKEN": "live-fixture-api-token",
 }
 
 
 def _set_live_copilot_environment(monkeypatch) -> None:
-    monkeypatch.delenv("COPILOT_AGENT_SESSION_ID", raising=False)
-    monkeypatch.delenv("COPILOT_CLI", raising=False)
+    for name in (
+        "COPILOT_CLI",
+        "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
+        "GITHUB_COPILOT_LOG_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
     for name, value in LIVE_COPILOT_ENVIRONMENT.items():
         monkeypatch.setenv(name, value)
 
@@ -71,6 +75,8 @@ def _set_normal_github_actions_environment(monkeypatch) -> None:
     for name in (
         "COPILOT_AGENT_SESSION_ID",
         "COPILOT_CLI",
+        "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
+        "GITHUB_COPILOT_LOG_ID",
         *LIVE_COPILOT_ENVIRONMENT,
     ):
         monkeypatch.delenv(name, raising=False)
@@ -237,7 +243,9 @@ def test_cloud_steward_persists_one_content_addressed_handoff(
     assert "trace" not in handoff.content.decode("utf-8").casefold()
     assert "dataset_row" not in handoff.content.decode("utf-8").casefold()
     assert b"live-fixture-api-token" not in handoff.content
-    assert b"copilot-action-download" not in handoff.content
+    assert LIVE_COPILOT_ENVIRONMENT[
+        "COPILOT_AGENT_SESSION_ID"
+    ].encode() not in handoff.content
 
     retry = StewardAdvanceService(
         inbox=GitCampaignInbox(),
@@ -315,6 +323,13 @@ def test_copilot_proxy_rejects_spoofed_marker_subsets(
         assert is_verified_copilot_git_proxy(repository) is False, marker
         monkeypatch.setenv(marker, LIVE_COPILOT_ENVIRONMENT[marker])
 
+    monkeypatch.delenv("COPILOT_AGENT_SESSION_ID")
+    monkeypatch.setenv(
+        "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
+        "https://example.invalid/copilot-action-download",
+    )
+    assert is_verified_copilot_git_proxy(repository) is False
+
 
 def test_copilot_proxy_rejects_malformed_live_markers(
     tmp_path: Path,
@@ -342,8 +357,13 @@ def test_copilot_proxy_rejects_malformed_live_markers(
         ("COPILOT_AGENT_TIMEOUT_MIN", "1441"),
         ("GITHUB_COPILOT_API_TOKEN", ""),
         ("GITHUB_COPILOT_API_TOKEN", "   "),
-        ("GITHUB_COPILOT_ACTION_DOWNLOAD_URL", ""),
-        ("GITHUB_COPILOT_ACTION_DOWNLOAD_URL", "   "),
+        ("COPILOT_AGENT_SESSION_ID", ""),
+        ("COPILOT_AGENT_SESSION_ID", "   "),
+        ("COPILOT_AGENT_SESSION_ID", "short"),
+        ("COPILOT_AGENT_SESSION_ID", "session id"),
+        ("COPILOT_AGENT_SESSION_ID", "session/id"),
+        ("COPILOT_AGENT_SESSION_ID", "session-id\nspoof"),
+        ("COPILOT_AGENT_SESSION_ID", "x" * 129),
     )
 
     for name, value in malformed:
@@ -353,6 +373,27 @@ def test_copilot_proxy_rejects_malformed_live_markers(
             name,
             value,
         )
+
+
+def test_copilot_proxy_does_not_require_absent_optional_markers(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    monkeypatch.setenv(
+        "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
+        "https://example.invalid/copilot-action-download",
+    )
+    monkeypatch.setenv("GITHUB_COPILOT_LOG_ID", "optional-log-id")
+
+    assert is_verified_copilot_git_proxy(repository) is True
 
 
 def test_copilot_proxy_requires_exact_loopback_repository_path(
@@ -373,11 +414,18 @@ def test_copilot_proxy_requires_exact_loopback_repository_path(
         "--get",
         "remote.origin.url",
     )
+    assert remote_url == (
+        "http://localhost:26831/"
+        "microsoft-foundry/luffy-test-agents-repo"
+    )
     assert is_verified_copilot_git_proxy(repository) is True
 
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/other")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft-foundry/other")
     assert is_verified_copilot_git_proxy(repository) is False
-    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
+    monkeypatch.setenv(
+        "GITHUB_REPOSITORY",
+        "microsoft-foundry/luffy-test-agents-repo",
+    )
 
     invalid_urls = (
         f"{remote_url}/",
