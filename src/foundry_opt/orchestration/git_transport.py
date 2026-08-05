@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from ipaddress import ip_address
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 from typing import Iterator
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 from uuid import uuid4
 
 
@@ -527,6 +528,7 @@ def _trusted_http_header(
             origin_path,
             records,
         )
+    _validate_authorization_destination(parsed)
     return value
 
 
@@ -709,6 +711,21 @@ def _validate_authorization_header(value: str) -> None:
     ):
         raise GitTransportError(
             "Git authentication configuration is invalid"
+        )
+
+
+def _validate_authorization_destination(parsed: SplitResult) -> None:
+    if parsed.scheme != "http":
+        return
+    try:
+        address = ip_address(parsed.hostname or "")
+    except ValueError as error:
+        raise GitTransportError(
+            "Git authentication cannot use cleartext HTTP"
+        ) from error
+    if not address.is_loopback:
+        raise GitTransportError(
+            "Git authentication cannot use cleartext HTTP"
         )
 
 

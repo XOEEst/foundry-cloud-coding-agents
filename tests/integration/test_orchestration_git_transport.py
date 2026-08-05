@@ -710,6 +710,32 @@ def test_direct_local_authorization_still_authenticates_exact_remote(
         server.close()
 
 
+def test_authorization_is_not_forwarded_over_non_loopback_http(
+    tmp_path: Path,
+) -> None:
+    repository, _, _, _ = _private_repository(tmp_path)
+    remote_url = "http://192.0.2.1/private/repository.git"
+    _git(repository, "remote", "set-url", "origin", remote_url)
+    _git(
+        repository,
+        "config",
+        "http.http://192.0.2.1/.extraheader",
+        "Authorization: Basic Y2xlYXJ0ZXh0",
+    )
+    remote = resolve_safe_fetch_remote(repository, "origin")
+    assert remote is not None
+
+    with pytest.raises(
+        GitTransportError,
+        match="cleartext HTTP",
+    ):
+        remote_revision(
+            repository,
+            remote,
+            "refs/heads/main",
+        )
+
+
 def test_copilot_proxy_url_does_not_import_github_authorization(
     tmp_path: Path,
     monkeypatch,
