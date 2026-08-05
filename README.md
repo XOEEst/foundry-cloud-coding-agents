@@ -155,12 +155,17 @@ either `policy_approved` or `human_review`.
   non-secret `FOUNDRY_OPT_COPILOT_GIT_PROXY=1` marker; no pull-request input
   controls it. Proxy authority additionally requires `GITHUB_ACTIONS=true`, the
   exact repository, an exact loopback HTTP(S) origin with port and repository
-  path, and the actual Git symbolic ref to be a native `copilot/` branch.
-  Available production/session markers must be sane, while hidden token and
-  download markers are not required; `COPILOT_CLI` is always rejected.
+  path, and either an attached native `copilot/` symbolic ref or a detached
+  checkout bound to a safe `GITHUB_AGENT_BRANCH_NAME` and
+  `GITHUB_AGENT_ACTOR`. Detached sessions require complete, sane
+  production/session markers, a valid HEAD commit, and an exact match with the
+  proxy branch tip when that branch already exists. Attached wrapper branch
+  metadata must match the symbolic ref. Hidden token and download markers are
+  not required; `COPILOT_CLI` is always rejected.
 - In a verified Copilot proxy context, the canonical command does not send the
   private state/design ref through the proxy. It commits one privacy-validated,
-  content-addressed envelope on the native session branch instead. A
+  content-addressed envelope on the verified wrapper session branch, creating
+  that branch with compare-and-swap when needed. A
   base-context workflow reads only that exact object, CAS-publishes the private
   ref, applies persisted outbox effects, and auto-closes the internal handoff PR.
 - Private state/design transport and handoff publication bind to one captured

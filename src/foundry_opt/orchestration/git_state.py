@@ -53,6 +53,12 @@ _GITHUB_REPOSITORY = re.compile(
 _NATIVE_COPILOT_REF = re.compile(
     r"^refs/heads/copilot/[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$"
 )
+_NATIVE_COPILOT_BRANCH = re.compile(
+    r"^copilot/[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$"
+)
+_GITHUB_AGENT_ACTOR = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:\[bot\])?$"
+)
 _COPILOT_GIT_PROXY_MARKER = "FOUNDRY_OPT_COPILOT_GIT_PROXY"
 _COPILOT_AGENT_SOURCE_ENVIRONMENTS = frozenset({"production"})
 _COPILOT_AGENT_START_TIME_SEC = re.compile(r"^[0-9]{10}$")
@@ -388,6 +394,13 @@ _COMMIT_ENVIRONMENT = {
     "GIT_COMMITTER_NAME": "Foundry Optimizer Steward",
     "GIT_COMMITTER_EMAIL": "foundry-opt@example.invalid",
 }
+
+
+@dataclass(frozen=True)
+class VerifiedCopilotGitProxySession:
+    remote_url: str
+    branch: str
+    head_revision: str
 
 
 class StateRefError(RuntimeError):
@@ -2259,7 +2272,7 @@ def is_verified_copilot_git_proxy(
     remote: str = "origin",
 ) -> bool:
     return (
-        verified_copilot_git_proxy_url(repository_root, remote)
+        verified_copilot_git_proxy_session(repository_root, remote)
         is not None
     )
 
@@ -2268,22 +2281,38 @@ def verified_copilot_git_proxy_url(
     repository_root: Path,
     remote: str = "origin",
 ) -> str | None:
+    session = verified_copilot_git_proxy_session(repository_root, remote)
+    return None if session is None else session.remote_url
+
+
+def verified_copilot_git_proxy_session(
+    repository_root: Path,
+    remote: str = "origin",
+) -> VerifiedCopilotGitProxySession | None:
     try:
         root = _repository_root(repository_root)
         _identifier(remote, "remote")
     except (StateRefError, ValueError):
         return None
-    return _verified_copilot_git_proxy_url(root, remote)
+    return _verified_copilot_git_proxy_session(root, remote)
 
 
 def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
-    return _verified_copilot_git_proxy_url(root, remote) is not None
+    return _verified_copilot_git_proxy_session(root, remote) is not None
 
 
 def _verified_copilot_git_proxy_url(
     root: Path,
     remote: str,
 ) -> str | None:
+    session = _verified_copilot_git_proxy_session(root, remote)
+    return None if session is None else session.remote_url
+
+
+def _verified_copilot_git_proxy_session(
+    root: Path,
+    remote: str,
+) -> VerifiedCopilotGitProxySession | None:
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     trusted_markers = (
         os.environ.get(_COPILOT_GIT_PROXY_MARKER) == "1"
@@ -2307,7 +2336,6 @@ def _verified_copilot_git_proxy_url(
             or _sane_copilot_agent_session_id()
         )
         and "COPILOT_CLI" not in os.environ
-        and _native_copilot_branch(root)
     )
     if not trusted_markers:
         return None
@@ -2339,10 +2367,20 @@ def _verified_copilot_git_proxy_url(
         return None
     if parsed.path != f"/{repository}":
         return None
-    return remote_url
+    branch = _native_copilot_branch(root, remote_url)
+    if branch is None:
+        return None
+    return VerifiedCopilotGitProxySession(
+        remote_url=remote_url,
+        branch=branch[0],
+        head_revision=branch[1],
+    )
 
 
-def _native_copilot_branch(root: Path) -> bool:
+def _native_copilot_branch(
+    root: Path,
+    remote_url: str,
+) -> tuple[str, str] | None:
     symbolic = _run(
         root,
         "git",
@@ -2351,6 +2389,10 @@ def _native_copilot_branch(root: Path) -> bool:
         "HEAD",
         check=False,
     )
+    if symbolic.returncode == 1:
+        return _detached_copilot_branch(root, remote_url)
+    if symbolic.returncode != 0:
+        return None
     resolved = _run(
         root,
         "git",
@@ -2360,14 +2402,108 @@ def _native_copilot_branch(root: Path) -> bool:
         "HEAD",
         check=False,
     )
-    if symbolic.returncode != 0 or resolved.returncode != 0:
-        return False
+    if resolved.returncode != 0:
+        return None
     symbolic_ref = symbolic.stdout.decode("utf-8").strip()
     resolved_ref = resolved.stdout.decode("utf-8").strip()
-    return (
-        symbolic_ref == resolved_ref
-        and _NATIVE_COPILOT_REF.fullmatch(symbolic_ref) is not None
+    if (
+        symbolic_ref != resolved_ref
+        or _NATIVE_COPILOT_REF.fullmatch(symbolic_ref) is None
+    ):
+        return None
+    branch = symbolic_ref.removeprefix("refs/heads/")
+    if not _sane_copilot_branch(root, branch):
+        return None
+    wrapper_branch = os.environ.get("GITHUB_AGENT_BRANCH_NAME")
+    if wrapper_branch is not None and (
+        wrapper_branch != branch
+        or not _sane_copilot_branch(root, wrapper_branch)
+    ):
+        return None
+    head_revision = _head_commit(root)
+    if head_revision is None:
+        return None
+    return branch, head_revision
+
+
+def _detached_copilot_branch(
+    root: Path,
+    remote_url: str,
+) -> tuple[str, str] | None:
+    branch = os.environ.get("GITHUB_AGENT_BRANCH_NAME", "")
+    actor = os.environ.get("GITHUB_AGENT_ACTOR", "")
+    if (
+        os.environ.get("COPILOT_AGENT_SOURCE_ENVIRONMENT")
+        not in _COPILOT_AGENT_SOURCE_ENVIRONMENTS
+        or not _sane_copilot_agent_start_time()
+        or not _sane_copilot_agent_timeout()
+        or not _sane_copilot_agent_session_id()
+        or not _sane_copilot_branch(root, branch)
+        or _GITHUB_AGENT_ACTOR.fullmatch(actor) is None
+    ):
+        return None
+    status = _run(
+        root,
+        "git",
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "--untracked-files=no",
+        check=False,
     )
+    if status.returncode != 0 or b"# branch.head (detached)" not in (
+        status.stdout.splitlines()
+    ):
+        return None
+    head_revision = _head_commit(root)
+    if head_revision is None:
+        return None
+    try:
+        remote_revision = isolated_remote_revision(
+            root,
+            remote_url,
+            f"refs/heads/{branch}",
+        )
+    except GitTransportError:
+        return None
+    if (
+        remote_revision is not None
+        and remote_revision != head_revision
+    ):
+        return None
+    return branch, head_revision
+
+
+def _sane_copilot_branch(root: Path, value: str) -> bool:
+    if _NATIVE_COPILOT_BRANCH.fullmatch(value) is None:
+        return False
+    checked = _run(
+        root,
+        "git",
+        "check-ref-format",
+        "--branch",
+        value,
+        check=False,
+    )
+    return (
+        checked.returncode == 0
+        and checked.stdout.decode("utf-8").strip() == value
+    )
+
+
+def _head_commit(root: Path) -> str | None:
+    resolved = _run(
+        root,
+        "git",
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        check=False,
+    )
+    if resolved.returncode != 0:
+        return None
+    revision = resolved.stdout.decode("ascii").strip()
+    return revision if _COMMIT.fullmatch(revision) is not None else None
 
 
 def _sane_copilot_agent_start_time() -> bool:

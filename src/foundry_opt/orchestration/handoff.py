@@ -20,7 +20,7 @@ from foundry_opt.orchestration.git_state import (
     StateRefProposal,
     StateRefPushUnacknowledgedError,
     StateRefSnapshot,
-    verified_copilot_git_proxy_url,
+    verified_copilot_git_proxy_session,
 )
 from foundry_opt.orchestration.git_transport import (
     GitTransportError,
@@ -40,6 +40,7 @@ from foundry_opt.preflight.interfaces import CommandRunner
 
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_ZERO_COMMIT = "0" * 40
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _BRANCH = re.compile(
     r"^copilot/[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$"
@@ -1697,7 +1698,10 @@ class CloudHandoffStore:
         if proposal is None:
             raise HandoffError("state proposal metadata is unavailable")
         root = repository_root.expanduser().resolve()
-        if verified_copilot_git_proxy_url(root, self._remote) is None:
+        if (
+            verified_copilot_git_proxy_session(root, self._remote)
+            is None
+        ):
             raise StateRefConflictError(
                 "verified Copilot git proxy is unavailable"
             )
@@ -2001,19 +2005,33 @@ class CloudHandoffStore:
             raise HandoffError(
                 "cloud session branch query failed"
             ) from error
-        if remote_before != session.base_revision:
+        if remote_before not in {None, session.base_revision}:
             artifact_path.unlink(missing_ok=True)
             raise HandoffError(
                 "cloud session branch changed concurrently"
             )
-        _run(
-            root,
-            "git",
-            "update-ref",
-            branch_ref,
-            commit,
-            session.base_revision,
-        )
+        try:
+            local_before = _local_revision(root, branch_ref)
+        except HandoffError:
+            artifact_path.unlink(missing_ok=True)
+            raise
+        if local_before not in {None, session.base_revision}:
+            artifact_path.unlink(missing_ok=True)
+            raise HandoffError(
+                "local cloud session branch changed concurrently"
+            )
+        try:
+            _run(
+                root,
+                "git",
+                "update-ref",
+                branch_ref,
+                commit,
+                local_before or _ZERO_COMMIT,
+            )
+        except HandoffError:
+            artifact_path.unlink(missing_ok=True)
+            raise
         _run(root, "git", "reset", "--mixed", "--quiet", commit)
         try:
             pushed = isolated_compare_and_swap_push(
@@ -2042,19 +2060,18 @@ class CloudHandoffStore:
 
 
 def _cloud_session(root: Path, remote: str) -> _CloudSession:
-    remote_url = verified_copilot_git_proxy_url(root, remote)
-    if remote_url is None:
+    verified = verified_copilot_git_proxy_session(root, remote)
+    if verified is None:
         raise HandoffError("verified Copilot git proxy is unavailable")
-    branch = _git_text(root, "symbolic-ref", "--short", "HEAD")
-    if _BRANCH.fullmatch(branch) is None:
+    if _BRANCH.fullmatch(verified.branch) is None:
         raise HandoffError("native Copilot session branch is invalid")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if _REPOSITORY.fullmatch(repository) is None:
         raise HandoffError("Copilot cloud repository marker is unavailable")
     return _CloudSession(
-        branch=branch,
-        base_revision=_git_text(root, "rev-parse", "HEAD^{commit}"),
-        remote_url=remote_url,
+        branch=verified.branch,
+        base_revision=verified.head_revision,
+        remote_url=verified.remote_url,
     )
 
 
@@ -2069,6 +2086,26 @@ def _cloud_remote_revision(
         raise HandoffError(
             "isolated cloud handoff remote query failed"
         ) from error
+
+
+def _local_revision(root: Path, ref: str) -> str | None:
+    resolved = _run(
+        root,
+        "git",
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"{ref}^{{commit}}",
+        check=False,
+    )
+    if resolved.returncode == 1:
+        return None
+    if resolved.returncode != 0:
+        raise HandoffError("local cloud session branch query failed")
+    revision = resolved.stdout.decode("ascii").strip()
+    if _COMMIT.fullmatch(revision) is None:
+        raise HandoffError("local cloud session branch is invalid")
+    return revision
 
 
 def _existing_handoff_content(

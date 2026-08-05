@@ -73,6 +73,8 @@ LIVE_COPILOT_ENVIRONMENT = {
     "COPILOT_AGENT_SESSION_ID": (
         "11111111-2222-4333-8444-555555555555"
     ),
+    "GITHUB_AGENT_BRANCH_NAME": "copilot/steward-issue-46",
+    "GITHUB_AGENT_ACTOR": "copilot-swe-agent[bot]",
 }
 
 

@@ -59,6 +59,8 @@ LIVE_COPILOT_ENVIRONMENT = {
     "COPILOT_AGENT_SESSION_ID": (
         "11111111-2222-4333-8444-555555555555"
     ),
+    "GITHUB_AGENT_BRANCH_NAME": "copilot/steward-issue-31",
+    "GITHUB_AGENT_ACTOR": "copilot-swe-agent[bot]",
 }
 
 
@@ -948,7 +950,7 @@ def test_non_copilot_branch_with_trusted_setup_marker_keeps_conflict_semantics(
     assert proxy.real_revision("refs/heads/main") == base
 
 
-def test_detached_head_cannot_spoof_native_copilot_branch(
+def test_detached_head_rejects_invalid_wrapper_branch(
     tmp_path: Path,
     monkeypatch,
     copilot_git_proxy,
@@ -962,12 +964,173 @@ def test_detached_head_cannot_spoof_native_copilot_branch(
     _set_live_copilot_environment(monkeypatch)
     head = _git(repository, "rev-parse", "HEAD")
     _git(repository, "checkout", "--detach", head)
-    monkeypatch.setenv(
-        "GITHUB_REF",
-        "refs/heads/copilot/steward-issue-31",
+
+    assert is_verified_copilot_git_proxy(repository) is True
+    for branch in (
+        "",
+        "main",
+        "refs/heads/copilot/session",
+        "copilot/../main",
+        "copilot/session.lock",
+        "copilot/session//nested",
+        "copilot/session@{1}",
+        f"copilot/{'x' * 201}",
+    ):
+        monkeypatch.setenv("GITHUB_AGENT_BRANCH_NAME", branch)
+        assert is_verified_copilot_git_proxy(repository) is False, branch
+
+
+def test_detached_copilot_branch_requires_wrapper_identity_markers(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
     )
+    _set_live_copilot_environment(monkeypatch)
+    head = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "checkout", "--detach", head)
+
+    assert is_verified_copilot_git_proxy(repository) is True
+    for marker in (
+        "GITHUB_AGENT_BRANCH_NAME",
+        "GITHUB_AGENT_ACTOR",
+        "COPILOT_AGENT_SOURCE_ENVIRONMENT",
+        "COPILOT_AGENT_START_TIME_SEC",
+        "COPILOT_AGENT_TIMEOUT_MIN",
+        "COPILOT_AGENT_SESSION_ID",
+    ):
+        _set_live_copilot_environment(monkeypatch)
+        monkeypatch.delenv(marker)
+        assert is_verified_copilot_git_proxy(repository) is False, marker
+    for actor in (
+        "",
+        "copilot/agent",
+        "copilot agent",
+        "copilot-agent\nspoof",
+        "x" * 106,
+    ):
+        _set_live_copilot_environment(monkeypatch)
+        monkeypatch.setenv("GITHUB_AGENT_ACTOR", actor)
+        assert is_verified_copilot_git_proxy(repository) is False, actor
+
+
+def test_attached_copilot_branch_requires_matching_wrapper_branch(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+
+    assert is_verified_copilot_git_proxy(repository) is True
+
+    monkeypatch.setenv(
+        "GITHUB_AGENT_BRANCH_NAME",
+        "copilot/other-session",
+    )
+    assert is_verified_copilot_git_proxy(repository) is False
+
+    monkeypatch.setenv(
+        "GITHUB_AGENT_BRANCH_NAME",
+        "copilot/steward-issue-31",
+    )
+    _git(repository, "checkout", "main")
+    assert is_verified_copilot_git_proxy(repository) is False
+
+
+def test_detached_copilot_branch_must_match_proxy_tip(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    (repository / "README.md").write_text(
+        "unpublished detached head\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "unpublished detached head")
+    head = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "checkout", "--detach", head)
 
     assert is_verified_copilot_git_proxy(repository) is False
+
+
+def test_live_detached_copilot_branch_creates_state_handoff(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    branch = (
+        "copilot/optimize-agent-instructions-"
+        "11111111-2222-4333-8444-555555555555"
+    )
+    base = _git(repository, "rev-parse", "HEAD")
+    event = CampaignEvent(
+        "github-run-1",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    assert GitIssueEventInbox(repository).append(31, event) is True
+    proxy = copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    monkeypatch.setenv("GITHUB_AGENT_BRANCH_NAME", branch)
+    _git(repository, "checkout", "--detach", base)
+
+    result = StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        handoffs=CloudHandoffStore(),
+    ).advance(StewardAdvanceRequest(repository, 31))
+
+    assert result.status is StewardAdvanceStatus.WAITING
+    assert result.code == "state_handoff_created"
+    head = _git(repository, "rev-parse", "HEAD")
+    assert head != base
+    assert proxy.real_revision(f"refs/heads/{branch}") == head
+    path = _git(
+        repository,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        f"{head}^1",
+        head,
+    )
+    assert path.startswith(
+        ".foundry-optimizer/handoffs/steward/issue-31/"
+    )
+    assert (repository / path).is_file()
+    assert (
+        subprocess.run(
+            ("git", "symbolic-ref", "--quiet", "HEAD"),
+            cwd=repository,
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )
 
 
 def test_copilot_markers_without_loopback_keep_conflict_semantics(
