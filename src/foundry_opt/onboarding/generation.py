@@ -202,9 +202,13 @@ jobs:
       - name: Install pinned Foundry optimizer
         run: uv tool install {shell_quote(request.product_install)}
 """
-    legacy_setup_workflow_text = workflow_text
     workflow_text += """      - name: Verify issue-only steward entry point
         run: foundry-opt steward advance --help
+"""
+    legacy_setup_workflow_text = workflow_text
+    workflow_text += """      - name: Export non-secret Foundry Copilot Git proxy marker
+        shell: bash
+        run: printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> "$GITHUB_ENV"
 """
 
     contents = {

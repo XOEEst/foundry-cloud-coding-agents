@@ -117,6 +117,12 @@ from foundry_opt.orchestration.git_state import (
     StateRefError,
     StateRefPushUnacknowledgedError,
 )
+from foundry_opt.orchestration.git_transport import (
+    compare_and_swap_push,
+    GitTransportError,
+    remote_revision,
+    resolve_safe_push_remote,
+)
 from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 from foundry_opt.orchestration.models import EventKind
 from foundry_opt.orchestration.spec_policy import (
@@ -1707,33 +1713,42 @@ class _ProductionCandidateDesignRepository:
                 changed_paths=candidate_paths,
             )
             proxy_context = is_verified_copilot_git_proxy(root)
-            existing = self._commands.run(
-                ("git", "ls-remote", "--heads", "origin", ref),
-                cwd=root,
-            ).stdout.strip()
-            if existing:
-                remote_commit = existing.split()[0]
-                if remote_commit != commit:
+            if proxy_context:
+                raise CandidateDesignPushUnacknowledgedError(
+                    artifact
+                )
+            safe_remote = resolve_safe_push_remote(root, "origin")
+            if safe_remote is None:
+                raise CandidateDesignPushUnacknowledgedError(
+                    artifact
+                )
+            try:
+                existing = remote_revision(root, safe_remote, ref)
+            except GitTransportError as error:
+                raise ValueError(
+                    "candidate design remote query failed"
+                ) from error
+            if existing is not None:
+                if existing != commit:
                     raise ValueError("candidate design ref changed")
             else:
-                self._commands.run(
-                    ("git", "push", "--quiet", "origin", f"{commit}:{ref}"),
-                    cwd=root,
-                )
-                if proxy_context:
+                try:
+                    pushed = compare_and_swap_push(
+                        root,
+                        safe_remote,
+                        source_revision=commit,
+                        destination_ref=ref,
+                        expected_revision=None,
+                    )
+                except GitTransportError as error:
+                    raise ValueError(
+                        "candidate design transport failed"
+                    ) from error
+                if pushed.before is not None or pushed.returncode != 0:
                     raise CandidateDesignPushUnacknowledgedError(
                         artifact
                     )
-                acknowledged = self._commands.run(
-                    ("git", "ls-remote", "--heads", "origin", ref),
-                    cwd=root,
-                ).stdout.strip()
-                if not acknowledged:
-                    raise CandidateDesignPushUnacknowledgedError(
-                        artifact
-                    )
-                fields = acknowledged.split()
-                if len(fields) != 2 or fields[0] != commit or fields[1] != ref:
+                if pushed.after != commit:
                     raise ValueError(
                         "candidate design ref acknowledgement changed"
                     )

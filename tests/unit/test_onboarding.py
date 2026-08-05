@@ -282,6 +282,23 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
     )
     assert "runs-on: ubuntu-latest" in workflow
     assert 'environment: "acceptance"' in workflow
+    workflow_document = yaml.safe_load(workflow)
+    marker_step = next(
+        step
+        for step in workflow_document["jobs"]["copilot-setup-steps"]["steps"]
+        if step.get("name")
+        == "Export non-secret Foundry Copilot Git proxy marker"
+    )
+    assert marker_step == {
+        "name": "Export non-secret Foundry Copilot Git proxy marker",
+        "shell": "bash",
+        "run": (
+            "printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' "
+            '>> "$GITHUB_ENV"'
+        ),
+    }
+    assert "${{" not in marker_step["run"]
+    assert "secrets." not in marker_step["run"]
     assert "python-version: '3.12'" in generated
     assert "Missing GitHub Agents or Actions variable: $name" in generated
     assert (
@@ -391,13 +408,27 @@ def test_generated_change_set_has_content_addressed_ownership_manifest(
     assert manifest["accepted_previous_sha256"][
         ".github/skills/foundry-agent-optimizer/SKILL.md"
     ] == [
-        "dc85a8a2246e36d27000a778b7a114419fdb594d56b15569ddc5713f5f0a11ec"
+        "ff0c3f9a072d5381bfd5d056efc9a0fbb27d82be319297666502a8142143e9e9"
     ]
     assert {
         ".github/workflows/copilot-setup-steps.yml",
         ".github/workflows/foundry-exact-candidate-check.yml",
         ".github/workflows/foundry-optimization-issue-intake.yml",
     } <= set(manifest["accepted_previous_normalized_sha256"])
+    workflow_path = Path(".github/workflows/copilot-setup-steps.yml")
+    marker_block = (
+        "      - name: Export non-secret Foundry Copilot Git proxy marker\n"
+        "        shell: bash\n"
+        "        run: printf '%s\\n' "
+        "'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> \"$GITHUB_ENV\"\n"
+    )
+    legacy_workflow = contents[workflow_path].replace(marker_block, "")
+    assert legacy_workflow != contents[workflow_path]
+    assert manifest["accepted_previous_sha256"][
+        workflow_path.as_posix()
+    ] == [
+        hashlib.sha256(legacy_workflow.encode("utf-8")).hexdigest()
+    ]
     assert {
         ".github/workflows/foundry-optimization-control.yml",
         ".github/workflows/foundry-post-deployment-check.yml",

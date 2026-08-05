@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import textwrap
+from threading import Thread
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -27,6 +30,18 @@ class CopilotGitProxyInstallation:
     real_git: str
 
     def disable(self) -> None:
+        subprocess.run(
+            (
+                self.real_git,
+                "remote",
+                "set-url",
+                "origin",
+                str(self.real_origin),
+            ),
+            cwd=self.repository_root,
+            check=True,
+            capture_output=True,
+        )
         for key in (
             "remote.origin.receivepack",
             "remote.origin.uploadpack",
@@ -59,6 +74,119 @@ class CopilotGitProxyInstallation:
         return result.stdout.strip() if result.returncode == 0 else None
 
 
+class _GitSmartHttpServer:
+    def __init__(
+        self,
+        *,
+        git: str,
+        repository: str,
+        shadow: Path,
+    ) -> None:
+        repository_path = f"/{repository}"
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:
+                parsed = urlsplit(self.path)
+                services = parse_qs(parsed.query).get("service", ())
+                if (
+                    parsed.path != f"{repository_path}/info/refs"
+                    or len(services) != 1
+                    or services[0]
+                    not in {"git-upload-pack", "git-receive-pack"}
+                ):
+                    self.send_error(404)
+                    return
+                service = services[0]
+                completed = subprocess.run(
+                    (
+                        git,
+                        service.removeprefix("git-"),
+                        "--stateless-rpc",
+                        "--advertise-refs",
+                        str(shadow),
+                    ),
+                    check=False,
+                    capture_output=True,
+                )
+                if completed.returncode != 0:
+                    self.send_error(500)
+                    return
+                announcement = f"# service={service}\n".encode("ascii")
+                prefix = (
+                    f"{len(announcement) + 4:04x}".encode("ascii")
+                    + announcement
+                    + b"0000"
+                )
+                self._send(
+                    prefix + completed.stdout,
+                    f"application/x-{service}-advertisement",
+                )
+
+            def do_POST(self) -> None:
+                parsed = urlsplit(self.path)
+                service = parsed.path.removeprefix(
+                    f"{repository_path}/"
+                )
+                if (
+                    parsed.query
+                    or service
+                    not in {"git-upload-pack", "git-receive-pack"}
+                ):
+                    self.send_error(404)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self.send_error(400)
+                    return
+                completed = subprocess.run(
+                    (
+                        git,
+                        service.removeprefix("git-"),
+                        "--stateless-rpc",
+                        str(shadow),
+                    ),
+                    input=self.rfile.read(length),
+                    check=False,
+                    capture_output=True,
+                )
+                if completed.returncode != 0:
+                    self.send_error(500)
+                    return
+                self._send(
+                    completed.stdout,
+                    f"application/x-{service}-result",
+                )
+
+            def _send(self, content: bytes, content_type: str) -> None:
+                self.send_response(200)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = Thread(
+            target=self._server.serve_forever,
+            daemon=True,
+        )
+        self._thread.start()
+        self.endpoint = (
+            f"http://127.0.0.1:{self._server.server_port}/{repository}"
+        )
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
 class CopilotGitProxy:
     def __init__(self, root: Path) -> None:
         git = shutil.which("git")
@@ -67,6 +195,7 @@ class CopilotGitProxy:
         self._root = root
         self._git = git
         self._counter = 0
+        self._servers: list[_GitSmartHttpServer] = []
 
     def install(
         self,
@@ -254,38 +383,100 @@ class CopilotGitProxy:
             encoding="utf-8",
         )
         if loopback_origin:
-            endpoint = f"http://localhost:26831/{repository}"
+            self._install_http_proxy_hook(
+                shadow,
+                real_origin,
+                acknowledgement=acknowledgement,
+                synthetic=synthetic,
+            )
+            server = _GitSmartHttpServer(
+                git=self._git,
+                repository=repository,
+                shadow=shadow,
+            )
+            self._servers.append(server)
             self._run(
                 "remote",
                 "set-url",
                 "origin",
-                endpoint,
+                server.endpoint,
+                cwd=repository_root,
+            )
+        else:
+            python = Path(sys.executable).as_posix()
+            self._run(
+                "config",
+                "remote.origin.receivepack",
+                f'"{python}" "{receive_script.as_posix()}"',
                 cwd=repository_root,
             )
             self._run(
                 "config",
-                f"url.{real_origin.resolve().as_uri()}.insteadOf",
-                endpoint,
+                "remote.origin.uploadpack",
+                f'"{python}" "{upload_script.as_posix()}"',
                 cwd=repository_root,
             )
-        python = Path(sys.executable).as_posix()
-        self._run(
-            "config",
-            "remote.origin.receivepack",
-            f'"{python}" "{receive_script.as_posix()}"',
-            cwd=repository_root,
-        )
-        self._run(
-            "config",
-            "remote.origin.uploadpack",
-            f'"{python}" "{upload_script.as_posix()}"',
-            cwd=repository_root,
-        )
         return CopilotGitProxyInstallation(
             repository_root,
             real_origin,
             self._git,
         )
+
+    def close(self) -> None:
+        for server in reversed(self._servers):
+            server.close()
+        self._servers.clear()
+
+    def _install_http_proxy_hook(
+        self,
+        shadow: Path,
+        real_origin: Path,
+        *,
+        acknowledgement: str,
+        synthetic: str,
+    ) -> None:
+        hook = shadow / "hooks" / "post-receive"
+        hook.write_text(
+            "#!/bin/sh\n"
+            'git_dir="${GIT_DIR:-.}"\n'
+            "zero=0000000000000000000000000000000000000000\n"
+            "while read old new ref; do\n"
+            '  case "$ref" in\n'
+            "    refs/heads/foundry-opt/state/*|"
+            "refs/heads/foundry-opt/design/*)\n"
+            f"      case {_shell_quote(acknowledgement)} in\n"
+            "        absent)\n"
+            '          git --git-dir="$git_dir" update-ref '
+            '-d "$ref" "$new"\n'
+            "          ;;\n"
+            "        expected)\n"
+            '          if [ "$old" = "$zero" ]; then\n'
+            '            git --git-dir="$git_dir" update-ref '
+            '-d "$ref" "$new"\n'
+            "          else\n"
+            '            git --git-dir="$git_dir" update-ref '
+            '"$ref" "$old" "$new"\n'
+            "          fi\n"
+            "          ;;\n"
+            "        proposed)\n"
+            "          ;;\n"
+            "        unrelated)\n"
+            '          git --git-dir="$git_dir" update-ref '
+            f'"$ref" {_shell_quote(synthetic)} "$new"\n'
+            "          ;;\n"
+            "      esac\n"
+            "      ;;\n"
+            "    refs/heads/*)\n"
+            '      git --git-dir="$git_dir" push --quiet --force '
+            f"{_shell_quote(real_origin.resolve().as_posix())} "
+            '"$new:$ref"\n'
+            "      ;;\n"
+            "  esac\n"
+            "done\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        hook.chmod(0o755)
 
     def _run(
         self,
@@ -303,4 +494,12 @@ class CopilotGitProxy:
 
 @pytest.fixture
 def copilot_git_proxy(tmp_path: Path) -> CopilotGitProxy:
-    return CopilotGitProxy(tmp_path)
+    proxy = CopilotGitProxy(tmp_path)
+    try:
+        yield proxy
+    finally:
+        proxy.close()
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"

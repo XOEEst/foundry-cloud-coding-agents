@@ -151,11 +151,25 @@ either `policy_approved` or `human_review`.
   authorized deployment intents. Actions may replay canonical interfaces to
   verify a proposed handoff exactly, but cannot choose another transition or
   invent an effect.
-- If Copilot's local Git proxy acknowledges a private state/design ref push
-  without publishing it, the canonical command commits one privacy-validated,
-  content-addressed envelope on the native session branch. A base-context
-  workflow reads only that exact object, CAS-publishes the private ref, applies
-  persisted outbox effects, and auto-closes the internal handoff PR.
+- The default-branch-generated Copilot setup workflow exports the static,
+  non-secret `FOUNDRY_OPT_COPILOT_GIT_PROXY=1` marker; no pull-request input
+  controls it. Proxy authority additionally requires `GITHUB_ACTIONS=true`, the
+  exact repository, an exact loopback HTTP(S) origin with port and repository
+  path, and the actual Git symbolic ref to be a native `copilot/` branch.
+  Available production/session markers must be sane, while hidden token and
+  download markers are not required; `COPILOT_CLI` is always rejected.
+- In a verified Copilot proxy context, the canonical command does not send the
+  private state/design ref through the proxy. It commits one privacy-validated,
+  content-addressed envelope on the native session branch instead. A
+  base-context workflow reads only that exact object, CAS-publishes the private
+  ref, applies persisted outbox effects, and auto-closes the internal handoff PR.
+- Private state/design transport and handoff publication bind to one captured
+  URL through an isolated Git configuration. Ambiguous `pushurl`, URL-rewrite,
+  pack-helper, or proxy settings fail closed and cannot redirect proposal
+  objects.
+- The explicit marker alone grants no state authority. Ordinary Actions origins
+  and branches remain on normal Git semantics, and a local spoof can only route
+  through the trusted handoff validator and compare-and-swap checks.
 - Pull requests are opened natively by Copilot planner and applier sessions,
   not by Actions or direct GitHub API calls, to comply with enterprise policy.
 - The planner materializes exceptional immutable spec PRs; the designer edits

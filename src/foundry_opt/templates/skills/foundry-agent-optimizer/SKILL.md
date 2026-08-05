@@ -89,11 +89,23 @@ GitHub Actions are transport/capability only. Pull requests must be opened nativ
 planner and applier sessions, not by Actions or direct PR APIs, because enterprise policy reserves
 PR authorship to Copilot.
 
-When the Copilot Git proxy acknowledges a canonical state or designer-result push without creating
-the ref, the command may commit one privacy-validated, content-addressed envelope at the reserved
-handoff path on the native session branch. Those internal handoff pull requests are transport
-artifacts, never specification or candidate pull requests, and are auto-closed after handling.
-Generated `pull_request` workflows skip handoff-only changes.
+The trusted default-branch Copilot setup workflow exports the static, non-secret
+`FOUNDRY_OPT_COPILOT_GIT_PROXY=1` marker; no pull-request input controls it. Proxy authority also
+requires `GITHUB_ACTIONS=true`, the exact repository, an exact loopback HTTP(S) origin with port and
+repository path, and Git plumbing confirmation that HEAD is a native `copilot/` branch. Available
+production/session markers must be sane, hidden token/download markers are not required, and
+`COPILOT_CLI` is rejected. The marker alone grants no state authority: ordinary Actions retain
+normal Git semantics, while a local spoof can only enter the trusted handoff validator and
+compare-and-swap path.
+
+In a verified Copilot proxy context, the command does not send the private canonical state or
+designer-result ref through the proxy. It commits one privacy-validated, content-addressed envelope
+at the reserved handoff path on the native session branch instead. Those internal handoff pull requests
+are transport artifacts, never specification or candidate pull requests, and are
+auto-closed after handling. Generated `pull_request` workflows skip handoff-only changes.
+Private state/design transport and handoff publication bind to one captured URL through an isolated
+Git configuration. Ambiguous `pushurl`, URL-rewrite, pack-helper, or proxy settings fail closed and
+cannot redirect proposal objects.
 
 Actions may replay canonical interfaces only to verify the exact proposed transition and persisted
 effects. Actions cannot choose a different transition, add an effect, reinterpret the model's

@@ -32,13 +32,20 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
         names = set(archive.namelist())
         assert skill_path in names
         assert "foundry_opt/onboarding/bundle.py" in names
+        assert "foundry_opt/onboarding/generation.py" in names
+        assert "foundry_opt/orchestration/git_transport.py" in names
         assert "foundry_opt/orchestration/transport.py" in names
         assert "foundry_opt/orchestration/handoff.py" in names
         bundle = archive.read(
             "foundry_opt/onboarding/bundle.py"
         ).decode("utf-8")
+        generation = archive.read(
+            "foundry_opt/onboarding/generation.py"
+        ).decode("utf-8")
         skill = archive.read(skill_path).decode("utf-8")
 
     assert "Create one `[Optimize]` issue" in skill
     assert "foundry-opt steward advance --issue <number>" in skill
+    assert "FOUNDRY_OPT_COPILOT_GIT_PROXY=1" in generation
+    assert "FOUNDRY_OPT_COPILOT_GIT_PROXY=1" in skill
     assert "pull_request_target" in bundle

@@ -324,6 +324,23 @@ def test_skill_template_does_not_claim_datasets_are_staged_in_worktrees() -> Non
     assert "held-out set stays opaque" not in text
 
 
+def test_skill_template_documents_explicit_copilot_proxy_authority() -> None:
+    text = _normalized(
+        (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    )
+    lowered = text.lower()
+
+    assert "`FOUNDRY_OPT_COPILOT_GIT_PROXY=1`" in text
+    assert "non-secret" in lowered
+    assert "exact loopback" in lowered
+    assert "native `copilot/` branch" in text
+    assert "handoff validator" in lowered
+    assert "compare-and-swap" in lowered
+    assert "isolated git configuration" in lowered
+    assert "`pushurl`" in text
+    assert "pack-helper" in lowered
+
+
 def test_skill_template_references_the_vendored_snapshot() -> None:
     text = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
     assert "references/tenzing" in text

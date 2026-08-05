@@ -1183,7 +1183,7 @@ def legacy_repository_agent_hashes(
     }
     hashes[
         Path(".github/skills/foundry-agent-optimizer/SKILL.md")
-    ] = "dc85a8a2246e36d27000a778b7a114419fdb594d56b15569ddc5713f5f0a11ec"
+    ] = "ff0c3f9a072d5381bfd5d056efc9a0fbb27d82be319297666502a8142143e9e9"
     return hashes
 
 

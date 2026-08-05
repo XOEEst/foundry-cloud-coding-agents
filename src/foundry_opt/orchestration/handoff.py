@@ -15,12 +15,17 @@ from uuid import uuid4
 from foundry_opt import __version__
 from foundry_opt.orchestration.git_state import (
     GitStateRef,
-    is_verified_copilot_git_proxy,
     StateRefConflictError,
     StateRefError,
     StateRefProposal,
     StateRefPushUnacknowledgedError,
     StateRefSnapshot,
+    verified_copilot_git_proxy_url,
+)
+from foundry_opt.orchestration.git_transport import (
+    GitTransportError,
+    isolated_compare_and_swap_push,
+    isolated_remote_revision,
 )
 from foundry_opt.orchestration.candidate_workers import (
     CandidateDesignArtifact,
@@ -1671,6 +1676,7 @@ class HandoffApplyService:
 class _CloudSession:
     branch: str
     base_revision: str
+    remote_url: str
 
 
 class CloudHandoffStore:
@@ -1691,6 +1697,10 @@ class CloudHandoffStore:
         if proposal is None:
             raise HandoffError("state proposal metadata is unavailable")
         root = repository_root.expanduser().resolve()
+        if verified_copilot_git_proxy_url(root, self._remote) is None:
+            raise StateRefConflictError(
+                "verified Copilot git proxy is unavailable"
+            )
         session = _cloud_session(root, self._remote)
         existing = _existing_handoff_content(root, session.base_revision)
         if existing is not None:
@@ -1704,9 +1714,9 @@ class CloudHandoffStore:
                 != proposal.expected_revision
                 or handoff.event_ids != proposal.event_ids
                 or handoff.session_branch != session.branch
-                or _remote_revision(
+                or _cloud_remote_revision(
                     root,
-                    self._remote,
+                    session,
                     f"refs/heads/{session.branch}",
                 )
                 != session.base_revision
@@ -1719,9 +1729,9 @@ class CloudHandoffStore:
                 handoff.path,
                 session.base_revision,
             )
-        source_inbox_revision = _remote_revision(
+        source_inbox_revision = _cloud_remote_revision(
             root,
-            self._remote,
+            session,
             (
                 "refs/heads/foundry-opt/inbox/"
                 f"issue-{proposal.issue_number}"
@@ -1770,9 +1780,9 @@ class CloudHandoffStore:
                 != request.worker_issue_number
                 or handoff.result != result
                 or handoff.session_branch != session.branch
-                or _remote_revision(
+                or _cloud_remote_revision(
                     root,
-                    self._remote,
+                    session,
                     f"refs/heads/{session.branch}",
                 )
                 != session.base_revision
@@ -1785,9 +1795,9 @@ class CloudHandoffStore:
                 handoff.path,
                 session.base_revision,
             )
-        source_inbox_revision = _remote_revision(
+        source_inbox_revision = _cloud_remote_revision(
             root,
-            self._remote,
+            session,
             (
                 "refs/heads/foundry-opt/inbox/"
                 f"issue-{request.issue_number}"
@@ -1901,7 +1911,7 @@ class CloudHandoffStore:
                     "existing cloud handoff ancestry is invalid"
                 )
             branch_ref = f"refs/heads/{session.branch}"
-            remote = _remote_revision(root, self._remote, branch_ref)
+            remote = _cloud_remote_revision(root, session, branch_ref)
             if remote != session.base_revision:
                 raise HandoffError(
                     "existing cloud handoff is not published"
@@ -1981,10 +1991,21 @@ class CloudHandoffStore:
             index.unlink(missing_ok=True)
             Path(f"{index}.lock").unlink(missing_ok=True)
         branch_ref = f"refs/heads/{session.branch}"
-        remote_before = _remote_revision(root, self._remote, branch_ref)
+        try:
+            remote_before = isolated_remote_revision(
+                root,
+                session.remote_url,
+                branch_ref,
+            )
+        except GitTransportError as error:
+            raise HandoffError(
+                "cloud session branch query failed"
+            ) from error
         if remote_before != session.base_revision:
             artifact_path.unlink(missing_ok=True)
-            raise HandoffError("cloud session branch changed concurrently")
+            raise HandoffError(
+                "cloud session branch changed concurrently"
+            )
         _run(
             root,
             "git",
@@ -1994,18 +2015,24 @@ class CloudHandoffStore:
             session.base_revision,
         )
         _run(root, "git", "reset", "--mixed", "--quiet", commit)
-        result = _run(
-            root,
-            "git",
-            "push",
-            f"--force-with-lease={branch_ref}:{remote_before}",
-            self._remote,
-            f"{commit}:{branch_ref}",
-            check=False,
-        )
-        if result.returncode != 0:
+        try:
+            pushed = isolated_compare_and_swap_push(
+                root,
+                session.remote_url,
+                source_revision=commit,
+                destination_ref=branch_ref,
+                expected_revision=remote_before,
+            )
+        except GitTransportError as error:
+            raise HandoffError(
+                "cloud session handoff transport failed"
+            ) from error
+        if (
+            pushed.before != remote_before
+            or pushed.returncode != 0
+        ):
             raise HandoffError("cloud session handoff push failed")
-        if _remote_revision(root, self._remote, branch_ref) != commit:
+        if pushed.after != commit:
             raise HandoffError(
                 "cloud session handoff push was not acknowledged"
             )
@@ -2015,7 +2042,8 @@ class CloudHandoffStore:
 
 
 def _cloud_session(root: Path, remote: str) -> _CloudSession:
-    if not is_verified_copilot_git_proxy(root, remote):
+    remote_url = verified_copilot_git_proxy_url(root, remote)
+    if remote_url is None:
         raise HandoffError("verified Copilot git proxy is unavailable")
     branch = _git_text(root, "symbolic-ref", "--short", "HEAD")
     if _BRANCH.fullmatch(branch) is None:
@@ -2026,7 +2054,21 @@ def _cloud_session(root: Path, remote: str) -> _CloudSession:
     return _CloudSession(
         branch=branch,
         base_revision=_git_text(root, "rev-parse", "HEAD^{commit}"),
+        remote_url=remote_url,
     )
+
+
+def _cloud_remote_revision(
+    root: Path,
+    session: _CloudSession,
+    ref: str,
+) -> str | None:
+    try:
+        return isolated_remote_revision(root, session.remote_url, ref)
+    except GitTransportError as error:
+        raise HandoffError(
+            "isolated cloud handoff remote query failed"
+        ) from error
 
 
 def _existing_handoff_content(

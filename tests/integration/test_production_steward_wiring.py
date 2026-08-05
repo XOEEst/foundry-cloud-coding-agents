@@ -64,6 +64,7 @@ from foundry_opt.orchestration.steward import (
 
 ISSUE = 46
 LIVE_COPILOT_ENVIRONMENT = {
+    "FOUNDRY_OPT_COPILOT_GIT_PROXY": "1",
     "GITHUB_ACTIONS": "true",
     "GITHUB_REPOSITORY": "microsoft-foundry/luffy-test-agents-repo",
     "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
@@ -98,6 +99,7 @@ def _set_normal_github_actions_environment(monkeypatch) -> None:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
+    monkeypatch.setenv("FOUNDRY_OPT_COPILOT_GIT_PROXY", "1")
 
 
 def _git(root: Path, *arguments: str) -> str:

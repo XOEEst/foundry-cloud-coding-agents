@@ -22,6 +22,17 @@ from foundry_opt.orchestration.models import (
     CampaignPhase,
     EventKind,
 )
+from foundry_opt.orchestration.git_state import (
+    verified_copilot_git_proxy_url,
+)
+from foundry_opt.orchestration.git_transport import (
+    fetch_revision,
+    GitTransportError,
+    isolated_fetch_revision,
+    isolated_remote_revision,
+    remote_revision,
+    resolve_safe_fetch_remote,
+)
 from foundry_opt.preflight.interfaces import CommandRunner
 from foundry_opt.security import reject_secret_content
 
@@ -1070,35 +1081,52 @@ class GitIssueEventInbox:
         issue_number: int,
     ) -> tuple[str | None, tuple[CampaignEvent, ...]]:
         ref = _inbox_ref(issue_number)
-        output = _git_text(
+        proxy_url = verified_copilot_git_proxy_url(
             self._root,
-            "ls-remote",
-            "--heads",
             self._remote,
-            ref,
         )
-        if not output:
+        try:
+            if proxy_url is not None:
+                revision = isolated_remote_revision(
+                    self._root,
+                    proxy_url,
+                    ref,
+                )
+            else:
+                safe_remote = resolve_safe_fetch_remote(
+                    self._root,
+                    self._remote,
+                )
+                if safe_remote is None:
+                    raise IssueInboxError(
+                        "inbox fetch destination is not trusted"
+                    )
+                revision = remote_revision(
+                    self._root,
+                    safe_remote,
+                    ref,
+                )
+        except GitTransportError as error:
+            raise IssueInboxError("inbox ref query failed") from error
+        if revision is None:
             return None, ()
-        fields = output.split()
-        if (
-            len(fields) != 2
-            or fields[1] != ref
-            or not re.fullmatch(r"[0-9a-f]{40}", fields[0])
-        ):
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
             raise IssueInboxError("inbox ref metadata is invalid")
-        revision = fields[0]
-        _git(
-            self._root,
-            "fetch",
-            "--quiet",
-            self._remote,
-            ref,
-        )
-        fetched = _git_text(
-            self._root,
-            "rev-parse",
-            "FETCH_HEAD^{commit}",
-        )
+        try:
+            if proxy_url is not None:
+                fetched = isolated_fetch_revision(
+                    self._root,
+                    proxy_url,
+                    ref,
+                )
+            else:
+                fetched = fetch_revision(
+                    self._root,
+                    safe_remote,
+                    ref,
+                )
+        except GitTransportError as error:
+            raise IssueInboxError("inbox ref fetch failed") from error
         if fetched != revision:
             raise _IssueInboxPushConflict(
                 "inbox ref changed while loading"

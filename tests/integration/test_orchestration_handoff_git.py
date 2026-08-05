@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -49,6 +50,7 @@ from foundry_opt.optimization.production import (
 
 NOW = datetime(2026, 8, 3, tzinfo=UTC)
 LIVE_COPILOT_ENVIRONMENT = {
+    "FOUNDRY_OPT_COPILOT_GIT_PROXY": "1",
     "GITHUB_ACTIONS": "true",
     "GITHUB_REPOSITORY": "microsoft-foundry/luffy-test-agents-repo",
     "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
@@ -83,6 +85,7 @@ def _set_normal_github_actions_environment(monkeypatch) -> None:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
+    monkeypatch.setenv("FOUNDRY_OPT_COPILOT_GIT_PROXY", "1")
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -267,7 +270,7 @@ def test_cloud_steward_persists_one_content_addressed_handoff(
     )
 
 
-def test_live_cloud_proxy_push_is_reported_as_unacknowledged(
+def test_verified_cloud_proxy_routes_state_without_private_push(
     tmp_path: Path,
     monkeypatch,
     copilot_git_proxy,
@@ -277,6 +280,14 @@ def test_live_cloud_proxy_push_is_reported_as_unacknowledged(
         repository,
         origin,
         acknowledgement="unrelated",
+    )
+    push_target = tmp_path / "push-target.git"
+    _git(tmp_path, "init", "--bare", str(push_target))
+    _git(
+        repository,
+        "config",
+        "remote.origin.pushurl",
+        str(push_target),
     )
     _set_live_copilot_environment(monkeypatch)
     event = CampaignEvent(
@@ -303,6 +314,16 @@ def test_live_cloud_proxy_push_is_reported_as_unacknowledged(
     assert proxy.real_revision(
         "refs/heads/foundry-opt/state/issue-31"
     ) is None
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--heads",
+            str(push_target),
+            "refs/heads/foundry-opt/state/issue-31",
+        )
+        == ""
+    )
 
 
 def test_copilot_proxy_rejects_spoofed_marker_subsets(
@@ -319,17 +340,18 @@ def test_copilot_proxy_rejects_spoofed_marker_subsets(
     _set_live_copilot_environment(monkeypatch)
     assert is_verified_copilot_git_proxy(repository) is True
 
-    for marker in LIVE_COPILOT_ENVIRONMENT:
+    for marker in (
+        "FOUNDRY_OPT_COPILOT_GIT_PROXY",
+        "GITHUB_ACTIONS",
+        "GITHUB_REPOSITORY",
+    ):
         monkeypatch.delenv(marker)
         assert is_verified_copilot_git_proxy(repository) is False, marker
         monkeypatch.setenv(marker, LIVE_COPILOT_ENVIRONMENT[marker])
 
-    monkeypatch.delenv("COPILOT_AGENT_SESSION_ID")
-    monkeypatch.setenv(
-        "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
-        "https://example.invalid/copilot-action-download",
-    )
-    assert is_verified_copilot_git_proxy(repository) is False
+    for value in ("", "0", "01", "true", " 1 "):
+        monkeypatch.setenv("FOUNDRY_OPT_COPILOT_GIT_PROXY", value)
+        assert is_verified_copilot_git_proxy(repository) is False, value
 
 
 def test_copilot_proxy_accepts_live_child_without_api_token(
@@ -361,6 +383,9 @@ def test_copilot_proxy_rejects_malformed_live_markers(
         acknowledgement="unrelated",
     )
     malformed = (
+        ("FOUNDRY_OPT_COPILOT_GIT_PROXY", ""),
+        ("FOUNDRY_OPT_COPILOT_GIT_PROXY", "0"),
+        ("FOUNDRY_OPT_COPILOT_GIT_PROXY", "true"),
         ("GITHUB_ACTIONS", "TRUE"),
         ("GITHUB_ACTIONS", "false"),
         ("GITHUB_REPOSITORY", "octo-org/optimizer/extra"),
@@ -391,7 +416,7 @@ def test_copilot_proxy_rejects_malformed_live_markers(
         )
 
 
-def test_copilot_proxy_does_not_require_absent_optional_markers(
+def test_copilot_proxy_does_not_require_absent_runtime_markers(
     tmp_path: Path,
     monkeypatch,
     copilot_git_proxy,
@@ -403,11 +428,16 @@ def test_copilot_proxy_does_not_require_absent_optional_markers(
         acknowledgement="unrelated",
     )
     _set_live_copilot_environment(monkeypatch)
-    monkeypatch.setenv(
+    for name in (
+        "COPILOT_AGENT_SOURCE_ENVIRONMENT",
+        "COPILOT_AGENT_START_TIME_SEC",
+        "COPILOT_AGENT_TIMEOUT_MIN",
+        "COPILOT_AGENT_SESSION_ID",
+        "GITHUB_COPILOT_API_TOKEN",
         "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
-        "https://example.invalid/copilot-action-download",
-    )
-    monkeypatch.setenv("GITHUB_COPILOT_LOG_ID", "optional-log-id")
+        "GITHUB_COPILOT_LOG_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
     assert is_verified_copilot_git_proxy(repository) is True
 
@@ -430,11 +460,23 @@ def test_copilot_proxy_requires_exact_loopback_repository_path(
         "--get",
         "remote.origin.url",
     )
-    assert remote_url == (
-        "http://localhost:26831/"
-        "microsoft-foundry/luffy-test-agents-repo"
+    parsed_remote = urlsplit(remote_url)
+    assert parsed_remote.scheme == "http"
+    assert parsed_remote.hostname == "127.0.0.1"
+    assert parsed_remote.port is not None
+    assert parsed_remote.path == (
+        "/microsoft-foundry/luffy-test-agents-repo"
     )
-    assert is_verified_copilot_git_proxy(repository) is True
+    valid_urls = (
+        remote_url,
+        "https://127.0.0.1:26831/"
+        "microsoft-foundry/luffy-test-agents-repo",
+        "http://[::1]:26831/"
+        "microsoft-foundry/luffy-test-agents-repo",
+    )
+    for valid_url in valid_urls:
+        _git(repository, "remote", "set-url", "origin", valid_url)
+        assert is_verified_copilot_git_proxy(repository) is True, valid_url
 
     monkeypatch.setenv("GITHUB_REPOSITORY", "microsoft-foundry/other")
     assert is_verified_copilot_git_proxy(repository) is False
@@ -447,7 +489,14 @@ def test_copilot_proxy_requires_exact_loopback_repository_path(
         f"{remote_url}/",
         re.sub(r":\d+/", "/", remote_url, count=1),
         re.sub(r":\d+/", ":0/", remote_url, count=1),
+        remote_url.replace(
+            "microsoft-foundry/luffy-test-agents-repo",
+            "microsoft-foundry/other",
+        ),
         f"{remote_url}?transport=proxy",
+        f"{remote_url}#transport=proxy",
+        remote_url.replace("127.0.0.1", "user@127.0.0.1"),
+        remote_url.replace("127.0.0.1", "github.com"),
     )
     for invalid_url in invalid_urls:
         _git(repository, "remote", "set-url", "origin", invalid_url)
@@ -499,6 +548,11 @@ def test_verified_copilot_proxy_always_creates_state_handoff(
         acknowledgement=acknowledgement,
     )
     _set_live_copilot_environment(monkeypatch)
+    assert os.environ["FOUNDRY_OPT_COPILOT_GIT_PROXY"] == "1"
+    assert _git(repository, "symbolic-ref", "--short", "HEAD").startswith(
+        "copilot/"
+    )
+    assert is_verified_copilot_git_proxy(repository) is True
 
     result = StewardAdvanceService(
         inbox=GitCampaignInbox(),
@@ -567,6 +621,96 @@ def test_verified_copilot_proxy_always_creates_state_handoff(
     assert applied.snapshot.revision == handoff.proposed_revision
 
 
+@pytest.mark.parametrize(
+    "redirect",
+    ("pushurl", "pushInsteadOf", "insteadOf"),
+)
+def test_handoff_transport_ignores_untrusted_push_redirection(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+    redirect: str,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    event = CampaignEvent(
+        "github-run-1",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    assert GitIssueEventInbox(repository).append(31, event) is True
+    (origin / "hooks" / "post-receive").unlink()
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    remote_url = _git(
+        repository,
+        "config",
+        "--get",
+        "remote.origin.url",
+    )
+    push_target = tmp_path / f"{redirect}.git"
+    _git(tmp_path, "init", "--bare", str(push_target))
+    if redirect == "pushurl":
+        _git(
+            repository,
+            "config",
+            "remote.origin.pushurl",
+            str(push_target),
+        )
+    elif redirect == "pushInsteadOf":
+        _git(
+            repository,
+            "config",
+            f"url.{push_target.resolve().as_uri()}.pushInsteadOf",
+            remote_url,
+        )
+    else:
+        _git(
+            repository,
+            "config",
+            f"url.{push_target.resolve().as_uri()}.insteadOf",
+            remote_url,
+        )
+    _set_live_copilot_environment(monkeypatch)
+
+    result = StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        handoffs=CloudHandoffStore(),
+    ).advance(StewardAdvanceRequest(repository, 31))
+
+    assert result.code == "state_handoff_created"
+    handoff_commit = _git(repository, "rev-parse", "HEAD")
+    proposed_revision = _git(
+        repository,
+        "rev-parse",
+        f"{handoff_commit}^2",
+    )
+    assert subprocess.run(
+        (
+            "git",
+            f"--git-dir={push_target}",
+            "cat-file",
+            "-e",
+            f"{proposed_revision}^{{commit}}",
+        ),
+        check=False,
+        capture_output=True,
+    ).returncode != 0
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--heads",
+            str(push_target),
+            "refs/heads/copilot/steward-issue-31",
+        )
+        == ""
+    )
+
+
 def test_local_copilot_cli_marker_does_not_enable_cloud_handoff(
     tmp_path: Path,
     monkeypatch,
@@ -593,8 +737,8 @@ def test_local_copilot_cli_marker_does_not_enable_cloud_handoff(
         handoffs=CloudHandoffStore(),
     ).advance(StewardAdvanceRequest(repository, 31))
 
-    assert result.status is StewardAdvanceStatus.FAILED
-    assert result.code == "state_handoff_failed"
+    assert result.status is StewardAdvanceStatus.CONFLICT
+    assert result.code == "state_ref_conflict"
     assert _git(repository, "rev-parse", "HEAD") == base
     assert (
         _git(
@@ -610,10 +754,12 @@ def test_local_copilot_cli_marker_does_not_enable_cloud_handoff(
     )
 
 
-def test_loopback_origin_without_copilot_markers_keeps_conflict_semantics(
+@pytest.mark.parametrize("marker", (None, "", "0", "true", "01", " 1 "))
+def test_missing_or_wrong_setup_marker_keeps_conflict_semantics(
     tmp_path: Path,
     monkeypatch,
     copilot_git_proxy,
+    marker: str | None,
 ) -> None:
     repository, origin, base = _repository(tmp_path)
     event = CampaignEvent(
@@ -628,7 +774,14 @@ def test_loopback_origin_without_copilot_markers_keeps_conflict_semantics(
         origin,
         acknowledgement="unrelated",
     )
-    _set_normal_github_actions_environment(monkeypatch)
+    _set_live_copilot_environment(monkeypatch)
+    if marker is None:
+        monkeypatch.delenv(
+            "FOUNDRY_OPT_COPILOT_GIT_PROXY",
+            raising=False,
+        )
+    else:
+        monkeypatch.setenv("FOUNDRY_OPT_COPILOT_GIT_PROXY", marker)
 
     result = StewardAdvanceService(
         inbox=GitCampaignInbox(),
@@ -643,6 +796,178 @@ def test_loopback_origin_without_copilot_markers_keeps_conflict_semantics(
     assert proxy.real_revision(
         "refs/heads/copilot/steward-issue-31"
     ) == base
+
+
+@pytest.mark.parametrize("redirect", ("pushurl", "pushInsteadOf"))
+def test_wrong_marker_cannot_redirect_private_state_objects(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+    redirect: str,
+) -> None:
+    repository, origin, base = _repository(tmp_path)
+    event = CampaignEvent(
+        "github-run-1",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    assert GitIssueEventInbox(repository).append(31, event) is True
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    remote_url = _git(
+        repository,
+        "config",
+        "--get",
+        "remote.origin.url",
+    )
+    push_target = tmp_path / f"wrong-marker-{redirect}.git"
+    _git(tmp_path, "init", "--bare", str(push_target))
+    if redirect == "pushurl":
+        _git(
+            repository,
+            "config",
+            "remote.origin.pushurl",
+            str(push_target),
+        )
+    else:
+        _git(
+            repository,
+            "config",
+            f"url.{push_target.resolve().as_uri()}.pushInsteadOf",
+            remote_url,
+        )
+    _set_live_copilot_environment(monkeypatch)
+    monkeypatch.setenv("FOUNDRY_OPT_COPILOT_GIT_PROXY", "0")
+
+    result = StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        handoffs=CloudHandoffStore(),
+    ).advance(StewardAdvanceRequest(repository, 31))
+
+    assert result.status is StewardAdvanceStatus.CONFLICT
+    assert result.code == "state_ref_conflict"
+    assert _git(repository, "rev-parse", "HEAD") == base
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--heads",
+            str(push_target),
+            "refs/heads/foundry-opt/state/issue-31",
+        )
+        == ""
+    )
+
+
+def test_wrong_marker_ignores_untrusted_pack_helpers(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, base = _repository(tmp_path)
+    event = CampaignEvent(
+        "github-run-1",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    assert GitIssueEventInbox(repository).append(31, event) is True
+    (origin / "hooks" / "post-receive").unlink()
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+        loopback_origin=False,
+    )
+    _set_live_copilot_environment(monkeypatch)
+    monkeypatch.setenv("FOUNDRY_OPT_COPILOT_GIT_PROXY", "0")
+
+    state = OptimizationCampaign().advance(
+        AdvanceRequest(31, None, (event,))
+    ).state
+    snapshot = GitStateRef().commit(
+        repository,
+        issue_number=31,
+        expected_revision=None,
+        state=state,
+        inbox=(event,),
+    )
+
+    assert snapshot.state == state
+    assert _git(repository, "rev-parse", "HEAD") == base
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--heads",
+            str(origin),
+            "refs/heads/foundry-opt/state/issue-31",
+        )
+        != ""
+    )
+
+
+def test_non_copilot_branch_with_trusted_setup_marker_keeps_conflict_semantics(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, base = _repository(tmp_path)
+    event = CampaignEvent(
+        "github-run-1",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    assert GitIssueEventInbox(repository).append(31, event) is True
+    _git(repository, "checkout", "main")
+    proxy = copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/copilot/spoofed")
+
+    assert is_verified_copilot_git_proxy(repository) is False
+    result = StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        handoffs=CloudHandoffStore(),
+    ).advance(StewardAdvanceRequest(repository, 31))
+
+    assert result.status is StewardAdvanceStatus.CONFLICT
+    assert result.code == "state_ref_conflict"
+    assert _git(repository, "rev-parse", "HEAD") == base
+    assert proxy.real_revision(
+        "refs/heads/foundry-opt/state/issue-31"
+    ) is None
+    assert proxy.real_revision("refs/heads/main") == base
+
+
+def test_detached_head_cannot_spoof_native_copilot_branch(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    head = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "checkout", "--detach", head)
+    monkeypatch.setenv(
+        "GITHUB_REF",
+        "refs/heads/copilot/steward-issue-31",
+    )
+
+    assert is_verified_copilot_git_proxy(repository) is False
 
 
 def test_copilot_markers_without_loopback_keep_conflict_semantics(
@@ -679,6 +1004,57 @@ def test_copilot_markers_without_loopback_keep_conflict_semantics(
     assert proxy.real_revision(
         "refs/heads/copilot/steward-issue-31"
     ) == base
+
+
+def test_ordinary_actions_setup_marker_keeps_normal_non_handoff_semantics(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, base = _repository(tmp_path)
+    event = CampaignEvent(
+        "github-run-1",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    assert GitIssueEventInbox(repository).append(31, event) is True
+    _git(repository, "checkout", "main")
+    proxy = copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+        loopback_origin=False,
+    )
+    github_origin = "https://github.com/octo-org/optimizer"
+    _git(repository, "remote", "set-url", "origin", github_origin)
+    _git(
+        repository,
+        "config",
+        f"url.{origin.resolve().as_uri()}.insteadOf",
+        github_origin,
+    )
+    _set_normal_github_actions_environment(monkeypatch)
+
+    assert (
+        _git(repository, "config", "--get", "remote.origin.url")
+        == github_origin
+    )
+    assert _git(repository, "symbolic-ref", "--short", "HEAD") == "main"
+    assert os.environ["FOUNDRY_OPT_COPILOT_GIT_PROXY"] == "1"
+    assert is_verified_copilot_git_proxy(repository) is False
+    result = StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        handoffs=CloudHandoffStore(),
+    ).advance(StewardAdvanceRequest(repository, 31))
+
+    assert result.status is StewardAdvanceStatus.FAILED
+    assert result.code == "state_ref_unavailable"
+    assert _git(repository, "rev-parse", "HEAD") == base
+    assert proxy.real_revision(
+        "refs/heads/foundry-opt/state/issue-31"
+    ) is None
+    assert proxy.real_revision("refs/heads/main") == base
 
 
 def test_trusted_transport_cas_applies_handoff_once(

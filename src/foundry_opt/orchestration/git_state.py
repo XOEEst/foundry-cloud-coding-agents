@@ -16,6 +16,17 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from foundry_opt.orchestration.campaign import OptimizationCampaign
+from foundry_opt.orchestration.git_transport import (
+    compare_and_swap_push,
+    configured_remote_url,
+    fetch_revision,
+    GitTransportError,
+    isolated_fetch_revision,
+    isolated_remote_revision,
+    remote_revision,
+    resolve_safe_fetch_remote,
+    resolve_safe_push_remote,
+)
 from foundry_opt.orchestration.models import (
     AdvanceRequest,
     CampaignEvent,
@@ -39,6 +50,10 @@ _GITHUB_REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
 )
+_NATIVE_COPILOT_REF = re.compile(
+    r"^refs/heads/copilot/[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$"
+)
+_COPILOT_GIT_PROXY_MARKER = "FOUNDRY_OPT_COPILOT_GIT_PROXY"
 _COPILOT_AGENT_SOURCE_ENVIRONMENTS = frozenset({"production"})
 _COPILOT_AGENT_START_TIME_SEC = re.compile(r"^[0-9]{10}$")
 _COPILOT_AGENT_TIMEOUT_MIN = re.compile(r"^[0-9]{1,4}$")
@@ -578,20 +593,6 @@ class GitStateRef:
             raise StateRefConflictError(
                 "state ref changed before handoff publication"
             )
-        lease = f"--force-with-lease={ref}:{expected_revision or ''}"
-        result = _run(
-            root,
-            "git",
-            "push",
-            lease,
-            self._remote,
-            f"{proposed_revision}:{ref}",
-            check=False,
-        )
-        if result.returncode != 0:
-            raise StateRefConflictError(
-                "state handoff compare-and-swap failed"
-            )
         if proxy_context:
             raise StateRefPushUnacknowledgedError(
                 ref=ref,
@@ -603,7 +604,31 @@ class GitStateRef:
                     f"{proposed_revision}^{{tree}}",
                 ),
             )
-        acknowledged = self._remote_revision(root, ref)
+        safe_remote = resolve_safe_push_remote(root, self._remote)
+        if safe_remote is None:
+            raise StateRefConflictError(
+                "state handoff push destination is not trusted"
+            )
+        try:
+            pushed = compare_and_swap_push(
+                root,
+                safe_remote,
+                source_revision=proposed_revision,
+                destination_ref=ref,
+                expected_revision=expected_revision,
+            )
+        except GitTransportError as error:
+            raise StateRefConflictError(
+                "state handoff transport failed"
+            ) from error
+        if (
+            pushed.before != expected_revision
+            or pushed.returncode != 0
+        ):
+            raise StateRefConflictError(
+                "state handoff compare-and-swap failed"
+            )
+        acknowledged = pushed.after
         if acknowledged != proposed_revision:
             if acknowledged != expected_revision:
                 raise StateRefConflictError(
@@ -816,26 +841,63 @@ class GitStateRef:
         return replace(pending, revision=revision)
 
     def _remote_revision(self, root: Path, ref: str) -> str | None:
-        result = _run(
+        proxy_url = _verified_copilot_git_proxy_url(
             root,
-            "git",
-            "ls-remote",
-            "--heads",
             self._remote,
-            ref,
         )
-        output = result.stdout.decode("utf-8").strip()
-        if not output:
-            return None
-        fields = output.split()
-        if len(fields) != 2 or fields[1] != ref:
-            raise StateRefCorruptionError("state ref metadata is invalid")
-        _commit(fields[0], "state revision")
-        return fields[0]
+        if proxy_url is not None:
+            try:
+                revision = isolated_remote_revision(
+                    root,
+                    proxy_url,
+                    ref,
+                )
+            except GitTransportError as error:
+                raise StateRefError("state ref query failed") from error
+            if revision is not None:
+                _commit(revision, "state revision")
+            return revision
+        safe_remote = resolve_safe_fetch_remote(root, self._remote)
+        if safe_remote is None:
+            raise StateRefError(
+                "state ref fetch destination is not trusted"
+            )
+        try:
+            revision = remote_revision(root, safe_remote, ref)
+        except GitTransportError as error:
+            raise StateRefError("state ref query failed") from error
+        if revision is not None:
+            _commit(revision, "state revision")
+        return revision
 
     def _fetch(self, root: Path, ref: str, revision: str) -> None:
-        _run(root, "git", "fetch", "--quiet", self._remote, ref)
-        fetched = _git_text(root, "rev-parse", "FETCH_HEAD^{commit}")
+        proxy_url = _verified_copilot_git_proxy_url(
+            root,
+            self._remote,
+        )
+        if proxy_url is not None:
+            try:
+                fetched = isolated_fetch_revision(
+                    root,
+                    proxy_url,
+                    ref,
+                )
+            except GitTransportError as error:
+                raise StateRefError("state ref fetch failed") from error
+            if fetched != revision:
+                raise StateRefConflictError(
+                    "state ref changed while it was being loaded"
+                )
+            return
+        safe_remote = resolve_safe_fetch_remote(root, self._remote)
+        if safe_remote is None:
+            raise StateRefError(
+                "state ref fetch destination is not trusted"
+            )
+        try:
+            fetched = fetch_revision(root, safe_remote, ref)
+        except GitTransportError as error:
+            raise StateRefError("state ref fetch failed") from error
         if fetched != revision:
             raise StateRefConflictError(
                 "state ref changed while it was being loaded"
@@ -983,21 +1045,7 @@ class GitStateRef:
             index_path.unlink(missing_ok=True)
             Path(f"{index_path}.lock").unlink(missing_ok=True)
 
-        lease = f"--force-with-lease={ref}:{parent or ''}"
         proxy_context = _verified_copilot_git_proxy(root, self._remote)
-        result = _run(
-            root,
-            "git",
-            "push",
-            lease,
-            self._remote,
-            f"{commit_sha}:{ref}",
-            check=False,
-        )
-        if result.returncode != 0:
-            raise StateRefConflictError(
-                "state ref compare-and-swap failed"
-            )
         if proxy_context:
             raise StateRefPushUnacknowledgedError(
                 ref=ref,
@@ -1005,7 +1053,28 @@ class GitStateRef:
                 proposed_revision=commit_sha,
                 proposed_tree=tree,
             )
-        acknowledged = self._remote_revision(root, ref)
+        safe_remote = resolve_safe_push_remote(root, self._remote)
+        if safe_remote is None:
+            raise StateRefConflictError(
+                "state ref push destination is not trusted"
+            )
+        try:
+            pushed = compare_and_swap_push(
+                root,
+                safe_remote,
+                source_revision=commit_sha,
+                destination_ref=ref,
+                expected_revision=parent,
+            )
+        except GitTransportError as error:
+            raise StateRefConflictError(
+                "state ref transport failed"
+            ) from error
+        if pushed.before != parent or pushed.returncode != 0:
+            raise StateRefConflictError(
+                "state ref compare-and-swap failed"
+            )
+        acknowledged = pushed.after
         if acknowledged != commit_sha:
             if acknowledged != parent:
                 raise StateRefConflictError(
@@ -2189,46 +2258,68 @@ def is_verified_copilot_git_proxy(
     repository_root: Path,
     remote: str = "origin",
 ) -> bool:
+    return (
+        verified_copilot_git_proxy_url(repository_root, remote)
+        is not None
+    )
+
+
+def verified_copilot_git_proxy_url(
+    repository_root: Path,
+    remote: str = "origin",
+) -> str | None:
     try:
         root = _repository_root(repository_root)
         _identifier(remote, "remote")
     except (StateRefError, ValueError):
-        return False
-    return _verified_copilot_git_proxy(root, remote)
+        return None
+    return _verified_copilot_git_proxy_url(root, remote)
 
 
 def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
+    return _verified_copilot_git_proxy_url(root, remote) is not None
+
+
+def _verified_copilot_git_proxy_url(
+    root: Path,
+    remote: str,
+) -> str | None:
     repository = os.environ.get("GITHUB_REPOSITORY", "")
-    # The CCA wrapper unsets its API token before launching the tool runtime.
     trusted_markers = (
-        os.environ.get("GITHUB_ACTIONS") == "true"
+        os.environ.get(_COPILOT_GIT_PROXY_MARKER) == "1"
+        and os.environ.get("GITHUB_ACTIONS") == "true"
         and _GITHUB_REPOSITORY.fullmatch(repository) is not None
-        and os.environ.get("COPILOT_AGENT_SOURCE_ENVIRONMENT")
-        in _COPILOT_AGENT_SOURCE_ENVIRONMENTS
-        and _sane_copilot_agent_start_time()
-        and _sane_copilot_agent_timeout()
-        and _sane_copilot_agent_session_id()
+        and (
+            "COPILOT_AGENT_SOURCE_ENVIRONMENT" not in os.environ
+            or os.environ["COPILOT_AGENT_SOURCE_ENVIRONMENT"]
+            in _COPILOT_AGENT_SOURCE_ENVIRONMENTS
+        )
+        and (
+            "COPILOT_AGENT_START_TIME_SEC" not in os.environ
+            or _sane_copilot_agent_start_time()
+        )
+        and (
+            "COPILOT_AGENT_TIMEOUT_MIN" not in os.environ
+            or _sane_copilot_agent_timeout()
+        )
+        and (
+            "COPILOT_AGENT_SESSION_ID" not in os.environ
+            or _sane_copilot_agent_session_id()
+        )
         and "COPILOT_CLI" not in os.environ
+        and _native_copilot_branch(root)
     )
     if not trusted_markers:
-        return False
-    result = _run(
-        root,
-        "git",
-        "config",
-        "--get",
-        f"remote.{remote}.url",
-        check=False,
-    )
-    if result.returncode != 0:
-        return False
-    remote_url = result.stdout.decode("utf-8").strip()
+        return None
+    remote_url = configured_remote_url(root, remote)
+    if remote_url is None:
+        return None
     try:
         parsed = urlsplit(remote_url)
         hostname = parsed.hostname
         port = parsed.port
     except ValueError:
-        return False
+        return None
     try:
         loopback = hostname == "localhost" or (
             hostname is not None and ip_address(hostname).is_loopback
@@ -2245,8 +2336,38 @@ def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
         or parsed.query
         or parsed.fragment
     ):
+        return None
+    if parsed.path != f"/{repository}":
+        return None
+    return remote_url
+
+
+def _native_copilot_branch(root: Path) -> bool:
+    symbolic = _run(
+        root,
+        "git",
+        "symbolic-ref",
+        "--quiet",
+        "HEAD",
+        check=False,
+    )
+    resolved = _run(
+        root,
+        "git",
+        "rev-parse",
+        "--verify",
+        "--symbolic-full-name",
+        "HEAD",
+        check=False,
+    )
+    if symbolic.returncode != 0 or resolved.returncode != 0:
         return False
-    return parsed.path == f"/{repository}"
+    symbolic_ref = symbolic.stdout.decode("utf-8").strip()
+    resolved_ref = resolved.stdout.decode("utf-8").strip()
+    return (
+        symbolic_ref == resolved_ref
+        and _NATIVE_COPILOT_REF.fullmatch(symbolic_ref) is not None
+    )
 
 
 def _sane_copilot_agent_start_time() -> bool:

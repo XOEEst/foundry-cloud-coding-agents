@@ -588,6 +588,14 @@ class StewardAdvanceService:
             )
         try:
             self._handoffs.persist_state(request.repository_root, error)
+        except StateRefConflictError:
+            return self._failure(
+                request,
+                StewardAdvanceStatus.CONFLICT,
+                "The durable campaign state changed concurrently.",
+                "state_ref_conflict",
+                snapshot,
+            )
         except Exception:
             return self._failure(
                 request,
