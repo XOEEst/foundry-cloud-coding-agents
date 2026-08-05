@@ -72,13 +72,13 @@ LIVE_COPILOT_ENVIRONMENT = {
     "COPILOT_AGENT_SESSION_ID": (
         "11111111-2222-4333-8444-555555555555"
     ),
-    "GITHUB_COPILOT_API_TOKEN": "live-fixture-api-token",
 }
 
 
 def _set_live_copilot_environment(monkeypatch) -> None:
     for name in (
         "COPILOT_CLI",
+        "GITHUB_COPILOT_API_TOKEN",
         "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
         "GITHUB_COPILOT_LOG_ID",
     ):

@@ -2199,6 +2199,7 @@ def is_verified_copilot_git_proxy(
 
 def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
     repository = os.environ.get("GITHUB_REPOSITORY", "")
+    # The CCA wrapper unsets its API token before launching the tool runtime.
     trusted_markers = (
         os.environ.get("GITHUB_ACTIONS") == "true"
         and _GITHUB_REPOSITORY.fullmatch(repository) is not None
@@ -2207,7 +2208,6 @@ def _verified_copilot_git_proxy(root: Path, remote: str) -> bool:
         and _sane_copilot_agent_start_time()
         and _sane_copilot_agent_timeout()
         and _sane_copilot_agent_session_id()
-        and _nonempty_environment_marker("GITHUB_COPILOT_API_TOKEN")
         and "COPILOT_CLI" not in os.environ
     )
     if not trusted_markers:
@@ -2270,11 +2270,6 @@ def _sane_copilot_agent_timeout() -> bool:
 def _sane_copilot_agent_session_id() -> bool:
     value = os.environ.get("COPILOT_AGENT_SESSION_ID", "")
     return _COPILOT_AGENT_SESSION_ID.fullmatch(value) is not None
-
-
-def _nonempty_environment_marker(name: str) -> bool:
-    value = os.environ.get(name)
-    return value is not None and bool(value.strip())
 
 
 def _repository_root(path: Path) -> Path:

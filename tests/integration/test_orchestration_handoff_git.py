@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -56,13 +57,13 @@ LIVE_COPILOT_ENVIRONMENT = {
     "COPILOT_AGENT_SESSION_ID": (
         "11111111-2222-4333-8444-555555555555"
     ),
-    "GITHUB_COPILOT_API_TOKEN": "live-fixture-api-token",
 }
 
 
 def _set_live_copilot_environment(monkeypatch) -> None:
     for name in (
         "COPILOT_CLI",
+        "GITHUB_COPILOT_API_TOKEN",
         "GITHUB_COPILOT_ACTION_DOWNLOAD_URL",
         "GITHUB_COPILOT_LOG_ID",
     ):
@@ -331,6 +332,23 @@ def test_copilot_proxy_rejects_spoofed_marker_subsets(
     assert is_verified_copilot_git_proxy(repository) is False
 
 
+def test_copilot_proxy_accepts_live_child_without_api_token(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="unrelated",
+    )
+    _set_live_copilot_environment(monkeypatch)
+
+    assert "GITHUB_COPILOT_API_TOKEN" not in os.environ
+    assert is_verified_copilot_git_proxy(repository) is True
+
+
 def test_copilot_proxy_rejects_malformed_live_markers(
     tmp_path: Path,
     monkeypatch,
@@ -355,8 +373,6 @@ def test_copilot_proxy_rejects_malformed_live_markers(
         ("COPILOT_AGENT_TIMEOUT_MIN", "0"),
         ("COPILOT_AGENT_TIMEOUT_MIN", "60.0"),
         ("COPILOT_AGENT_TIMEOUT_MIN", "1441"),
-        ("GITHUB_COPILOT_API_TOKEN", ""),
-        ("GITHUB_COPILOT_API_TOKEN", "   "),
         ("COPILOT_AGENT_SESSION_ID", ""),
         ("COPILOT_AGENT_SESSION_ID", "   "),
         ("COPILOT_AGENT_SESSION_ID", "short"),
