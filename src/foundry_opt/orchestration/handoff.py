@@ -967,8 +967,7 @@ class GhHandoffPullRequestGateway:
             f"{label} envelope was handled by the trusted base workflow."
         )
         self._write(
-            "PATCH",
-            f"repos/{self._repository}/pulls/{number}",
+            f"repos/{self._repository}/issues/{number}",
             {
                 "body": body,
                 "state": "closed",
@@ -1030,7 +1029,6 @@ class GhHandoffPullRequestGateway:
 
     def _write(
         self,
-        method: str,
         endpoint: str,
         body: Mapping[str, object] | None,
     ) -> None:
@@ -1038,7 +1036,7 @@ class GhHandoffPullRequestGateway:
             "gh",
             "api",
             "--method",
-            method,
+            "PATCH",
             endpoint,
         ]
         input_text = None

@@ -485,6 +485,15 @@ def test_github_handoff_gateway_never_checks_out_or_executes_pr_content() -> Non
     assert close_payload["state"] == "closed"
     assert close_payload["title"].startswith("[internal]")
     assert "<!-- foundry-opt:internal-handoff:" in close_payload["body"]
+    assert close_call["arguments"] == (
+        "gh",
+        "api",
+        "--method",
+        "PATCH",
+        "repos/octo-org/optimizer/issues/90",
+        "--input",
+        "-",
+    )
     assert (
         "git",
         "push",
