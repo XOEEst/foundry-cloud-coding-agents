@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
@@ -938,14 +939,14 @@ class GhHandoffPullRequestGateway:
                     or not isinstance(payload, Mapping)
                     or payload.get("head") != revision
                     or payload.get("ref") != ref
-                    or payload.get("repository_id") != repository_id
                 ):
                     continue
                 actor = item.get("actor")
                 return (
                     isinstance(actor, Mapping)
                     and actor.get("id") == _COPILOT_APP_USER_ID
-                    and actor.get("login") == "Copilot"
+                    and actor.get("login")
+                    in {"Copilot", "copilot-swe-agent[bot]"}
                 )
             if len(value) < _DISCOVERY_PAGE_SIZE:
                 return False
@@ -1190,7 +1191,14 @@ def discover_trusted_handoff_requests(
                 gateway,
                 require_open=True,
             )
-        except HandoffEventError:
+        except HandoffEventError as error:
+            print(
+                (
+                    "Skipping internal handoff pull request "
+                    f"#{number}: {error}"
+                ),
+                file=sys.stderr,
+            )
             continue
         requests.append(request)
         if len(requests) == limit:
@@ -2688,8 +2696,6 @@ def _copilot_author_login(user: Mapping[str, Any]) -> str | None:
         login == "Copilot"
         and user.get("id") == _COPILOT_APP_USER_ID
         and user.get("type") == "Bot"
-        and user.get("html_url")
-        == "https://github.com/apps/copilot-swe-agent"
     ):
         return login
     return None

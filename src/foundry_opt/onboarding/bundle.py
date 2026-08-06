@@ -545,10 +545,7 @@ jobs:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
         with:
           fetch-depth: 0
-          persist-credentials: false
           ref: ${{{{ github.event.repository.default_branch }}}}
-      - name: Configure trusted GitHub transport
-        run: gh auth setup-git
       - uses: {_SETUP_UV_ACTION} # v9.0.0
       - name: Validate and apply exact internal handoff
         env:

@@ -177,11 +177,12 @@ either `policy_approved` or `human_review`.
   Discovery re-fetches each live PR and exact head SHA, binds that SHA and ref
   to a recent GitHub push event from the exact Copilot App, requires one
   reserved JSON change, and never checks out or executes PR content. The job
-  always checks out the trusted default branch with persisted checkout
-  credentials disabled and ignores repository uv and dotenv configuration. A
-  base-controlled bounded product-commit allowlist permits already-open
-  envelopes to survive a transport-only rollout without weakening canonical
-  validation.
+  always checks out the trusted default branch, ignores repository uv and
+  dotenv configuration, and lets the existing isolated Git transport validate
+  and scope the checkout credential header for private-ref reads and CAS
+  writes. A base-controlled bounded product-commit allowlist permits
+  already-open envelopes to survive a transport-only rollout without
+  weakening canonical validation.
 - Private state/design transport and handoff publication bind to one captured
   URL through an isolated Git configuration. Ambiguous `pushurl`, URL-rewrite,
   pack-helper, or proxy settings fail closed and cannot redirect proposal

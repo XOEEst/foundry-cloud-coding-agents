@@ -654,7 +654,7 @@ def test_bundle_generates_base_context_handoff_transport_workflow() -> None:
         "${{ github.event.repository.default_branch }}"
     )
     assert checkout["with"]["fetch-depth"] == 0
-    assert checkout["with"]["persist-credentials"] is False
+    assert "persist-credentials" not in checkout["with"]
     assert "github.event.pull_request.head.sha" not in str(checkout)
     assert "python -m foundry_opt.orchestration.handoff" in text
     assert "TRUSTED_EVENT_PATH: ${{ github.event_path }}" in text
@@ -673,7 +673,7 @@ def test_bundle_generates_base_context_handoff_transport_workflow() -> None:
     assert "github.event.pull_request.user.id == 198982749" in text
     assert "github.event.pull_request.user.login == 'Copilot'" in text
     assert "TRUSTED_HANDOFF_PRODUCT_COMMITS:" in text
-    assert "gh auth setup-git" in text
+    assert "gh auth setup-git" not in text
     assert "uv run --no-project --no-config --no-env-file" in text
     assert "source " not in text
     assert "id-token" not in workflow["permissions"]

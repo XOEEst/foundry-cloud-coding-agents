@@ -179,6 +179,7 @@ def test_scheduled_discovery_filters_orders_and_deduplicates_candidates() -> Non
         92,
         created_at="2026-08-05T20:56:42Z",
     )
+    newest["user"].pop("html_url")
     newest["statusCheckRollup"] = [{"conclusion": "action_required"}]
     oldest = _live_copilot_pull_request(
         91,
@@ -554,11 +555,13 @@ def test_github_discovery_paginates_explicitly_and_fails_on_bound() -> None:
 
 def test_github_discovery_binds_head_to_exact_copilot_push_event() -> None:
     event = {
-        "actor": {"id": 198982749, "login": "Copilot"},
+        "actor": {
+            "id": 198982749,
+            "login": "copilot-swe-agent[bot]",
+        },
         "payload": {
             "head": HEAD,
             "ref": "refs/heads/copilot/steward-issue-31",
-            "repository_id": 123,
         },
         "type": "PushEvent",
     }

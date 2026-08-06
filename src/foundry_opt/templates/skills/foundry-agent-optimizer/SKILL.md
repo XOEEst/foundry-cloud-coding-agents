@@ -110,9 +110,10 @@ PRs without consulting check conclusions, so an `action_required` run does not b
 Discovery binds the exact head SHA and ref to a recent GitHub push event from the exact Copilot App
 and selects transport envelopes only; canonical replay still validates the steward's exact decision,
 commit markers, blob, hashes, and compare-and-swap precondition. The job checks out only the trusted
-default branch, disables persisted checkout credentials, and ignores repository uv and dotenv
-configuration. A base-controlled bounded product-commit allowlist lets an already-open envelope
-survive a transport-only rollout.
+default branch, ignores repository uv and dotenv configuration, and lets the isolated Git transport
+validate and scope the checkout credential header for private-ref reads and CAS writes. A
+base-controlled bounded product-commit allowlist lets an already-open envelope survive a
+transport-only rollout.
 Private state/design transport and handoff publication bind to one captured URL through an isolated
 Git configuration. Ambiguous `pushurl`, URL-rewrite, pack-helper, or proxy settings fail closed and
 cannot redirect proposal objects.
