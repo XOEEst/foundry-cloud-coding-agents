@@ -2,6 +2,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
+import re
 from time import sleep as _sleep
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -51,6 +52,7 @@ class _RunContext:
     agent: AgentVersionRef
     dataset: DatasetVersionRef
     evaluator: EvaluatorDefinitionRef
+    idempotency_key: str | None
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,10 @@ class BatchEvaluationRequest:
     evaluator: EvaluatorDefinitionRef
     subject_id: str = "candidate"
     split: DatasetSplit = DatasetSplit.DEVELOPMENT
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_idempotency_key(self.idempotency_key)
 
 
 @dataclass(frozen=True)
@@ -90,8 +96,10 @@ class MultiTurnSimulationRequest:
     personas: tuple[str, ...]
     subject_id: str = "candidate"
     split: DatasetSplit = DatasetSplit.DEVELOPMENT
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
+        _validate_idempotency_key(self.idempotency_key)
         if self.max_turns < 1:
             raise ValueError("max_turns must be positive.")
         if not self.personas:
@@ -315,6 +323,7 @@ class EvaluationGateway:
             agent=request.agent,
             dataset=request.dataset,
             evaluator=request.evaluator,
+            idempotency_key=request.idempotency_key,
         )
         run = _parse_run(response)
         context = _RunContext(
@@ -326,6 +335,7 @@ class EvaluationGateway:
             agent=request.agent,
             dataset=request.dataset,
             evaluator=request.evaluator,
+            idempotency_key=request.idempotency_key,
         )
         existing = self._contexts.get(run.run_id)
         if existing is not None and existing != context:
@@ -354,6 +364,7 @@ class EvaluationGateway:
             agent=request.agent,
             dataset=request.dataset,
             evaluator=request.evaluator,
+            idempotency_key=request.idempotency_key,
         )
         run = _parse_run(response)
         context = _RunContext(
@@ -365,6 +376,7 @@ class EvaluationGateway:
             agent=request.agent,
             dataset=request.dataset,
             evaluator=request.evaluator,
+            idempotency_key=request.idempotency_key,
         )
         self._contexts[run.run_id] = context
         return run
@@ -383,6 +395,7 @@ class EvaluationGateway:
                     agent=context.agent,
                     dataset=context.dataset,
                     evaluator=context.evaluator,
+                    idempotency_key=context.idempotency_key,
                     run_id=context.run_id,
                     evaluation_id=context.evaluation_id,
                 )
@@ -426,6 +439,7 @@ class EvaluationGateway:
                 agent=context.agent,
                 dataset=context.dataset,
                 evaluator=context.evaluator,
+                idempotency_key=context.idempotency_key,
                 run_id=context.run_id,
                 evaluation_id=context.evaluation_id,
             )
@@ -483,6 +497,8 @@ def _serialize_run_request(
             "max_turns": request.max_turns,
             "personas": list(request.personas),
         }
+    if request.idempotency_key is not None:
+        payload["idempotency_key"] = request.idempotency_key
     return payload
 
 
@@ -595,6 +611,7 @@ def _parse_item(
         agent=context.agent,
         dataset=context.dataset,
         evaluator=context.evaluator,
+        idempotency_key=context.idempotency_key,
         run_id=context.run_id,
         evaluation_id=context.evaluation_id,
     )
@@ -759,6 +776,7 @@ def _validate_and_fill_context(
     agent: AgentVersionRef,
     dataset: DatasetVersionRef,
     evaluator: EvaluatorDefinitionRef,
+    idempotency_key: str | None = None,
     run_id: str | None = None,
     evaluation_id: str | None = None,
 ) -> dict[str, object]:
@@ -768,6 +786,8 @@ def _validate_and_fill_context(
         "subject_id": subject_id,
         "split": split.value,
     }
+    if idempotency_key is not None:
+        expected_scalars["idempotency_key"] = idempotency_key
     if run_id is not None:
         expected_scalars["run_id"] = run_id
     if evaluation_id is not None:
@@ -810,6 +830,11 @@ def _validate_and_fill_context(
         "evaluator",
     )
     return validated
+
+
+def _validate_idempotency_key(value: str | None) -> None:
+    if value is not None and re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError("idempotency_key must be a SHA-256 digest")
 
 
 def _validated_reference(

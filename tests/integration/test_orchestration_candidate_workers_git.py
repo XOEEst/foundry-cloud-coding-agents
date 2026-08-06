@@ -167,7 +167,7 @@ class Evaluations:
             intent.subject.subject_id,
             DatasetSplit.DEVELOPMENT,
             intent.subject.agent,
-            DatasetVersionRef("dev", "1"),
+            intent.dataset,
             EvaluatorDefinitionRef("quality", "1"),
             EvaluationStatus.COMPLETED,
             None,

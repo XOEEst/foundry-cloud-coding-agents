@@ -61,6 +61,7 @@ from foundry_opt.orchestration.candidate_workers import (
     CandidateWorkerRequest,
     CandidateWorkerService,
     CandidateWorkerStatus,
+    _evaluation_intent,
 )
 from foundry_opt.packaging import BundleArtifact, ValidationReport
 from foundry_opt.packaging import ValidationResult
@@ -185,6 +186,132 @@ def test_candidate_assets_are_durably_delegated_before_any_worker_adapter(
     }
 
 
+def test_evaluation_idempotency_binds_campaign_generation_and_draft() -> None:
+    plan = _plan()
+    draft = DraftRecord(
+        plan.target,
+        "draft-baseline",
+        plan.base_agent_version,
+        "e" * 64,
+        "draft",
+    )
+
+    first = _evaluation_intent(plan, "baseline", draft)
+    duplicate = _evaluation_intent(plan, "baseline", draft)
+    new_generation = _evaluation_intent(
+        replace(
+            plan,
+            generation=2,
+            spec_sha256="c" * 64,
+        ),
+        "baseline",
+        draft,
+    )
+    new_draft = _evaluation_intent(
+        plan,
+        "baseline",
+        replace(draft, version_id="draft-baseline-2"),
+    )
+    new_base = _evaluation_intent(
+        replace(plan, base_commit="d" * 40),
+        "baseline",
+        draft,
+    )
+    new_dataset = _evaluation_intent(
+        replace(
+            plan,
+            assets=(
+                replace(plan.assets[0], remote_id="foundry-dev-2"),
+                *plan.assets[1:],
+            ),
+        ),
+        "baseline",
+        draft,
+    )
+
+    assert first.idempotency_key == duplicate.idempotency_key
+    assert len(first.idempotency_key) == 64
+    assert first.subject.idempotency_key == first.idempotency_key
+    assert new_generation.idempotency_key != first.idempotency_key
+    assert new_draft.idempotency_key != first.idempotency_key
+    assert new_base.idempotency_key != first.idempotency_key
+    assert new_dataset.idempotency_key != first.idempotency_key
+
+
+def test_legacy_evaluation_plan_without_key_resumes_compatibly(
+    tmp_path: Path,
+) -> None:
+    plan = _plan()
+    intent = _evaluation_intent(
+        plan,
+        "baseline",
+        DraftRecord(
+            plan.target,
+            "draft-baseline",
+            plan.base_agent_version,
+            "e" * 64,
+            "draft",
+        ),
+    )
+    snapshot = _seed_snapshot()
+    legacy = OutboxRecord(
+        intent.effect_id,
+        "candidate_effect_planned",
+        1,
+        snapshot.state.sequence,
+        {
+            "base_commit": plan.base_commit,
+            "candidate_id": "baseline",
+            "effect_id": intent.effect_id,
+            "effect_kind": "foundry_evaluation",
+            "issue_number": 31,
+            "max_attempts": 1,
+            "slot": 0,
+            "spec_sha256": plan.spec_sha256,
+        },
+    )
+    ledger = Ledger(
+        StateRefSnapshot(
+            snapshot.revision,
+            snapshot.state,
+            snapshot.inbox,
+            (legacy,),
+        )
+    )
+    service = CandidateWorkerService(
+        ledger=ledger,
+        resolver=PlanResolver(plan),
+        dependencies=CandidateWorkerDependencies(
+            repository=Repository(tmp_path),
+            designer=DeferredDesigner(),
+            validate=lambda path: ValidationReport((), False),
+            build_bundle=lambda root, output: pytest.fail(
+                "legacy plan check must not build"
+            ),
+            drafts=Drafts(),
+            evaluations=Evaluations(),
+            write_evidence=lambda request: pytest.fail(
+                "legacy plan check must not write evidence"
+            ),
+            clock=Clock(),
+        ),
+    )
+
+    result = service._plan_effect(
+        CandidateWorkerRequest(tmp_path, 31),
+        ledger.snapshot,
+        intent.effect_id,
+        "foundry_evaluation",
+        "baseline",
+        0,
+        plan,
+        idempotency_key=intent.idempotency_key,
+    )
+
+    assert result is ledger.snapshot
+    assert ledger.commits == 0
+
+
 def test_foundry_draft_is_deferred_after_its_durable_effect_plan(
     tmp_path: Path,
 ) -> None:
@@ -300,6 +427,19 @@ def test_foundry_evaluation_is_deferred_after_draft_success(
     ]
     assert len(evaluation_plans) == 1
     assert evaluation_plans[0].payload["max_attempts"] == 1
+    assert evaluation_plans[0].payload["idempotency_key"] == (
+        _evaluation_intent(
+            _plan(),
+            "baseline",
+            DraftRecord(
+                "support",
+                "draft-baseline",
+                12,
+                "e" * 64,
+                "draft",
+            ),
+        ).idempotency_key
+    )
 
 
 def test_candidate_patch_is_durable_before_candidate_draft_delegation(
@@ -355,6 +495,69 @@ def test_candidate_patch_is_durable_before_candidate_draft_delegation(
     )
     assert patch.sha256 == patch_hash
     assert b"data/" not in patch.content
+
+
+@pytest.mark.parametrize("mismatch", ["draft", "dataset", "subject"])
+def test_evaluation_result_rejects_reconciled_binding_mismatch(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    class MismatchedEvaluations(Evaluations):
+        def run(self, intent):
+            result = super().run(intent)
+            run = result.run
+            if mismatch == "draft":
+                run = replace(
+                    run,
+                    agent=replace(
+                        run.agent,
+                        draft_id="draft-other",
+                    ),
+                )
+            elif mismatch == "dataset":
+                run = replace(
+                    run,
+                    dataset=replace(
+                        run.dataset,
+                        dataset_id="dataset-other",
+                    ),
+                )
+            else:
+                run = replace(run, subject_id="candidate-other")
+            changed = replace(result, run=run)
+            self.results[intent.effect_id] = changed
+            return changed
+
+    def build_bundle(root: Path, output: Path) -> BundleArtifact:
+        return BundleArtifact(
+            output,
+            "e" * 64,
+            ("agent/instructions.md",),
+            (),
+            1,
+            output.with_suffix(".manifest.json"),
+        )
+
+    result = CandidateWorkerService(
+        ledger=Ledger(_seed_snapshot()),
+        resolver=PlanResolver(_plan()),
+        dependencies=CandidateWorkerDependencies(
+            repository=Repository(tmp_path),
+            designer=DeferredDesigner(),
+            validate=lambda path: ValidationReport((), False),
+            build_bundle=build_bundle,
+            drafts=Drafts(),
+            evaluations=MismatchedEvaluations(),
+            write_evidence=lambda request: (_ for _ in ()).throw(
+                AssertionError("mismatched evaluation must not be evidenced")
+            ),
+            clock=Clock(),
+        ),
+    ).advance(CandidateWorkerRequest(tmp_path, 31))
+
+    assert result.status is CandidateWorkerStatus.FAILED
+    assert result.code == "evaluation_binding_mismatch"
+    assert result.snapshot.state.phase is CampaignPhase.BASELINE
 
 
 def test_candidate_designer_result_is_bound_to_the_exact_reservation() -> None:
@@ -707,7 +910,11 @@ class Evaluations(CandidateEvaluationEffects):
     def run(self, intent):
         self.runs += 1
         value = 0.5 if intent.subject.subject_id == "baseline" else 0.9
-        result = _evaluation(intent.subject, value)
+        result = _evaluation(
+            intent.subject,
+            value,
+            dataset=intent.dataset,
+        )
         self.results[intent.effect_id] = result
         return result
 
@@ -723,6 +930,8 @@ class PlanResolver:
 def _evaluation(
     subject,
     value: float,
+    *,
+    dataset: DatasetVersionRef = DatasetVersionRef("dev", "1"),
 ) -> EvaluationResult:
     outcome = Outcome.PASS if value >= 0.8 else Outcome.FAIL
     run = EvaluationRun(
@@ -731,7 +940,7 @@ def _evaluation(
         subject_id=subject.subject_id,
         split=DatasetSplit.DEVELOPMENT,
         agent=subject.agent,
-        dataset=DatasetVersionRef("dev", "1"),
+        dataset=dataset,
         evaluator=EvaluatorDefinitionRef("quality", "1"),
         status=EvaluationStatus.COMPLETED,
         portal_url=None,
@@ -2029,6 +2238,7 @@ def test_global_development_pareto_revises_dominated_earlier_candidate(
             result = _evaluation(
                 intent.subject,
                 values[intent.subject.subject_id],
+                dataset=intent.dataset,
             )
             self.results[intent.effect_id] = result
             return result
@@ -2120,6 +2330,7 @@ def test_completed_generation_ignores_later_cutoff_and_deadline_reentry(
             result = _evaluation(
                 intent.subject,
                 values[intent.subject.subject_id],
+                dataset=intent.dataset,
             )
             self.results[intent.effect_id] = result
             return result

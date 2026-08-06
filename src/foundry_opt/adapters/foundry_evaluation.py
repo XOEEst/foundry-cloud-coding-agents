@@ -218,6 +218,14 @@ class FoundryEvaluationTransport(EvaluationTransport):
             "data_source": data_source,
             "metadata": metadata,
         }
+        idempotency_key = context.get("idempotency_key")
+        if idempotency_key is not None:
+            kwargs["extra_headers"] = {
+                "Idempotency-Key": _required_string(
+                    idempotency_key,
+                    "idempotency_key",
+                )
+            }
         if kind == "multi_turn_simulation":
             kwargs["extra_body"] = {"evaluation_level": "conversation"}
         response = _provider_call(
@@ -253,6 +261,10 @@ class FoundryEvaluationTransport(EvaluationTransport):
             )
         list_runs = getattr(self._client.evals.runs, "list", None)
         if not callable(list_runs):
+            if context.get("idempotency_key") is not None:
+                raise EvaluationConflictError(
+                    "Foundry evaluation run reconciliation is unavailable."
+                )
             return None
         expected_name = _required_string(
             payload.get("display_name"),
@@ -897,6 +909,17 @@ def _run_context(payload: Mapping[str, object]) -> dict[str, object]:
             _required_mapping(payload.get("evaluator"), "evaluator")
         ),
     }
+    idempotency_key = payload.get("idempotency_key")
+    if idempotency_key is not None:
+        key = _required_string(
+            idempotency_key,
+            "idempotency_key",
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", key) is None:
+            raise EvaluationSchemaError(
+                "Foundry evaluation idempotency_key is invalid."
+            )
+        context["idempotency_key"] = key
     if kind == "multi_turn_simulation":
         simulation = _required_mapping(
             payload.get("simulation"),
@@ -976,6 +999,11 @@ def _run_metadata(context: Mapping[str, object]) -> dict[str, str]:
             "evaluator version",
         ),
     }
+    idempotency_key = context.get("idempotency_key")
+    if idempotency_key is not None:
+        metadata[f"{_METADATA_PREFIX}idempotency_key"] = (
+            _required_string(idempotency_key, "idempotency_key")
+        )
     simulation = context.get("simulation")
     if simulation is not None:
         simulation_mapping = _required_mapping(simulation, "simulation")
@@ -1002,7 +1030,7 @@ def _validate_run_metadata(
 
 
 def _public_context(context: Mapping[str, object]) -> dict[str, object]:
-    return {
+    result = {
         "kind": context["kind"],
         "subject_id": context["subject_id"],
         "split": context["split"],
@@ -1012,6 +1040,9 @@ def _public_context(context: Mapping[str, object]) -> dict[str, object]:
             _required_mapping(context["evaluator"], "evaluator")
         ),
     }
+    if context.get("idempotency_key") is not None:
+        result["idempotency_key"] = context["idempotency_key"]
+    return result
 
 
 def _map_status(

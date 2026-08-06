@@ -35,6 +35,9 @@ The generated five-minute capability workflow validates the exact persisted inte
 optimizer OIDC identity, reconciles or executes the idempotent Foundry operation, CAS-records only
 privacy-safe remote identities and normalized results, and reassigns the steward. It cannot choose
 candidates, change policy, revise eligibility, or alter the slate.
+Evaluation idempotency is bound to the campaign, generation, base commit, exact draft version,
+dataset/evaluator identities, split, and metric policy. Capability and handoff envelopes reject
+unknown fields; path, commit, and comment markers are secondary checks, never schema authority.
 
 ## User-visible contract
 

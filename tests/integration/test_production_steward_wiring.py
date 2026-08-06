@@ -318,7 +318,7 @@ def _evaluation(subject, split, attempt):
         subject_id=subject.subject_id,
         split=DatasetSplit.DEVELOPMENT,
         agent=subject.agent,
-        dataset=DatasetVersionRef("development", "v1"),
+        dataset=DatasetVersionRef("remote:development", "v1"),
         evaluator=EvaluatorDefinitionRef("task-quality", "v1"),
         status=EvaluationStatus.COMPLETED,
         portal_url=None,

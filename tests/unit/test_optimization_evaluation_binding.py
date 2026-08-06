@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import hashlib
 from typing import Any
 
 import pytest
@@ -427,6 +428,32 @@ def test_development_split_runs_against_dev_dataset_and_draft() -> None:
     assert result.usage.input_tokens == 10
     assert client.closed == 1
     assert provider.created[0].closed == 1
+
+
+def test_evaluation_attempt_derives_stable_run_idempotency_key() -> None:
+    spec = _spec()
+    transport = FakeTransport()
+    binder, _client, _provider = _binder(transport)
+    base_key = "a" * 64
+
+    evaluate = binder(spec, _assets(spec))
+    evaluate(
+        EvaluationSubject(
+            "candidate-1",
+            AgentVersionRef(
+                "support_agent",
+                "draft-candidate-1",
+                "3",
+            ),
+            base_key,
+        ),
+        DatasetSplit.DEVELOPMENT,
+        2,
+    )
+
+    assert transport.created_runs[0]["idempotency_key"] == hashlib.sha256(
+        f"{base_key}:attempt:2".encode("ascii")
+    ).hexdigest()
 
 
 def test_validation_split_selects_validation_dataset() -> None:

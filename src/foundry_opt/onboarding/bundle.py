@@ -488,7 +488,8 @@ jobs:
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
         run: >-
-          uv run --no-project --with "$OPTIMIZER_PACKAGE"
+          uv run --no-project --no-config --no-env-file
+          --with "$OPTIMIZER_PACKAGE"
           python -m foundry_opt.orchestration.issue_intake
 """
 
@@ -638,7 +639,8 @@ jobs:
           TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
           TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
         run: >-
-          uv run --no-project --with "$OPTIMIZER_PACKAGE"
+          uv run --no-project --no-config --no-env-file
+          --with "$OPTIMIZER_PACKAGE"
           python -m foundry_opt.orchestration.issue_intake
 """
 
@@ -816,7 +818,8 @@ jobs:
               exit 1
             fi
             publication_json="$(
-              uv run --no-project --with "$OPTIMIZER_PACKAGE" \
+              uv run --no-project --no-config --no-env-file \
+                --with "$OPTIMIZER_PACKAGE" \
                 foundry-opt steward publication-result-auto \
                 --result-file "${{result_files[0]}}" \
                 --expected-run-id "$TRUSTED_WORKFLOW_RUN_ID"
@@ -835,9 +838,13 @@ jobs:
               echo "Invalid issue number" >&2
               exit 1
             fi
-            uv run --no-project --with "$OPTIMIZER_PACKAGE" foundry-opt steward deployment-bridge --issue "$REQUESTED_ISSUE"
+            uv run --no-project --no-config --no-env-file \
+              --with "$OPTIMIZER_PACKAGE" \
+              foundry-opt steward deployment-bridge \
+              --issue "$REQUESTED_ISSUE"
           else
-            uv run --no-project --with "$OPTIMIZER_PACKAGE" \
+            uv run --no-project --no-config --no-env-file \
+              --with "$OPTIMIZER_PACKAGE" \
               python -m foundry_opt.orchestration.deployment_bridge
           fi
 """

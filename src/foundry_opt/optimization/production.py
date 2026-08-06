@@ -1896,6 +1896,9 @@ class _ProductionCandidateEvaluationEffects:
         from foundry_opt.orchestration.capability_bridge import (
             evaluation_result_from_state_object,
         )
+        from foundry_opt.orchestration.candidate_workers import (
+            _validate_evaluation_result,
+        )
 
         root, _, _, _ = self._source.resolved_for(
             intent.issue_number,
@@ -1933,17 +1936,22 @@ class _ProductionCandidateEvaluationEffects:
             generation=intent.generation,
             spec_sha256=intent.spec_sha256,
             base_commit=intent.base_commit,
+            idempotency_key=intent.idempotency_key,
         )
         if (
             success.payload.get("evaluation_id")
             != result.run.evaluation_id
             or success.payload.get("run_id") != result.run.run_id
-            or result.run.subject_id != intent.subject.subject_id
-            or result.run.split is not intent.split
+            or (
+                success.payload.get("idempotency_key") is not None
+                and success.payload.get("idempotency_key")
+                != intent.idempotency_key
+            )
         ):
             raise ValueError(
                 "candidate evaluation result binding changed"
             )
+        _validate_evaluation_result(intent, result)
         return result
 
     def run(self, intent: Any) -> Any:
@@ -2284,6 +2292,7 @@ class _ProductionCandidateCapabilityExecutor:
             CandidateWorkerRequest,
             _aggregate_metrics,
             _evaluation_intent,
+            _validate_evaluation_result,
         )
 
         plan = _ProductionCandidateWorkerPlanResolver(self._source).resolve(
@@ -2306,19 +2315,26 @@ class _ProductionCandidateCapabilityExecutor:
             "draft",
         )
         intent = _evaluation_intent(plan, candidate_id, draft)
+        expected_payload = {
+            "base_commit": plan.base_commit,
+            "candidate_id": candidate_id,
+            "effect_id": intent.effect_id,
+            "effect_kind": "foundry_evaluation",
+            "idempotency_key": intent.idempotency_key,
+            "issue_number": intent.issue_number,
+            "max_attempts": plan.limits.transient_retries + 1,
+            "slot": _candidate_slot(candidate_id),
+            "spec_sha256": intent.spec_sha256,
+        }
+        legacy_payload = {
+            key: value
+            for key, value in expected_payload.items()
+            if key != "idempotency_key"
+        }
         if (
             intent.effect_id != planned.record_id
             or dict(planned.payload)
-            != {
-                "base_commit": plan.base_commit,
-                "candidate_id": candidate_id,
-                "effect_id": intent.effect_id,
-                "effect_kind": "foundry_evaluation",
-                "issue_number": intent.issue_number,
-                "max_attempts": plan.limits.transient_retries + 1,
-                "slot": _candidate_slot(candidate_id),
-                "spec_sha256": intent.spec_sha256,
-            }
+            not in (expected_payload, legacy_payload)
         ):
             raise ValueError("candidate evaluation intent changed")
         result = _ActionsCandidateEvaluationEffects(
@@ -2331,12 +2347,14 @@ class _ProductionCandidateCapabilityExecutor:
                 "foundry_evaluation_unavailable",
                 "candidate evaluation could not be reconciled",
             )
+        _validate_evaluation_result(intent, result)
         result_object = evaluation_result_state_object(
             effect_id=intent.effect_id,
             issue_number=intent.issue_number,
             generation=intent.generation,
             spec_sha256=intent.spec_sha256,
             base_commit=intent.base_commit,
+            idempotency_key=intent.idempotency_key,
             result=result,
         )
         return CandidateCapabilityExecution(
@@ -2349,6 +2367,7 @@ class _ProductionCandidateCapabilityExecutor:
                 "effect_id": intent.effect_id,
                 "effect_kind": "foundry_evaluation",
                 "evaluation_id": result.run.evaluation_id,
+                "idempotency_key": intent.idempotency_key,
                 "issue_number": intent.issue_number,
                 "metrics": _aggregate_metrics(result),
                 "run_id": result.run.run_id,

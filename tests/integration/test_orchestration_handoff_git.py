@@ -1426,6 +1426,10 @@ def test_trusted_transport_cas_applies_handoff_once(
         ).split()[0]
         == handoff.proposed_revision
     )
+    # Applying authoritative state is separate from transport finalization.
+    # No PR close or branch deletion may happen inside apply().
+    assert gateway.deleted == []
+    assert gateway.closed == []
 
     class Assignments:
         def release(self, issue_number):

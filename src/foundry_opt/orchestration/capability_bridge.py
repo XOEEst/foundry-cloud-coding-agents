@@ -184,6 +184,24 @@ class CandidateCapabilityBridge:
                 code="candidate_capability_not_pending",
             )
         effect_id = planned.record_id
+        try:
+            _validate_planned_capability(
+                snapshot,
+                planned,
+                issue_number,
+            )
+        except ValueError:
+            return self._record_failure(
+                repository_root,
+                issue_number,
+                snapshot,
+                planned,
+                1,
+                CandidateCapabilityExecutionError(
+                    "candidate_capability_intent_invalid",
+                    retryable=False,
+                ),
+            )
         succeeded = _record(snapshot, f"{effect_id}-succeeded")
         if succeeded is not None:
             self._resume(issue_number, effect_id, "succeeded")
@@ -270,7 +288,13 @@ class CandidateCapabilityBridge:
                     snapshot,
                     planned,
                 )
-            _validate_execution(planned, execution)
+            try:
+                _validate_execution(planned, execution)
+            except ValueError as error:
+                raise CandidateCapabilityExecutionError(
+                    "candidate_capability_result_invalid",
+                    retryable=False,
+                ) from error
         except Exception as error:
             return self._record_failure(
                 repository_root,
@@ -429,12 +453,16 @@ def evaluation_result_state_object(
     generation: int,
     spec_sha256: str,
     base_commit: str,
+    idempotency_key: str,
     result: EvaluationResult,
 ) -> StateObject:
+    if re.fullmatch(r"[0-9a-f]{64}", idempotency_key) is None:
+        raise ValueError("evaluation idempotency_key is invalid")
     document = {
         "base_commit": base_commit,
         "effect_id": effect_id,
         "generation": generation,
+        "idempotency_key": idempotency_key,
         "issue_number": issue_number,
         "kind": "candidate_evaluation_result",
         "result": {
@@ -484,7 +512,7 @@ def evaluation_result_state_object(
             "run": _evaluation_run_document(result.run),
             "usage": _usage_document(result.usage),
         },
-        "schema_version": 1,
+        "schema_version": 2,
         "spec_sha256": spec_sha256,
     }
     return StateObject(
@@ -510,23 +538,43 @@ def evaluation_result_from_state_object(
     generation: int,
     spec_sha256: str,
     base_commit: str,
+    idempotency_key: str,
 ) -> EvaluationResult:
+    if re.fullmatch(r"[0-9a-f]{64}", idempotency_key) is None:
+        raise ValueError("evaluation idempotency_key is invalid")
     try:
         document = json.loads(state_object.content)
+        version = (
+            document.get("schema_version")
+            if isinstance(document, dict)
+            else None
+        )
+        expected_fields = {
+            "base_commit",
+            "effect_id",
+            "generation",
+            "idempotency_key",
+            "issue_number",
+            "kind",
+            "result",
+            "schema_version",
+            "spec_sha256",
+        }
+        legacy_fields = expected_fields - {"idempotency_key"}
         if (
             not isinstance(document, dict)
-            or set(document)
-            != {
-                "base_commit",
-                "effect_id",
-                "generation",
-                "issue_number",
-                "kind",
-                "result",
-                "schema_version",
-                "spec_sha256",
-            }
-            or document["schema_version"] != 1
+            or (
+                version == 2
+                and (
+                    set(document) != expected_fields
+                    or document["idempotency_key"] != idempotency_key
+                )
+            )
+            or (
+                version == 1
+                and set(document) != legacy_fields
+            )
+            or version not in {1, 2}
             or document["kind"] != "candidate_evaluation_result"
             or document["effect_id"] != effect_id
             or document["issue_number"] != issue_number
@@ -674,6 +722,45 @@ def _validate_execution(
     execution: CandidateCapabilityExecution,
 ) -> None:
     payload = execution.payload
+    effect_kind = planned.payload["effect_kind"]
+    expected_fields = {
+        "foundry_assets": {
+            "base_commit",
+            "capability_path",
+            "capability_sha256",
+            "effect_id",
+            "effect_kind",
+            "issue_number",
+            "result_id",
+            "spec_sha256",
+        },
+        "foundry_draft": {
+            "base_commit",
+            "bundle_sha256",
+            "candidate_id",
+            "draft_id",
+            "effect_id",
+            "effect_kind",
+            "issue_number",
+            "spec_sha256",
+        },
+        "foundry_evaluation": {
+            "base_commit",
+            "candidate_id",
+            "capability_path",
+            "capability_sha256",
+            "effect_id",
+            "effect_kind",
+            "evaluation_id",
+            "idempotency_key",
+            "issue_number",
+            "metrics",
+            "run_id",
+            "spec_sha256",
+        },
+    }[effect_kind]
+    if set(payload) != expected_fields:
+        raise ValueError("candidate capability result schema is invalid")
     for key in (
         "base_commit",
         "effect_id",
@@ -683,11 +770,24 @@ def _validate_execution(
     ):
         if payload.get(key) != planned.payload.get(key):
             raise ValueError("candidate capability result changed its intent")
-    if planned.payload["effect_kind"] == "foundry_assets":
+    if (
+        effect_kind == "foundry_evaluation"
+        and planned.payload.get("idempotency_key") is not None
+        and payload.get("idempotency_key")
+        != planned.payload.get("idempotency_key")
+    ):
+        raise ValueError(
+            "candidate evaluation result changed its idempotency binding"
+        )
+    if effect_kind == "foundry_assets":
         if execution.record_kind != "candidate_assets_registration_succeeded":
             raise ValueError("candidate asset result kind is invalid")
     elif execution.record_kind != "candidate_effect_succeeded":
         raise ValueError("candidate effect result kind is invalid")
+    if effect_kind == "foundry_draft" and execution.objects:
+        raise ValueError("candidate draft result must not contain objects")
+    if effect_kind != "foundry_draft" and len(execution.objects) != 1:
+        raise ValueError("candidate capability result object is required")
     if execution.objects:
         paths = {item.path: item.sha256 for item in execution.objects}
         if (
@@ -696,6 +796,144 @@ def _validate_execution(
             != payload.get("capability_sha256")
         ):
             raise ValueError("candidate capability result object is unbound")
+
+
+def _validate_planned_capability(
+    snapshot: StateRefSnapshot,
+    planned: OutboxRecord,
+    issue_number: int,
+) -> None:
+    effect_kind = planned.payload.get("effect_kind")
+    expected_fields = {
+        "foundry_assets": {
+            "base_commit",
+            "capability_path",
+            "capability_sha256",
+            "effect_id",
+            "effect_kind",
+            "environment",
+            "issue_number",
+            "max_attempts",
+            "spec_sha256",
+            "target",
+        },
+        "foundry_draft": {
+            "base_commit",
+            "bundle_sha256",
+            "candidate_id",
+            "effect_id",
+            "effect_kind",
+            "idempotency_key",
+            "issue_number",
+            "max_attempts",
+            "slot",
+            "spec_sha256",
+        },
+        "foundry_evaluation": {
+            "base_commit",
+            "candidate_id",
+            "effect_id",
+            "effect_kind",
+            "idempotency_key",
+            "issue_number",
+            "max_attempts",
+            "slot",
+            "spec_sha256",
+        },
+    }.get(effect_kind)
+    allowed_fields = (
+        (
+            expected_fields,
+            expected_fields - {"idempotency_key"},
+        )
+        if effect_kind == "foundry_evaluation"
+        and expected_fields is not None
+        else (expected_fields,)
+    )
+    if (
+        expected_fields is None
+        or set(planned.payload) not in allowed_fields
+        or planned.record_id != planned.payload.get("effect_id")
+        or planned.payload.get("issue_number") != issue_number
+        or planned.generation != snapshot.state.generation
+        or planned.payload.get("spec_sha256")
+        != snapshot.state.spec_sha256
+    ):
+        raise ValueError("candidate capability plan schema is invalid")
+    if planned.kind == "candidate_assets_registration_planned":
+        if effect_kind != "foundry_assets":
+            raise ValueError("candidate asset effect kind is invalid")
+        _validate_asset_intent_object(snapshot, planned)
+    elif (
+        planned.kind != "candidate_effect_planned"
+        or effect_kind == "foundry_assets"
+    ):
+        raise ValueError("candidate effect plan kind is invalid")
+
+
+def _validate_asset_intent_object(
+    snapshot: StateRefSnapshot,
+    planned: OutboxRecord,
+) -> None:
+    path = planned.payload["capability_path"]
+    digest = planned.payload["capability_sha256"]
+    objects = tuple(item for item in snapshot.objects if item.path == path)
+    if len(objects) != 1 or objects[0].sha256 != digest:
+        raise ValueError("candidate asset intent object is unavailable")
+    document = json.loads(objects[0].content)
+    if (
+        not isinstance(document, dict)
+        or set(document)
+        != {
+            "assets",
+            "base_commit",
+            "effect_id",
+            "environment",
+            "generation",
+            "issue_number",
+            "kind",
+            "schema_version",
+            "spec_sha256",
+            "target",
+        }
+        or document["schema_version"] != 1
+        or document["kind"] != "candidate_assets_registration"
+        or document["effect_id"] != planned.record_id
+        or document["generation"] != planned.generation
+        or document["issue_number"] != planned.payload["issue_number"]
+        or document["base_commit"] != planned.payload["base_commit"]
+        or document["spec_sha256"] != planned.payload["spec_sha256"]
+        or document["environment"] != planned.payload["environment"]
+        or document["target"] != planned.payload["target"]
+        or not isinstance(document["assets"], list)
+        or not document["assets"]
+    ):
+        raise ValueError("candidate asset intent schema is invalid")
+    asset_fields = {
+        "approval_gate",
+        "asset_id",
+        "content_sha256",
+        "created_by",
+        "kind",
+        "metrics",
+        "name",
+        "path",
+        "remote_id",
+        "role",
+        "source",
+        "version",
+    }
+    if any(
+        not isinstance(asset, dict) or set(asset) != asset_fields
+        for asset in document["assets"]
+    ):
+        raise ValueError("candidate asset entry schema is invalid")
+    asset_ids = [asset["asset_id"] for asset in document["assets"]]
+    if (
+        any(not isinstance(asset_id, str) or not asset_id for asset_id in asset_ids)
+        or len(asset_ids) != len(set(asset_ids))
+    ):
+        raise ValueError("candidate asset identities are invalid")
 
 
 def _evaluation_run_document(run: EvaluationRun) -> dict[str, object]:

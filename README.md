@@ -196,6 +196,11 @@ either `policy_approved` or `human_review`.
   idempotent external operation under the optimizer OIDC identity, CAS-records
   privacy-safe identities and normalized results, then wakes the steward.
   Actions cannot choose candidates, alter policy, eligibility, or the slate.
+  Development evaluations use a deterministic key bound to campaign,
+  generation, base commit, draft version, dataset/evaluator identities, split,
+  and metric policy; retries reconcile that exact provider run after ack loss.
+  Capability and handoff JSON are closed-schema; commit/body markers are only
+  secondary correlation checks.
 - The default-branch-generated Copilot setup workflow exports the static,
   non-secret `FOUNDRY_OPT_COPILOT_GIT_PROXY=1` marker; no pull-request input
   controls it. Proxy authority additionally requires `GITHUB_ACTIONS=true`, the

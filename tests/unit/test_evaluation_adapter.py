@@ -29,6 +29,7 @@ class FakeEvaluationTransport:
         self.definition: Mapping[str, object] | None = None
         self.created_definitions: list[Mapping[str, object]] = []
         self.created_runs: list[Mapping[str, object]] = []
+        self.find_run_requests: list[Mapping[str, object]] = []
         self.found_run: Mapping[str, object] | None = None
         self.run_responses: list[Mapping[str, object] | Exception] = []
         self.page_responses: dict[str | None, Mapping[str, object]] = {}
@@ -56,6 +57,7 @@ class FakeEvaluationTransport:
         self,
         payload: Mapping[str, object],
     ) -> Mapping[str, object] | None:
+        self.find_run_requests.append(payload)
         return self.found_run
 
     def get_run(self, run_id: str) -> Mapping[str, object]:
@@ -173,6 +175,46 @@ def test_create_or_reuse_run_recovers_existing_exact_operation() -> None:
     assert run.run_id == "run-1"
     assert run.status is EvaluationStatus.COMPLETED
     assert transport.created_runs == []
+
+
+def test_create_or_reuse_run_binds_deterministic_idempotency_key() -> None:
+    transport = FakeEvaluationTransport()
+    transport.found_run = _run_payload("completed")
+    gateway = EvaluationGateway(transport)
+    key = "a" * 64
+    request = BatchEvaluationRequest(
+        display_name="candidate development",
+        agent=AgentVersionRef("agent-1", "draft-9", "3"),
+        dataset=DatasetVersionRef("dataset-1", "12"),
+        evaluator=EvaluatorDefinitionRef("eval-def-1", "7"),
+        idempotency_key=key,
+    )
+
+    run = gateway.create_or_reuse_run(request)
+
+    assert run.run_id == "run-1"
+    assert transport.find_run_requests[0]["idempotency_key"] == key
+    assert transport.created_runs == []
+
+
+def test_reconciled_run_rejects_conflicting_idempotency_key() -> None:
+    transport = FakeEvaluationTransport()
+    transport.found_run = _run_payload(
+        "completed",
+        idempotency_key="b" * 64,
+    )
+    gateway = EvaluationGateway(transport)
+
+    with pytest.raises(EvaluationSchemaError, match="idempotency_key"):
+        gateway.create_or_reuse_run(
+            BatchEvaluationRequest(
+                display_name="candidate development",
+                agent=AgentVersionRef("agent-1", "draft-9", "3"),
+                dataset=DatasetVersionRef("dataset-1", "12"),
+                evaluator=EvaluatorDefinitionRef("eval-def-1", "7"),
+                idempotency_key="a" * 64,
+            )
+        )
 
 
 def test_create_run_accepts_foundry_dataset_resource_id() -> None:

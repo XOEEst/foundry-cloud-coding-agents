@@ -42,6 +42,8 @@ from foundry_opt.orchestration.capability_bridge import (
     evaluation_result_from_state_object,
     evaluation_result_state_object,
     verify_active_optimizer_identity,
+    _validate_planned_capability,
+    _validate_execution,
 )
 from foundry_opt.preflight.interfaces import CommandResult
 
@@ -118,8 +120,24 @@ def _snapshot() -> StateRefSnapshot:
         (
             json.dumps(
                 {
-                    "assets": [],
+                    "assets": [
+                        {
+                            "approval_gate": "policy",
+                            "asset_id": "development",
+                            "content_sha256": None,
+                            "created_by": "foundry-deferred-provider",
+                            "kind": "dataset",
+                            "metrics": [],
+                            "name": "development",
+                            "path": None,
+                            "remote_id": None,
+                            "role": "development",
+                            "source": "foundry",
+                            "version": "1",
+                        }
+                    ],
                     "base_commit": BASE_COMMIT,
+                    "effect_id": effect_id,
                     "environment": "acceptance",
                     "generation": 1,
                     "issue_number": 31,
@@ -459,6 +477,7 @@ def test_evaluation_result_object_round_trips_only_privacy_safe_evidence() -> No
         generation=1,
         spec_sha256=SPEC_SHA256,
         base_commit=BASE_COMMIT,
+        idempotency_key="d" * 64,
         result=original,
     )
     restored = evaluation_result_from_state_object(
@@ -468,11 +487,13 @@ def test_evaluation_result_object_round_trips_only_privacy_safe_evidence() -> No
         generation=1,
         spec_sha256=SPEC_SHA256,
         base_commit=BASE_COMMIT,
+        idempotency_key="d" * 64,
     )
 
     assert b"private evaluator prompt" not in state_object.content
     assert b"private provider response" not in state_object.content
     assert b"access_token" not in state_object.content
+    assert json.loads(state_object.content)["idempotency_key"] == "d" * 64
     assert restored.run.run_id == original.run.run_id
     assert restored.run.evaluation_id == original.run.evaluation_id
     assert restored.metrics == original.metrics
@@ -481,6 +502,40 @@ def test_evaluation_result_object_round_trips_only_privacy_safe_evidence() -> No
     ] == [("case-1", "c" * 64)]
     assert restored.cases[0].scores[0].reason is None
     assert restored.cases[0].error == "case_error"
+    legacy_document = json.loads(state_object.content)
+    legacy_document.pop("idempotency_key")
+    legacy_document["schema_version"] = 1
+    legacy_object = StateObject(
+        state_object.path,
+        (
+            json.dumps(
+                legacy_document,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+    )
+    legacy = evaluation_result_from_state_object(
+        legacy_object,
+        effect_id=effect_id,
+        issue_number=31,
+        generation=1,
+        spec_sha256=SPEC_SHA256,
+        base_commit=BASE_COMMIT,
+        idempotency_key="d" * 64,
+    )
+    assert legacy.run == restored.run
+    with pytest.raises(ValueError, match="result object is invalid"):
+        evaluation_result_from_state_object(
+            state_object,
+            effect_id=effect_id,
+            issue_number=31,
+            generation=1,
+            spec_sha256=SPEC_SHA256,
+            base_commit="c" * 40,
+            idempotency_key="d" * 64,
+        )
 
 
 def test_bridge_processes_new_effect_after_an_earlier_success(
@@ -719,3 +774,172 @@ def test_capability_scope_and_optimizer_identity_are_fail_closed(
                 "AZURE_DEPLOYMENT_CLIENT_ID": "optimizer-client",
             },
         )
+
+
+def test_capability_plan_rejects_unknown_fields_before_execution(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot()
+    planned = snapshot.outbox[0]
+    unknown = OutboxRecord(
+        planned.record_id,
+        planned.kind,
+        planned.generation,
+        planned.sequence,
+        {**dict(planned.payload), "status": "unexpected"},
+    )
+    ledger = Ledger(
+        StateRefSnapshot(
+            snapshot.revision,
+            snapshot.state,
+            snapshot.inbox,
+            (unknown,),
+            snapshot.objects,
+        )
+    )
+    effect_id = planned.record_id
+    result_object = StateObject(
+        f"objects/capabilities/{effect_id}-result.json",
+        b'{"assets":[],"kind":"candidate_assets_registration_result"}\n',
+    )
+    executor = Executor(
+        CandidateCapabilityExecution(
+            record_kind="candidate_assets_registration_succeeded",
+            payload={
+                "base_commit": BASE_COMMIT,
+                "capability_path": result_object.path,
+                "capability_sha256": result_object.sha256,
+                "effect_id": effect_id,
+                "effect_kind": "foundry_assets",
+                "issue_number": 31,
+                "result_id": f"{effect_id}-result",
+                "spec_sha256": SPEC_SHA256,
+            },
+            objects=(result_object,),
+        )
+    )
+
+    result = CandidateCapabilityBridge(
+        ledger=ledger,
+        executor=executor,
+        assignments=Assignments(),
+    ).advance(tmp_path, 31)
+
+    assert result.status is CandidateCapabilityStatus.TERMINAL
+    assert result.code == "candidate_capability_intent_invalid"
+    assert executor.reconciles == []
+    assert executor.executes == []
+
+
+def test_capability_result_rejects_unknown_fields(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot()
+    effect_id = snapshot.outbox[0].record_id
+    result_object = StateObject(
+        f"objects/capabilities/{effect_id}-result.json",
+        b'{"assets":[],"kind":"candidate_assets_registration_result"}\n',
+    )
+    execution = CandidateCapabilityExecution(
+        record_kind="candidate_assets_registration_succeeded",
+        payload={
+            "base_commit": BASE_COMMIT,
+            "capability_path": result_object.path,
+            "capability_sha256": result_object.sha256,
+            "effect_id": effect_id,
+            "effect_kind": "foundry_assets",
+            "issue_number": 31,
+            "result_id": f"{effect_id}-result",
+            "spec_sha256": SPEC_SHA256,
+            "status": "unexpected",
+        },
+        objects=(result_object,),
+    )
+
+    result = CandidateCapabilityBridge(
+        ledger=Ledger(snapshot),
+        executor=Executor(execution),
+        assignments=Assignments(),
+    ).advance(tmp_path, 31)
+
+    assert result.status is CandidateCapabilityStatus.TERMINAL
+    assert result.code == "candidate_capability_result_invalid"
+
+
+def test_legacy_evaluation_plan_is_an_explicit_closed_schema() -> None:
+    snapshot = _snapshot()
+    effect_id = "evaluation-31-1-baseline"
+    legacy = OutboxRecord(
+        effect_id,
+        "candidate_effect_planned",
+        1,
+        snapshot.state.sequence,
+        {
+            "base_commit": BASE_COMMIT,
+            "candidate_id": "baseline",
+            "effect_id": effect_id,
+            "effect_kind": "foundry_evaluation",
+            "issue_number": 31,
+            "max_attempts": 2,
+            "slot": 0,
+            "spec_sha256": SPEC_SHA256,
+        },
+    )
+
+    _validate_planned_capability(
+        StateRefSnapshot(
+            snapshot.revision,
+            snapshot.state,
+            snapshot.inbox,
+            (legacy,),
+            snapshot.objects,
+        ),
+        legacy,
+        31,
+    )
+
+
+def test_evaluation_result_key_must_match_current_plan() -> None:
+    effect_id = "evaluation-31-1-baseline"
+    planned = OutboxRecord(
+        effect_id,
+        "candidate_effect_planned",
+        1,
+        2,
+        {
+            "base_commit": BASE_COMMIT,
+            "candidate_id": "baseline",
+            "effect_id": effect_id,
+            "effect_kind": "foundry_evaluation",
+            "idempotency_key": "a" * 64,
+            "issue_number": 31,
+            "max_attempts": 2,
+            "slot": 0,
+            "spec_sha256": SPEC_SHA256,
+        },
+    )
+    result_object = StateObject(
+        f"objects/capabilities/{effect_id}-result.json",
+        b'{"kind":"candidate_evaluation_result"}\n',
+    )
+    execution = CandidateCapabilityExecution(
+        "candidate_effect_succeeded",
+        {
+            "base_commit": BASE_COMMIT,
+            "candidate_id": "baseline",
+            "capability_path": result_object.path,
+            "capability_sha256": result_object.sha256,
+            "effect_id": effect_id,
+            "effect_kind": "foundry_evaluation",
+            "evaluation_id": "evaluation-1",
+            "idempotency_key": "b" * 64,
+            "issue_number": 31,
+            "metrics": {"quality": 0.9},
+            "run_id": "run-1",
+            "spec_sha256": SPEC_SHA256,
+        },
+        (result_object,),
+    )
+
+    with pytest.raises(ValueError, match="idempotency binding"):
+        _validate_execution(planned, execution)

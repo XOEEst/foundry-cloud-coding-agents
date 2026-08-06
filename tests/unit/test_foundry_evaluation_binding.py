@@ -114,6 +114,8 @@ class FakeRuns:
         self.retrieve_responses: list[object | Exception] = []
         self.create_calls: list[dict[str, object]] = []
         self.retrieve_calls: list[dict[str, object]] = []
+        self.list_calls: list[dict[str, object]] = []
+        self.list_response: object = FakePage([])
 
     def create(self, **kwargs: object) -> object:
         self.create_calls.append(kwargs)
@@ -128,6 +130,10 @@ class FakeRuns:
         if isinstance(response, Exception):
             raise response
         return response
+
+    def list(self, **kwargs: object) -> object:
+        self.list_calls.append(kwargs)
+        return self.list_response
 
 
 class FakeEvals:
@@ -1348,6 +1354,79 @@ def test_gateway_subject_and_split_are_metadata_not_provider_fields() -> None:
     assert call["metadata"]["foundry_opt_split"] == "validation"
     assert run.subject_id == "candidate-42"
     assert run.split is DatasetSplit.VALIDATION
+
+
+def test_gateway_idempotency_key_is_exact_run_metadata() -> None:
+    transport, client = _transport()
+    _create_definition(transport, client)
+    key = "a" * 64
+
+    def create(**kwargs: object) -> object:
+        client.evals.runs.create_calls.append(kwargs)
+        return _run_payload(kwargs["metadata"])
+
+    client.evals.runs.create = create  # type: ignore[method-assign]
+    request = {**_batch_run_request(), "idempotency_key": key}
+
+    transport.create_run(request)
+
+    metadata = client.evals.runs.create_calls[0]["metadata"]
+    assert metadata["foundry_opt_idempotency_key"] == key
+    assert client.evals.runs.create_calls[0]["extra_headers"] == {
+        "Idempotency-Key": key
+    }
+
+
+def test_find_run_reconciles_only_exact_idempotency_binding() -> None:
+    transport, client = _transport()
+    _create_definition(transport, client)
+    key = "a" * 64
+    request = {**_batch_run_request(), "idempotency_key": key}
+    exact_metadata = {
+        "foundry_opt_kind": "batch",
+        "foundry_opt_subject_id": "candidate-1",
+        "foundry_opt_split": "development",
+        "foundry_opt_agent_id": "agent-name",
+        "foundry_opt_draft_id": "draft-9",
+        "foundry_opt_agent_version": "3",
+        "foundry_opt_dataset_id": "development",
+        "foundry_opt_dataset_version": "12",
+        "foundry_opt_evaluator_id": "eval-definition",
+        "foundry_opt_evaluator_version": "7",
+        "foundry_opt_idempotency_key": key,
+    }
+    client.evals.runs.list_response = FakePage(
+        [
+            _run_payload(
+                exact_metadata,
+                name="candidate development",
+            )
+        ]
+    )
+
+    exact = transport.find_run(request)
+    conflicting = transport.find_run(
+        {**request, "idempotency_key": "b" * 64}
+    )
+
+    assert exact is not None
+    assert exact["run_id"] == "evalrun-1"
+    assert conflicting is None
+    assert client.evals.runs.create_calls == []
+
+
+def test_idempotent_run_fails_closed_when_reconcile_api_is_unavailable() -> None:
+    transport, client = _transport()
+    _create_definition(transport, client)
+    client.evals.runs.list = None  # type: ignore[method-assign]
+
+    with pytest.raises(EvaluationConflictError, match="reconciliation"):
+        transport.find_run(
+            {
+                **_batch_run_request(),
+                "idempotency_key": "a" * 64,
+            }
+        )
 
 
 def test_run_response_rejects_context_mismatch() -> None:

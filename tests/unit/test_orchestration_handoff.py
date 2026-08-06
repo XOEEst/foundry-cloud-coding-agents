@@ -10,12 +10,14 @@ from foundry_opt.adapters.commands import CommandExitError
 from foundry_opt.preflight.interfaces import CommandResult
 from foundry_opt.orchestration.handoff import (
     _ProductionHandoffEffects,
+    CandidateDesignHandoff,
     GhHandoffPullRequestGateway,
     HandoffApplyResult,
     HandoffApplyStatus,
     HandoffError,
     HandoffEventError,
     HandoffFinalizer,
+    StewardStateHandoff,
     TrustedHandoffContext,
     discover_trusted_handoff_requests,
     trusted_handoff_request_from_payload,
@@ -855,6 +857,43 @@ def test_closing_an_already_closed_internal_handoff_is_idempotent() -> None:
     )
 
     assert len(commands.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "envelope_type",
+    [StewardStateHandoff, CandidateDesignHandoff],
+)
+def test_handoff_envelopes_reject_unknown_top_level_fields(
+    envelope_type,
+) -> None:
+    content = json.dumps(
+        {
+            "handoff_id": "d" * 64,
+            "payload": {},
+            "marker": "secondary-only",
+        }
+    ).encode()
+
+    with pytest.raises(ValueError, match="document is invalid"):
+        envelope_type.from_bytes(content)
+
+
+@pytest.mark.parametrize(
+    "envelope_type",
+    [StewardStateHandoff, CandidateDesignHandoff],
+)
+def test_handoff_envelopes_reject_unknown_payload_fields(
+    envelope_type,
+) -> None:
+    content = json.dumps(
+        {
+            "handoff_id": "d" * 64,
+            "payload": {"unknown": True},
+        }
+    ).encode()
+
+    with pytest.raises(ValueError, match="fields are invalid"):
+        envelope_type.from_bytes(content)
 
 
 def test_handoff_finalizer_does_not_close_an_advanced_branch() -> None:

@@ -25,6 +25,7 @@ from foundry_opt.drafts import DraftRecord
 from foundry_opt.evaluation import (
     AgentVersionRef,
     DatasetSplit,
+    DatasetVersionRef,
     EvaluationPolicy,
     EvaluationResult,
     EvaluationSubject,
@@ -748,8 +749,10 @@ class CandidateEvaluationIntent:
     generation: int
     spec_sha256: str
     base_commit: str
+    idempotency_key: str
     subject: EvaluationSubject
     split: DatasetSplit
+    dataset: DatasetVersionRef
     policy: EvaluationPolicy
 
     def __post_init__(self) -> None:
@@ -762,6 +765,14 @@ class CandidateEvaluationIntent:
             raise ValueError("evaluation intent spec_sha256 is invalid")
         if not _COMMIT.fullmatch(self.base_commit):
             raise ValueError("evaluation intent base_commit is invalid")
+        if not _SHA256.fullmatch(self.idempotency_key):
+            raise ValueError(
+                "evaluation intent idempotency_key is invalid"
+            )
+        if self.subject.idempotency_key != self.idempotency_key:
+            raise ValueError(
+                "evaluation subject idempotency binding is invalid"
+            )
         if self.split is not DatasetSplit.DEVELOPMENT:
             raise ValueError(
                 "candidate workers may only evaluate development data"
@@ -2107,11 +2118,25 @@ class CandidateWorkerService:
                 "effect_reconciliation_failed",
                 "A candidate evaluation could not be reconciled.",
             )
+        try:
+            _validate_evaluation_result(intent, result)
+        except ValueError:
+            raise _CandidateRecoveryFailure(
+                snapshot,
+                "evaluation_binding_mismatch",
+                "Candidate evaluation binding changed.",
+            ) from None
         if (
             evaluation_record.payload.get("evaluation_id")
             != result.run.evaluation_id
             or evaluation_record.payload.get("run_id")
             != result.run.run_id
+            or (
+                evaluation_record.payload.get("idempotency_key")
+                is not None
+                and evaluation_record.payload.get("idempotency_key")
+                != intent.idempotency_key
+            )
         ):
             raise _CandidateRecoveryFailure(
                 snapshot,
@@ -2283,6 +2308,7 @@ class CandidateWorkerService:
             intent.subject.subject_id,
             slot,
             plan,
+            idempotency_key=intent.idempotency_key,
         )
         success_id = f"{intent.effect_id}-succeeded"
         succeeded = _record(snapshot, success_id)
@@ -2293,6 +2319,15 @@ class CandidateWorkerService:
                 snapshot,
                 "foundry_evaluation",
             ) from None
+        if result is not None:
+            try:
+                _validate_evaluation_result(intent, result)
+            except ValueError:
+                raise _CandidateRecoveryFailure(
+                    snapshot,
+                    "evaluation_binding_mismatch",
+                    "Candidate evaluation binding changed.",
+                ) from None
         if succeeded is not None:
             if result is None:
                 raise _CandidateRecoveryFailure(
@@ -2304,6 +2339,11 @@ class CandidateWorkerService:
                 succeeded.payload.get("evaluation_id")
                 != result.run.evaluation_id
                 or succeeded.payload.get("run_id") != result.run.run_id
+                or (
+                    succeeded.payload.get("idempotency_key") is not None
+                    and succeeded.payload.get("idempotency_key")
+                    != intent.idempotency_key
+                )
             ):
                 raise _CandidateRecoveryFailure(
                     snapshot,
@@ -2324,6 +2364,14 @@ class CandidateWorkerService:
                     snapshot,
                     "foundry_evaluation",
                 ) from None
+            try:
+                _validate_evaluation_result(intent, result)
+            except ValueError:
+                raise _CandidateRecoveryFailure(
+                    snapshot,
+                    "evaluation_binding_mismatch",
+                    "Candidate evaluation binding changed.",
+                ) from None
         if _record(snapshot, success_id) is None:
             snapshot = self._append(
                 request,
@@ -2339,6 +2387,7 @@ class CandidateWorkerService:
                             "effect_kind": "foundry_evaluation",
                             "evaluation_id": result.run.evaluation_id,
                             "issue_number": intent.issue_number,
+                            "idempotency_key": intent.idempotency_key,
                             "metrics": _aggregate_metrics(result),
                             "run_id": result.run.run_id,
                             "spec_sha256": intent.spec_sha256,
@@ -2378,9 +2427,24 @@ class CandidateWorkerService:
             payload["max_attempts"] = plan.limits.transient_retries + 1
         existing = _record(snapshot, effect_id)
         if existing is not None:
+            legacy_payload = (
+                {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "idempotency_key"
+                }
+                if effect_kind == "foundry_evaluation"
+                else None
+            )
             if (
                 existing.kind != "candidate_effect_planned"
-                or dict(existing.payload) != payload
+                or (
+                    dict(existing.payload) != payload
+                    and (
+                        legacy_payload is None
+                        or dict(existing.payload) != legacy_payload
+                    )
+                )
             ):
                 raise _CandidateRecoveryFailure(
                     snapshot,
@@ -2535,10 +2599,23 @@ class CandidateWorkerService:
                 "effect_reconciliation_failed",
                 "The persisted baseline evaluation could not be reconciled.",
             )
+        try:
+            _validate_evaluation_result(intent, result)
+        except ValueError:
+            raise _CandidateRecoveryFailure(
+                snapshot,
+                "evaluation_binding_mismatch",
+                "Baseline evaluation binding changed.",
+            ) from None
         if (
             record.payload.get("evaluation_id")
             != result.run.evaluation_id
             or record.payload.get("run_id") != result.run.run_id
+            or (
+                record.payload.get("idempotency_key") is not None
+                and record.payload.get("idempotency_key")
+                != intent.idempotency_key
+            )
         ):
             raise _CandidateRecoveryFailure(
                 snapshot,
@@ -2894,19 +2971,117 @@ def _evaluation_intent(
     subject_id: str,
     draft: DraftRecord,
 ) -> CandidateEvaluationIntent:
+    datasets = tuple(
+        asset
+        for asset in plan.assets
+        if asset.kind == "dataset"
+        and asset.role == DatasetSplit.DEVELOPMENT.value
+    )
+    if (
+        len(datasets) != 1
+        or datasets[0].remote_id is None
+        or datasets[0].version is None
+    ):
+        raise ValueError(
+            "development evaluation dataset binding is invalid"
+        )
+    dataset = DatasetVersionRef(
+        datasets[0].remote_id,
+        datasets[0].version,
+    )
+    binding = {
+        "assets": [
+            {
+                "approval_gate": asset.approval_gate,
+                "asset_id": asset.asset_id,
+                "content_sha256": asset.content_sha256,
+                "kind": asset.kind,
+                "metrics": list(asset.metrics),
+                "name": asset.name,
+                "remote_id": asset.remote_id,
+                "role": asset.role,
+                "source": asset.source,
+                "version": asset.version,
+            }
+            for asset in sorted(
+                plan.assets,
+                key=lambda item: item.asset_id,
+            )
+        ],
+        "base_commit": plan.base_commit,
+        "campaign_id": plan.campaign_id,
+        "draft": {
+            "base_version": draft.base_version,
+            "bundle_sha256": draft.sha256,
+            "version_id": draft.version_id,
+        },
+        "generation": plan.generation,
+        "issue_number": plan.issue_number,
+        "policy": [
+            {
+                "borderline_distance": plan.evaluation_policy.borderline_distance,
+                "direction": metric.direction.value,
+                "hard_guardrail": metric.hard_guardrail,
+                "materiality": metric.materiality,
+                "name": metric.name,
+                "noisy_spread": plan.evaluation_policy.noisy_spread,
+                "threshold": metric.threshold,
+                "undefined_behavior": metric.undefined_behavior.value,
+            }
+            for metric in sorted(
+                plan.evaluation_policy.metrics,
+                key=lambda item: item.name,
+            )
+        ],
+        "spec_sha256": plan.spec_sha256,
+        "split": DatasetSplit.DEVELOPMENT.value,
+        "subject_id": subject_id,
+        "target": plan.target,
+    }
+    idempotency_key = hashlib.sha256(
+        json.dumps(
+            binding,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
     return CandidateEvaluationIntent(
         f"evaluation-{plan.issue_number}-{plan.generation}-{subject_id}",
         plan.issue_number,
         plan.generation,
         plan.spec_sha256,
         plan.base_commit,
+        idempotency_key,
         EvaluationSubject(
             subject_id,
             AgentVersionRef(plan.target, draft.version_id, draft.version_id),
+            idempotency_key,
         ),
         DatasetSplit.DEVELOPMENT,
+        dataset,
         plan.evaluation_policy,
     )
+
+
+def _validate_evaluation_result(
+    intent: CandidateEvaluationIntent,
+    result: EvaluationResult,
+) -> None:
+    runs = result.all_runs
+    if not runs:
+        raise ValueError("evaluation result has no runs")
+    for run in runs:
+        if (
+            run.subject_id != intent.subject.subject_id
+            or run.split is not intent.split
+            or run.agent != intent.subject.agent
+            or run.dataset != intent.dataset
+            or not run.evaluator.definition_id
+            or not run.evaluator.version
+        ):
+            raise ValueError("evaluation result binding changed")
 
 
 def _validate_draft(

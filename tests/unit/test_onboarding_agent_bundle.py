@@ -475,6 +475,18 @@ def test_candidate_check_never_sources_pr_controlled_shell_content() -> None:
     assert "len(markers) != 1" in workflow
     assert "campaign_match" not in workflow
     assert "Candidate issue: #" not in workflow
+    assert (
+        'foundry-opt optimize apply --issue "$ISSUE" '
+        '--candidate "$CANDIDATE" --verify-only'
+    ) in workflow
+    for executable_pr_code in (
+        "uv run pytest",
+        "npm test",
+        "python agent/",
+        "bash ./",
+        "sh ./",
+    ):
+        assert executable_pr_code not in workflow
 
 
 def test_dispatch_inputs_are_validated_through_environment_variables() -> None:
@@ -496,8 +508,9 @@ def test_dispatch_inputs_are_validated_through_environment_variables() -> None:
     assert "TRUSTED_ISSUE_NUMBER: ${{ inputs.issue }}" in recovery
     assert '--issue "${{ inputs.issue }}"' not in deployment
     assert "REQUESTED_ISSUE: ${{ inputs.issue }}" in deployment
-    assert 'foundry-opt steward deployment-bridge --issue "$REQUESTED_ISSUE"' in (
-        deployment
+    assert (
+        'foundry-opt steward deployment-bridge --issue "$REQUESTED_ISSUE"'
+        in " ".join(deployment.split())
     )
     assert "31;echo" not in deployment
 
@@ -521,6 +534,30 @@ def test_state_ref_workflows_fetch_full_history() -> None:
         assert "ref: ${{ github.event.repository.default_branch }}" in (
             files[path]
         )
+
+
+def test_privileged_workflows_disable_project_uv_and_dotenv_configuration() -> (
+    None
+):
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+
+    for path in (
+        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
+        Path(".github/workflows/foundry-optimization-reconcile.yml"),
+        Path(".github/workflows/foundry-optimization-capability.yml"),
+        Path(
+            ".github/workflows/"
+            "foundry-optimization-deployment-bridge.yml"
+        ),
+    ):
+        normalized = " ".join(files[path].split())
+        assert normalized.count("uv run --no-project") == normalized.count(
+            "uv run --no-project --no-config --no-env-file"
+        ), path
+        assert "uv run --no-project --with" not in normalized, path
 
 
 def test_deployment_workflow_uses_only_deployment_oidc_identity() -> None:
@@ -863,9 +900,10 @@ def test_bundle_generates_transport_recovery_and_deployment_workflows() -> None:
     assert "AZURE_DEPLOYMENT_CLIENT_ID" in bridge
     assert "AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}" not in bridge
     assert (
-        'uv run --no-project --with "$OPTIMIZER_PACKAGE" '
-        'foundry-opt steward deployment-bridge'
-    ) in bridge
+        "uv run --no-project --no-config --no-env-file "
+        '--with "$OPTIMIZER_PACKAGE" '
+        "foundry-opt steward deployment-bridge"
+    ) in " ".join(bridge.split())
     assert "uv tool install" not in bridge
     assert "foundry-optimization-deployment-result" in bridge
     assert "publication-result-auto" in bridge

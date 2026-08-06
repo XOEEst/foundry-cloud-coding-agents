@@ -327,6 +327,11 @@ class OptimizationEvaluationBinder:
             display_name=(
                 f"foundry-opt {plan.target} {subject.subject_id} "
                 f"{split.value} attempt {attempt}"
+                + (
+                    f" {subject.idempotency_key[:12]}"
+                    if subject.idempotency_key is not None
+                    else ""
+                )
             ),
             agent=subject.agent,
             dataset=DatasetVersionRef(dataset.remote_id, dataset.version),
@@ -335,6 +340,15 @@ class OptimizationEvaluationBinder:
             ),
             subject_id=subject.subject_id,
             split=split,
+            idempotency_key=(
+                hashlib.sha256(
+                    (
+                        f"{subject.idempotency_key}:attempt:{attempt}"
+                    ).encode("ascii")
+                ).hexdigest()
+                if subject.idempotency_key is not None
+                else None
+            ),
         )
         created = gateway.create_or_reuse_run(request)
         run = gateway.get_run(created.run_id)

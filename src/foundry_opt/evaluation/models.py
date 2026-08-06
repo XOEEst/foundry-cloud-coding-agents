@@ -317,6 +317,19 @@ class ParetoResult:
 class EvaluationSubject:
     subject_id: str
     agent: AgentVersionRef
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.idempotency_key is not None and (
+            len(self.idempotency_key) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.idempotency_key
+            )
+        ):
+            raise ValueError(
+                "evaluation subject idempotency_key must be a SHA-256 digest"
+            )
 
 
 @dataclass(frozen=True)
