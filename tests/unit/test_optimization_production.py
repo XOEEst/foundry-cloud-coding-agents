@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+import hashlib
 import json
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
 from typing import Any
 import zipfile
 
 import pytest
 import yaml
 
-from foundry_opt.adapters.commands import CommandExitError
+from foundry_opt.adapters.commands import (
+    CommandExitError,
+    SubprocessCommandRunner,
+)
 from foundry_opt.adapters.drafts import DraftAuthenticationError, DraftGateway
 from foundry_opt.adapters.foundry import AzureCliCredentialProvider
 from foundry_opt.adapters.foundry_assets import (
@@ -46,15 +53,31 @@ from foundry_opt.optimization.production import (
     ProductionOptimizationCommandService,
     _DraftCreator,
     _EvaluationBinder,
+    _ProductionCandidateCapabilityExecutor,
+    _ProductionPostDeploymentEvaluationEffects,
     _RegistrationGateway,
+    _candidate_assets_registration_plan,
     build_issue_optimization_dependencies,
     build_optimization_command_service,
     build_production_steward_candidate_selection,
     build_production_steward_candidate_slate,
     build_production_steward_candidate_workers,
+    build_production_steward_spec_policy,
     build_specification_asset_registry,
 )
-from foundry_opt.orchestration import StateRefError
+from foundry_opt.orchestration import (
+    AdvanceRequest,
+    CampaignEvent,
+    EventKind,
+    OptimizationCampaign,
+    OutboxRecord,
+    StateObject,
+    StateRefError,
+    StateRefSnapshot,
+)
+from foundry_opt.orchestration.capability_bridge import (
+    CandidateCapabilityExecutionError,
+)
 from foundry_opt.optimization.runner import (
     CapabilityUnavailableError,
     IssueOptimizationRunner,
@@ -63,7 +86,11 @@ from foundry_opt.optimization.specification import (
     OptimizationSpecService,
     spec_file_path,
 )
-from foundry_opt.packaging import BundleArtifact
+from foundry_opt.packaging import (
+    BundleArtifact,
+    BundleRequest,
+    build_source_bundle,
+)
 
 BASE_COMMIT = "b" * 40
 DEFAULT_COMMIT = "a" * 40
@@ -725,6 +752,386 @@ def test_default_factories_build_real_adapter_types() -> None:
     binder = dependencies.bind_evaluation._binder_factory(ACCEPTANCE_ENDPOINT)
     assert isinstance(binder, OptimizationEvaluationBinder)
     assert binder._evaluator_model_deployment == "gpt-5.1"
+
+
+def test_production_steward_defers_existing_foundry_resolution(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    repository_policy = build_production_steward_spec_policy()
+    policy = repository_policy._factory(tmp_path)
+    provider = policy._resolver._registry.get("foundry")
+
+    prepared = provider.prepare(
+        EvaluationAssetRequest(
+            asset_id="development",
+            kind=AssetKind.DATASET,
+            source="foundry",
+            role="development",
+            name="dev",
+            version="v1",
+        ),
+        EvaluationAssetContext(
+            repository_root=tmp_path,
+            project_endpoint=ACCEPTANCE_ENDPOINT,
+            target="support-agent",
+            issue_number=31,
+        ),
+    )
+
+    assert prepared.files == {}
+    assert prepared.provenance.name == "dev"
+    assert prepared.provenance.version == "v1"
+    assert prepared.provenance.remote_id is None
+    assert not hasattr(provider, "_gateway_factory")
+
+
+def test_copilot_post_deployment_reconcile_never_calls_foundry(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class Adapter:
+        def reconcile(self, intent):
+            raise AssertionError("Copilot must not call held-out Foundry")
+
+    effects = object.__new__(_ProductionPostDeploymentEvaluationEffects)
+    effects._root = tmp_path
+    effects._adapter = Adapter()
+    monkeypatch.setattr(
+        "foundry_opt.optimization.production.GitStateRef.load",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "foundry_opt.optimization.production.is_verified_copilot_git_proxy",
+        lambda root: True,
+    )
+    intent = SimpleNamespace(
+        binding=SimpleNamespace(issue_number=31),
+        effect_id="post-deploy-31-1",
+    )
+
+    assert effects.reconcile(intent) is None
+
+
+def test_actions_capability_executor_registers_exact_persisted_assets(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _config()
+    _write_config(tmp_path)
+    development = b'{"query":"hello"}\n'
+    validation = b'{"query":"refund"}\n'
+    spec = OptimizationSpec(
+        issue_number=31,
+        repository="octo-org/optimizer",
+        base_commit=BASE_COMMIT,
+        target="support-agent",
+        environment="acceptance",
+        base_agent_version="12",
+        goal="Improve grounded answers while preserving every guardrail.",
+        datasets=(
+            AssetProvenance(
+                asset_id="development",
+                kind=AssetKind.DATASET,
+                source="repository",
+                role="development",
+                content_sha256=hashlib.sha256(development).hexdigest(),
+                created_by="repository-provider",
+            ),
+            AssetProvenance(
+                asset_id="validation",
+                kind=AssetKind.DATASET,
+                source="repository",
+                role="validation",
+                content_sha256=hashlib.sha256(validation).hexdigest(),
+                created_by="repository-provider",
+            ),
+        ),
+        evaluators=(
+            AssetProvenance(
+                asset_id="quality",
+                kind=AssetKind.EVALUATOR,
+                source="builtin",
+                name="quality",
+                version="1",
+                created_by="builtin-evaluator-provider",
+                remote_id="builtin:quality:1",
+                metrics=("quality",),
+            ),
+        ),
+        metrics=config.targets["support-agent"].metrics,
+        allowed_mutations=frozenset({"system_instructions"}),
+    )
+    paths = {
+        "development": Path("data/development.jsonl"),
+        "validation": Path("data/validation.jsonl"),
+        "quality": None,
+    }
+    plan = _candidate_assets_registration_plan(config, spec, paths, 1)
+    created = CampaignEvent(
+        "created",
+        EventKind.ISSUE_CREATED,
+        1,
+        datetime(2026, 8, 6, tzinfo=UTC),
+    )
+    approved = CampaignEvent(
+        "approved",
+        EventKind.SPEC_POLICY_APPROVED,
+        1,
+        datetime(2026, 8, 6, tzinfo=UTC),
+        {"spec_sha256": spec.sha256},
+    )
+    state = OptimizationCampaign().advance(
+        AdvanceRequest(31, None, (created, approved))
+    ).state
+    planned = OutboxRecord(
+        plan.effect_id,
+        "candidate_assets_registration_planned",
+        1,
+        state.sequence,
+        plan.payload,
+    )
+    snapshot = StateRefSnapshot(
+        "1" * 40,
+        state,
+        (created, approved),
+        (planned,),
+        (plan.intent,),
+    )
+    monkeypatch.setattr(
+        "foundry_opt.optimization.production._production_approved_spec",
+        lambda *args: (spec, paths),
+    )
+    monkeypatch.setattr(
+        "foundry_opt.optimization.production._production_git_bytes",
+        lambda root, commit, path: {
+            paths["development"]: development,
+            paths["validation"]: validation,
+        }[path],
+    )
+
+    class Registration:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def register(self, *, kind, name, version, content):
+            self.calls.append((kind, name, version, dict(content)))
+            return AssetIdentity(
+                remote_id=f"remote-{name}",
+                name=name,
+                version=version,
+                content_sha256=hashlib.sha256(
+                    next(iter(content.values()))
+                ).hexdigest(),
+            )
+
+    registration = Registration()
+    executor = _ProductionCandidateCapabilityExecutor(
+        config_path=Path(".github/foundry-optimizer.yaml"),
+        commands=_FakeCommands({}),
+        credential=_fake_credential_provider(),
+        resolution_gateway_factory=lambda endpoint: (_ for _ in ()).throw(
+            AssertionError("existing Foundry resolution is not expected")
+        ),
+        registration_gateway_factory=lambda endpoint: registration,
+        binder_factory=None,
+        draft_gateway=None,
+    )
+
+    execution = executor.reconcile(tmp_path, snapshot, planned)
+
+    assert execution.record_kind == (
+        "candidate_assets_registration_succeeded"
+    )
+    assert len(registration.calls) == 2
+    result = json.loads(execution.objects[0].content)
+    assert result["base_commit"] == BASE_COMMIT
+    assert result["spec_sha256"] == spec.sha256
+    by_id = {asset["asset_id"]: asset for asset in result["assets"]}
+    assert by_id["development"]["remote_id"].startswith("remote-dataset-")
+    assert by_id["validation"]["remote_id"].startswith("remote-dataset-")
+    assert by_id["quality"]["remote_id"] == "builtin:quality:1"
+    assert "hello" not in execution.objects[0].content.decode()
+    assert "refund" not in execution.objects[0].content.decode()
+
+    stale = OutboxRecord(
+        plan.effect_id,
+        planned.kind,
+        planned.generation,
+        planned.sequence,
+        {**dict(planned.payload), "base_commit": "c" * 40},
+    )
+    stale_snapshot = StateRefSnapshot(
+        snapshot.revision,
+        snapshot.state,
+        snapshot.inbox,
+        (stale,),
+        snapshot.objects,
+    )
+    registration.calls.clear()
+
+    with pytest.raises(
+        CandidateCapabilityExecutionError,
+        match="candidate_capability_execution_failed",
+    ) as excinfo:
+        executor.reconcile(tmp_path, stale_snapshot, stale)
+
+    assert excinfo.value.retryable is False
+    assert registration.calls == []
+
+
+def test_actions_draft_rebuilds_candidate_from_durable_patch_object(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+
+    def git(*arguments: str, cwd: Path = root) -> str:
+        return subprocess.run(
+            ("git", *arguments),
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    config_document = _config_dict()
+    del config_document["targets"]["billing-agent"]
+    config_path = root / ".github" / "foundry-optimizer.yaml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        yaml.safe_dump(config_document, sort_keys=False),
+        encoding="utf-8",
+    )
+    (root / "agent").mkdir()
+    (root / "agent" / "main.py").write_text(
+        "VALUE = 'baseline'\n",
+        encoding="utf-8",
+    )
+    git("add", ".")
+    git("commit", "-m", "base")
+    base_commit = git("rev-parse", "HEAD")
+    source = root / ".foundry-optimizer" / "candidate-source"
+    source.parent.mkdir(parents=True)
+    git("worktree", "add", "--detach", str(source), base_commit)
+    (source / "agent" / "main.py").write_text(
+        "VALUE = 'candidate'\n",
+        encoding="utf-8",
+    )
+    patch = subprocess.run(
+        (
+            "git",
+            "diff",
+            "--binary",
+            "--full-index",
+            base_commit,
+            "--",
+        ),
+        cwd=source,
+        check=True,
+        capture_output=True,
+    ).stdout
+    subprocess.run(
+        ("git", "add", "agent/main.py"),
+        cwd=source,
+        check=True,
+    )
+    result_tree = git("write-tree", cwd=source)
+    expected_bundle = build_source_bundle(
+        BundleRequest(
+            repository_root=source,
+            output_path=source / ".expected.zip",
+            include=("agent/**",),
+            exclude=(),
+            dependency_resolution="bundled",
+        )
+    )
+    git("worktree", "remove", "--force", str(source))
+    patch_sha256 = hashlib.sha256(patch).hexdigest()
+    spec_sha256 = "a" * 64
+    created = CampaignEvent(
+        "created",
+        EventKind.ISSUE_CREATED,
+        1,
+        datetime(2026, 8, 6, tzinfo=UTC),
+    )
+    approved = CampaignEvent(
+        "approved",
+        EventKind.SPEC_POLICY_APPROVED,
+        1,
+        datetime(2026, 8, 6, tzinfo=UTC),
+        {"spec_sha256": spec_sha256},
+    )
+    state = OptimizationCampaign().advance(
+        AdvanceRequest(31, None, (created, approved))
+    ).state
+    artifact = OutboxRecord(
+        "candidate-artifact-1-1",
+        "candidate_artifact_ready",
+        1,
+        state.sequence,
+        {
+            "base_commit": base_commit,
+            "bundle_sha256": expected_bundle.sha256,
+            "candidate_id": "candidate-1",
+            "issue_number": 31,
+            "patch_path": (
+                ".foundry-optimizer/campaigns/candidate-1.patch"
+            ),
+            "patch_sha256": patch_sha256,
+            "result_commit": "c" * 40,
+            "slot": 1,
+            "spec_sha256": spec_sha256,
+            "tree_sha": result_tree,
+        },
+    )
+    snapshot = StateRefSnapshot(
+        "1" * 40,
+        state,
+        (created, approved),
+        (artifact,),
+        (
+            StateObject(
+                f"objects/patches/{patch_sha256}.patch",
+                patch,
+            ),
+        ),
+    )
+    executor = _ProductionCandidateCapabilityExecutor(
+        config_path=Path(".github/foundry-optimizer.yaml"),
+        commands=SubprocessCommandRunner(),
+        credential=_fake_credential_provider(),
+        resolution_gateway_factory=lambda endpoint: object(),
+        registration_gateway_factory=lambda endpoint: object(),
+        binder_factory=None,
+        draft_gateway=None,
+    )
+
+    rebuilt = executor._build_exact_bundle(
+        root,
+        SimpleNamespace(
+            base_commit=base_commit,
+            generation=1,
+            spec_sha256=spec_sha256,
+        ),
+        "draft-31-1-candidate-1",
+        snapshot,
+        "candidate-1",
+        expected_bundle.sha256,
+    )
+
+    assert rebuilt.sha256 == expected_bundle.sha256
+    with zipfile.ZipFile(rebuilt.path) as archive:
+        assert archive.read("agent/main.py").replace(
+            b"\r\n", b"\n"
+        ) == b"VALUE = 'candidate'\n"
+    executor._remove_capability_worktree(
+        root,
+        "draft-31-1-candidate-1",
+    )
 
 
 def test_default_validator_runs_target_configured_commands(

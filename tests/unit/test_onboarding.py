@@ -625,7 +625,10 @@ def test_run_onboarding_is_idempotent_when_bundle_is_current(
     assert result.guidance[0] == (
         "Generated onboarding files are already current."
     )
-    assert "COPILOT_ASSIGNMENT_TOKEN" in result.guidance[1]
+    assert any(
+        "COPILOT_ASSIGNMENT_TOKEN" in guidance
+        for guidance in result.guidance
+    )
 
 
 def test_run_onboarding_preserves_existing_files_and_reports_conflicts(

@@ -781,6 +781,16 @@ class CandidateDesignPending(RuntimeError):
     """Signal that a durable designer assignment must complete first."""
 
 
+class CandidateEffectPending(RuntimeError):
+    """Signal that trusted Actions must execute a persisted Foundry effect."""
+
+    def __init__(self, effect_kind: str) -> None:
+        if effect_kind not in {"foundry_draft", "foundry_evaluation"}:
+            raise ValueError("candidate pending effect kind is invalid")
+        self.effect_kind = effect_kind
+        super().__init__(f"{effect_kind} awaits trusted capability execution")
+
+
 class CandidateDraftEffects(Protocol):
     def reconcile(
         self,
@@ -797,6 +807,65 @@ class CandidateEvaluationEffects(Protocol):
     ) -> EvaluationResult | None: ...
 
     def run(self, intent: CandidateEvaluationIntent) -> EvaluationResult: ...
+
+
+@dataclass(frozen=True)
+class CandidateAssetsRegistrationPlan:
+    effect_id: str
+    issue_number: int
+    generation: int
+    spec_sha256: str
+    base_commit: str
+    target: str
+    environment: str
+    max_attempts: int
+    intent: StateObject
+
+    def __post_init__(self) -> None:
+        _identifier(self.effect_id, "asset registration effect_id")
+        if self.issue_number < 1 or self.generation < 1:
+            raise ValueError(
+                "asset registration issue and generation must be positive"
+            )
+        if not _SHA256.fullmatch(self.spec_sha256):
+            raise ValueError("asset registration spec_sha256 is invalid")
+        if not _COMMIT.fullmatch(self.base_commit):
+            raise ValueError("asset registration base_commit is invalid")
+        _identifier(self.target, "asset registration target")
+        _identifier(self.environment, "asset registration environment")
+        if self.max_attempts < 1:
+            raise ValueError(
+                "asset registration max_attempts must be positive"
+            )
+        if self.intent.path != (
+            f"objects/capabilities/{self.effect_id}.json"
+        ):
+            raise ValueError("asset registration intent path is invalid")
+
+    @property
+    def payload(self) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "base_commit": self.base_commit,
+                "capability_path": self.intent.path,
+                "capability_sha256": self.intent.sha256,
+                "effect_id": self.effect_id,
+                "effect_kind": "foundry_assets",
+                "environment": self.environment,
+                "issue_number": self.issue_number,
+                "max_attempts": self.max_attempts,
+                "spec_sha256": self.spec_sha256,
+                "target": self.target,
+            }
+        )
+
+
+class CandidateAssetsRegistrationPending(RuntimeError):
+    """Signal that trusted Actions must materialize approved assets."""
+
+    def __init__(self, plan: CandidateAssetsRegistrationPlan) -> None:
+        self.plan = plan
+        super().__init__("candidate assets await trusted capability execution")
 
 
 class CandidateWorkerPlanResolver(Protocol):
@@ -883,6 +952,19 @@ class _CandidateDesignDeferred(RuntimeError):
         super().__init__("candidate design is awaiting a specialist")
 
 
+class _CandidateEffectDeferred(RuntimeError):
+    def __init__(
+        self,
+        snapshot: StateRefSnapshot,
+        effect_kind: str,
+    ) -> None:
+        self.snapshot = snapshot
+        self.effect_kind = effect_kind
+        super().__init__(
+            f"{effect_kind} is awaiting trusted capability execution"
+        )
+
+
 class _CandidateRecoveryFailure(RuntimeError):
     def __init__(
         self,
@@ -946,7 +1028,10 @@ class CandidateWorkerService:
                 "Candidate workers are not valid in this campaign phase.",
                 "candidate_workers_phase_invalid",
             )
-        plan = self._resolver.resolve(request, snapshot.state)
+        try:
+            plan = self._resolver.resolve(request, snapshot.state)
+        except CandidateAssetsRegistrationPending as pending:
+            return self._defer_assets(request, snapshot, pending.plan)
         mismatch = _plan_mismatch(plan, snapshot, request.issue_number)
         if mismatch is not None:
             return CandidateWorkerResult(
@@ -1006,6 +1091,21 @@ class CandidateWorkerService:
                 "Candidate design is awaiting its assigned specialist.",
                 "candidate_design_pending",
             )
+        except _CandidateEffectDeferred as deferred:
+            label = (
+                "draft"
+                if deferred.effect_kind == "foundry_draft"
+                else "evaluation"
+            )
+            return CandidateWorkerResult(
+                CandidateWorkerStatus.WAITING,
+                deferred.snapshot,
+                (
+                    f"Candidate {label} is awaiting trusted "
+                    "capability execution."
+                ),
+                f"candidate_{label}_pending",
+            )
         except _CandidateRecoveryFailure as failure:
             return CandidateWorkerResult(
                 CandidateWorkerStatus.FAILED,
@@ -1024,6 +1124,76 @@ class CandidateWorkerService:
             CandidateWorkerStatus.COMPLETE,
             snapshot,
             "Candidate worker loop completed.",
+        )
+
+    def _defer_assets(
+        self,
+        request: CandidateWorkerRequest,
+        snapshot: StateRefSnapshot,
+        plan: CandidateAssetsRegistrationPlan,
+    ) -> CandidateWorkerResult:
+        if (
+            plan.issue_number != request.issue_number
+            or plan.issue_number != snapshot.state.issue_number
+            or plan.generation != snapshot.state.generation
+            or plan.spec_sha256 != snapshot.state.spec_sha256
+        ):
+            return CandidateWorkerResult(
+                CandidateWorkerStatus.BLOCKED,
+                snapshot,
+                "Candidate asset registration inputs are stale.",
+                "candidate_assets_registration_stale",
+            )
+        existing = _record(snapshot, plan.effect_id)
+        existing_object = next(
+            (
+                item
+                for item in snapshot.objects
+                if item.path == plan.intent.path
+            ),
+            None,
+        )
+        if existing is not None:
+            if (
+                existing.kind != "candidate_assets_registration_planned"
+                or dict(existing.payload) != dict(plan.payload)
+                or existing_object != plan.intent
+            ):
+                return CandidateWorkerResult(
+                    CandidateWorkerStatus.FAILED,
+                    snapshot,
+                    "The persisted candidate asset intent changed.",
+                    "candidate_assets_registration_mismatch",
+                )
+            persisted = snapshot
+        elif existing_object is not None:
+            return CandidateWorkerResult(
+                CandidateWorkerStatus.FAILED,
+                snapshot,
+                "The persisted candidate asset intent changed.",
+                "candidate_assets_registration_mismatch",
+            )
+        else:
+            persisted = self._ledger.commit(
+                request.repository_root,
+                issue_number=request.issue_number,
+                expected_revision=snapshot.revision,
+                state=snapshot.state,
+                outbox=(
+                    _outbox(
+                        snapshot,
+                        plan.effect_id,
+                        "candidate_assets_registration_planned",
+                        plan.payload,
+                    ),
+                ),
+                objects=(plan.intent,),
+            )
+        return CandidateWorkerResult(
+            CandidateWorkerStatus.WAITING,
+            persisted,
+            "Candidate assets await trusted capability execution.",
+            "candidate_assets_registration_pending",
         )
 
     def _start(
@@ -1591,6 +1761,11 @@ class CandidateWorkerService:
             worktree.path,
             output,
         )
+        patch_content = (
+            request.repository_root / patch.path
+        ).read_bytes()
+        if hashlib.sha256(patch_content).hexdigest() != patch.sha256:
+            raise ValueError("candidate patch changed before persistence")
         snapshot = self._append(
             request,
             snapshot,
@@ -1611,6 +1786,12 @@ class CandidateWorkerService:
                         "spec_sha256": plan.spec_sha256,
                         "tree_sha": patch.result_tree,
                     },
+                ),
+            ),
+            objects=(
+                StateObject(
+                    f"objects/patches/{patch.sha256}.patch",
+                    patch_content,
                 ),
             ),
         )
@@ -2014,7 +2195,13 @@ class CandidateWorkerService:
         )
         success_id = f"{intent.effect_id}-succeeded"
         succeeded = _record(snapshot, success_id)
-        draft = self._deps.drafts.reconcile(intent)
+        try:
+            draft = self._deps.drafts.reconcile(intent)
+        except CandidateEffectPending:
+            raise _CandidateEffectDeferred(
+                snapshot,
+                "foundry_draft",
+            ) from None
         if succeeded is not None:
             if draft is None:
                 if (
@@ -2045,7 +2232,13 @@ class CandidateWorkerService:
         ):
             raise _CandidateSessionTimeout(snapshot)
         if draft is None:
-            draft = self._deps.drafts.create(intent)
+            try:
+                draft = self._deps.drafts.create(intent)
+            except CandidateEffectPending:
+                raise _CandidateEffectDeferred(
+                    snapshot,
+                    "foundry_draft",
+                ) from None
         _validate_draft(intent, draft)
         if _record(snapshot, success_id) is None:
             snapshot = self._append(
@@ -2093,7 +2286,13 @@ class CandidateWorkerService:
         )
         success_id = f"{intent.effect_id}-succeeded"
         succeeded = _record(snapshot, success_id)
-        result = self._deps.evaluations.reconcile(intent)
+        try:
+            result = self._deps.evaluations.reconcile(intent)
+        except CandidateEffectPending:
+            raise _CandidateEffectDeferred(
+                snapshot,
+                "foundry_evaluation",
+            ) from None
         if succeeded is not None:
             if result is None:
                 raise _CandidateRecoveryFailure(
@@ -2118,7 +2317,13 @@ class CandidateWorkerService:
         ):
             raise _CandidateSessionTimeout(snapshot)
         if result is None:
-            result = self._deps.evaluations.run(intent)
+            try:
+                result = self._deps.evaluations.run(intent)
+            except CandidateEffectPending:
+                raise _CandidateEffectDeferred(
+                    snapshot,
+                    "foundry_evaluation",
+                ) from None
         if _record(snapshot, success_id) is None:
             snapshot = self._append(
                 request,
@@ -2169,6 +2374,8 @@ class CandidateWorkerService:
             payload["bundle_sha256"] = bundle_sha256
         if idempotency_key is not None:
             payload["idempotency_key"] = idempotency_key
+        if effect_kind in {"foundry_draft", "foundry_evaluation"}:
+            payload["max_attempts"] = plan.limits.transient_retries + 1
         existing = _record(snapshot, effect_id)
         if existing is not None:
             if (
@@ -2345,6 +2552,8 @@ class CandidateWorkerService:
         request: CandidateWorkerRequest,
         snapshot: StateRefSnapshot,
         outbox: tuple[OutboxRecord, ...],
+        *,
+        objects: tuple[StateObject, ...] = (),
     ) -> StateRefSnapshot:
         return self._ledger.commit(
             request.repository_root,
@@ -2352,6 +2561,7 @@ class CandidateWorkerService:
             expected_revision=snapshot.revision,
             state=snapshot.state,
             outbox=outbox,
+            objects=objects,
         )
 
     def _reconcile_worktree_cleanups(

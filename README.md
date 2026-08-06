@@ -17,7 +17,8 @@ deployment workflow. It generates:
 - the `[Optimize]` issue form
 - the Copilot steward, planner, candidate-designer, and exact-patch-applier
   custom agents
-- transport, reconciliation, candidate-check, and deployment-bridge workflows
+- transport, reconciliation, Foundry capability, candidate-check, and
+  deployment-bridge workflows
 - the `foundry-agent-optimizer` skill and its vendored Tenzing protocol snapshot
 
 Use `foundry-opt init --set-github-variables` to create the repository-level
@@ -38,9 +39,11 @@ Azure CLI's managed cache for the Foundry SDK scopes
 `https://ai.azure.com/.default` and
 `https://cognitiveservices.azure.com/.default`. Token command output and errors
 are suppressed and never copied into logs, workflow outputs, `GITHUB_ENV`, or
-repository files. The ARM management audience is deliberately not warmed
-because production Copilot-runtime adapters use only these Foundry data-plane
-audiences.
+repository files. Warming proves token acquisition only; campaign Foundry
+network operations never run in Copilot. The generated Actions capability
+workflow uses the optimizer OIDC identity to register assets, create exact
+drafts, and run development evaluations. The ARM management audience remains
+unneeded.
 
 Before merging or running the generated workflows, manually create the
 repository Actions secret `COPILOT_ASSIGNMENT_TOKEN`. `foundry-opt init`
@@ -143,6 +146,11 @@ recovery automation:
 - `candidate_worktree_failed`: Git, worktree, or durable state operations
 - `candidate_workers_unavailable`: an unclassified worker exception
 
+Durably delegated Foundry effects are not failures. The steward reports
+`candidate_assets_registration_pending`, `candidate_draft_pending`, or
+`candidate_evaluation_pending`, stops, and resumes only after the capability
+workflow CAS-records the exact result.
+
 The accompanying bounded summary contains the exception class and, only for
 known typed failures, a sanitized user-facing message. It never includes
 tracebacks, credentials, URLs, prompts, raw rows, or private evaluation
@@ -180,6 +188,14 @@ either `policy_approved` or `human_review`.
   verify a proposed handoff exactly, but cannot choose another transition or
   invent an effect. Handoff discovery selects transport envelopes only; the
   canonical replay path still validates the steward's exact decision.
+- The Copilot steward never calls Foundry network adapters. It persists
+  `candidate_assets_registration_planned` for exact approved asset
+  name/version/hash/path bindings and `candidate_effect_planned` for exact
+  draft and development-evaluation intents. The five-minute Actions capability
+  bridge validates those immutable bindings, reconciles or executes the
+  idempotent external operation under the optimizer OIDC identity, CAS-records
+  privacy-safe identities and normalized results, then wakes the steward.
+  Actions cannot choose candidates, alter policy, eligibility, or the slate.
 - The default-branch-generated Copilot setup workflow exports the static,
   non-secret `FOUNDRY_OPT_COPILOT_GIT_PROXY=1` marker; no pull-request input
   controls it. Proxy authority additionally requires `GITHUB_ACTIONS=true`, the

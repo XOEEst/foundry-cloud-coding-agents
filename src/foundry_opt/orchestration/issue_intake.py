@@ -449,6 +449,12 @@ class GitStateCampaignRecovery:
 
         if awaiting_specialist_result(snapshot):
             return False
+        from foundry_opt.orchestration.capability_bridge import (
+            awaiting_candidate_capability_result,
+        )
+
+        if awaiting_candidate_capability_result(snapshot):
+            return False
         return snapshot.state.phase not in _TERMINAL_CAMPAIGN_PHASES
 
     @staticmethod

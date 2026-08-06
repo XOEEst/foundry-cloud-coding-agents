@@ -39,10 +39,13 @@ from foundry_opt.orchestration import (
     EventKind,
     OptimizationCampaign,
     OutboxRecord,
+    StateObject,
     StateRefPrivacyError,
     StateRefSnapshot,
 )
 from foundry_opt.orchestration.candidate_workers import (
+    CandidateAssetsRegistrationPending,
+    CandidateAssetsRegistrationPlan,
     CandidateDesignPending,
     CandidateDesignArtifact,
     CandidateDesignIntent,
@@ -51,6 +54,7 @@ from foundry_opt.orchestration.candidate_workers import (
     CandidateDesignSubmissionService,
     CandidateDesignSubmissionStatus,
     CandidateDraftEffects,
+    CandidateEffectPending,
     CandidateEvaluationEffects,
     CandidateWorkerDependencies,
     CandidateWorkerPlan,
@@ -65,6 +69,292 @@ from foundry_opt.packaging import ValidationResult
 NOW = datetime(2026, 7, 31, 18, 0, tzinfo=UTC)
 SPEC_SHA256 = "a" * 64
 BASE_COMMIT = "b" * 40
+
+
+def test_candidate_assets_are_durably_delegated_before_any_worker_adapter(
+    tmp_path: Path,
+) -> None:
+    effect_id = f"assets-31-1-{SPEC_SHA256[:16]}"
+    intent = StateObject(
+        f"objects/capabilities/{effect_id}.json",
+        (
+            json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_id": "development",
+                            "content_sha256": "d" * 64,
+                            "kind": "dataset",
+                            "path": "evaluation/development.jsonl",
+                            "role": "development",
+                            "source": "repository",
+                        }
+                    ],
+                    "base_commit": BASE_COMMIT,
+                    "environment": "acceptance",
+                    "generation": 1,
+                    "issue_number": 31,
+                    "kind": "candidate_assets_registration",
+                    "schema_version": 1,
+                    "spec_sha256": SPEC_SHA256,
+                    "target": "support",
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+    )
+    registration = CandidateAssetsRegistrationPlan(
+        effect_id=effect_id,
+        issue_number=31,
+        generation=1,
+        spec_sha256=SPEC_SHA256,
+        base_commit=BASE_COMMIT,
+        target="support",
+        environment="acceptance",
+        max_attempts=2,
+        intent=intent,
+    )
+
+    class PendingResolver:
+        def resolve(self, request, state):
+            raise CandidateAssetsRegistrationPending(registration)
+
+    class NoWorkerRepository(Repository):
+        def pin_default_branch(self, repository_root):
+            raise AssertionError("candidate repository must not be touched")
+
+    class NoDrafts:
+        def reconcile(self, intent):
+            raise AssertionError("Foundry draft adapter must not be called")
+
+        create = reconcile
+
+    class NoEvaluations:
+        def reconcile(self, intent):
+            raise AssertionError(
+                "Foundry evaluation adapter must not be called"
+            )
+
+        run = reconcile
+
+    ledger = Ledger(_seed_snapshot())
+    service = CandidateWorkerService(
+        ledger=ledger,
+        resolver=PendingResolver(),
+        dependencies=CandidateWorkerDependencies(
+            repository=NoWorkerRepository(tmp_path),
+            designer=DeferredDesigner(),
+            validate=lambda path: (_ for _ in ()).throw(
+                AssertionError("validation must not run")
+            ),
+            build_bundle=lambda root, output: (_ for _ in ()).throw(
+                AssertionError("bundle creation must not run")
+            ),
+            drafts=NoDrafts(),
+            evaluations=NoEvaluations(),
+            write_evidence=lambda request: (_ for _ in ()).throw(
+                AssertionError("evidence must not be written")
+            ),
+            clock=Clock(),
+        ),
+    )
+
+    first = service.advance(CandidateWorkerRequest(tmp_path, 31))
+    second = service.advance(CandidateWorkerRequest(tmp_path, 31))
+
+    assert first.status is CandidateWorkerStatus.WAITING
+    assert first.code == "candidate_assets_registration_pending"
+    assert second.status is CandidateWorkerStatus.WAITING
+    assert ledger.commits == 1
+    assert first.snapshot.objects[-1] == intent
+    planned = first.snapshot.outbox[-1]
+    assert planned.kind == "candidate_assets_registration_planned"
+    assert dict(planned.payload) == {
+        "base_commit": BASE_COMMIT,
+        "capability_path": intent.path,
+        "capability_sha256": intent.sha256,
+        "effect_id": effect_id,
+        "effect_kind": "foundry_assets",
+        "environment": "acceptance",
+        "issue_number": 31,
+        "max_attempts": 2,
+        "spec_sha256": SPEC_SHA256,
+        "target": "support",
+    }
+
+
+def test_foundry_draft_is_deferred_after_its_durable_effect_plan(
+    tmp_path: Path,
+) -> None:
+    class PendingDrafts:
+        def reconcile(self, intent):
+            return None
+
+        def create(self, intent):
+            raise CandidateEffectPending("foundry_draft")
+
+    class NoEvaluations:
+        def reconcile(self, intent):
+            raise AssertionError("evaluation must wait for the draft result")
+
+        run = reconcile
+
+    def build_bundle(root: Path, output: Path) -> BundleArtifact:
+        return BundleArtifact(
+            output,
+            "e" * 64,
+            ("agent/instructions.md",),
+            (),
+            1,
+            output.with_suffix(".manifest.json"),
+        )
+
+    ledger = Ledger(_seed_snapshot())
+    result = CandidateWorkerService(
+        ledger=ledger,
+        resolver=PlanResolver(_plan()),
+        dependencies=CandidateWorkerDependencies(
+            repository=Repository(tmp_path),
+            designer=DeferredDesigner(),
+            validate=lambda path: ValidationReport((), False),
+            build_bundle=build_bundle,
+            drafts=PendingDrafts(),
+            evaluations=NoEvaluations(),
+            write_evidence=lambda request: (_ for _ in ()).throw(
+                AssertionError("evidence must wait for evaluation")
+            ),
+            clock=Clock(),
+        ),
+    ).advance(CandidateWorkerRequest(tmp_path, 31))
+
+    assert result.status is CandidateWorkerStatus.WAITING
+    assert result.code == "candidate_draft_pending"
+    planned = [
+        record
+        for record in result.snapshot.outbox
+        if record.kind == "candidate_effect_planned"
+        and record.payload.get("effect_kind") == "foundry_draft"
+    ]
+    assert len(planned) == 1
+    assert planned[0].payload["max_attempts"] == 1
+    assert not any(
+        record.kind == "candidate_effect_succeeded"
+        for record in result.snapshot.outbox
+    )
+
+
+def test_foundry_evaluation_is_deferred_after_draft_success(
+    tmp_path: Path,
+) -> None:
+    class PendingEvaluations:
+        def reconcile(self, intent):
+            return None
+
+        def run(self, intent):
+            raise CandidateEffectPending("foundry_evaluation")
+
+    def build_bundle(root: Path, output: Path) -> BundleArtifact:
+        return BundleArtifact(
+            output,
+            "e" * 64,
+            ("agent/instructions.md",),
+            (),
+            1,
+            output.with_suffix(".manifest.json"),
+        )
+
+    ledger = Ledger(_seed_snapshot())
+    drafts = Drafts()
+    result = CandidateWorkerService(
+        ledger=ledger,
+        resolver=PlanResolver(_plan()),
+        dependencies=CandidateWorkerDependencies(
+            repository=Repository(tmp_path),
+            designer=DeferredDesigner(),
+            validate=lambda path: ValidationReport((), False),
+            build_bundle=build_bundle,
+            drafts=drafts,
+            evaluations=PendingEvaluations(),
+            write_evidence=lambda request: (_ for _ in ()).throw(
+                AssertionError("evidence must wait for evaluation")
+            ),
+            clock=Clock(),
+        ),
+    ).advance(CandidateWorkerRequest(tmp_path, 31))
+
+    assert result.status is CandidateWorkerStatus.WAITING
+    assert result.code == "candidate_evaluation_pending"
+    assert drafts.creates == 1
+    assert any(
+        record.kind == "candidate_effect_succeeded"
+        and record.payload.get("effect_kind") == "foundry_draft"
+        for record in result.snapshot.outbox
+    )
+    evaluation_plans = [
+        record
+        for record in result.snapshot.outbox
+        if record.kind == "candidate_effect_planned"
+        and record.payload.get("effect_kind") == "foundry_evaluation"
+    ]
+    assert len(evaluation_plans) == 1
+    assert evaluation_plans[0].payload["max_attempts"] == 1
+
+
+def test_candidate_patch_is_durable_before_candidate_draft_delegation(
+    tmp_path: Path,
+) -> None:
+    class CandidatePendingDrafts(Drafts):
+        def create(self, intent):
+            if intent.subject_id != "baseline":
+                raise CandidateEffectPending("foundry_draft")
+            return super().create(intent)
+
+    def build_bundle(root: Path, output: Path) -> BundleArtifact:
+        return BundleArtifact(
+            output,
+            "e" * 64,
+            ("agent/instructions.md",),
+            (),
+            1,
+            output.with_suffix(".manifest.json"),
+        )
+
+    ledger = Ledger(_seed_snapshot())
+    repository = Repository(tmp_path)
+    result = CandidateWorkerService(
+        ledger=ledger,
+        resolver=PlanResolver(_plan()),
+        dependencies=CandidateWorkerDependencies(
+            repository=repository,
+            designer=Designer(repository),
+            validate=lambda path: ValidationReport((), False),
+            build_bundle=build_bundle,
+            drafts=CandidatePendingDrafts(),
+            evaluations=Evaluations(),
+            write_evidence=lambda request: (_ for _ in ()).throw(
+                AssertionError("candidate evidence must wait for evaluation")
+            ),
+            clock=Clock(),
+        ),
+    ).advance(CandidateWorkerRequest(tmp_path, 31))
+
+    assert result.status is CandidateWorkerStatus.WAITING
+    assert result.code == "candidate_draft_pending"
+    artifact = next(
+        record
+        for record in result.snapshot.outbox
+        if record.kind == "candidate_artifact_ready"
+    )
+    patch_hash = str(artifact.payload["patch_sha256"])
+    patch = next(
+        item
+        for item in result.snapshot.objects
+        if item.path == f"objects/patches/{patch_hash}.patch"
+    )
+    assert patch.sha256 == patch_hash
+    assert b"data/" not in patch.content
 
 
 def test_candidate_designer_result_is_bound_to_the_exact_reservation() -> None:
@@ -664,11 +954,11 @@ def test_steward_candidate_worker_completes_baseline_and_one_candidate(
     assert attestation.payload["motivation"] == (
         "Clarify the escalation rule."
     )
-    assert [item.path for item in result.snapshot.objects] == [
+    assert {item.path for item in result.snapshot.objects} == {
         "objects/candidates/g1-candidate-1.json",
         "objects/evidence/" + attestation.payload["evidence_sha256"] + ".json",
         "objects/patches/" + attestation.payload["patch_sha256"] + ".patch",
-    ]
+    }
 
     duplicate = service.advance(CandidateWorkerRequest(tmp_path, 31))
 

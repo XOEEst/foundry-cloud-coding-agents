@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from foundry_opt.adapters.commands import CommandExitError
 from foundry_opt.preflight.interfaces import CommandResult
 from foundry_opt.orchestration.handoff import (
     _ProductionHandoffEffects,
@@ -814,6 +815,46 @@ def test_handoff_finalizer_applies_effects_closes_and_reassigns() -> None:
     assert gateway.deleted == [
         ("copilot/steward-issue-31", HEAD)
     ]
+
+
+def test_closing_an_already_closed_internal_handoff_is_idempotent() -> None:
+    class Commands:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def run(self, arguments, **kwargs):
+            command = tuple(arguments)
+            self.calls.append(command)
+            if "--method" in command:
+                raise CommandExitError(
+                    command,
+                    exit_code=1,
+                    stdout="",
+                    stderr="pull request is already closed",
+                )
+            assert command[-1] == (
+                "repos/octo-org/optimizer/pulls/90"
+            )
+            return CommandResult(
+                0,
+                json.dumps({"number": 90, "state": "closed"}),
+                "",
+            )
+
+    commands = Commands()
+    gateway = GhHandoffPullRequestGateway(
+        commands,
+        Path("."),
+        "octo-org/optimizer",
+    )
+
+    gateway.close_internal_pull_request(
+        90,
+        handoff_id="d" * 64,
+        kind="steward_state",
+    )
+
+    assert len(commands.calls) == 2
 
 
 def test_handoff_finalizer_does_not_close_an_advanced_branch() -> None:

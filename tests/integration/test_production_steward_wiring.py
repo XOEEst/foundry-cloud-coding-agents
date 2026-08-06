@@ -32,6 +32,7 @@ from foundry_opt.optimization.models import (
     OptimizationSpec,
 )
 from foundry_opt.optimization.production import (
+    build_production_candidate_capability_bridge,
     build_production_steward_candidate_selection,
     build_production_steward_candidate_slate,
     build_production_steward_candidate_workers,
@@ -46,6 +47,9 @@ from foundry_opt.orchestration.handoff import (
     HandoffApplyService,
     HandoffApplyStatus,
     TrustedHandoffRequest,
+)
+from foundry_opt.orchestration.capability_bridge import (
+    CandidateCapabilityStatus,
 )
 from foundry_opt.orchestration.issue_intake import (
     GitIssueEventInbox,
@@ -431,10 +435,27 @@ def test_actual_cli_progresses_policy_issue_into_candidate_delegation(
         pinned_assets=object(),
         approvals=NoApprovals(),
     )
+    class FailCopilotFoundry:
+        def create_draft(self, request):
+            raise AssertionError(
+                "Copilot steward must not call the Foundry draft adapter"
+            )
+
+    def fail_copilot_binder(endpoint):
+        raise AssertionError(
+            "Copilot steward must not bind a Foundry evaluation"
+        )
+
+    def fail_copilot_registration(endpoint):
+        raise AssertionError(
+            "Copilot steward must not register Foundry assets"
+        )
+
     workers = build_production_steward_candidate_workers(
         repository=CampaignGit(default_branch=lambda root: "main"),
-        draft_gateway=DraftGateway(),
-        binder_factory=lambda endpoint: Binder(),
+        draft_gateway=FailCopilotFoundry(),
+        binder_factory=fail_copilot_binder,
+        registration_gateway_factory=fail_copilot_registration,
     )
     service = StewardAdvanceService(
         inbox=GitCampaignInbox(),
@@ -450,11 +471,80 @@ def test_actual_cli_progresses_policy_issue_into_candidate_delegation(
     )
     monkeypatch.chdir(root)
 
-    result = CliRunner().invoke(
+    assets_pending = CliRunner().invoke(
         cli.app,
         ["steward", "advance", "--issue", str(ISSUE), "--json"],
     )
 
+    assert assets_pending.exit_code == 0, assets_pending.stdout
+    payload = json.loads(assets_pending.stdout)
+    assert payload["status"] == "waiting"
+    assert payload["phase"] == "baseline"
+    assert payload["code"] == "candidate_assets_registration_pending"
+
+    class Resolution:
+        def resolve(self, *, kind, name, version):
+            return {
+                "support-development": "remote:development",
+                "support-validation": "remote:validation",
+            }[name]
+
+    class NoRegistration:
+        def register(self, **kwargs):
+            raise AssertionError("existing assets must not be registered")
+
+    class Credential:
+        def create(self):
+            raise AssertionError("injected Actions fakes need no credential")
+
+    class CapabilityAssignments:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def resume(self, issue_number, idempotency_key):
+            self.calls.append((issue_number, idempotency_key))
+
+    assignments = CapabilityAssignments()
+    capability = build_production_candidate_capability_bridge(
+        assignments=assignments,
+        credential_provider=Credential(),
+        resolution_gateway_factory=lambda endpoint: Resolution(),
+        registration_gateway_factory=lambda endpoint: NoRegistration(),
+        binder_factory=lambda endpoint: Binder(),
+        draft_gateway=DraftGateway(),
+    )
+
+    assets = capability.advance(root, ISSUE)
+    assert assets.status is CandidateCapabilityStatus.APPLIED
+
+    draft_pending = CliRunner().invoke(
+        cli.app,
+        ["steward", "advance", "--issue", str(ISSUE), "--json"],
+    )
+    assert draft_pending.exit_code == 0, draft_pending.stdout
+    assert json.loads(draft_pending.stdout)["code"] == (
+        "candidate_draft_pending"
+    )
+
+    draft = capability.advance(root, ISSUE)
+    assert draft.status is CandidateCapabilityStatus.APPLIED
+
+    evaluation_pending = CliRunner().invoke(
+        cli.app,
+        ["steward", "advance", "--issue", str(ISSUE), "--json"],
+    )
+    assert evaluation_pending.exit_code == 0, evaluation_pending.stdout
+    assert json.loads(evaluation_pending.stdout)["code"] == (
+        "candidate_evaluation_pending"
+    )
+
+    evaluation = capability.advance(root, ISSUE)
+    assert evaluation.status is CandidateCapabilityStatus.APPLIED
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["steward", "advance", "--issue", str(ISSUE), "--json"],
+    )
     assert result.exit_code == 0, result.stdout
     payload = json.loads(result.stdout)
     assert payload["status"] == "waiting"
@@ -467,6 +557,20 @@ def test_actual_cli_progresses_policy_issue_into_candidate_delegation(
         item.path == "objects/specifications/g1.json"
         for item in snapshot.objects
     )
+    assert [
+        record.payload["effect_kind"]
+        for record in snapshot.outbox
+        if record.kind
+        in {
+            "candidate_assets_registration_succeeded",
+            "candidate_effect_succeeded",
+        }
+    ][:3] == [
+        "foundry_assets",
+        "foundry_draft",
+        "foundry_evaluation",
+    ]
+    assert len(assignments.calls) == 3
     assert any(
         record.kind == "specialist_work_request"
         and record.payload.get("specialist")
@@ -607,9 +711,133 @@ def test_production_issue_created_advances_through_state_handoff(
         item.path == "objects/specifications/g1.json"
         for item in applied.snapshot.objects
     )
+    _git(root, "checkout", "-b", "copilot/steward-assets-issue-46", base_commit)
+    _git(root, "push", "-u", "origin", "copilot/steward-assets-issue-46")
+    _set_live_copilot_environment(monkeypatch)
+    monkeypatch.setenv(
+        "GITHUB_AGENT_BRANCH_NAME",
+        "copilot/steward-assets-issue-46",
+    )
+    monkeypatch.setenv(
+        "COPILOT_AGENT_SESSION_ID",
+        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    )
+    second_proxy = copilot_git_proxy.install(
+        root,
+        remote,
+        acknowledgement="unrelated",
+    )
+
+    class FailCopilotFoundry:
+        def create_draft(self, request):
+            raise AssertionError("Copilot must not call Foundry")
+
+    workers = build_production_steward_candidate_workers(
+        repository=CampaignGit(default_branch=lambda root: "main"),
+        draft_gateway=FailCopilotFoundry(),
+        binder_factory=lambda endpoint: (_ for _ in ()).throw(
+            AssertionError("Copilot must not bind Foundry evaluation")
+        ),
+        registration_gateway_factory=lambda endpoint: (_ for _ in ()).throw(
+            AssertionError("Copilot must not register Foundry assets")
+        ),
+    )
+    delegated_assets = StewardAdvanceService(
+        inbox=GitCampaignInbox(),
+        candidate_workers=workers,
+        handoffs=CloudHandoffStore(),
+    ).advance(
+        __import__(
+            "foundry_opt.orchestration.steward",
+            fromlist=["StewardAdvanceRequest"],
+        ).StewardAdvanceRequest(root, ISSUE)
+    )
+    assert delegated_assets.status.value == "waiting"
+    assert delegated_assets.disposition == "delegate"
+    assert delegated_assets.code == "state_handoff_created"
+    second_head = _git(root, "rev-parse", "HEAD")
+    second_path = _git(
+        root,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        f"{second_head}^1",
+        second_head,
+    )
+    second_blob = _git(
+        root,
+        "ls-tree",
+        second_head,
+        "--",
+        second_path,
+    ).split()[2]
+    second_proxy.disable()
+    _set_normal_github_actions_environment(monkeypatch)
+    applied_assets = HandoffApplyService().apply(
+        TrustedHandoffRequest(
+            repository_root=root,
+            repository="octo-org/optimizer",
+            repository_id=123,
+            pull_request_number=91,
+            author_login="copilot-swe-agent[bot]",
+            base_repository="octo-org/optimizer",
+            base_ref="main",
+            base_revision=base_commit,
+            head_repository="octo-org/optimizer",
+            head_ref="copilot/steward-assets-issue-46",
+            head_revision=second_head,
+            handoff_path=second_path,
+            handoff_blob=second_blob,
+        )
+    )
+    assert applied_assets.status is HandoffApplyStatus.APPLIED
+    assert applied_assets.snapshot is not None
+    assert any(
+        record.kind == "candidate_assets_registration_planned"
+        for record in applied_assets.snapshot.outbox
+    )
+
+    class Resolution:
+        def resolve(self, *, kind, name, version):
+            return {
+                "support-development": "remote:development",
+                "support-validation": "remote:validation",
+            }[name]
+
+    class Assignments:
+        def resume(self, issue_number, idempotency_key):
+            assert issue_number == ISSUE
+
+    capability = build_production_candidate_capability_bridge(
+        assignments=Assignments(),
+        credential_provider=type(
+            "Credential",
+            (),
+            {
+                "create": lambda self: (_ for _ in ()).throw(
+                    AssertionError("Actions fakes need no credential")
+                )
+            },
+        )(),
+        resolution_gateway_factory=lambda endpoint: Resolution(),
+        registration_gateway_factory=lambda endpoint: type(
+            "NoRegistration",
+            (),
+            {
+                "register": lambda self, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("existing assets need no registration")
+                )
+            },
+        )(),
+        binder_factory=lambda endpoint: Binder(),
+        draft_gateway=DraftGateway(),
+    )
+    capability_result = capability.advance(root, ISSUE)
+    assert capability_result.status is CandidateCapabilityStatus.APPLIED
     resumed = StewardAdvanceService(
         inbox=GitCampaignInbox(),
-        spec_policy=policy,
+        candidate_workers=workers,
     ).advance(
         __import__(
             "foundry_opt.orchestration.steward",
@@ -618,6 +846,7 @@ def test_production_issue_created_advances_through_state_handoff(
     )
     assert resumed.status.value == "waiting"
     assert resumed.phase == "baseline"
+    assert resumed.code == "candidate_draft_pending"
 
 
 def test_production_cli_resolves_trusted_issue_without_github_api(
@@ -880,10 +1109,13 @@ def test_production_cli_resolves_trusted_issue_without_github_api(
         ["steward", "advance", "--issue", str(ISSUE), "--json"],
     )
 
-    assert approval_result.exit_code == 1, approval_result.stdout
+    assert approval_result.exit_code == 0, approval_result.stdout
     approval_payload = json.loads(approval_result.stdout)
-    assert approval_payload["code"] == "candidate_assets_unavailable"
-    assert "CapabilityUnavailableError" in approval_payload["summary"]
+    assert approval_payload["status"] == "waiting"
+    assert approval_payload["disposition"] == "wait"
+    assert approval_payload["code"] == (
+        "candidate_assets_registration_pending"
+    )
     approved_snapshot = GitStateRef().load(root, ISSUE)
     assert approved_snapshot is not None
     assert approved_snapshot.state.phase.value == "baseline"
@@ -892,6 +1124,32 @@ def test_production_cli_resolves_trusted_issue_without_github_api(
         and event.generation == 2
         for event in approved_snapshot.inbox
     )
+    registration = next(
+        record
+        for record in approved_snapshot.outbox
+        if record.kind == "candidate_assets_registration_planned"
+        and record.generation == 2
+    )
+    assert registration.payload["base_commit"] == remote_main_commit
+    assert registration.payload["spec_sha256"] == (
+        approved_snapshot.state.spec_sha256
+    )
+    intent = next(
+        item
+        for item in approved_snapshot.objects
+        if item.path == registration.payload["capability_path"]
+    )
+    intent_document = json.loads(intent.content)
+    assert intent_document["generation"] == 2
+    assert {
+        item["path"] for item in intent_document["assets"]
+        if item["path"] is not None
+    } == {
+        "data/development.jsonl",
+        "data/validation.jsonl",
+    }
+    assert "hello" not in intent.content.decode("utf-8")
+    assert "refund" not in intent.content.decode("utf-8")
     assert not any(command[0] == "gh" for command in commands)
 
     invalid_body = edited_body.replace(

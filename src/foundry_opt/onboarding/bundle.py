@@ -42,6 +42,10 @@ def generate_repository_agent_bundle(
         "repository-level Agents variables.\n"
         "- Deployment uses only the separate "
         "`AZURE_DEPLOYMENT_CLIENT_ID` Actions-environment variable.\n"
+        "- Asset registration, draft creation, and development evaluation "
+        "run only in the generated Actions capability workflow under the "
+        "optimizer `AZURE_CLIENT_ID`; Copilot performs no Foundry network "
+        "operations.\n"
         "- Copilot session assignment uses the repository Actions secret "
         "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
         "user-to-server token; an installation token is not supported.\n"
@@ -63,7 +67,7 @@ def generate_repository_agent_bundle(
     contents.update(
         {
             Path(".foundry-optimizer/.gitignore"): (
-                "campaigns/\nworktrees/\n"
+                "campaigns/\nworktrees/\ncapability-worktrees/\n"
             ),
             Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml"): (
                 _issue_form(request)
@@ -89,6 +93,9 @@ def generate_repository_agent_bundle(
             Path(
                 ".github/workflows/foundry-optimization-handoff.yml"
             ): _handoff_workflow(request),
+            Path(
+                ".github/workflows/foundry-optimization-capability.yml"
+            ): _capability_workflow(request),
             Path(
                 ".github/workflows/"
                 "foundry-optimization-deployment-bridge.yml"
@@ -389,7 +396,8 @@ reproducing transitions in instructions, workflows, or shell.
 
 The command is the only campaign action. Report and project only through the
 persisted state and outbox effects it returns; transport workflows own GitHub
-projection and reassignment. Never inspect or edit agent source, tests, or configuration.
+projection and reassignment. The capability workflow owns exact persisted
+Foundry calls. Never inspect or edit agent source, tests, or configuration.
 If a state-ref push is not acknowledged in a Copilot cloud
 session, the command may create or update the internal handoff pull request artifact
 at only the reserved handoff path and never any other edit. Do not
@@ -413,6 +421,9 @@ Handle persisted specialist intents exactly as designed:
   `foundry-candidate-designer`.
 - `applier_worker_issue_planned` is projected by the transport bridge to a
   worker issue assigned to `foundry-candidate-applier`.
+- `candidate_assets_registration_planned` and Foundry
+  `candidate_effect_planned` records are executed only by the trusted Actions
+  capability bridge; stop and wait without calling a Foundry adapter.
 
 Do not create pull requests, merge, deploy, or apply GitHub effects directly.
 Native Copilot specialist sessions create their own pull requests; transport
@@ -629,6 +640,81 @@ jobs:
         run: >-
           uv run --no-project --with "$OPTIMIZER_PACKAGE"
           python -m foundry_opt.orchestration.issue_intake
+"""
+
+
+def _capability_workflow(request: OnboardingRequest) -> str:
+    install = json.dumps(request.product_install)
+    actions_environment = (
+        request.mirror_actions_environment or request.environment_name
+    )
+    return f"""name: Foundry optimization capability bridge
+
+on:
+  push:
+    branches:
+      - foundry-opt/state/issue-*
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Optional tracked optimization issue number to retry
+        required: false
+        type: number
+
+permissions:
+  contents: write
+  id-token: write
+  issues: write
+
+concurrency:
+  group: foundry-optimization-capability
+  cancel-in-progress: false
+
+jobs:
+  execute-capability:
+    runs-on: ubuntu-latest
+    environment: {json.dumps(actions_environment)}
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      AZURE_CLIENT_ID: ${{{{ vars.AZURE_CLIENT_ID }}}}
+      AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
+      AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - name: Require Copilot assignment token
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+        shell: bash
+        run: |
+          if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then
+            echo "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN" >&2
+            exit 1
+          fi
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
+        with:
+          client-id: ${{{{ vars.AZURE_CLIENT_ID }}}}
+          tenant-id: ${{{{ vars.AZURE_TENANT_ID }}}}
+          subscription-id: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      - uses: {_SETUP_PYTHON_ACTION} # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Execute exact persisted Foundry capabilities
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
+        run: >-
+          uv run --no-project --no-config --no-env-file
+          --with "$OPTIMIZER_PACKAGE"
+          python -m foundry_opt.orchestration.capability_bridge
 """
 
 

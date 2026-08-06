@@ -203,6 +203,12 @@ def test_skill_keeps_actions_as_verifying_transport_not_decision_owner() -> None
     assert "selects transport envelopes" in skill
     assert "canonical replay still validates the steward's exact" in skill
     assert "`action_required` run does not block fallback" in skill
+    assert "candidate_assets_registration_planned" in skill
+    assert "candidate_effect_planned" in skill
+    assert "optimizer OIDC identity" in skill
+    assert "cannot choose candidates" in " ".join(
+        skill.casefold().split()
+    )
 
 
 def test_issue_form_matches_strict_parser_and_configured_target() -> None:
@@ -333,6 +339,10 @@ def test_bundle_generates_transport_and_verification_workflows() -> None:
         Path(".github/workflows/foundry-optimization-reconcile.yml"),
         Path(
             ".github/workflows/"
+            "foundry-optimization-capability.yml"
+        ),
+        Path(
+            ".github/workflows/"
             "foundry-optimization-deployment-bridge.yml"
         ),
         Path(".github/workflows/foundry-optimization-handoff.yml"),
@@ -378,6 +388,9 @@ def test_assignment_workflows_require_dedicated_user_token_secret() -> None:
     assignment_paths = (
         Path(".github/workflows/foundry-optimization-issue-intake.yml"),
         Path(".github/workflows/foundry-optimization-reconcile.yml"),
+        Path(
+            ".github/workflows/foundry-optimization-capability.yml"
+        ),
     )
 
     for path in assignment_paths:
@@ -439,7 +452,7 @@ def test_bundle_ignores_runtime_state_but_not_approved_specs() -> None:
     )
 
     ignore = files[Path(".foundry-optimizer/.gitignore")]
-    assert ignore == "campaigns/\nworktrees/\n"
+    assert ignore == "campaigns/\nworktrees/\ncapability-worktrees/\n"
     assert "specs/" not in ignore
 
 
@@ -498,6 +511,7 @@ def test_state_ref_workflows_fetch_full_history() -> None:
     for path in (
         Path(".github/workflows/foundry-optimization-issue-intake.yml"),
         Path(".github/workflows/foundry-optimization-reconcile.yml"),
+        Path(".github/workflows/foundry-optimization-capability.yml"),
         Path(
             ".github/workflows/"
             "foundry-optimization-deployment-bridge.yml"
@@ -530,17 +544,70 @@ def test_deployment_workflow_uses_only_deployment_oidc_identity() -> None:
     assert "AZURE_" not in transport
 
 
+def test_capability_workflow_uses_optimizer_oidc_without_domain_decisions() -> (
+    None
+):
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    path = Path(
+        ".github/workflows/foundry-optimization-capability.yml"
+    )
+    text = files[path]
+    workflow = yaml.safe_load(text)
+
+    assert workflow[True] == {
+        "push": {"branches": ["foundry-opt/state/issue-*"]},
+        "schedule": [{"cron": "*/5 * * * *"}],
+        "workflow_dispatch": {
+            "inputs": {
+                "issue": {
+                    "description": (
+                        "Optional tracked optimization issue number to retry"
+                    ),
+                    "required": False,
+                    "type": "number",
+                }
+            }
+        },
+    }
+    assert workflow["permissions"] == {
+        "contents": "write",
+        "id-token": "write",
+        "issues": "write",
+    }
+    job = workflow["jobs"]["execute-capability"]
+    assert job["environment"] == "acceptance"
+    assert job["env"]["AZURE_CLIENT_ID"] == "${{ vars.AZURE_CLIENT_ID }}"
+    assert "AZURE_DEPLOYMENT_CLIENT_ID" not in text
+    assert "azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43" in (
+        text
+    )
+    assert "python -m foundry_opt.orchestration.capability_bridge" in text
+    assert "ref: ${{ github.event.repository.default_branch }}" in text
+    assert "fetch-depth: 0" in text
+    assert "pull_request" not in workflow[True]
+    assert "github.event.pull_request" not in text
+    assert "gh pr checkout" not in text
+    assert "select candidate" not in text.casefold()
+    assert "choose candidate" not in text.casefold()
+    assert "change policy" not in text.casefold()
+    assert "COPILOT_ASSIGNMENT_TOKEN" in text
+
+
 def test_deployment_bridge_uses_selected_actions_environment() -> None:
     request = replace(
         _request(),
         set_github_variables=True,
         mirror_actions_environment="production",
     )
+    files = generate_repository_agent_bundle(
+        request,
+        oidc_subject="repository_id:123",
+    )
     deployment = yaml.safe_load(
-        generate_repository_agent_bundle(
-            request,
-            oidc_subject="repository_id:123",
-        )[
+        files[
             Path(
                 ".github/workflows/"
                 "foundry-optimization-deployment-bridge.yml"
@@ -549,6 +616,17 @@ def test_deployment_bridge_uses_selected_actions_environment() -> None:
     )
 
     assert deployment["jobs"]["deployment-bridge"]["environment"] == (
+        "production"
+    )
+    capability = yaml.safe_load(
+        files[
+            Path(
+                ".github/workflows/"
+                "foundry-optimization-capability.yml"
+            )
+        ]
+    )
+    assert capability["jobs"]["execute-capability"]["environment"] == (
         "production"
     )
 

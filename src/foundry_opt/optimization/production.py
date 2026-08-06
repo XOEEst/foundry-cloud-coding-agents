@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+import re
 import shlex
 import subprocess
 from typing import Any
@@ -134,6 +135,8 @@ from foundry_opt.orchestration.spec_policy import (
     UnresolvedSpecification,
 )
 from foundry_opt.optimization.models import (
+    ApprovalGate,
+    AssetProvenance,
     AssetKind,
     EvaluationAssetContext,
     EvaluationAssetRequest,
@@ -441,6 +444,40 @@ class _PerEndpointFoundryResolutionProvider:
             ) from error
 
 
+class _DeferredFoundryResolutionProvider:
+    """Pin an exact name/version without contacting Foundry in Copilot."""
+
+    source_type = "foundry"
+
+    def prepare(
+        self,
+        request: EvaluationAssetRequest,
+        context: EvaluationAssetContext,
+    ) -> PreparedEvaluationAsset:
+        if (
+            request.source != "foundry"
+            or not request.name
+            or not request.version
+        ):
+            raise ValueError(
+                "Foundry assets require an exact name and version"
+            )
+        return PreparedEvaluationAsset(
+            provenance=AssetProvenance(
+                asset_id=request.asset_id,
+                kind=request.kind,
+                source=request.source,
+                role=request.role,
+                name=request.name,
+                version=request.version,
+                created_by="foundry-deferred-provider",
+                approval_gate=request.approval_gate,
+                metrics=request.metrics,
+            ),
+            files={},
+        )
+
+
 def build_specification_asset_registry(
     *,
     resolution_gateway_factory: ResolutionGatewayFactory,
@@ -458,6 +495,20 @@ def build_specification_asset_registry(
     registry.register(
         _PerEndpointFoundryResolutionProvider(resolution_gateway_factory)
     )
+    registry.register(RepositoryAssetProvider())
+    registry.register(SyntheticDatasetProvider(max_rows=synthetic_max_rows))
+    registry.register(TraceEvaluationAssetProvider())
+    registry.register(CustomEvaluatorAssetProvider())
+    registry.register(BuiltinEvaluatorProvider())
+    return registry
+
+
+def _build_deferred_specification_asset_registry(
+    *,
+    synthetic_max_rows: int = 200,
+) -> EvaluationAssetProviderRegistry:
+    registry = EvaluationAssetProviderRegistry()
+    registry.register(_DeferredFoundryResolutionProvider())
     registry.register(RepositoryAssetProvider())
     registry.register(SyntheticDatasetProvider(max_rows=synthetic_max_rows))
     registry.register(TraceEvaluationAssetProvider())
@@ -1197,9 +1248,6 @@ def build_production_steward_spec_policy(
     """Build the repository-aware specification policy for the steward."""
 
     commands = SubprocessCommandRunner()
-    environment = OsEnvironmentReader()
-    credential = _default_credential_provider(environment)
-    resolution_factory = _default_resolution_gateway_factory(credential)
     pinned_assets = GitPinnedAssetReader(commands)
     approvals = GitTransportMergedSpecApprovalReader(
         commands,
@@ -1210,9 +1258,7 @@ def build_production_steward_spec_policy(
         config = load_config(repository_root / config_path)
         resolver = _TrustedInboxSpecResolver(
             config,
-            registry=build_specification_asset_registry(
-                resolution_gateway_factory=resolution_factory
-            ),
+            registry=_build_deferred_specification_asset_registry(),
             publisher=GitSpecPublisher(commands),
         )
         return OptimizationSpecPolicy(
@@ -1413,6 +1459,7 @@ class _ProductionCandidatePlanSource:
             config,
             spec,
             asset_paths,
+            generation,
         )
         self._resolved[(issue_number, generation, spec.sha256)] = (
             root,
@@ -1441,57 +1488,245 @@ class _ProductionCandidatePlanSource:
         config: OptimizerConfig,
         spec: OptimizationSpec,
         paths: Mapping[str, Path | None],
+        generation: int,
     ) -> tuple[Any, ...]:
-        from foundry_opt.optimization.assets import (
-            canonicalize_repository_asset_content,
-            materialize_prepared_asset,
+        from foundry_opt.orchestration.candidate_workers import (
+            CandidateAssetsRegistrationPending,
         )
-        from foundry_opt.optimization.models import PreparedEvaluationAsset
         from foundry_opt.optimization.runner import _asset_reference
 
-        registration = _RegistrationGateway(
+        plan = _candidate_assets_registration_plan(
             config,
-            spec.environment,
-            self._registration_gateway_factory,
+            spec,
+            paths,
+            generation,
         )
-        references: list[Any] = []
-        for asset in (*spec.datasets, *spec.evaluators):
-            path = paths.get(asset.asset_id)
-            materialized = asset
-            if path is not None:
-                absolute = (root / path).resolve()
-                if not absolute.is_relative_to(root):
-                    raise ValueError(
-                        "approved candidate asset path is invalid"
-                    )
-                content = canonicalize_repository_asset_content(
-                    _production_git_bytes(
-                        root,
-                        spec.base_commit,
-                        path,
-                    )
-                )
+        snapshot = GitStateRef().load(root, spec.issue_number)
+        if snapshot is None:
+            raise ValueError("candidate asset state is unavailable")
+        success = next(
+            (
+                record
+                for record in snapshot.outbox
                 if (
-                    asset.content_sha256 is not None
-                    and hashlib.sha256(content).hexdigest()
-                    != asset.content_sha256
-                ):
-                    raise ValueError(
-                        "approved candidate asset content changed"
+                    record.record_id == f"{plan.effect_id}-succeeded"
+                    and record.kind
+                    == "candidate_assets_registration_succeeded"
+                    and record.generation == plan.generation
+                )
+            ),
+            None,
+        )
+        if success is None:
+            terminal = next(
+                (
+                    record
+                    for record in reversed(snapshot.outbox)
+                    if (
+                        record.kind == "candidate_capability_failed"
+                        and record.payload.get("effect_id")
+                        == plan.effect_id
+                        and record.payload.get("status") == "terminal"
                     )
-                materialized = materialize_prepared_asset(
-                    PreparedEvaluationAsset(
-                        provenance=asset,
-                        files={path: content},
-                    ),
-                    registration,
+                ),
+                None,
+            )
+            if terminal is not None:
+                raise CapabilityUnavailableError(
+                    "foundry_assets_capability_failed",
+                    "trusted Foundry asset capability execution failed",
                 )
-            elif asset.remote_id is None:
-                raise ValueError(
-                    "approved candidate asset has no remote identity"
+            raise CandidateAssetsRegistrationPending(plan)
+        result = _candidate_assets_registration_result(
+            snapshot,
+            plan,
+            spec,
+        )
+        return tuple(_asset_reference(asset) for asset in result)
+
+
+def _candidate_assets_registration_plan(
+    config: OptimizerConfig,
+    spec: OptimizationSpec,
+    paths: Mapping[str, Path | None],
+    generation: int,
+) -> Any:
+    from foundry_opt.orchestration.candidate_workers import (
+        CandidateAssetsRegistrationPlan,
+    )
+    from foundry_opt.orchestration.git_state import StateObject
+
+    assets = [
+        {
+            **asset.model_dump(mode="json"),
+            "path": (
+                paths[asset.asset_id].as_posix()
+                if paths[asset.asset_id] is not None
+                else None
+            ),
+        }
+        for asset in (*spec.datasets, *spec.evaluators)
+    ]
+    binding = {
+        "assets": assets,
+        "base_commit": spec.base_commit,
+        "environment": spec.environment,
+        "generation": generation,
+        "issue_number": spec.issue_number,
+        "kind": "candidate_assets_registration",
+        "schema_version": 1,
+        "spec_sha256": spec.sha256,
+        "target": spec.target,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            binding,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    effect_id = f"assets-{spec.issue_number}-{generation}-{digest[:16]}"
+    document = {**binding, "effect_id": effect_id}
+    intent = StateObject(
+        f"objects/capabilities/{effect_id}.json",
+        (
+            json.dumps(
+                document,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+    return CandidateAssetsRegistrationPlan(
+        effect_id=effect_id,
+        issue_number=spec.issue_number,
+        generation=generation,
+        spec_sha256=spec.sha256,
+        base_commit=spec.base_commit,
+        target=spec.target,
+        environment=spec.environment,
+        max_attempts=config.campaign.transient_retries + 1,
+        intent=intent,
+    )
+
+
+def _candidate_assets_registration_result(
+    snapshot: Any,
+    plan: Any,
+    spec: OptimizationSpec,
+) -> tuple[AssetProvenance, ...]:
+    from foundry_opt.optimization.assets import (
+        deterministic_asset_name,
+        deterministic_asset_version,
+    )
+
+    success = next(
+        record
+        for record in snapshot.outbox
+        if record.record_id == f"{plan.effect_id}-succeeded"
+    )
+    if (
+        success.payload.get("base_commit") != plan.base_commit
+        or success.payload.get("effect_id") != plan.effect_id
+        or success.payload.get("effect_kind") != "foundry_assets"
+        or success.payload.get("issue_number") != plan.issue_number
+        or success.payload.get("spec_sha256") != plan.spec_sha256
+    ):
+        raise ValueError("candidate asset result binding changed")
+    path = success.payload.get("capability_path")
+    digest = success.payload.get("capability_sha256")
+    objects = tuple(
+        item for item in snapshot.objects if item.path == path
+    )
+    if len(objects) != 1 or objects[0].sha256 != digest:
+        raise ValueError("candidate asset result object is unavailable")
+    try:
+        document = json.loads(objects[0].content)
+        if (
+            not isinstance(document, dict)
+            or set(document)
+            != {
+                "assets",
+                "base_commit",
+                "effect_id",
+                "environment",
+                "generation",
+                "issue_number",
+                "kind",
+                "schema_version",
+                "spec_sha256",
+                "target",
+            }
+            or document["schema_version"] != 1
+            or document["kind"]
+            != "candidate_assets_registration_result"
+            or document["effect_id"] != plan.effect_id
+            or document["issue_number"] != plan.issue_number
+            or document["generation"] != plan.generation
+            or document["spec_sha256"] != plan.spec_sha256
+            or document["base_commit"] != plan.base_commit
+            or document["target"] != plan.target
+            or document["environment"] != plan.environment
+            or not isinstance(document["assets"], list)
+        ):
+            raise ValueError
+        materialized = tuple(
+            AssetProvenance.model_validate(item)
+            for item in document["assets"]
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "candidate asset result object is invalid"
+        ) from error
+    expected = (*spec.datasets, *spec.evaluators)
+    if len(materialized) != len(expected):
+        raise ValueError("candidate asset result count changed")
+    by_id = {asset.asset_id: asset for asset in materialized}
+    if len(by_id) != len(materialized):
+        raise ValueError("candidate asset result identities repeat")
+    for approved in expected:
+        observed = by_id.get(approved.asset_id)
+        if (
+            observed is None
+            or observed.kind is not approved.kind
+            or observed.source != approved.source
+            or observed.role != approved.role
+            or observed.content_sha256 != approved.content_sha256
+            or observed.created_by != approved.created_by
+            or observed.approval_gate is not approved.approval_gate
+            or observed.metrics != approved.metrics
+            or not observed.name
+            or not observed.version
+            or not observed.remote_id
+            or (
+                approved.remote_id is not None
+                and observed.remote_id != approved.remote_id
+            )
+            or (
+                approved.source in {"foundry", "builtin"}
+                and (
+                    observed.name != approved.name
+                    or observed.version != approved.version
                 )
-            references.append(_asset_reference(materialized))
-        return tuple(references)
+            )
+            or (
+                approved.source not in {"foundry", "builtin"}
+                and observed.name != deterministic_asset_name(approved)
+            )
+            or (
+                approved.kind is AssetKind.DATASET
+                and approved.source not in {"foundry", "builtin"}
+                and observed.version
+                != deterministic_asset_version(approved)
+            )
+        ):
+            raise ValueError("candidate asset result changed approved inputs")
+    return tuple(by_id[asset.asset_id] for asset in expected)
 
 
 class _ProductionCandidateWorkerPlanResolver:
@@ -1537,7 +1772,7 @@ class _ProductionCandidateWorkerPlanResolver:
         )
 
 
-class _ProductionCandidateDraftEffects:
+class _ActionsCandidateDraftEffects:
     def __init__(
         self,
         source: _ProductionCandidatePlanSource,
@@ -1564,7 +1799,7 @@ class _ProductionCandidateDraftEffects:
         )
 
 
-class _ProductionCandidateEvaluationEffects:
+class _ActionsCandidateEvaluationEffects:
     def __init__(
         self,
         source: _ProductionCandidatePlanSource,
@@ -1600,6 +1835,723 @@ class _ProductionCandidateEvaluationEffects:
             intent.policy,
             evaluate,
         )
+
+
+class _ProductionCandidateDraftEffects:
+    """Read Actions-recorded draft results; never call Foundry."""
+
+    def __init__(self, source: _ProductionCandidatePlanSource) -> None:
+        self._source = source
+
+    def reconcile(self, intent: Any) -> DraftRecord | None:
+        root, _, _, _ = self._source.resolved_for(
+            intent.issue_number,
+            intent.generation,
+            intent.spec_sha256,
+        )
+        snapshot = GitStateRef().load(root, intent.issue_number)
+        if snapshot is None:
+            raise ValueError("candidate draft state is unavailable")
+        success = _candidate_capability_success(
+            snapshot,
+            intent.effect_id,
+            "foundry_draft",
+        )
+        if success is None:
+            _raise_terminal_candidate_capability(
+                snapshot,
+                intent.effect_id,
+                "foundry_drafts_capability_failed",
+            )
+            return None
+        if (
+            success.payload.get("bundle_sha256")
+            != intent.bundle.sha256
+            or success.payload.get("candidate_id") != intent.subject_id
+        ):
+            raise ValueError("candidate draft result binding changed")
+        return DraftRecord(
+            agent_name=intent.target,
+            version_id=str(success.payload["draft_id"]),
+            base_version=intent.base_agent_version,
+            sha256=intent.bundle.sha256,
+            status="draft",
+        )
+
+    def create(self, intent: Any) -> DraftRecord:
+        from foundry_opt.orchestration.candidate_workers import (
+            CandidateEffectPending,
+        )
+
+        raise CandidateEffectPending("foundry_draft")
+
+
+class _ProductionCandidateEvaluationEffects:
+    """Read Actions-recorded normalized results; never call Foundry."""
+
+    def __init__(self, source: _ProductionCandidatePlanSource) -> None:
+        self._source = source
+
+    def reconcile(self, intent: Any) -> Any | None:
+        from foundry_opt.orchestration.capability_bridge import (
+            evaluation_result_from_state_object,
+        )
+
+        root, _, _, _ = self._source.resolved_for(
+            intent.issue_number,
+            intent.generation,
+            intent.spec_sha256,
+        )
+        snapshot = GitStateRef().load(root, intent.issue_number)
+        if snapshot is None:
+            raise ValueError("candidate evaluation state is unavailable")
+        success = _candidate_capability_success(
+            snapshot,
+            intent.effect_id,
+            "foundry_evaluation",
+        )
+        if success is None:
+            _raise_terminal_candidate_capability(
+                snapshot,
+                intent.effect_id,
+                "foundry_evaluation_capability_failed",
+            )
+            return None
+        path = success.payload.get("capability_path")
+        digest = success.payload.get("capability_sha256")
+        objects = tuple(
+            item for item in snapshot.objects if item.path == path
+        )
+        if len(objects) != 1 or objects[0].sha256 != digest:
+            raise ValueError(
+                "candidate evaluation result object is unavailable"
+            )
+        result = evaluation_result_from_state_object(
+            objects[0],
+            effect_id=intent.effect_id,
+            issue_number=intent.issue_number,
+            generation=intent.generation,
+            spec_sha256=intent.spec_sha256,
+            base_commit=intent.base_commit,
+        )
+        if (
+            success.payload.get("evaluation_id")
+            != result.run.evaluation_id
+            or success.payload.get("run_id") != result.run.run_id
+            or result.run.subject_id != intent.subject.subject_id
+            or result.run.split is not intent.split
+        ):
+            raise ValueError(
+                "candidate evaluation result binding changed"
+            )
+        return result
+
+    def run(self, intent: Any) -> Any:
+        from foundry_opt.orchestration.candidate_workers import (
+            CandidateEffectPending,
+        )
+
+        raise CandidateEffectPending("foundry_evaluation")
+
+
+def _candidate_capability_success(
+    snapshot: Any,
+    effect_id: str,
+    effect_kind: str,
+) -> Any | None:
+    matches = tuple(
+        record
+        for record in snapshot.outbox
+        if record.record_id == f"{effect_id}-succeeded"
+    )
+    if not matches:
+        return None
+    if (
+        len(matches) != 1
+        or matches[0].kind != "candidate_effect_succeeded"
+        or matches[0].payload.get("effect_id") != effect_id
+        or matches[0].payload.get("effect_kind") != effect_kind
+        or matches[0].generation != snapshot.state.generation
+    ):
+        raise ValueError("candidate capability result is invalid")
+    return matches[0]
+
+
+def _raise_terminal_candidate_capability(
+    snapshot: Any,
+    effect_id: str,
+    code: str,
+) -> None:
+    if any(
+        record.kind == "candidate_capability_failed"
+        and record.payload.get("effect_id") == effect_id
+        and record.payload.get("status") == "terminal"
+        for record in snapshot.outbox
+    ):
+        raise CapabilityUnavailableError(
+            code,
+            "trusted Foundry capability execution failed",
+        )
+
+
+class _ProductionCandidateCapabilityExecutor:
+    """Execute persisted Foundry intents in trusted Actions only."""
+
+    def __init__(
+        self,
+        *,
+        config_path: Path,
+        commands: CommandRunner,
+        credential: AzureCredentialProvider,
+        resolution_gateway_factory: ResolutionGatewayFactory,
+        registration_gateway_factory: RegistrationGatewayFactory,
+        binder_factory: BinderFactory | None,
+        draft_gateway: Any | None,
+    ) -> None:
+        self._config_path = config_path
+        self._commands = commands
+        self._credential = credential
+        self._resolution_factory = resolution_gateway_factory
+        self._registration_factory = registration_gateway_factory
+        self._binder_factory = binder_factory
+        self._draft_gateway = draft_gateway
+        self._source = _ProductionCandidatePlanSource(
+            config_path=config_path,
+            registration_gateway_factory=registration_gateway_factory,
+        )
+
+    def reconcile(
+        self,
+        repository_root: Path,
+        snapshot: Any,
+        planned: Any,
+    ) -> Any:
+        return self._execute(repository_root, snapshot, planned)
+
+    def execute(
+        self,
+        repository_root: Path,
+        snapshot: Any,
+        planned: Any,
+    ) -> Any:
+        return self._execute(repository_root, snapshot, planned)
+
+    def _execute(
+        self,
+        repository_root: Path,
+        snapshot: Any,
+        planned: Any,
+    ) -> Any:
+        from foundry_opt.orchestration.capability_bridge import (
+            CandidateCapabilityExecutionError,
+        )
+
+        try:
+            effect_kind = planned.payload.get("effect_kind")
+            if effect_kind == "foundry_assets":
+                return self._assets(repository_root, snapshot, planned)
+            if effect_kind == "foundry_draft":
+                return self._draft(repository_root, snapshot, planned)
+            if effect_kind == "foundry_evaluation":
+                return self._evaluation(
+                    repository_root,
+                    snapshot,
+                    planned,
+                )
+            raise ValueError("candidate capability effect kind is invalid")
+        except CandidateCapabilityExecutionError:
+            raise
+        except CapabilityUnavailableError as error:
+            raise CandidateCapabilityExecutionError(
+                error.code,
+                retryable=True,
+            ) from error
+        except Exception as error:
+            raise CandidateCapabilityExecutionError(
+                "candidate_capability_execution_failed",
+                retryable=False,
+            ) from error
+
+    def _assets(
+        self,
+        root: Path,
+        snapshot: Any,
+        planned: Any,
+    ) -> Any:
+        from foundry_opt.optimization.assets import (
+            canonicalize_repository_asset_content,
+            materialize_prepared_asset,
+        )
+        from foundry_opt.orchestration.capability_bridge import (
+            CandidateCapabilityExecution,
+        )
+
+        config = load_config(root / self._config_path)
+        spec, paths = _production_approved_spec(
+            root,
+            snapshot.state.issue_number,
+            snapshot.state.generation,
+            str(snapshot.state.spec_sha256),
+        )
+        expected = _candidate_assets_registration_plan(
+            config,
+            spec,
+            paths,
+            snapshot.state.generation,
+        )
+        if (
+            planned.record_id != expected.effect_id
+            or planned.kind != "candidate_assets_registration_planned"
+            or dict(planned.payload) != dict(expected.payload)
+            or not any(
+                item == expected.intent for item in snapshot.objects
+            )
+        ):
+            raise ValueError("candidate asset intent changed")
+        registration = _RegistrationGateway(
+            config,
+            spec.environment,
+            self._registration_factory,
+        )
+        endpoint = _environment_endpoint(config, spec.environment)
+        materialized: list[AssetProvenance] = []
+        for asset in (*spec.datasets, *spec.evaluators):
+            path = paths[asset.asset_id]
+            if path is not None:
+                content = canonicalize_repository_asset_content(
+                    _production_git_bytes(root, spec.base_commit, path)
+                )
+                if (
+                    asset.content_sha256 is None
+                    or hashlib.sha256(content).hexdigest()
+                    != asset.content_sha256
+                ):
+                    raise ValueError(
+                        "candidate asset content changed"
+                    )
+                materialized.append(
+                    materialize_prepared_asset(
+                        PreparedEvaluationAsset(
+                            provenance=asset,
+                            files={path: content},
+                        ),
+                        registration,
+                    )
+                )
+                continue
+            if asset.source == "builtin":
+                if asset.remote_id is None:
+                    raise ValueError(
+                        "builtin candidate asset is not pinned"
+                    )
+                materialized.append(asset)
+                continue
+            if asset.source == "foundry":
+                if not asset.name or not asset.version:
+                    raise ValueError(
+                        "Foundry candidate asset is not pinned"
+                    )
+                remote_id = self._resolution_factory(endpoint).resolve(
+                    kind=asset.kind,
+                    name=asset.name,
+                    version=asset.version,
+                )
+                if not isinstance(remote_id, str) or not remote_id:
+                    raise ValueError(
+                        "Foundry candidate asset identity is invalid"
+                    )
+                if asset.remote_id is not None and remote_id != asset.remote_id:
+                    raise ValueError(
+                        "Foundry candidate asset identity changed"
+                    )
+                materialized.append(
+                    asset.model_copy(update={"remote_id": remote_id})
+                )
+                continue
+            if asset.remote_id is None:
+                raise ValueError(
+                    "candidate asset has no materialization path"
+                )
+            materialized.append(asset)
+        result_object = _candidate_assets_result_object(
+            expected,
+            tuple(materialized),
+        )
+        return CandidateCapabilityExecution(
+            record_kind="candidate_assets_registration_succeeded",
+            payload={
+                "base_commit": spec.base_commit,
+                "capability_path": result_object.path,
+                "capability_sha256": result_object.sha256,
+                "effect_id": expected.effect_id,
+                "effect_kind": "foundry_assets",
+                "issue_number": spec.issue_number,
+                "result_id": f"{expected.effect_id}-result",
+                "spec_sha256": spec.sha256,
+            },
+            objects=(result_object,),
+        )
+
+    def _draft(
+        self,
+        root: Path,
+        snapshot: Any,
+        planned: Any,
+    ) -> Any:
+        from foundry_opt.orchestration.capability_bridge import (
+            CandidateCapabilityExecution,
+        )
+        from foundry_opt.orchestration.candidate_workers import (
+            CandidateWorkerRequest,
+            _draft_intent,
+        )
+
+        plan = _ProductionCandidateWorkerPlanResolver(self._source).resolve(
+            CandidateWorkerRequest(root, snapshot.state.issue_number),
+            snapshot.state,
+        )
+        candidate_id = str(planned.payload["candidate_id"])
+        try:
+            bundle = self._build_exact_bundle(
+                root,
+                plan,
+                planned.record_id,
+                snapshot,
+                candidate_id,
+                str(planned.payload["bundle_sha256"]),
+            )
+            intent = _draft_intent(
+                plan,
+                candidate_id,
+                bundle,
+            )
+            if (
+                intent.effect_id != planned.record_id
+                or intent.idempotency_key
+                != planned.payload.get("idempotency_key")
+                or dict(planned.payload)
+                != {
+                    "base_commit": plan.base_commit,
+                    "bundle_sha256": bundle.sha256,
+                    "candidate_id": candidate_id,
+                    "effect_id": intent.effect_id,
+                    "effect_kind": "foundry_draft",
+                    "idempotency_key": intent.idempotency_key,
+                    "issue_number": intent.issue_number,
+                    "max_attempts": plan.limits.transient_retries + 1,
+                    "slot": _candidate_slot(candidate_id),
+                    "spec_sha256": intent.spec_sha256,
+                }
+            ):
+                raise ValueError("candidate draft intent changed")
+            draft = _ActionsCandidateDraftEffects(
+                self._source,
+                self._credential,
+                self._draft_gateway,
+            ).reconcile(intent)
+            if draft is None:
+                raise CapabilityUnavailableError(
+                    "foundry_drafts_unavailable",
+                    "candidate draft could not be reconciled",
+                )
+            return CandidateCapabilityExecution(
+                record_kind="candidate_effect_succeeded",
+                payload={
+                    "base_commit": plan.base_commit,
+                    "bundle_sha256": bundle.sha256,
+                    "candidate_id": intent.subject_id,
+                    "draft_id": draft.version_id,
+                    "effect_id": intent.effect_id,
+                    "effect_kind": "foundry_draft",
+                    "issue_number": intent.issue_number,
+                    "spec_sha256": intent.spec_sha256,
+                },
+            )
+        finally:
+            self._remove_capability_worktree(root, planned.record_id)
+
+    def _evaluation(
+        self,
+        root: Path,
+        snapshot: Any,
+        planned: Any,
+    ) -> Any:
+        from foundry_opt.orchestration.capability_bridge import (
+            CandidateCapabilityExecution,
+            evaluation_result_state_object,
+        )
+        from foundry_opt.orchestration.candidate_workers import (
+            CandidateWorkerRequest,
+            _aggregate_metrics,
+            _evaluation_intent,
+        )
+
+        plan = _ProductionCandidateWorkerPlanResolver(self._source).resolve(
+            CandidateWorkerRequest(root, snapshot.state.issue_number),
+            snapshot.state,
+        )
+        candidate_id = str(planned.payload["candidate_id"])
+        draft_record = _candidate_capability_success(
+            snapshot,
+            _draft_effect_id(plan, candidate_id),
+            "foundry_draft",
+        )
+        if draft_record is None:
+            raise ValueError("candidate evaluation draft is unavailable")
+        draft = DraftRecord(
+            plan.target,
+            str(draft_record.payload["draft_id"]),
+            plan.base_agent_version,
+            str(draft_record.payload["bundle_sha256"]),
+            "draft",
+        )
+        intent = _evaluation_intent(plan, candidate_id, draft)
+        if (
+            intent.effect_id != planned.record_id
+            or dict(planned.payload)
+            != {
+                "base_commit": plan.base_commit,
+                "candidate_id": candidate_id,
+                "effect_id": intent.effect_id,
+                "effect_kind": "foundry_evaluation",
+                "issue_number": intent.issue_number,
+                "max_attempts": plan.limits.transient_retries + 1,
+                "slot": _candidate_slot(candidate_id),
+                "spec_sha256": intent.spec_sha256,
+            }
+        ):
+            raise ValueError("candidate evaluation intent changed")
+        result = _ActionsCandidateEvaluationEffects(
+            self._source,
+            self._credential,
+            self._binder_factory,
+        ).reconcile(intent)
+        if result is None:
+            raise CapabilityUnavailableError(
+                "foundry_evaluation_unavailable",
+                "candidate evaluation could not be reconciled",
+            )
+        result_object = evaluation_result_state_object(
+            effect_id=intent.effect_id,
+            issue_number=intent.issue_number,
+            generation=intent.generation,
+            spec_sha256=intent.spec_sha256,
+            base_commit=intent.base_commit,
+            result=result,
+        )
+        return CandidateCapabilityExecution(
+            record_kind="candidate_effect_succeeded",
+            payload={
+                "base_commit": plan.base_commit,
+                "candidate_id": candidate_id,
+                "capability_path": result_object.path,
+                "capability_sha256": result_object.sha256,
+                "effect_id": intent.effect_id,
+                "effect_kind": "foundry_evaluation",
+                "evaluation_id": result.run.evaluation_id,
+                "issue_number": intent.issue_number,
+                "metrics": _aggregate_metrics(result),
+                "run_id": result.run.run_id,
+                "spec_sha256": intent.spec_sha256,
+            },
+            objects=(result_object,),
+        )
+
+    def _build_exact_bundle(
+        self,
+        root: Path,
+        plan: Any,
+        effect_id: str,
+        snapshot: Any,
+        candidate_id: str,
+        expected_sha256: str,
+    ) -> BundleArtifact:
+        worktree = _capability_worktree_path(root, effect_id)
+        self._remove_capability_worktree(root, effect_id)
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        self._commands.run(
+            (
+                "git",
+                "worktree",
+                "add",
+                "--detach",
+                "--force",
+                str(worktree),
+                plan.base_commit,
+            ),
+            cwd=root,
+        )
+        if candidate_id != "baseline":
+            artifact, patch = _candidate_patch_object(
+                snapshot,
+                plan,
+                candidate_id,
+            )
+            self._commands.run(
+                (
+                    "git",
+                    "apply",
+                    "--index",
+                    "--binary",
+                    "--whitespace=nowarn",
+                    "-",
+                ),
+                cwd=worktree,
+                input_bytes=patch.content,
+            )
+            tree = self._commands.run(
+                ("git", "write-tree"),
+                cwd=worktree,
+            ).stdout.strip()
+            if tree != artifact.payload.get("tree_sha"):
+                raise ValueError(
+                    "candidate capability patch tree changed"
+                )
+        config = load_config(worktree / self._config_path)
+        bundle = build_source_bundle(
+            _bundle_request(
+                config,
+                worktree,
+                worktree / ".foundry-opt-capability.zip",
+            )
+        )
+        if bundle.sha256 != expected_sha256:
+            raise ValueError("candidate capability bundle changed")
+        return bundle
+
+    def _remove_capability_worktree(
+        self,
+        root: Path,
+        effect_id: str,
+    ) -> None:
+        import shutil
+
+        worktree = _capability_worktree_path(root, effect_id)
+        try:
+            self._commands.run(
+                (
+                    "git",
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                ),
+                cwd=root,
+            )
+        except Exception:
+            pass
+        if worktree.exists():
+            shutil.rmtree(worktree)
+        try:
+            self._commands.run(
+                ("git", "worktree", "prune"),
+                cwd=root,
+            )
+        except Exception:
+            pass
+
+
+def _capability_worktree_path(root: Path, effect_id: str) -> Path:
+    if re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+        effect_id,
+    ) is None:
+        raise ValueError("candidate capability effect ID is invalid")
+    repository_root = root.expanduser().resolve()
+    current = repository_root
+    for part in (".foundry-optimizer", "capability-worktrees"):
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(
+                "candidate capability worktree parent is unsafe"
+            )
+    worktree = current / effect_id
+    if worktree.is_symlink():
+        raise ValueError("candidate capability worktree is unsafe")
+    parent = worktree.parent.resolve()
+    if not parent.is_relative_to(repository_root):
+        raise ValueError("candidate capability worktree escapes repository")
+    return parent / effect_id
+
+
+def _candidate_assets_result_object(
+    plan: Any,
+    assets: tuple[AssetProvenance, ...],
+) -> Any:
+    from foundry_opt.orchestration.git_state import StateObject
+
+    document = {
+        "assets": [
+            asset.model_dump(mode="json") for asset in assets
+        ],
+        "base_commit": plan.base_commit,
+        "effect_id": plan.effect_id,
+        "environment": plan.environment,
+        "generation": plan.generation,
+        "issue_number": plan.issue_number,
+        "kind": "candidate_assets_registration_result",
+        "schema_version": 1,
+        "spec_sha256": plan.spec_sha256,
+        "target": plan.target,
+    }
+    return StateObject(
+        f"objects/capabilities/{plan.effect_id}-result.json",
+        (
+            json.dumps(
+                document,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8"),
+    )
+
+
+def _candidate_patch_object(
+    snapshot: Any,
+    plan: Any,
+    candidate_id: str,
+) -> tuple[Any, Any]:
+    records = tuple(
+        record
+        for record in snapshot.outbox
+        if (
+            record.kind == "candidate_artifact_ready"
+            and record.generation == plan.generation
+            and record.payload.get("candidate_id") == candidate_id
+        )
+    )
+    if len(records) != 1:
+        raise ValueError("candidate artifact is unavailable")
+    patch_sha256 = records[0].payload.get("patch_sha256")
+    objects = tuple(
+        item
+        for item in snapshot.objects
+        if item.path == f"objects/patches/{patch_sha256}.patch"
+    )
+    if (
+        len(objects) != 1
+        or objects[0].sha256 != patch_sha256
+        or records[0].payload.get("base_commit") != plan.base_commit
+        or records[0].payload.get("spec_sha256") != plan.spec_sha256
+    ):
+        raise ValueError("candidate patch object is unavailable")
+    return records[0], objects[0]
+
+
+def _draft_effect_id(plan: Any, candidate_id: str) -> str:
+    return f"draft-{plan.issue_number}-{plan.generation}-{candidate_id}"
+
+
+def _candidate_slot(candidate_id: str) -> int:
+    if candidate_id == "baseline":
+        return 0
+    match = re.fullmatch(r"candidate-([1-9][0-9]*)", candidate_id)
+    if match is None:
+        raise ValueError("candidate capability subject is invalid")
+    return int(match.group(1))
 
 
 class _ProductionCandidateDesignRepository:
@@ -2168,19 +3120,54 @@ def build_production_steward_candidate_workers(
                     output,
                 )
             ),
-            drafts=_ProductionCandidateDraftEffects(
-                source,
-                credential,
-                draft_gateway,
-            ),
-            evaluations=_ProductionCandidateEvaluationEffects(
-                source,
-                credential,
-                binder_factory,
-            ),
+            drafts=_ProductionCandidateDraftEffects(source),
+            evaluations=_ProductionCandidateEvaluationEffects(source),
             write_evidence=write_redacted_evidence,
             clock=UtcClock(),
         ),
+    )
+
+
+def build_production_candidate_capability_bridge(
+    *,
+    assignments: Any,
+    config_path: Path = _DEFAULT_CONFIG_PATH,
+    command_runner: CommandRunner | None = None,
+    environment: EnvironmentReader | None = None,
+    credential_provider: AzureCredentialProvider | None = None,
+    resolution_gateway_factory: ResolutionGatewayFactory | None = None,
+    registration_gateway_factory: RegistrationGatewayFactory | None = None,
+    binder_factory: BinderFactory | None = None,
+    draft_gateway: Any | None = None,
+    ledger: Any | None = None,
+) -> Any:
+    from foundry_opt.orchestration.capability_bridge import (
+        CandidateCapabilityBridge,
+    )
+
+    commands = command_runner or SubprocessCommandRunner()
+    reader = environment or OsEnvironmentReader()
+    credential = credential_provider or _default_credential_provider(reader)
+    resolution = (
+        resolution_gateway_factory
+        or _default_resolution_gateway_factory(credential)
+    )
+    registration = (
+        registration_gateway_factory
+        or _default_registration_gateway_factory(credential)
+    )
+    return CandidateCapabilityBridge(
+        ledger=ledger or GitStateRef(),
+        executor=_ProductionCandidateCapabilityExecutor(
+            config_path=config_path,
+            commands=commands,
+            credential=credential,
+            resolution_gateway_factory=resolution,
+            registration_gateway_factory=registration,
+            binder_factory=binder_factory,
+            draft_gateway=draft_gateway,
+        ),
+        assignments=assignments,
     )
 
 
@@ -2590,6 +3577,8 @@ class _ProductionPostDeploymentEvaluationEffects:
                     observed[0],
                     intent,
                 )
+        if is_verified_copilot_git_proxy(self._root):
+            return None
         return self._adapter.reconcile(intent)
 
     def run(self, intent: Any) -> Any:
@@ -2601,6 +3590,12 @@ class _ProductionPostDeploymentEvaluationEffects:
             post_deployment_evaluation_result_from_record,
         )
 
+        if is_verified_copilot_git_proxy(self._root):
+            return PostDeploymentEvaluationResult(
+                result_id=f"{intent.effect_id}-pending",
+                intent=intent,
+                status=PostDeploymentEvaluationStatus.PENDING,
+            )
         ledger = GitStateRef()
         snapshot = ledger.load(
             self._root,

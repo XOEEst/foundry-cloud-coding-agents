@@ -966,14 +966,29 @@ class GhHandoffPullRequestGateway:
             "not a candidate or specification pull request. Its exact "
             f"{label} envelope was handled by the trusted base workflow."
         )
-        self._write(
-            f"repos/{self._repository}/issues/{number}",
-            {
-                "body": body,
-                "state": "closed",
-                "title": f"[internal] Foundry {label} handoff",
-            },
-        )
+        try:
+            self._write(
+                f"repos/{self._repository}/issues/{number}",
+                {
+                    "body": body,
+                    "state": "closed",
+                    "title": f"[internal] Foundry {label} handoff",
+                },
+            )
+        except CommandExitError:
+            current = self._json(
+                (
+                    "gh",
+                    "api",
+                    f"repos/{self._repository}/pulls/{number}",
+                )
+            )
+            if (
+                not isinstance(current, Mapping)
+                or current.get("number") != number
+                or current.get("state") != "closed"
+            ):
+                raise
 
     def delete_branch_if_head(
         self,

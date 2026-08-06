@@ -27,6 +27,15 @@ Comments and labels are projections, never authority. Transport workflows record
 apply only persisted outbox effects, and reassign Copilot; they never classify assets, design or
 evaluate candidates, select a winner, or declare completion.
 
+Copilot never calls Foundry network adapters. When approved assets lack a trusted materialization
+result, the steward persists `candidate_assets_registration_planned` with only exact
+generation/spec/base hashes, allowlisted repository paths, and immutable asset metadata, then
+stops. Draft creation and development evaluation likewise stop after `candidate_effect_planned`.
+The generated five-minute capability workflow validates the exact persisted intent, uses the
+optimizer OIDC identity, reconciles or executes the idempotent Foundry operation, CAS-records only
+privacy-safe remote identities and normalized results, and reassigns the steward. It cannot choose
+candidates, change policy, revise eligibility, or alter the slate.
+
 ## User-visible contract
 
 `.github/foundry-optimizer.yaml` is durable repository policy: environments, configured targets,
@@ -121,8 +130,9 @@ cannot redirect proposal objects.
 
 Actions may replay canonical interfaces only to verify the exact proposed transition and persisted
 effects. Actions cannot choose a different transition, add an effect, reinterpret the model's
-decision, or perform domain work. After verification, Actions provides only the missing Git/GitHub
-transport capability: compare-and-swap the private ref and apply the already-persisted outbox.
+decision, or perform domain work. After verification, Actions provides only missing transport or
+Foundry capability: compare-and-swap the private ref, apply the already-persisted outbox, or execute
+an exact persisted Foundry effect under the optimizer identity.
 
 ### Specification planner
 
@@ -139,8 +149,8 @@ The steward invokes `foundry-candidate-designer` only through the canonical
 designer edits only the reserved worktree and allowed paths, writes the typed result file, and runs
 `foundry-opt steward candidate-design-result` exactly once. It is the only specialist that
 generates ideas or writes candidate code, and it stays within the campaign's bounded candidate
-limits. Foundry draft creation, evaluation, eligibility, and selection remain deterministic steward
-responsibilities.
+limits. Foundry draft/evaluation intent, eligibility, and selection remain deterministic steward
+responsibilities; Actions supplies only the exact external draft/evaluation call and result.
 
 ### Exact-patch applier
 
@@ -168,6 +178,10 @@ request; merging is the selection signal.
   requests.
 - Deployment runs under the separate deployment OIDC identity and consumes only persisted
   deployment intents, claims, and results.
+- Asset registration, draft creation, and development evaluation run only in the generated
+  capability workflow under the optimizer OIDC identity. Its state contains hashes, allowlisted
+  paths, remote IDs/names/versions, and normalized evidence only—never raw rows, evaluator prompts,
+  responses, traces, or credentials.
 - Reconciliation must project the trusted inbox lifecycle before state, skip closed,
   declassified, blocked, or terminal campaigns, and resume only after an explicit reopen. It must
   not invent state from comments, labels, live issue fields, or conversation history.

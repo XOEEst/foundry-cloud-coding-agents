@@ -36,6 +36,7 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
         assert "foundry_opt/orchestration/git_transport.py" in names
         assert "foundry_opt/orchestration/transport.py" in names
         assert "foundry_opt/orchestration/handoff.py" in names
+        assert "foundry_opt/orchestration/capability_bridge.py" in names
         bundle = archive.read(
             "foundry_opt/onboarding/bundle.py"
         ).decode("utf-8")
@@ -53,3 +54,5 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
     assert "https://management.azure.com" not in generation
     assert "FOUNDRY_OPT_COPILOT_GIT_PROXY=1" in skill
     assert "pull_request_target" in bundle
+    assert "foundry-optimization-capability.yml" in bundle
+    assert "python -m foundry_opt.orchestration.capability_bridge" in bundle

@@ -187,6 +187,9 @@ def run_onboarding(
             variable_changes=variable_changes,
             guidance=(
                 "Generated onboarding files are already current.",
+                "Keep AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and the "
+                "optimizer AZURE_CLIENT_ID in the generated Actions "
+                "environment for the Foundry capability workflow.",
                 _COPILOT_ASSIGNMENT_GUIDANCE,
             ),
         )
@@ -381,15 +384,20 @@ def run_onboarding(
                 (
                     "The Actions deployment environment "
                     f"{request.mirror_actions_environment} received the "
-                    "separate AZURE_DEPLOYMENT_CLIENT_ID variable.",
+                    "optimizer AZURE_CLIENT_ID plus the separate "
+                    "AZURE_DEPLOYMENT_CLIENT_ID variable.",
                 )
                 if request.mirror_actions_environment is not None
                 else (
-                    "Create AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and "
+                    "Create AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, the "
+                    "optimizer AZURE_CLIENT_ID, and the separate "
                     "AZURE_DEPLOYMENT_CLIENT_ID in the Actions environment "
                     f"{request.environment_name}.",
                 )
             ),
+            "The generated Foundry capability workflow uses only the "
+            "optimizer identity for asset, draft, and development "
+            "evaluation effects.",
             "Azure OIDC itself uses no stored credential; Copilot "
             "assignment separately requires the Actions secret below.",
             _COPILOT_ASSIGNMENT_GUIDANCE,

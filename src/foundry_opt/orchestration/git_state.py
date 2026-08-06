@@ -227,6 +227,8 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "candidate_feedback",
         "candidate_issue_number",
         "candidate_pull_request_number",
+        "capability_path",
+        "capability_sha256",
         "changed_paths",
         "candidate_slate",
         "commit_sha",
@@ -247,6 +249,7 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "effect_id",
         "effect_kind",
         "eligible",
+        "environment",
         "evaluation_id",
         "evaluation_policy_sha256",
         "evidence_path",
@@ -261,6 +264,7 @@ _OUTBOX_PAYLOAD_FIELDS = frozenset(
         "lessons",
         "lineage_sha256",
         "max_changed_candidates",
+        "max_attempts",
         "marker",
         "merge_actor",
         "merge_commit",
@@ -318,6 +322,7 @@ _HASH_FIELDS = frozenset(
         "evidence_sha256",
         "attestation_sha256",
         "bundle_sha256",
+        "capability_sha256",
         "goal_sha256",
         "idempotency_key",
         "issue_sha256",
@@ -338,6 +343,7 @@ _NUMBER_FIELDS = frozenset(
         "candidate_pull_request_number",
         "issue_number",
         "max_changed_candidates",
+        "max_attempts",
         "pull_request_number",
         "repository_id",
         "attempt",
@@ -470,6 +476,7 @@ class StateObject:
             r"candidates/g[1-9][0-9]*-[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
             r"\.json|"
             r"specifications/g[1-9][0-9]*\.json|"
+            r"capabilities/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json|"
             r"evidence/[0-9a-f]{64}\.json|"
             r"patches/[0-9a-f]{64}\.patch"
             r")",
@@ -494,6 +501,7 @@ class StateObject:
                 self.path.startswith(
                     (
                         "objects/candidates/",
+                        "objects/capabilities/",
                         "objects/specifications/",
                     )
                 )
@@ -1846,6 +1854,7 @@ def _validate_candidate_feedback(value: Any) -> None:
 def _validate_payload_value(key: str, value: Any) -> None:
     if key in {
         "attestation_path",
+        "capability_path",
         "evidence_path",
         "patch_path",
         "workflow_path",

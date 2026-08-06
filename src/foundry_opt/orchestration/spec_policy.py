@@ -356,7 +356,10 @@ class OptimizationSpecPolicy:
                 if (
                     not asset.name
                     or not asset.version
-                    or not asset.remote_id
+                    or (
+                        asset.source == "builtin"
+                        and not asset.remote_id
+                    )
                     or resolved.asset_paths[asset.asset_id] is not None
                     or asset.content_sha256 is not None
                 ):
