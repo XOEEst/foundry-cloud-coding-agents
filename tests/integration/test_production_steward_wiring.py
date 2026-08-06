@@ -882,7 +882,8 @@ def test_production_cli_resolves_trusted_issue_without_github_api(
 
     assert approval_result.exit_code == 1, approval_result.stdout
     approval_payload = json.loads(approval_result.stdout)
-    assert approval_payload["code"] == "candidate_workers_unavailable"
+    assert approval_payload["code"] == "candidate_assets_unavailable"
+    assert "CapabilityUnavailableError" in approval_payload["summary"]
     approved_snapshot = GitStateRef().load(root, ISSUE)
     assert approved_snapshot is not None
     assert approved_snapshot.state.phase.value == "baseline"

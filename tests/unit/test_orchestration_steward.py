@@ -4,7 +4,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from pydantic import BaseModel, ValidationError
+
+from foundry_opt.adapters.drafts import DraftAuthenticationError, DraftError
+from foundry_opt.adapters.evaluation import EvaluationSchemaError
+from foundry_opt.adapters.foundry_assets import FoundryAssetTransportError
+from foundry_opt.adapters.optimization_evaluation import (
+    OptimizationEvaluationError,
+)
 from foundry_opt.config.models import AutomationPolicy
+from foundry_opt.evidence.writer import SensitiveEvidenceError
+from foundry_opt.optimization.runner import CapabilityUnavailableError
+from foundry_opt.optimization.runner import IdeaContractError
 from foundry_opt.optimization.specification import PreparedSpecFile
 from foundry_opt.orchestration import (
     AdvanceDisposition,
@@ -20,6 +32,7 @@ from foundry_opt.orchestration import (
     StateRefSnapshot,
     StateObject,
 )
+from foundry_opt.orchestration.git_transport import GitTransportError
 from foundry_opt.orchestration.steward import (
     GitCampaignInbox,
     StewardAdvanceRequest,
@@ -47,6 +60,17 @@ from foundry_opt.orchestration.spec_policy import (
 
 
 NOW = datetime(2026, 7, 31, tzinfo=UTC)
+
+
+def _pydantic_validation_error() -> ValidationError:
+    class CandidateInput(BaseModel):
+        attempts: int
+
+    try:
+        CandidateInput(attempts="private-input")
+    except ValidationError as error:
+        return error
+    raise AssertionError("invalid input unexpectedly passed validation")
 
 
 def _event(
@@ -850,6 +874,212 @@ def test_steward_owns_and_invokes_candidate_worker_phase(
     assert result.state == completed
     assert workers.requests[0].issue_number == 31
     assert workers.requests[0].repository_root == tmp_path
+
+
+def _candidate_worker_snapshot() -> SimpleNamespace:
+    created = _event("event-1", EventKind.ISSUE_CREATED)
+    approved = CampaignEvent(
+        "event-2",
+        EventKind.SPEC_POLICY_APPROVED,
+        1,
+        NOW,
+        {"spec_sha256": "d" * 64},
+    )
+    baseline = OptimizationCampaign().advance(
+        __import__(
+            "foundry_opt.orchestration",
+            fromlist=["AdvanceRequest"],
+        ).AdvanceRequest(31, None, (created, approved))
+    ).state
+    return SimpleNamespace(
+        revision="a" * 40,
+        state=baseline,
+        inbox=(created, approved),
+        outbox=(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    (
+        (
+            CapabilityUnavailableError(
+                "foundry_registration_unavailable",
+                "Foundry asset registration is unavailable.",
+            ),
+            "candidate_assets_unavailable",
+        ),
+        (
+            FoundryAssetTransportError(),
+            "candidate_assets_unavailable",
+        ),
+        (
+            ValueError("candidate idea failed domain validation"),
+            "candidate_validation_failed",
+        ),
+        (
+            _pydantic_validation_error(),
+            "candidate_validation_failed",
+        ),
+        (
+            IdeaContractError(
+                "the idea file must live outside the candidate worktree"
+            ),
+            "candidate_validation_failed",
+        ),
+        (
+            DraftAuthenticationError(),
+            "candidate_draft_unavailable",
+        ),
+        (
+            EvaluationSchemaError("Evaluation schema is invalid."),
+            "candidate_evaluation_unavailable",
+        ),
+        (
+            SensitiveEvidenceError("Evidence contains private content."),
+            "candidate_evidence_unavailable",
+        ),
+        (
+            GitTransportError("Managed worktree transport failed."),
+            "candidate_worktree_failed",
+        ),
+        (
+            ValueError("campaign worktree path already exists"),
+            "candidate_worktree_failed",
+        ),
+        (
+            RuntimeError("fatal: could not remove managed worktree"),
+            "candidate_worktree_failed",
+        ),
+    ),
+)
+def test_steward_maps_typed_candidate_worker_failures(
+    tmp_path: Path,
+    error: Exception,
+    code: str,
+) -> None:
+    class Workers:
+        def advance(self, request):
+            raise error
+
+    result = StewardAdvanceService(
+        ledger=Ledger(_candidate_worker_snapshot()),
+        inbox=Inbox(()),
+        candidate_workers=Workers(),
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.status is StewardAdvanceStatus.FAILED
+    assert result.code == code
+    assert type(error).__name__ in result.summary
+    assert result.exit_code == 1
+    assert "private-input" not in result.summary
+
+
+def test_steward_redacts_typed_candidate_failure_detail(
+    tmp_path: Path,
+) -> None:
+    secret = "ghp_" + "a" * 36
+    error = DraftError(
+        "draft failed for "
+        f"https://user:{secret}@example.test/run?token={secret}"
+    )
+
+    class Workers:
+        def advance(self, request):
+            raise error
+
+    result = StewardAdvanceService(
+        ledger=Ledger(_candidate_worker_snapshot()),
+        inbox=Inbox(()),
+        candidate_workers=Workers(),
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.code == "candidate_draft_unavailable"
+    assert "DraftError" in result.summary
+    assert secret not in result.summary
+    assert "https://" not in result.summary
+    assert len(result.summary) <= 320
+
+
+def test_steward_does_not_surface_nested_evaluation_error_content(
+    tmp_path: Path,
+) -> None:
+    private_content = "Patient John Doe SSN 123-45-6789"
+    error = OptimizationEvaluationError(
+        "the per-specification Foundry evaluation failed: "
+        f"row 12 input {private_content}"
+    )
+
+    class Workers:
+        def advance(self, request):
+            raise error
+
+    result = StewardAdvanceService(
+        ledger=Ledger(_candidate_worker_snapshot()),
+        inbox=Inbox(()),
+        candidate_workers=Workers(),
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.code == "candidate_evaluation_unavailable"
+    assert result.summary == (
+        "Candidate evaluation could not be completed. "
+        "(OptimizationEvaluationError)"
+    )
+    assert private_content not in result.summary
+
+
+def test_steward_unknown_candidate_failure_exposes_exception_class_only(
+    tmp_path: Path,
+) -> None:
+    secret = "github_pat_" + "b" * 40
+    error = RuntimeError(
+        f"raw prompt and row at https://example.test/?token={secret}"
+    )
+
+    class Workers:
+        def advance(self, request):
+            raise error
+
+    result = StewardAdvanceService(
+        ledger=Ledger(_candidate_worker_snapshot()),
+        inbox=Inbox(()),
+        candidate_workers=Workers(),
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.code == "candidate_workers_unavailable"
+    assert result.summary == (
+        "Candidate workers could not be advanced. (RuntimeError)"
+    )
+    assert secret not in result.summary
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "candidate produced an invalid digit count",
+        "the legit input was malformed",
+        "evaluation state reflects an unexpected schema",
+        "candidate commitment field is invalid",
+    ),
+)
+def test_steward_does_not_guess_worktree_failure_from_substrings(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    class Workers:
+        def advance(self, request):
+            raise RuntimeError(message)
+
+    result = StewardAdvanceService(
+        ledger=Ledger(_candidate_worker_snapshot()),
+        inbox=Inbox(()),
+        candidate_workers=Workers(),
+    ).advance(StewardAdvanceRequest(tmp_path, 31))
+
+    assert result.code == "candidate_workers_unavailable"
+    assert result.summary == (
+        "Candidate workers could not be advanced. (RuntimeError)"
+    )
 
 
 def test_steward_publishes_slate_after_candidate_workers_complete(

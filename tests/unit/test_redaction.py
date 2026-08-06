@@ -130,3 +130,33 @@ def test_redact_does_not_mask_ordinary_security_words() -> None:
     )
 
     assert redact(text) == text
+
+
+def test_redact_masks_bare_provider_tokens_and_jwts() -> None:
+    github_token = "ghp_" + "a" * 36
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signaturevalue"
+
+    assert redact(f"tokens: {github_token} and {jwt}") == (
+        "tokens: [REDACTED] and [REDACTED]"
+    )
+
+
+def test_redact_masks_url_userinfo_and_standalone_token_fields() -> None:
+    text = (
+        "clone https://user:super-secret@example.test/repo.git "
+        "then token=another-secret"
+    )
+
+    assert redact(text) == (
+        "clone https://[REDACTED]@example.test/repo.git "
+        "then token=[REDACTED]"
+    )
+
+
+def test_redact_masks_private_key_blocks() -> None:
+    text = (
+        "key follows\n-----BEGIN PRIVATE KEY-----\n"
+        "private-material\n-----END PRIVATE KEY-----\ncomplete"
+    )
+
+    assert redact(text) == "key follows\n[REDACTED]\ncomplete"

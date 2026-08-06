@@ -4,8 +4,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 import hashlib
 from pathlib import Path
+import re
 from typing import Any, Callable, Protocol
 
+from foundry_opt.preflight.redaction import redact
+from foundry_opt.security import reject_secret_content
 from foundry_opt.orchestration.campaign import (
     InvalidCampaignTransition,
     OptimizationCampaign,
@@ -48,6 +51,213 @@ from foundry_opt.orchestration.spec_policy import (
     SpecPolicyDecision,
     SpecPolicyRequest,
 )
+
+
+_MAX_EXCEPTION_DETAIL = 240
+_URL = re.compile(r"(?i)\b(?:https?|ssh|git)://\S+")
+_PRIVATE_CONTENT = re.compile(
+    r"(?i)\b(?:prompt|raw[_ -]?(?:row|response)s?|held[- ]out|trace)\b"
+)
+_ABSOLUTE_PATH = re.compile(r"(?:\b[A-Za-z]:\\|(?<!\w)/(?:home|users|var)/)")
+_OPAQUE_TOKEN = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
+_WORKTREE_FAILURE = re.compile(
+    r"(?i)(?:"
+    r"\bfatal:|"
+    r"\b(?:campaign|candidate|managed|registered|optimizer|git)\s+worktree\b|"
+    r"\bworktree\s+(?:path|repository|branch|cleanup)\b|"
+    r"\brepository_root\b|"
+    r"\bstate ref\b|"
+    r"\bcampaign state\b|"
+    r"\bgit (?:command|transport|operation)\b|"
+    r"\bremote default branch\b"
+    r")"
+)
+
+
+def _exception_class(error: Exception) -> str:
+    name = type(error).__name__
+    return name if name.isidentifier() else "Exception"
+
+
+def _safe_exception_detail(
+    error: Exception,
+    *,
+    include_message: bool,
+) -> str:
+    error_class = _exception_class(error)
+    if not include_message:
+        return error_class
+    message = " ".join(str(error).split())
+    sanitized = redact(message) or ""
+    sanitized = _URL.sub("[REDACTED]", sanitized)
+    if (
+        not sanitized
+        or _PRIVATE_CONTENT.search(sanitized)
+        or _ABSOLUTE_PATH.search(sanitized)
+        or _OPAQUE_TOKEN.search(sanitized)
+    ):
+        return error_class
+    try:
+        reject_secret_content(sanitized)
+    except ValueError:
+        return error_class
+    if len(sanitized) > _MAX_EXCEPTION_DETAIL:
+        sanitized = sanitized[: _MAX_EXCEPTION_DETAIL - 1].rstrip() + "…"
+    return f"{error_class}: {sanitized}"
+
+
+def _failure_summary(
+    summary: str,
+    error: Exception,
+    *,
+    include_message: bool = False,
+) -> str:
+    return (
+        f"{summary} "
+        f"({_safe_exception_detail(error, include_message=include_message)})"
+    )
+
+
+def _looks_like_worktree_failure(error: Exception) -> bool:
+    if not isinstance(error, (RuntimeError, ValueError)):
+        return False
+    return _WORKTREE_FAILURE.search(str(error)) is not None
+
+
+def _candidate_worker_failure(error: Exception) -> tuple[str, str]:
+    from pydantic import ValidationError
+
+    from foundry_opt.adapters.drafts import (
+        DraftApiError,
+        DraftAuthenticationError,
+        DraftAuthorizationError,
+        DraftConflictError,
+        DraftError,
+        DraftHashMismatchError,
+        DraftResponseError,
+    )
+    from foundry_opt.adapters.evaluation import EvaluationAdapterError
+    from foundry_opt.adapters.foundry_assets import (
+        FoundryAssetAuthenticationError,
+        FoundryAssetAuthorizationError,
+        FoundryAssetGatewayError,
+        FoundryAssetServiceError,
+        FoundryAssetThrottledError,
+        FoundryAssetTransportError,
+        FoundryAssetUnexpectedSdkError,
+    )
+    from foundry_opt.adapters.optimization_evaluation import (
+        OptimizationEvaluationError,
+    )
+    from foundry_opt.campaign.protocols import (
+        ActiveCampaignError,
+        CampaignStateError,
+        UnsafeMutationError,
+    )
+    from foundry_opt.evidence.writer import SensitiveEvidenceError
+    from foundry_opt.optimization.assets import EvaluationAssetError
+    from foundry_opt.optimization.runner import (
+        CampaignRecoveryError,
+        CapabilityUnavailableError,
+        IdeaContractError,
+    )
+    from foundry_opt.orchestration.git_transport import GitTransportError
+    from foundry_opt.packaging.models import BundleError
+
+    code = "candidate_workers_unavailable"
+    summary = "Candidate workers could not be advanced."
+    if isinstance(error, CapabilityUnavailableError):
+        capability = error.code.casefold()
+        if any(
+            marker in capability
+            for marker in ("asset", "registration", "resolution")
+        ):
+            code = "candidate_assets_unavailable"
+            summary = "Candidate assets could not be prepared."
+        elif "draft" in capability:
+            code = "candidate_draft_unavailable"
+            summary = "Candidate draft could not be created."
+        elif "evaluation" in capability:
+            code = "candidate_evaluation_unavailable"
+            summary = "Candidate evaluation could not be completed."
+        elif "evidence" in capability:
+            code = "candidate_evidence_unavailable"
+            summary = "Candidate evidence could not be produced."
+        elif "validation" in capability:
+            code = "candidate_validation_failed"
+            summary = "Candidate validation failed."
+        elif any(
+            marker in capability
+            for marker in ("git", "worktree", "state", "repository", "campaign")
+        ):
+            code = "candidate_worktree_failed"
+            summary = "Candidate worktree or state operation failed."
+    elif isinstance(
+        error,
+        (FoundryAssetGatewayError, EvaluationAssetError),
+    ):
+        code = "candidate_assets_unavailable"
+        summary = "Candidate assets could not be prepared."
+    elif isinstance(error, DraftError):
+        code = "candidate_draft_unavailable"
+        summary = "Candidate draft could not be created."
+    elif isinstance(
+        error,
+        (EvaluationAdapterError, OptimizationEvaluationError),
+    ):
+        code = "candidate_evaluation_unavailable"
+        summary = "Candidate evaluation could not be completed."
+    elif isinstance(error, SensitiveEvidenceError):
+        code = "candidate_evidence_unavailable"
+        summary = "Candidate evidence could not be produced."
+    elif isinstance(
+        error,
+        (
+            StateRefError,
+            GitTransportError,
+            ActiveCampaignError,
+            CampaignStateError,
+            CampaignRecoveryError,
+        ),
+    ):
+        code = "candidate_worktree_failed"
+        summary = "Candidate worktree or state operation failed."
+    elif isinstance(
+        error,
+        (
+            ValidationError,
+            IdeaContractError,
+            UnsafeMutationError,
+            BundleError,
+        ),
+    ):
+        code = "candidate_validation_failed"
+        summary = "Candidate validation failed."
+    elif _looks_like_worktree_failure(error):
+        code = "candidate_worktree_failed"
+        summary = "Candidate worktree or state operation failed."
+    elif isinstance(error, ValueError):
+        code = "candidate_validation_failed"
+        summary = "Candidate validation failed."
+    include_message = type(error) in (
+        DraftApiError,
+        DraftAuthenticationError,
+        DraftAuthorizationError,
+        DraftConflictError,
+        DraftHashMismatchError,
+        DraftResponseError,
+        FoundryAssetAuthenticationError,
+        FoundryAssetAuthorizationError,
+        FoundryAssetServiceError,
+        FoundryAssetThrottledError,
+        FoundryAssetTransportError,
+        FoundryAssetUnexpectedSdkError,
+    )
+    return code, _failure_summary(
+        summary,
+        error,
+        include_message=include_message,
+    )
 
 
 class StewardAdvanceStatus(StrEnum):
@@ -634,12 +844,13 @@ class StewardAdvanceService:
             )
         except StateRefPushUnacknowledgedError as error:
             return self._state_handoff(request, error, snapshot)
-        except Exception:
+        except Exception as error:
+            code, summary = _candidate_worker_failure(error)
             return self._failure(
                 request,
                 StewardAdvanceStatus.FAILED,
-                "Candidate workers could not be advanced.",
-                "candidate_workers_unavailable",
+                summary,
+                code,
                 snapshot,
             )
         status_by_worker = {
@@ -705,11 +916,14 @@ class StewardAdvanceService:
             )
         except StateRefPushUnacknowledgedError as error:
             return self._state_handoff(request, error, snapshot)
-        except Exception:
+        except Exception as error:
             return self._failure(
                 request,
                 StewardAdvanceStatus.FAILED,
-                "Candidate selection could not be advanced.",
+                _failure_summary(
+                    "Candidate selection could not be advanced.",
+                    error,
+                ),
                 "candidate_selection_unavailable",
                 snapshot,
             )
@@ -772,11 +986,14 @@ class StewardAdvanceService:
             )
         except StateRefPushUnacknowledgedError as error:
             return self._state_handoff(request, error, snapshot)
-        except Exception:
+        except Exception as error:
             return self._failure(
                 request,
                 StewardAdvanceStatus.FAILED,
-                "Deployment orchestration could not be advanced.",
+                _failure_summary(
+                    "Deployment orchestration could not be advanced.",
+                    error,
+                ),
                 "deployment_orchestration_unavailable",
                 snapshot,
             )
@@ -846,11 +1063,14 @@ class StewardAdvanceService:
             )
         except StateRefPushUnacknowledgedError as error:
             return self._state_handoff(request, error, snapshot)
-        except Exception:
+        except Exception as error:
             return self._failure(
                 request,
                 StewardAdvanceStatus.FAILED,
-                "Candidate slate could not be advanced.",
+                _failure_summary(
+                    "Candidate slate could not be advanced.",
+                    error,
+                ),
                 "candidate_slate_unavailable",
                 snapshot,
             )

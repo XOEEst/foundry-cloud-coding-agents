@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 import foundry_opt.cli as cli
@@ -401,6 +402,43 @@ def test_steward_advance_strict_failure_returns_one(
 
     assert result.exit_code == 1
     assert "state_ref_conflict" in result.stdout
+
+
+@pytest.mark.parametrize("json_output", (False, True))
+def test_steward_advance_renders_stable_candidate_failure_detail(
+    monkeypatch,
+    tmp_path: Path,
+    json_output: bool,
+) -> None:
+    summary = (
+        "Candidate draft could not be created. "
+        "(DraftAuthenticationError: Azure authentication failed.)"
+    )
+    service = StewardService(
+        StewardAdvanceResult(
+            status=StewardAdvanceStatus.FAILED,
+            issue_number=42,
+            summary=summary,
+            phase="baseline",
+            revision="a" * 40,
+            code="candidate_draft_unavailable",
+        )
+    )
+    monkeypatch.setattr(cli, "build_steward_advance_service", lambda: service)
+    monkeypatch.chdir(tmp_path)
+    arguments = ["steward", "advance", "--issue", "42"]
+    if json_output:
+        arguments.append("--json")
+
+    result = CliRunner().invoke(cli.app, arguments)
+
+    assert result.exit_code == 1
+    assert "candidate_draft_unavailable" in result.stdout
+    assert "DraftAuthenticationError" in result.stdout
+    if json_output:
+        payload = json.loads(result.stdout)
+        assert payload["summary"] == summary
+        assert payload["code"] == "candidate_draft_unavailable"
 
 
 def test_candidate_designer_submits_typed_result_through_cli(

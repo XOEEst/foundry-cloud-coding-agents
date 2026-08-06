@@ -131,6 +131,24 @@ campaign history. The append-only
 authority consulted before state during recovery; comments, labels, and
 conversation history are projections rather than authority.
 
+Candidate worker failures retain the existing failed state and non-zero exit
+semantics while exposing a privacy-safe blocker code for dashboards and
+recovery automation:
+
+- `candidate_assets_unavailable`: asset resolution or registration
+- `candidate_validation_failed`: candidate or bundle validation
+- `candidate_draft_unavailable`: Foundry draft creation
+- `candidate_evaluation_unavailable`: evaluation binding or execution
+- `candidate_evidence_unavailable`: redacted evidence production
+- `candidate_worktree_failed`: Git, worktree, or durable state operations
+- `candidate_workers_unavailable`: an unclassified worker exception
+
+The accompanying bounded summary contains the exception class and, only for
+known typed failures, a sanitized user-facing message. It never includes
+tracebacks, credentials, URLs, prompts, raw rows, or private evaluation
+content. Operators should route recovery by the stable code rather than parse
+the summary.
+
 ## Policy versus an issue
 
 `.github/foundry-optimizer.yaml` is the durable repository boundary. It records
