@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 import json
 
@@ -11,9 +12,11 @@ from foundry_opt.orchestration.handoff import (
     GhHandoffPullRequestGateway,
     HandoffApplyResult,
     HandoffApplyStatus,
+    HandoffError,
     HandoffEventError,
     HandoffFinalizer,
     TrustedHandoffContext,
+    discover_trusted_handoff_requests,
     trusted_handoff_request_from_payload,
 )
 
@@ -46,6 +49,7 @@ def _pull_request() -> dict[str, object]:
         "state": "open",
         "title": "Advance optimization issue 31",
         "user": {"login": "copilot-swe-agent[bot]"},
+        "created_at": "2026-08-05T20:54:42Z",
     }
 
 
@@ -57,6 +61,12 @@ def _payload() -> dict[str, object]:
             "default_branch": "trunk",
             "full_name": "octo-org/optimizer",
             "id": 123,
+        },
+        "sender": {
+            "html_url": "https://github.com/apps/copilot-swe-agent",
+            "id": 198982749,
+            "login": "Copilot",
+            "type": "Bot",
         },
     }
 
@@ -81,9 +91,222 @@ class Gateway:
         assert number == 90
         return self.files
 
-    def fetch_head(self, revision: str) -> str:
+    def fetch_revision(self, revision: str) -> str:
         self.fetched.append(revision)
         return revision
+
+    def head_was_pushed_by_copilot(
+        self,
+        branch: str,
+        revision: str,
+        repository_id: int,
+    ) -> bool:
+        return True
+
+
+def _live_copilot_pull_request(
+    number: int,
+    *,
+    created_at: str,
+) -> dict[str, object]:
+    pull_request = deepcopy(_pull_request())
+    pull_request["number"] = number
+    pull_request["created_at"] = created_at
+    pull_request["draft"] = True
+    pull_request["head"]["ref"] = f"copilot/steward-issue-{number}"
+    pull_request["head"]["sha"] = f"{number % 16:x}" * 40
+    pull_request["user"] = {
+        "html_url": "https://github.com/apps/copilot-swe-agent",
+        "id": 198982749,
+        "login": "Copilot",
+        "type": "Bot",
+    }
+    return pull_request
+
+
+class DiscoveryGateway:
+    def __init__(
+        self,
+        pull_requests: list[dict[str, object]],
+    ) -> None:
+        self.pull_requests = pull_requests
+        self.live = {
+            int(pull_request["number"]): pull_request
+            for pull_request in pull_requests
+            if isinstance(pull_request.get("number"), int)
+        }
+        self.files = {
+            number: [
+                {
+                    "filename": PATH,
+                    "sha": BLOB,
+                    "status": "added",
+                }
+            ]
+            for number in self.live
+        }
+        self.fetched: list[str] = []
+        self.copilot_pushes = {
+            str(pull_request["head"]["sha"]): True
+            for pull_request in self.live.values()
+        }
+
+    def list_open_pull_requests(self):
+        return self.pull_requests
+
+    def get_pull_request(self, number: int):
+        return self.live[number]
+
+    def get_pull_request_files(self, number: int):
+        return self.files[number]
+
+    def fetch_revision(self, revision: str) -> str:
+        self.fetched.append(revision)
+        return revision
+
+    def head_was_pushed_by_copilot(
+        self,
+        branch: str,
+        revision: str,
+        repository_id: int,
+    ) -> bool:
+        assert repository_id == 123
+        return self.copilot_pushes.get(revision, False)
+
+
+def test_scheduled_discovery_filters_orders_and_deduplicates_candidates() -> None:
+    newest = _live_copilot_pull_request(
+        92,
+        created_at="2026-08-05T20:56:42Z",
+    )
+    newest["statusCheckRollup"] = [{"conclusion": "action_required"}]
+    oldest = _live_copilot_pull_request(
+        91,
+        created_at="2026-08-05T20:54:42Z",
+    )
+    wrong_author = _live_copilot_pull_request(
+        93,
+        created_at="2026-08-05T20:53:42Z",
+    )
+    wrong_author["user"] = {
+        "id": 1,
+        "login": "attacker",
+        "type": "User",
+    }
+    fork = _live_copilot_pull_request(
+        94,
+        created_at="2026-08-05T20:52:42Z",
+    )
+    fork["head"]["repo"]["full_name"] = "attacker/fork"
+    wrong_branch = _live_copilot_pull_request(
+        95,
+        created_at="2026-08-05T20:51:42Z",
+    )
+    wrong_branch["head"]["ref"] = "feature/not-a-handoff"
+    wrong_base = _live_copilot_pull_request(
+        96,
+        created_at="2026-08-05T20:50:42Z",
+    )
+    wrong_base["base"]["ref"] = "release"
+    closed = _live_copilot_pull_request(
+        97,
+        created_at="2026-08-05T20:49:42Z",
+    )
+    closed["state"] = "closed"
+    renamed = _live_copilot_pull_request(
+        98,
+        created_at="2026-08-05T20:48:42Z",
+    )
+    wrong_pusher = _live_copilot_pull_request(
+        99,
+        created_at="2026-08-05T20:47:42Z",
+    )
+    gateway = DiscoveryGateway(
+        [
+            newest,
+            wrong_author,
+            deepcopy(oldest),
+            fork,
+            oldest,
+            wrong_branch,
+            wrong_base,
+            closed,
+            renamed,
+            wrong_pusher,
+        ]
+    )
+    newest_summary = deepcopy(newest)
+    newest_summary.pop("merged")
+    newest_summary["merged_at"] = None
+    gateway.pull_requests[0] = newest_summary
+    gateway.files[98][0]["previous_filename"] = "README.md"
+    gateway.copilot_pushes[str(wrong_pusher["head"]["sha"])] = False
+
+    requests = discover_trusted_handoff_requests(
+        TrustedHandoffContext(
+            "schedule",
+            "octo-org/optimizer",
+            123,
+            "trunk",
+        ),
+        Path("repository"),
+        gateway,
+        limit=10,
+    )
+
+    assert [request.pull_request_number for request in requests] == [91, 92]
+    assert [request.author_login for request in requests] == [
+        "Copilot",
+        "Copilot",
+    ]
+    assert gateway.fetched == [
+        BASE,
+        oldest["head"]["sha"],
+        BASE,
+        newest["head"]["sha"],
+    ]
+
+    limited_gateway = DiscoveryGateway([newest, oldest])
+    limited = discover_trusted_handoff_requests(
+        TrustedHandoffContext(
+            "schedule",
+            "octo-org/optimizer",
+            123,
+            "trunk",
+        ),
+        Path("repository"),
+        limited_gateway,
+        limit=1,
+    )
+    assert [request.pull_request_number for request in limited] == [91]
+
+
+def test_dispatch_retry_still_requires_exact_single_handoff_file() -> None:
+    pull_request = _live_copilot_pull_request(
+        90,
+        created_at="2026-08-05T20:54:42Z",
+    )
+    gateway = DiscoveryGateway([pull_request])
+    gateway.files[90].append(
+        {
+            "filename": "agent/instructions.md",
+            "sha": "e" * 40,
+            "status": "modified",
+        }
+    )
+
+    with pytest.raises(HandoffEventError, match="exactly one"):
+        discover_trusted_handoff_requests(
+            TrustedHandoffContext(
+                "workflow_dispatch",
+                "octo-org/optimizer",
+                123,
+                "trunk",
+            ),
+            Path("repository"),
+            gateway,
+            requested_pull_request=90,
+        )
 
 
 def test_trusted_event_accepts_only_current_exact_copilot_handoff() -> None:
@@ -107,7 +330,29 @@ def test_trusted_event_accepts_only_current_exact_copilot_handoff() -> None:
     assert request.head_revision == HEAD
     assert request.handoff_path == PATH
     assert request.handoff_blob == BLOB
-    assert gateway.fetched == [HEAD]
+    assert gateway.fetched == [BASE, HEAD]
+
+
+def test_trusted_event_rejects_non_copilot_sender() -> None:
+    payload = _payload()
+    payload["sender"] = {
+        "id": 1,
+        "login": "collaborator",
+        "type": "User",
+    }
+
+    with pytest.raises(HandoffEventError, match="sender"):
+        trusted_handoff_request_from_payload(
+            payload,
+            TrustedHandoffContext(
+                "pull_request_target",
+                "octo-org/optimizer",
+                123,
+                "trunk",
+            ),
+            Path("repository"),
+            Gateway(),
+        )
 
 
 def test_trusted_event_retry_accepts_already_closed_internal_pr() -> None:
@@ -157,11 +402,11 @@ class Commands:
     def __init__(self) -> None:
         self.responses = [
             json.dumps(_pull_request()),
-            json.dumps([[{
+            json.dumps([{
                 "filename": PATH,
                 "sha": BLOB,
                 "status": "added",
-            }]]),
+            }]),
             "",
             HEAD,
             "",
@@ -202,7 +447,7 @@ def test_github_handoff_gateway_never_checks_out_or_executes_pr_content() -> Non
 
     assert gateway.get_pull_request(90)["number"] == 90
     assert gateway.get_pull_request_files(90)[0]["filename"] == PATH
-    assert gateway.fetch_head(HEAD) == HEAD
+    assert gateway.fetch_revision(HEAD) == HEAD
     gateway.close_internal_pull_request(
         90,
         handoff_id="d" * 64,
@@ -226,6 +471,12 @@ def test_github_handoff_gateway_never_checks_out_or_executes_pr_content() -> Non
         "origin",
         HEAD,
     ) in arguments
+    assert (
+        "gh",
+        "api",
+        "repos/octo-org/optimizer/pulls/90/files?per_page=2",
+    ) in arguments
+    assert all("--paginate" not in call for call in arguments)
     assert all("checkout" not in call for call in arguments)
     assert all(call["environment"] is None for call in commands.calls)
     close_call = commands.calls[4]
@@ -236,10 +487,112 @@ def test_github_handoff_gateway_never_checks_out_or_executes_pr_content() -> Non
     assert (
         "git",
         "push",
+        f"--force-with-lease=refs/heads/copilot/steward-issue-31:{HEAD}",
         "origin",
-        "--delete",
-        "copilot/steward-issue-31",
+        ":refs/heads/copilot/steward-issue-31",
     ) in arguments
+
+
+class DiscoveryCommands:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = [
+            json.dumps(response)
+            for response in responses
+        ]
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(
+        self,
+        arguments,
+        *,
+        cwd=None,
+        environment=None,
+        input_text=None,
+        input_bytes=None,
+    ) -> CommandResult:
+        self.calls.append(tuple(arguments))
+        return CommandResult(0, self.responses.pop(0), "")
+
+
+def test_github_discovery_paginates_explicitly_and_fails_on_bound() -> None:
+    item = _live_copilot_pull_request(
+        90,
+        created_at="2026-08-05T20:54:42Z",
+    )
+    commands = DiscoveryCommands([[item] * 100, [item]])
+    gateway = GhHandoffPullRequestGateway(
+        commands,
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert len(gateway.list_open_pull_requests()) == 101
+    assert all("--paginate" not in call for call in commands.calls)
+    assert commands.calls == [
+        (
+            "gh",
+            "api",
+            "repos/octo-org/optimizer/pulls"
+            "?state=open&sort=created&direction=asc&per_page=100&page=1",
+        ),
+        (
+            "gh",
+            "api",
+            "repos/octo-org/optimizer/pulls"
+            "?state=open&sort=created&direction=asc&per_page=100&page=2",
+        ),
+    ]
+
+    bounded = GhHandoffPullRequestGateway(
+        DiscoveryCommands([[item] * 100, [item] * 100]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+    with pytest.raises(HandoffEventError, match="bounded"):
+        bounded.list_open_pull_requests()
+
+
+def test_github_discovery_binds_head_to_exact_copilot_push_event() -> None:
+    event = {
+        "actor": {"id": 198982749, "login": "Copilot"},
+        "payload": {
+            "head": HEAD,
+            "ref": "refs/heads/copilot/steward-issue-31",
+            "repository_id": 123,
+        },
+        "type": "PushEvent",
+    }
+    commands = DiscoveryCommands([[event]])
+    gateway = GhHandoffPullRequestGateway(
+        commands,
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_was_pushed_by_copilot(
+        "copilot/steward-issue-31",
+        HEAD,
+        123,
+    ) is True
+    assert commands.calls == [
+        (
+            "gh",
+            "api",
+            "repos/octo-org/optimizer/events?per_page=100&page=1",
+        )
+    ]
+
+    bounded = GhHandoffPullRequestGateway(
+        DiscoveryCommands([[{}] * 100, [{}] * 100, [{}] * 100]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+    with pytest.raises(HandoffEventError, match="event discovery"):
+        bounded.head_was_pushed_by_copilot(
+            "copilot/steward-issue-31",
+            HEAD,
+            123,
+        )
 
 
 @pytest.mark.parametrize(
@@ -422,6 +775,59 @@ def test_handoff_finalizer_applies_effects_closes_and_reassigns() -> None:
     assert gateway.deleted == [
         ("copilot/steward-issue-31", HEAD)
     ]
+
+
+def test_handoff_finalizer_does_not_close_an_advanced_branch() -> None:
+    class FinalizeGateway:
+        def __init__(self) -> None:
+            self.closed: list[int] = []
+
+        def close_internal_pull_request(self, number, **kwargs):
+            self.closed.append(number)
+
+        def delete_branch_if_head(self, branch, revision):
+            return False
+
+    class Assignments:
+        def release(self, issue_number):
+            pass
+
+        def assign(self, issue_number, idempotency_key):
+            return True
+
+    gateway = FinalizeGateway()
+    finalizer = HandoffFinalizer(
+        gateway=gateway,
+        assignments=Assignments(),
+        effects=type(
+            "Effects",
+            (),
+            {"reconcile": lambda self, issue_number: None},
+        )(),
+        should_reassign=lambda issue_number: False,
+    )
+    request = type(
+        "Request",
+        (),
+        {
+            "pull_request_number": 90,
+            "head_ref": "copilot/steward-issue-31",
+            "head_revision": HEAD,
+        },
+    )()
+
+    with pytest.raises(HandoffError, match="advanced"):
+        finalizer.finalize(
+            request,
+            HandoffApplyResult(
+                HandoffApplyStatus.APPLIED,
+                handoff_id="d" * 64,
+                issue_number=31,
+                kind="steward_state",
+            ),
+        )
+
+    assert gateway.closed == []
 
 
 def test_trusted_event_rejects_fork_and_stale_head() -> None:

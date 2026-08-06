@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import StrEnum
 import hashlib
 from importlib import metadata
@@ -13,6 +14,7 @@ from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from foundry_opt import __version__
+from foundry_opt.adapters.commands import CommandExitError
 from foundry_opt.orchestration.git_state import (
     GitStateRef,
     StateRefConflictError,
@@ -49,6 +51,11 @@ _REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
 )
+_COPILOT_APP_USER_ID = 198982749
+_DISCOVERY_PAGE_SIZE = 100
+_DISCOVERY_MAX_PAGES = 2
+_DISCOVERY_LIMIT = 10
+_PUSH_EVENT_MAX_PAGES = 3
 _HANDOFF_COMMIT_ENVIRONMENT = {
     "GIT_AUTHOR_NAME": "Foundry Optimizer Handoff",
     "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
@@ -733,7 +740,7 @@ class TrustedHandoffRequest:
             or self.pull_request_number < 1
         ):
             raise ValueError("handoff pull request identity is invalid")
-        if self.author_login != "copilot-swe-agent[bot]":
+        if self.author_login not in {"Copilot", "copilot-swe-agent[bot]"}:
             raise ValueError("handoff pull request author is invalid")
         if not _safe_ref_name(self.base_ref):
             raise ValueError("handoff base branch is invalid")
@@ -759,7 +766,11 @@ class TrustedHandoffContext:
     default_branch: str
 
     def __post_init__(self) -> None:
-        if self.event_name != "pull_request_target":
+        if self.event_name not in {
+            "pull_request_target",
+            "schedule",
+            "workflow_dispatch",
+        }:
             raise HandoffEventError("handoff event name is invalid")
         if _REPOSITORY.fullmatch(self.repository) is None:
             raise HandoffEventError("handoff repository is invalid")
@@ -770,6 +781,8 @@ class TrustedHandoffContext:
 
 
 class HandoffPullRequestGateway(Protocol):
+    def list_open_pull_requests(self) -> list[Mapping[str, Any]]: ...
+
     def get_pull_request(self, number: int) -> Mapping[str, Any]: ...
 
     def get_pull_request_files(
@@ -777,7 +790,14 @@ class HandoffPullRequestGateway(Protocol):
         number: int,
     ) -> list[Mapping[str, Any]]: ...
 
-    def fetch_head(self, revision: str) -> str: ...
+    def fetch_revision(self, revision: str) -> str: ...
+
+    def head_was_pushed_by_copilot(
+        self,
+        branch: str,
+        revision: str,
+        repository_id: int,
+    ) -> bool: ...
 
 
 class GhHandoffPullRequestGateway:
@@ -792,6 +812,35 @@ class GhHandoffPullRequestGateway:
         self._commands = commands
         self._root = repository_root
         self._repository = repository
+
+    def list_open_pull_requests(self) -> list[Mapping[str, Any]]:
+        result: list[Mapping[str, Any]] = []
+        for page in range(1, _DISCOVERY_MAX_PAGES + 1):
+            value = self._json(
+                (
+                    "gh",
+                    "api",
+                    (
+                        f"repos/{self._repository}/pulls"
+                        "?state=open&sort=created&direction=asc"
+                        f"&per_page={_DISCOVERY_PAGE_SIZE}&page={page}"
+                    ),
+                )
+            )
+            if (
+                not isinstance(value, list)
+                or len(value) > _DISCOVERY_PAGE_SIZE
+                or any(not isinstance(item, Mapping) for item in value)
+            ):
+                raise HandoffEventError(
+                    "GitHub pull request discovery response is invalid"
+                )
+            result.extend(value)
+            if len(value) < _DISCOVERY_PAGE_SIZE:
+                return result
+        raise HandoffEventError(
+            "GitHub pull request discovery exceeded its bounded pagination"
+        )
 
     def get_pull_request(self, number: int) -> Mapping[str, Any]:
         _positive_number(number, "pull request number")
@@ -815,32 +864,25 @@ class GhHandoffPullRequestGateway:
             (
                 "gh",
                 "api",
-                "--paginate",
-                "--slurp",
                 (
                     f"repos/{self._repository}/pulls/{number}/files"
-                    "?per_page=100"
+                    "?per_page=2"
                 ),
             )
         )
         if not isinstance(value, list):
             raise HandoffEventError("GitHub pull request files are invalid")
         result: list[Mapping[str, Any]] = []
-        for page in value:
-            if not isinstance(page, list):
+        for item in value:
+            if not isinstance(item, Mapping):
                 raise HandoffEventError(
                     "GitHub pull request files are invalid"
                 )
-            for item in page:
-                if not isinstance(item, Mapping):
-                    raise HandoffEventError(
-                        "GitHub pull request files are invalid"
-                    )
-                result.append(item)
+            result.append(item)
         return result
 
-    def fetch_head(self, revision: str) -> str:
-        _require_commit(revision, "handoff head revision")
+    def fetch_revision(self, revision: str) -> str:
+        _require_commit(revision, "handoff revision")
         self._commands.run(
             (
                 "git",
@@ -858,6 +900,58 @@ class GhHandoffPullRequestGateway:
         ).stdout.strip()
         _require_commit(fetched, "fetched handoff revision")
         return fetched
+
+    def head_was_pushed_by_copilot(
+        self,
+        branch: str,
+        revision: str,
+        repository_id: int,
+    ) -> bool:
+        if _BRANCH.fullmatch(branch) is None:
+            raise ValueError("handoff branch is invalid")
+        _require_commit(revision, "handoff head revision")
+        _positive_number(repository_id, "handoff repository ID")
+        ref = f"refs/heads/{branch}"
+        for page in range(1, _PUSH_EVENT_MAX_PAGES + 1):
+            value = self._json(
+                (
+                    "gh",
+                    "api",
+                    (
+                        f"repos/{self._repository}/events"
+                        f"?per_page={_DISCOVERY_PAGE_SIZE}&page={page}"
+                    ),
+                )
+            )
+            if (
+                not isinstance(value, list)
+                or len(value) > _DISCOVERY_PAGE_SIZE
+                or any(not isinstance(item, Mapping) for item in value)
+            ):
+                raise HandoffEventError(
+                    "GitHub repository events response is invalid"
+                )
+            for item in value:
+                payload = item.get("payload")
+                if (
+                    item.get("type") != "PushEvent"
+                    or not isinstance(payload, Mapping)
+                    or payload.get("head") != revision
+                    or payload.get("ref") != ref
+                    or payload.get("repository_id") != repository_id
+                ):
+                    continue
+                actor = item.get("actor")
+                return (
+                    isinstance(actor, Mapping)
+                    and actor.get("id") == _COPILOT_APP_USER_ID
+                    and actor.get("login") == "Copilot"
+                )
+            if len(value) < _DISCOVERY_PAGE_SIZE:
+                return False
+        raise HandoffEventError(
+            "GitHub repository event discovery exceeded its bound"
+        )
 
     def close_internal_pull_request(
         self,
@@ -915,10 +1009,22 @@ class GhHandoffPullRequestGateway:
             )
         if fields[0] != revision:
             return False
-        self._commands.run(
-            ("git", "push", "origin", "--delete", branch),
-            cwd=self._root,
-        )
+        try:
+            self._commands.run(
+                (
+                    "git",
+                    "push",
+                    f"--force-with-lease={ref}:{revision}",
+                    "origin",
+                    f":{ref}",
+                ),
+                cwd=self._root,
+            )
+        except CommandExitError:
+            return not self._commands.run(
+                ("git", "ls-remote", "--heads", "origin", ref),
+                cwd=self._root,
+            ).stdout.strip()
         return not self._commands.run(
             ("git", "ls-remote", "--heads", "origin", ref),
             cwd=self._root,
@@ -967,8 +1073,16 @@ def trusted_handoff_request_from_payload(
     repository_root: Path,
     gateway: HandoffPullRequestGateway,
 ) -> TrustedHandoffRequest:
+    if context.event_name != "pull_request_target":
+        raise HandoffEventError("handoff event mode is invalid")
     if payload.get("action") not in {"opened", "synchronize", "reopened"}:
         raise HandoffEventError("handoff event action is invalid")
+    sender = payload.get("sender")
+    if (
+        not isinstance(sender, Mapping)
+        or _copilot_author_login(sender) is None
+    ):
+        raise HandoffEventError("handoff event sender is invalid")
     repository = payload.get("repository")
     event_pull_request = payload.get("pull_request")
     if (
@@ -1004,7 +1118,109 @@ def trusted_handoff_request_from_payload(
         raise HandoffEventError(
             "handoff pull request head is not current"
         )
-    files = gateway.get_pull_request_files(event_identity["number"])
+    return _trusted_handoff_request_from_live(
+        live,
+        context,
+        repository_root,
+        gateway,
+        require_open=False,
+    )
+
+
+def discover_trusted_handoff_requests(
+    context: TrustedHandoffContext,
+    repository_root: Path,
+    gateway: HandoffPullRequestGateway,
+    *,
+    requested_pull_request: int | None = None,
+    limit: int = _DISCOVERY_LIMIT,
+) -> tuple[TrustedHandoffRequest, ...]:
+    if context.event_name not in {"schedule", "workflow_dispatch"}:
+        raise HandoffEventError("handoff discovery event mode is invalid")
+    if type(limit) is not int or limit < 1 or limit > _DISCOVERY_LIMIT:
+        raise HandoffEventError("handoff discovery limit is invalid")
+    if requested_pull_request is not None:
+        if context.event_name != "workflow_dispatch":
+            raise HandoffEventError(
+                "handoff retry is only valid for workflow dispatch"
+            )
+        _positive_number(
+            requested_pull_request,
+            "requested pull request number",
+        )
+        return (
+            _trusted_handoff_request_from_live(
+                gateway.get_pull_request(requested_pull_request),
+                context,
+                repository_root,
+                gateway,
+                require_open=True,
+            ),
+        )
+
+    candidates: dict[int, tuple[datetime, Mapping[str, Any]]] = {}
+    for pull_request in gateway.list_open_pull_requests():
+        try:
+            identity = _pull_request_identity(
+                pull_request,
+                context,
+                allow_open_summary=True,
+            )
+            created_at = _pull_request_created_at(pull_request)
+        except HandoffEventError:
+            continue
+        if pull_request.get("state") != "open":
+            continue
+        number = identity["number"]
+        current = candidates.get(number)
+        if current is None or created_at < current[0]:
+            candidates[number] = (created_at, pull_request)
+
+    requests: list[TrustedHandoffRequest] = []
+    for _, pull_request in sorted(
+        candidates.values(),
+        key=lambda item: (item[0], item[1]["number"]),
+    ):
+        number = pull_request["number"]
+        try:
+            request = _trusted_handoff_request_from_live(
+                gateway.get_pull_request(number),
+                context,
+                repository_root,
+                gateway,
+                require_open=True,
+            )
+        except HandoffEventError:
+            continue
+        requests.append(request)
+        if len(requests) == limit:
+            break
+    return tuple(requests)
+
+
+def _trusted_handoff_request_from_live(
+    live: Mapping[str, Any],
+    context: TrustedHandoffContext,
+    repository_root: Path,
+    gateway: HandoffPullRequestGateway,
+    *,
+    require_open: bool,
+) -> TrustedHandoffRequest:
+    live_identity = _pull_request_identity(live, context)
+    if require_open and live.get("state") != "open":
+        raise HandoffEventError("handoff pull request is not open")
+    if (
+        context.event_name != "pull_request_target"
+        and not gateway.head_was_pushed_by_copilot(
+            live_identity["head_ref"],
+            live_identity["head_revision"],
+            context.repository_id,
+        )
+    ):
+        raise HandoffEventError(
+            "handoff head was not pushed by the Copilot App"
+        )
+    files = gateway.get_pull_request_files(live_identity["number"])
     if len(files) != 1:
         raise HandoffEventError(
             "handoff pull request must change exactly one file"
@@ -1029,21 +1245,24 @@ def trusted_handoff_request_from_payload(
         or file.get("previous_filename") is not None
     ):
         raise HandoffEventError("handoff pull request file is invalid")
-    fetched = gateway.fetch_head(event_identity["head_revision"])
-    if fetched != event_identity["head_revision"]:
+    fetched_base = gateway.fetch_revision(live_identity["base_revision"])
+    if fetched_base != live_identity["base_revision"]:
+        raise HandoffEventError("handoff pull request fetch is not exact")
+    fetched_head = gateway.fetch_revision(live_identity["head_revision"])
+    if fetched_head != live_identity["head_revision"]:
         raise HandoffEventError("handoff pull request fetch is not exact")
     return TrustedHandoffRequest(
         repository_root=repository_root,
         repository=context.repository,
         repository_id=context.repository_id,
-        pull_request_number=event_identity["number"],
-        author_login=event_identity["author_login"],
-        base_repository=event_identity["base_repository"],
-        base_ref=event_identity["base_ref"],
-        base_revision=event_identity["base_revision"],
-        head_repository=event_identity["head_repository"],
-        head_ref=event_identity["head_ref"],
-        head_revision=event_identity["head_revision"],
+        pull_request_number=live_identity["number"],
+        author_login=live_identity["author_login"],
+        base_repository=live_identity["base_repository"],
+        base_ref=live_identity["base_ref"],
+        base_revision=live_identity["base_revision"],
+        head_repository=live_identity["head_repository"],
+        head_ref=live_identity["head_ref"],
+        head_revision=live_identity["head_revision"],
         handoff_path=path,
         handoff_blob=blob,
     )
@@ -1104,14 +1323,17 @@ class HandoffFinalizer:
                 result.issue_number,
                 f"handoff-{result.handoff_id}",
             )
+        if not self._gateway.delete_branch_if_head(
+            request.head_ref,
+            request.head_revision,
+        ):
+            raise HandoffError(
+                "handoff branch advanced before finalization"
+            )
         self._gateway.close_internal_pull_request(
             request.pull_request_number,
             handoff_id=result.handoff_id,
             kind=result.kind,
-        )
-        self._gateway.delete_branch_if_head(
-            request.head_ref,
-            request.head_revision,
         )
 
 
@@ -1368,16 +1590,20 @@ class HandoffApplyService:
         if len(parents) != 3:
             raise HandoffError("handoff commit parents are invalid")
         session_parent, proposed_revision = parents[1:]
-        if _run(
+        base_revisions = _git_text(
             root,
-            "git",
             "merge-base",
-            "--is-ancestor",
+            "--all",
             request.base_revision,
             session_parent,
-            check=False,
-        ).returncode != 0:
+        ).splitlines()
+        if len(base_revisions) != 1:
             raise HandoffError("handoff session parent is not based on base")
+        effective_base_revision = base_revisions[0]
+        _require_commit(
+            effective_base_revision,
+            "handoff effective base revision",
+        )
         first_parent_paths = tuple(
             line
             for line in _git_text(
@@ -1395,7 +1621,7 @@ class HandoffApplyService:
                 root,
                 "diff",
                 "--name-only",
-                request.base_revision,
+                effective_base_revision,
                 request.head_revision,
             ).splitlines()
             if line
@@ -1476,7 +1702,8 @@ class HandoffApplyService:
         version, product_commit = _product_identity()
         if (
             handoff.product_version != version
-            or handoff.product_commit != product_commit
+            or handoff.product_commit
+            not in _trusted_handoff_product_commits(product_commit)
         ):
             raise HandoffError("handoff product identity is invalid")
         if isinstance(handoff, CandidateDesignHandoff):
@@ -2218,6 +2445,24 @@ def _product_identity() -> tuple[str, str]:
     return __version__, commit
 
 
+def _trusted_handoff_product_commits(
+    installed_commit: str,
+) -> frozenset[str]:
+    _require_commit(installed_commit, "installed product commit")
+    raw = os.environ.get("TRUSTED_HANDOFF_PRODUCT_COMMITS", "")
+    if not raw:
+        return frozenset((installed_commit,))
+    values = raw.split(",")
+    if (
+        len(values) > 8
+        or any(_COMMIT.fullmatch(value) is None for value in values)
+    ):
+        raise HandoffError(
+            "trusted handoff product commit allowlist is invalid"
+        )
+    return frozenset((installed_commit, *values))
+
+
 def _remote_revision(
     root: Path,
     remote: str,
@@ -2374,13 +2619,23 @@ def _candidate_result_from_document(value: Any) -> CandidateDesignResult:
 def _pull_request_identity(
     pull_request: Mapping[str, Any],
     context: TrustedHandoffContext,
+    *,
+    allow_open_summary: bool = False,
 ) -> dict[str, Any]:
     user = pull_request.get("user")
     base = pull_request.get("base")
     head = pull_request.get("head")
+    state = pull_request.get("state")
+    merged = pull_request.get("merged")
+    summary_is_unmerged = (
+        allow_open_summary
+        and state == "open"
+        and merged is None
+        and pull_request.get("merged_at") is None
+    )
     if (
-        pull_request.get("state") not in {"open", "closed"}
-        or pull_request.get("merged") is not False
+        state not in {"open", "closed"}
+        or (merged is not False and not summary_is_unmerged)
         or not isinstance(user, Mapping)
         or not isinstance(base, Mapping)
         or not isinstance(head, Mapping)
@@ -2389,7 +2644,7 @@ def _pull_request_identity(
     ):
         raise HandoffEventError("handoff pull request identity is invalid")
     number = pull_request.get("number")
-    author = user.get("login")
+    author = _copilot_author_login(user)
     base_repository = base["repo"].get("full_name")
     head_repository = head["repo"].get("full_name")
     base_ref = base.get("ref")
@@ -2399,7 +2654,7 @@ def _pull_request_identity(
     if (
         type(number) is not int
         or number < 1
-        or author != "copilot-swe-agent[bot]"
+        or author is None
         or base_repository != context.repository
         or head_repository != context.repository
         or base_ref != context.default_branch
@@ -2421,6 +2676,46 @@ def _pull_request_identity(
         "head_revision": head_revision,
         "number": number,
     }
+
+
+def _copilot_author_login(user: Mapping[str, Any]) -> str | None:
+    login = user.get("login")
+    if login == "copilot-swe-agent[bot]":
+        if user.get("type") not in {None, "Bot"}:
+            return None
+        return login
+    if (
+        login == "Copilot"
+        and user.get("id") == _COPILOT_APP_USER_ID
+        and user.get("type") == "Bot"
+        and user.get("html_url")
+        == "https://github.com/apps/copilot-swe-agent"
+    ):
+        return login
+    return None
+
+
+def _pull_request_created_at(
+    pull_request: Mapping[str, Any],
+) -> datetime:
+    value = pull_request.get("created_at")
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise HandoffEventError(
+            "handoff pull request creation time is invalid"
+        )
+    try:
+        created_at = datetime.fromisoformat(
+            value.removesuffix("Z") + "+00:00"
+        )
+    except ValueError as error:
+        raise HandoffEventError(
+            "handoff pull request creation time is invalid"
+        ) from error
+    if created_at.utcoffset() is None:
+        raise HandoffEventError(
+            "handoff pull request creation time is invalid"
+        )
+    return created_at
 
 
 def _validate_candidate_handoff_privacy(
@@ -2660,17 +2955,24 @@ def main() -> None:
         root,
         repository,
     )
-    request = trusted_handoff_request_from_payload(
-        payload,
-        context,
-        root,
-        gateway,
-    )
-    result = HandoffApplyService().apply(request)
-    if result.handoff_id is None:
-        result = replace(
-            result,
-            **_handoff_identity_from_path(request.handoff_path),
+    if event_name == "pull_request_target":
+        requests = (
+            trusted_handoff_request_from_payload(
+                payload,
+                context,
+                root,
+                gateway,
+            ),
+        )
+    else:
+        _validate_trusted_event_repository(payload, context)
+        requests = discover_trusted_handoff_requests(
+            context,
+            root,
+            gateway,
+            requested_pull_request=_optional_positive_environment(
+                "TRUSTED_PULL_REQUEST_NUMBER"
+            ),
         )
     inbox = GitIssueEventInbox(root)
     ledger = GitStateRef()
@@ -2681,7 +2983,7 @@ def main() -> None:
         assignment_token=assignment_token,
     )
     recovery = GitStateCampaignRecovery(root, inbox, ledger)
-    HandoffFinalizer(
+    finalizer = HandoffFinalizer(
         gateway=gateway,
         assignments=assignments,
         effects=_ProductionHandoffEffects(
@@ -2691,20 +2993,33 @@ def main() -> None:
             assignment_token,
         ),
         should_reassign=recovery.should_recover,
-    ).finalize(request, result)
-    print(
-        json.dumps(
-            {
-                "code": result.code,
-                "handoff_id": result.handoff_id,
-                "issue_number": result.issue_number,
-                "kind": result.kind,
-                "status": result.status.value,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        )
     )
+    if not requests:
+        print('{"processed":0}')
+        return
+    service = HandoffApplyService(ledger=ledger)
+    for request in requests:
+        result = service.apply(request)
+        if result.handoff_id is None:
+            result = replace(
+                result,
+                **_handoff_identity_from_path(request.handoff_path),
+            )
+        finalizer.finalize(request, result)
+        print(
+            json.dumps(
+                {
+                    "code": result.code,
+                    "handoff_id": result.handoff_id,
+                    "issue_number": result.issue_number,
+                    "kind": result.kind,
+                    "pull_request_number": request.pull_request_number,
+                    "status": result.status.value,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
 
 
 def _handoff_identity_from_path(path: str) -> dict[str, object]:
@@ -2733,6 +3048,33 @@ def _required_environment(name: str) -> str:
             f"required trusted environment is unavailable: {name}"
         )
     return value
+
+
+def _optional_positive_environment(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value in {None, ""}:
+        return None
+    if not value.isdecimal() or int(value) < 1:
+        raise HandoffEventError(
+            f"trusted positive integer is invalid: {name}"
+        )
+    return int(value)
+
+
+def _validate_trusted_event_repository(
+    payload: Mapping[str, Any],
+    context: TrustedHandoffContext,
+) -> None:
+    repository = payload.get("repository")
+    if (
+        not isinstance(repository, Mapping)
+        or repository.get("full_name") != context.repository
+        or repository.get("id") != context.repository_id
+        or repository.get("default_branch") != context.default_branch
+    ):
+        raise HandoffEventError(
+            "handoff event repository identity is invalid"
+        )
 
 
 if __name__ == "__main__":

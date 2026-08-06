@@ -199,6 +199,10 @@ def test_skill_keeps_actions_as_verifying_transport_not_decision_owner() -> None
     assert "cannot choose a different transition" in skill
     assert "internal handoff pull requests" in skill
     assert "auto-closed" in skill
+    assert "Discovery binds the exact head SHA and ref" in skill
+    assert "selects transport envelopes only" in skill
+    assert "canonical replay still validates the steward's exact" in skill
+    assert "`action_required` run does not block fallback" in skill
 
 
 def test_issue_form_matches_strict_parser_and_configured_target() -> None:
@@ -346,9 +350,23 @@ def test_bundle_generates_transport_and_verification_workflows() -> None:
     handoff = yaml.safe_load(
         files[Path(".github/workflows/foundry-optimization-handoff.yml")]
     )
-    assert handoff[True]["pull_request_target"] == {
-        "types": ["opened", "synchronize", "reopened"],
-        "paths": [".foundry-optimizer/handoffs/**"],
+    assert handoff[True] == {
+        "pull_request_target": {
+            "types": ["opened", "synchronize", "reopened"],
+            "paths": [".foundry-optimizer/handoffs/**"],
+        },
+        "schedule": [{"cron": "*/5 * * * *"}],
+        "workflow_dispatch": {
+            "inputs": {
+                "pull_request": {
+                    "description": (
+                        "Optional internal handoff pull request number to retry"
+                    ),
+                    "required": False,
+                    "type": "number",
+                }
+            }
+        },
     }
 
 
@@ -602,7 +620,19 @@ def test_bundle_generates_base_context_handoff_transport_workflow() -> None:
         "pull_request_target": {
             "types": ["opened", "synchronize", "reopened"],
             "paths": [".foundry-optimizer/handoffs/**"],
-        }
+        },
+        "schedule": [{"cron": "*/5 * * * *"}],
+        "workflow_dispatch": {
+            "inputs": {
+                "pull_request": {
+                    "description": (
+                        "Optional internal handoff pull request number to retry"
+                    ),
+                    "required": False,
+                    "type": "number",
+                }
+            }
+        },
     }
     assert workflow["permissions"] == {
         "contents": "write",
@@ -611,19 +641,25 @@ def test_bundle_generates_base_context_handoff_transport_workflow() -> None:
     }
     job = workflow["jobs"]["apply-handoff"]
     assert "environment" not in job
+    assert workflow["concurrency"] == {
+        "group": "foundry-internal-handoff",
+        "cancel-in-progress": False,
+    }
     checkout = next(
         step
         for step in job["steps"]
         if step.get("uses", "").startswith("actions/checkout@")
     )
     assert checkout["with"]["ref"] == (
-        "${{ github.event.pull_request.base.sha }}"
+        "${{ github.event.repository.default_branch }}"
     )
     assert checkout["with"]["fetch-depth"] == 0
+    assert checkout["with"]["persist-credentials"] is False
     assert "github.event.pull_request.head.sha" not in str(checkout)
     assert "python -m foundry_opt.orchestration.handoff" in text
     assert "TRUSTED_EVENT_PATH: ${{ github.event_path }}" in text
     assert "TRUSTED_EVENT_NAME: ${{ github.event_name }}" in text
+    assert "TRUSTED_PULL_REQUEST_NUMBER: ${{ inputs.pull_request }}" in text
     assert "TRUSTED_REPOSITORY: ${{ github.repository }}" in text
     assert "TRUSTED_REPOSITORY_ID: ${{ github.repository_id }}" in text
     assert "TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}" in (
@@ -632,6 +668,13 @@ def test_bundle_generates_base_context_handoff_transport_workflow() -> None:
     assert "COPILOT_ASSIGNMENT_TOKEN" in text
     assert "pull_request.head.ref }}" not in text
     assert "pull_request.head.sha }}" not in text
+    assert "github.event.pull_request.base.ref ==" in text
+    assert "github.event.sender.id == 198982749" in text
+    assert "github.event.pull_request.user.id == 198982749" in text
+    assert "github.event.pull_request.user.login == 'Copilot'" in text
+    assert "TRUSTED_HANDOFF_PRODUCT_COMMITS:" in text
+    assert "gh auth setup-git" in text
+    assert "uv run --no-project --no-config --no-env-file" in text
     assert "source " not in text
     assert "id-token" not in workflow["permissions"]
     assert "actions" not in workflow["permissions"]

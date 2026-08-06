@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+import foundry_opt.orchestration.handoff as handoff_module
 from foundry_opt.adapters.commands import SubprocessCommandRunner
 from foundry_opt.orchestration import (
     AdvanceRequest,
@@ -30,8 +31,11 @@ from foundry_opt.orchestration.handoff import (
     CloudHandoffStore,
     HandoffApplyService,
     HandoffApplyStatus,
+    HandoffFinalizer,
     StewardStateHandoff,
+    TrustedHandoffContext,
     TrustedHandoffRequest,
+    discover_trusted_handoff_requests,
 )
 from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 from foundry_opt.orchestration.git_state import (
@@ -1291,23 +1295,108 @@ def test_trusted_transport_cas_applies_handoff_once(
         NOW + timedelta(minutes=1),
     )
     assert GitIssueEventInbox(repository).append(31, edited) is True
+    _git(repository, "checkout", "main")
+    (repository / "rollout.txt").write_text(
+        "transport-only rollout\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "rollout.txt")
+    _git(repository, "commit", "-m", "roll out fallback transport")
+    rolled_out_base = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "push", "origin", "main")
     proxy.disable()
     (origin / "hooks" / "post-receive").unlink()
     _set_normal_github_actions_environment(monkeypatch)
-    request = TrustedHandoffRequest(
-        repository_root=repository,
-        repository="octo-org/optimizer",
-        repository_id=123,
-        pull_request_number=90,
-        author_login="copilot-swe-agent[bot]",
-        base_repository="octo-org/optimizer",
-        base_ref="main",
-        base_revision=base,
-        head_repository="octo-org/optimizer",
-        head_ref="copilot/steward-issue-31",
-        head_revision=head,
-        handoff_path=path,
-        handoff_blob=blob,
+    current_product_commit = "f" * 40
+    monkeypatch.setattr(
+        handoff_module,
+        "_product_identity",
+        lambda: (handoff.product_version, current_product_commit),
+    )
+    monkeypatch.setenv(
+        "TRUSTED_HANDOFF_PRODUCT_COMMITS",
+        handoff.product_commit,
+    )
+
+    class OpenPullRequestGateway:
+        def __init__(self) -> None:
+            self.closed: list[int] = []
+            self.deleted: list[tuple[str, str]] = []
+
+        def list_open_pull_requests(self):
+            return [self.get_pull_request(90), self.get_pull_request(90)]
+
+        def get_pull_request(self, number):
+            assert number == 90
+            return {
+                "base": {
+                    "ref": "main",
+                    "repo": {"full_name": "octo-org/optimizer"},
+                    "sha": rolled_out_base,
+                },
+                "created_at": "2026-08-05T20:54:42Z",
+                "draft": True,
+                "head": {
+                    "ref": "copilot/steward-issue-31",
+                    "repo": {"full_name": "octo-org/optimizer"},
+                    "sha": head,
+                },
+                "merged": False,
+                "number": 90,
+                "state": "open",
+                "statusCheckRollup": [{"conclusion": "action_required"}],
+                "user": {
+                    "html_url": (
+                        "https://github.com/apps/copilot-swe-agent"
+                    ),
+                    "id": 198982749,
+                    "login": "Copilot",
+                    "type": "Bot",
+                },
+            }
+
+        def get_pull_request_files(self, number):
+            assert number == 90
+            return [
+                {
+                    "filename": path,
+                    "sha": blob,
+                    "status": "added",
+                }
+            ]
+
+        def fetch_revision(self, revision):
+            assert revision in {rolled_out_base, head}
+            return revision
+
+        def head_was_pushed_by_copilot(
+            self,
+            branch,
+            revision,
+            repository_id,
+        ):
+            assert branch == "copilot/steward-issue-31"
+            assert revision == head
+            assert repository_id == 123
+            return True
+
+        def close_internal_pull_request(self, number, **kwargs):
+            self.closed.append(number)
+
+        def delete_branch_if_head(self, branch, revision):
+            self.deleted.append((branch, revision))
+            return True
+
+    gateway = OpenPullRequestGateway()
+    request, = discover_trusted_handoff_requests(
+        TrustedHandoffContext(
+            "schedule",
+            "octo-org/optimizer",
+            123,
+            "main",
+        ),
+        repository,
+        gateway,
     )
     service = HandoffApplyService()
 
@@ -1337,6 +1426,29 @@ def test_trusted_transport_cas_applies_handoff_once(
         ).split()[0]
         == handoff.proposed_revision
     )
+
+    class Assignments:
+        def release(self, issue_number):
+            assert issue_number == 31
+
+        def assign(self, issue_number, idempotency_key):
+            raise AssertionError("terminal state must not be reassigned")
+
+    class Effects:
+        def reconcile(self, issue_number):
+            assert issue_number == 31
+
+    HandoffFinalizer(
+        gateway=gateway,
+        assignments=Assignments(),
+        effects=Effects(),
+        should_reassign=lambda issue_number: False,
+    ).finalize(request, applied)
+
+    assert gateway.deleted == [
+        ("copilot/steward-issue-31", head)
+    ]
+    assert gateway.closed == [90]
 
 
 def test_competing_valid_state_handoff_fails_closed(

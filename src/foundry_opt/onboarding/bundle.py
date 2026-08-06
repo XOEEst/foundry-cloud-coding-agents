@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import yaml
 
@@ -483,6 +484,9 @@ jobs:
 
 def _handoff_workflow(request: OnboardingRequest) -> str:
     install = json.dumps(request.product_install)
+    trusted_product_commit = json.dumps(
+        _product_commit_from_install(request.product_install) or ""
+    )
     return f"""name: Foundry internal handoff transport
 
 on:
@@ -490,6 +494,14 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - .foundry-optimizer/handoffs/**
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Optional internal handoff pull request number to retry
+        required: false
+        type: number
 
 permissions:
   contents: write
@@ -497,18 +509,29 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: foundry-internal-handoff-${{{{ github.event.pull_request.number }}}}
+  group: foundry-internal-handoff
   cancel-in-progress: false
 
 jobs:
   apply-handoff:
     if: >-
+      github.event_name != 'pull_request_target' ||
+      (github.event.pull_request.base.ref ==
+      github.event.repository.default_branch &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login == 'copilot-swe-agent[bot]'
+      (github.event.pull_request.user.login == 'copilot-swe-agent[bot]' ||
+      (github.event.pull_request.user.login == 'Copilot' &&
+      github.event.pull_request.user.id == 198982749 &&
+      github.event.pull_request.user.type == 'Bot')) &&
+      (github.event.sender.login == 'copilot-swe-agent[bot]' ||
+      (github.event.sender.login == 'Copilot' &&
+      github.event.sender.id == 198982749 &&
+      github.event.sender.type == 'Bot')))
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{{{ github.token }}}}
       OPTIMIZER_PACKAGE: {install}
+      TRUSTED_HANDOFF_PRODUCT_COMMITS: {trusted_product_commit}
     steps:
       - name: Require Copilot assignment token
         env:
@@ -522,7 +545,10 @@ jobs:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{{{ github.event.pull_request.base.sha }}}}
+          persist-credentials: false
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - name: Configure trusted GitHub transport
+        run: gh auth setup-git
       - uses: {_SETUP_UV_ACTION} # v9.0.0
       - name: Validate and apply exact internal handoff
         env:
@@ -530,13 +556,20 @@ jobs:
           TRUSTED_DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_PULL_REQUEST_NUMBER: ${{{{ inputs.pull_request }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
         run: >-
-          uv run --no-project --with "$OPTIMIZER_PACKAGE"
+          uv run --no-project --no-config --no-env-file
+          --with "$OPTIMIZER_PACKAGE"
           python -m foundry_opt.orchestration.handoff
 """
+
+
+def _product_commit_from_install(install: str) -> str | None:
+    match = re.search(r"@([0-9a-f]{40})$", install)
+    return match.group(1) if match is not None else None
 
 
 def _reconciliation_workflow(request: OnboardingRequest) -> str:

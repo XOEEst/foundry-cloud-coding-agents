@@ -150,7 +150,8 @@ either `policy_approved` or `human_review`.
   project persisted effects, reconcile inactivity, and dispatch already
   authorized deployment intents. Actions may replay canonical interfaces to
   verify a proposed handoff exactly, but cannot choose another transition or
-  invent an effect.
+  invent an effect. Handoff discovery selects transport envelopes only; the
+  canonical replay path still validates the steward's exact decision.
 - The default-branch-generated Copilot setup workflow exports the static,
   non-secret `FOUNDRY_OPT_COPILOT_GIT_PROXY=1` marker; no pull-request input
   controls it. Proxy authority additionally requires `GITHUB_ACTIONS=true`, the
@@ -169,6 +170,18 @@ either `policy_approved` or `human_review`.
   that branch with compare-and-swap when needed. A
   base-context workflow reads only that exact object, CAS-publishes the private
   ref, applies persisted outbox effects, and auto-closes the internal handoff PR.
+  The `pull_request_target` event is the fast path. A default-branch five-minute
+  schedule and retry-only dispatch also discover a bounded, oldest-first set of
+  open same-repository Copilot handoff PRs. They do not depend on PR check
+  conclusions, so an `action_required` event run cannot block fallback.
+  Discovery re-fetches each live PR and exact head SHA, binds that SHA and ref
+  to a recent GitHub push event from the exact Copilot App, requires one
+  reserved JSON change, and never checks out or executes PR content. The job
+  always checks out the trusted default branch with persisted checkout
+  credentials disabled and ignores repository uv and dotenv configuration. A
+  base-controlled bounded product-commit allowlist permits already-open
+  envelopes to survive a transport-only rollout without weakening canonical
+  validation.
 - Private state/design transport and handoff publication bind to one captured
   URL through an isolated Git configuration. Ambiguous `pushurl`, URL-rewrite,
   pack-helper, or proxy settings fail closed and cannot redirect proposal

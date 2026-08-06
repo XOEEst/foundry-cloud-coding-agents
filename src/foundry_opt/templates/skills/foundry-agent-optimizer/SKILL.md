@@ -104,6 +104,15 @@ designer-result ref through the proxy. It commits one privacy-validated, content
 at the reserved handoff path on the native session branch instead. Those internal handoff pull requests
 are transport artifacts, never specification or candidate pull requests, and are
 auto-closed after handling. Generated `pull_request` workflows skip handoff-only changes.
+The `pull_request_target` event remains the fast path. A default-branch five-minute schedule and
+retry-only dispatch discover a bounded, oldest-first set of open same-repository Copilot handoff
+PRs without consulting check conclusions, so an `action_required` run does not block fallback.
+Discovery binds the exact head SHA and ref to a recent GitHub push event from the exact Copilot App
+and selects transport envelopes only; canonical replay still validates the steward's exact decision,
+commit markers, blob, hashes, and compare-and-swap precondition. The job checks out only the trusted
+default branch, disables persisted checkout credentials, and ignores repository uv and dotenv
+configuration. A base-controlled bounded product-commit allowlist lets an already-open envelope
+survive a transport-only rollout.
 Private state/design transport and handoff publication bind to one captured URL through an isolated
 Git configuration. Ambiguous `pushurl`, URL-rewrite, pack-helper, or proxy settings fail closed and
 cannot redirect proposal objects.
@@ -148,6 +157,8 @@ request; merging is the selection signal.
 - Never source pull-request-controlled scripts or interpolate untrusted event text into commands.
 - A handoff workflow may fetch and inspect only the exact validated head object; it never checks out
   or executes pull-request code and installs the optimizer only from the pinned base workflow.
+- Scheduled discovery re-fetches live GitHub metadata, accepts only one reserved JSON change from an
+  exact Copilot-authored same-repository `copilot/` branch to the default base, and remains bounded.
 - Candidate work stays in its reserved code-only worktree; no dataset content is staged there.
   Dataset content never enters a pull request.
 - Actions may create and update issues, comments, labels, assignments, durable refs, and persisted
