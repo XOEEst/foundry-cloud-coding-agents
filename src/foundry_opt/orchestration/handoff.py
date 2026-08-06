@@ -52,11 +52,12 @@ _REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
 )
+_COPILOT_APP_ID = 1143301
 _COPILOT_APP_USER_ID = 198982749
 _DISCOVERY_PAGE_SIZE = 100
 _DISCOVERY_MAX_PAGES = 2
 _DISCOVERY_LIMIT = 10
-_PUSH_EVENT_MAX_PAGES = 3
+_TIMELINE_MAX_PAGES = 3
 _HANDOFF_COMMIT_ENVIRONMENT = {
     "GIT_AUTHOR_NAME": "Foundry Optimizer Handoff",
     "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
@@ -793,11 +794,11 @@ class HandoffPullRequestGateway(Protocol):
 
     def fetch_revision(self, revision: str) -> str: ...
 
-    def head_was_pushed_by_copilot(
+    def head_has_copilot_session_attestation(
         self,
+        number: int,
         branch: str,
         revision: str,
-        repository_id: int,
     ) -> bool: ...
 
 
@@ -902,24 +903,26 @@ class GhHandoffPullRequestGateway:
         _require_commit(fetched, "fetched handoff revision")
         return fetched
 
-    def head_was_pushed_by_copilot(
+    def head_has_copilot_session_attestation(
         self,
+        number: int,
         branch: str,
         revision: str,
-        repository_id: int,
     ) -> bool:
+        _positive_number(number, "pull request number")
         if _BRANCH.fullmatch(branch) is None:
             raise ValueError("handoff branch is invalid")
         _require_commit(revision, "handoff head revision")
-        _positive_number(repository_id, "handoff repository ID")
-        ref = f"refs/heads/{branch}"
-        for page in range(1, _PUSH_EVENT_MAX_PAGES + 1):
+        events: list[Mapping[str, Any]] = []
+        for page in range(1, _TIMELINE_MAX_PAGES + 1):
             value = self._json(
                 (
                     "gh",
                     "api",
+                    "-H",
+                    "Accept: application/vnd.github+json",
                     (
-                        f"repos/{self._repository}/events"
+                        f"repos/{self._repository}/issues/{number}/timeline"
                         f"?per_page={_DISCOVERY_PAGE_SIZE}&page={page}"
                     ),
                 )
@@ -930,28 +933,13 @@ class GhHandoffPullRequestGateway:
                 or any(not isinstance(item, Mapping) for item in value)
             ):
                 raise HandoffEventError(
-                    "GitHub repository events response is invalid"
+                    "GitHub pull request timeline response is invalid"
                 )
-            for item in value:
-                payload = item.get("payload")
-                if (
-                    item.get("type") != "PushEvent"
-                    or not isinstance(payload, Mapping)
-                    or payload.get("head") != revision
-                    or payload.get("ref") != ref
-                ):
-                    continue
-                actor = item.get("actor")
-                return (
-                    isinstance(actor, Mapping)
-                    and actor.get("id") == _COPILOT_APP_USER_ID
-                    and actor.get("login")
-                    in {"Copilot", "copilot-swe-agent[bot]"}
-                )
+            events.extend(value)
             if len(value) < _DISCOVERY_PAGE_SIZE:
-                return False
+                return _timeline_attests_copilot_head(events, revision)
         raise HandoffEventError(
-            "GitHub repository event discovery exceeded its bound"
+            "GitHub pull request timeline discovery exceeded its bound"
         )
 
     def close_internal_pull_request(
@@ -1219,14 +1207,14 @@ def _trusted_handoff_request_from_live(
         raise HandoffEventError("handoff pull request is not open")
     if (
         context.event_name != "pull_request_target"
-        and not gateway.head_was_pushed_by_copilot(
+        and not gateway.head_has_copilot_session_attestation(
+            live_identity["number"],
             live_identity["head_ref"],
             live_identity["head_revision"],
-            context.repository_id,
         )
     ):
         raise HandoffEventError(
-            "handoff head was not pushed by the Copilot App"
+            "handoff head lacks a Copilot session attestation"
         )
     files = gateway.get_pull_request_files(live_identity["number"])
     if len(files) != 1:
@@ -2699,6 +2687,72 @@ def _copilot_author_login(user: Mapping[str, Any]) -> str | None:
     ):
         return login
     return None
+
+
+def _timeline_attests_copilot_head(
+    events: list[Mapping[str, Any]],
+    revision: str,
+) -> bool:
+    valid_windows = 0
+    for start_index, start in enumerate(events):
+        if (
+            start.get("event") != "copilot_work_started"
+            or not _exact_copilot_app(start.get("performed_via_github_app"))
+            or not isinstance(start.get("actor"), Mapping)
+        ):
+            continue
+        start_actor = start["actor"].get("id")
+        for finish_index in range(start_index + 1, len(events)):
+            finish = events[finish_index]
+            if finish.get("event") != "copilot_work_finished":
+                continue
+            if (
+                not _exact_copilot_app(
+                    finish.get("performed_via_github_app")
+                )
+                or not isinstance(finish.get("actor"), Mapping)
+                or finish["actor"].get("id") != start_actor
+            ):
+                break
+            window = events[start_index + 1 : finish_index]
+            commits = [
+                event.get("sha")
+                for event in window
+                if event.get("event") == "committed"
+            ]
+            connected = any(
+                event.get("event") == "connected"
+                and isinstance(event.get("actor"), Mapping)
+                and event["actor"].get("id") == _COPILOT_APP_USER_ID
+                and event["actor"].get("login")
+                in {"Copilot", "copilot-swe-agent[bot]"}
+                for event in window
+            )
+            later_head_change = any(
+                event.get("event")
+                in {"committed", "head_ref_force_pushed"}
+                for event in events[finish_index + 1 :]
+            )
+            if (
+                commits == [revision]
+                and connected
+                and not later_head_change
+                and not any(
+                    event.get("event") == "head_ref_force_pushed"
+                    for event in window
+                )
+            ):
+                valid_windows += 1
+            break
+    return valid_windows == 1
+
+
+def _exact_copilot_app(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("id") == _COPILOT_APP_ID
+        and value.get("slug") == "copilot-swe-agent"
+    )
 
 
 def _pull_request_created_at(

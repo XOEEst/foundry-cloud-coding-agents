@@ -174,9 +174,10 @@ either `policy_approved` or `human_review`.
   schedule and retry-only dispatch also discover a bounded, oldest-first set of
   open same-repository Copilot handoff PRs. They do not depend on PR check
   conclusions, so an `action_required` event run cannot block fallback.
-  Discovery re-fetches each live PR and exact head SHA, binds that SHA and ref
-  to a recent GitHub push event from the exact Copilot App, requires one
-  reserved JSON change, and never checks out or executes PR content. The job
+  Discovery re-fetches each live PR and exact head SHA, binds that SHA to a
+  bounded GitHub timeline window started and finished by the exact Copilot App
+  with exactly one commit and no later head change, requires one reserved JSON
+  change, and never checks out or executes PR content. The job
   always checks out the trusted default branch, ignores repository uv and
   dotenv configuration, and lets the existing isolated Git transport validate
   and scope the checkout credential header for private-ref reads and CAS

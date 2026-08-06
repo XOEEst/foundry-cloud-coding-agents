@@ -199,8 +199,8 @@ def test_skill_keeps_actions_as_verifying_transport_not_decision_owner() -> None
     assert "cannot choose a different transition" in skill
     assert "internal handoff pull requests" in skill
     assert "auto-closed" in skill
-    assert "Discovery binds the exact head SHA and ref" in skill
-    assert "selects transport envelopes only" in skill
+    assert "Discovery binds the exact head SHA to a bounded GitHub" in skill
+    assert "selects transport envelopes" in skill
     assert "canonical replay still validates the steward's exact" in skill
     assert "`action_required` run does not block fallback" in skill
 

@@ -107,11 +107,12 @@ auto-closed after handling. Generated `pull_request` workflows skip handoff-only
 The `pull_request_target` event remains the fast path. A default-branch five-minute schedule and
 retry-only dispatch discover a bounded, oldest-first set of open same-repository Copilot handoff
 PRs without consulting check conclusions, so an `action_required` run does not block fallback.
-Discovery binds the exact head SHA and ref to a recent GitHub push event from the exact Copilot App
-and selects transport envelopes only; canonical replay still validates the steward's exact decision,
-commit markers, blob, hashes, and compare-and-swap precondition. The job checks out only the trusted
-default branch, ignores repository uv and dotenv configuration, and lets the isolated Git transport
-validate and scope the checkout credential header for private-ref reads and CAS writes. A
+Discovery binds the exact head SHA to a bounded GitHub timeline window started and finished by the
+exact Copilot App, with exactly one commit and no later head change, and selects transport envelopes
+only; canonical replay still validates the steward's exact decision, commit markers, blob, hashes,
+and compare-and-swap precondition. The job checks out only the trusted default branch, ignores
+repository uv and dotenv configuration, and lets the isolated Git transport validate and scope the
+checkout credential header for private-ref reads and CAS writes. A
 base-controlled bounded product-commit allowlist lets an already-open envelope survive a
 transport-only rollout.
 Private state/design transport and handoff publication bind to one captured URL through an isolated

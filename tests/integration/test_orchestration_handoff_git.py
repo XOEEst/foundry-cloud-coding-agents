@@ -1369,15 +1369,15 @@ def test_trusted_transport_cas_applies_handoff_once(
             assert revision in {rolled_out_base, head}
             return revision
 
-        def head_was_pushed_by_copilot(
+        def head_has_copilot_session_attestation(
             self,
+            number,
             branch,
             revision,
-            repository_id,
         ):
+            assert number == 90
             assert branch == "copilot/steward-issue-31"
             assert revision == head
-            assert repository_id == 123
             return True
 
         def close_internal_pull_request(self, number, **kwargs):

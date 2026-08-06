@@ -95,11 +95,11 @@ class Gateway:
         self.fetched.append(revision)
         return revision
 
-    def head_was_pushed_by_copilot(
+    def head_has_copilot_session_attestation(
         self,
+        number: int,
         branch: str,
         revision: str,
-        repository_id: int,
     ) -> bool:
         return True
 
@@ -164,13 +164,13 @@ class DiscoveryGateway:
         self.fetched.append(revision)
         return revision
 
-    def head_was_pushed_by_copilot(
+    def head_has_copilot_session_attestation(
         self,
+        number: int,
         branch: str,
         revision: str,
-        repository_id: int,
     ) -> bool:
-        assert repository_id == 123
+        assert number in self.live
         return self.copilot_pushes.get(revision, False)
 
 
@@ -553,48 +553,75 @@ def test_github_discovery_paginates_explicitly_and_fails_on_bound() -> None:
         bounded.list_open_pull_requests()
 
 
-def test_github_discovery_binds_head_to_exact_copilot_push_event() -> None:
-    event = {
-        "actor": {
-            "id": 198982749,
-            "login": "copilot-swe-agent[bot]",
+def test_github_discovery_binds_head_to_exact_copilot_session() -> None:
+    app = {"id": 1143301, "slug": "copilot-swe-agent"}
+    events = [
+        {
+            "actor": {"id": 7, "login": "maintainer"},
+            "event": "copilot_work_started",
+            "performed_via_github_app": app,
         },
-        "payload": {
-            "head": HEAD,
-            "ref": "refs/heads/copilot/steward-issue-31",
+        {
+            "actor": {"id": 198982749, "login": "Copilot"},
+            "event": "connected",
         },
-        "type": "PushEvent",
-    }
-    commands = DiscoveryCommands([[event]])
+        {"event": "committed", "sha": HEAD},
+        {
+            "actor": {"id": 7, "login": "maintainer"},
+            "event": "copilot_work_finished",
+            "performed_via_github_app": app,
+        },
+    ]
+    commands = DiscoveryCommands([events])
     gateway = GhHandoffPullRequestGateway(
         commands,
         Path("repository"),
         "octo-org/optimizer",
     )
 
-    assert gateway.head_was_pushed_by_copilot(
+    assert gateway.head_has_copilot_session_attestation(
+        90,
         "copilot/steward-issue-31",
         HEAD,
-        123,
     ) is True
     assert commands.calls == [
         (
             "gh",
             "api",
-            "repos/octo-org/optimizer/events?per_page=100&page=1",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "repos/octo-org/optimizer/issues/90/timeline"
+            "?per_page=100&page=1",
         )
     ]
+
+    forged = GhHandoffPullRequestGateway(
+        DiscoveryCommands(
+            [[
+                *events[:2],
+                {"event": "committed", "sha": "f" * 40},
+                *events[2:],
+            ]]
+        ),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+    assert forged.head_has_copilot_session_attestation(
+        90,
+        "copilot/steward-issue-31",
+        HEAD,
+    ) is False
 
     bounded = GhHandoffPullRequestGateway(
         DiscoveryCommands([[{}] * 100, [{}] * 100, [{}] * 100]),
         Path("repository"),
         "octo-org/optimizer",
     )
-    with pytest.raises(HandoffEventError, match="event discovery"):
-        bounded.head_was_pushed_by_copilot(
+    with pytest.raises(HandoffEventError, match="timeline discovery"):
+        bounded.head_has_copilot_session_attestation(
+            90,
             "copilot/steward-issue-31",
             HEAD,
-            123,
         )
 
 
