@@ -32,6 +32,16 @@ The optimizer and deployment client IDs must be different. Copilot receives
 only the optimizer identity. Deployment runs only through the Actions
 environment and its deployment identity. No Azure client secret is required.
 
+Immediately after `azure/login`, the generated Copilot setup workflow verifies
+that Azure CLI is using the configured optimizer service principal and warms
+Azure CLI's managed cache for the Foundry SDK scopes
+`https://ai.azure.com/.default` and
+`https://cognitiveservices.azure.com/.default`. Token command output and errors
+are suppressed and never copied into logs, workflow outputs, `GITHUB_ENV`, or
+repository files. The ARM management audience is deliberately not warmed
+because production Copilot-runtime adapters use only these Foundry data-plane
+audiences.
+
 Before merging or running the generated workflows, manually create the
 repository Actions secret `COPILOT_ASSIGNMENT_TOKEN`. `foundry-opt init`
 cannot create Actions secrets. The value must be a user-to-server credential

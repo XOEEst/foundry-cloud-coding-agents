@@ -32,6 +32,136 @@ SETUP_PYTHON_ACTION = (
 )
 SETUP_UV_ACTION = "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9"
 AZURE_LOGIN_ACTION = "azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43"
+FOUNDRY_AZURE_SDK_SCOPES = (
+    "https://ai.azure.com/.default",
+    "https://cognitiveservices.azure.com/.default",
+)
+FOUNDRY_AZURE_CLI_RESOURCES = tuple(
+    scope.removesuffix("/.default")
+    for scope in FOUNDRY_AZURE_SDK_SCOPES
+)
+
+
+def _azure_token_cache_warmup_step() -> str:
+    commands = "".join(
+        f"""          if ! az account get-access-token \\
+            --resource {resource} \\
+            --output none \\
+            --only-show-errors >/dev/null 2>&1; then
+            echo "Failed to cache a required Foundry access token." >&2
+            exit 1
+          fi
+"""
+        for resource in FOUNDRY_AZURE_CLI_RESOURCES
+    )
+    return (
+        """      - name: Verify optimizer identity and warm Azure token cache
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! active_client_id="$(
+            az account show \\
+              --query user.name \\
+              --output tsv \\
+              --only-show-errors 2>/dev/null
+          )"; then
+            echo "Azure CLI could not read the active optimizer identity." >&2
+            exit 1
+          fi
+          if ! active_principal_type="$(
+            az account show \\
+              --query user.type \\
+              --output tsv \\
+              --only-show-errors 2>/dev/null
+          )"; then
+            echo "Azure CLI could not read the active optimizer identity." >&2
+            exit 1
+          fi
+          if [[ "$active_principal_type" != "servicePrincipal" ]] || \\
+             [[ "${active_client_id,,}" != "${AZURE_CLIENT_ID,,}" ]]; then
+            echo "Azure login did not establish the configured optimizer service principal." >&2
+            exit 1
+          fi
+
+          # AIProjectClient uses https://ai.azure.com/.default. Azure OpenAI
+          # data-plane clients use https://cognitiveservices.azure.com/.default.
+          # AzureCliCredential maps those scopes to the resources below.
+          # Keep tokens only in Azure CLI's cache; never capture or export output.
+"""
+        + commands
+    )
+
+
+def _render_setup_workflow(
+    request: OnboardingRequest,
+    *,
+    warm_token_cache: bool,
+    export_proxy_marker: bool,
+) -> str:
+    workflow = f"""name: Copilot Setup Steps
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    environment: {json.dumps(request.environment_name)}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: {CHECKOUT_ACTION} # v7.0.1
+      - name: Export non-secret Azure OIDC identifiers
+        env:
+          ACTIONS_AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
+          ACTIONS_AZURE_CLIENT_ID: ${{{{ vars.AZURE_CLIENT_ID }}}}
+          ACTIONS_AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+        shell: bash
+        run: |
+          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_SUBSCRIPTION_ID; do
+            fallback="ACTIONS_${{name}}"
+            value="${{!name:-${{!fallback:-}}}}"
+            if [ -z "$value" ]; then
+              echo "Missing GitHub Agents or Actions variable: $name" >&2
+              exit 1
+            fi
+            printf '%s=%s\\n' "$name" "$value" >> "$GITHUB_ENV"
+          done
+      - name: Sign in to Azure with repository-ID OIDC
+        uses: {AZURE_LOGIN_ACTION} # v3.0.0
+        with:
+          client-id: ${{{{ env.AZURE_CLIENT_ID }}}}
+          tenant-id: ${{{{ env.AZURE_TENANT_ID }}}}
+          subscription-id: ${{{{ env.AZURE_SUBSCRIPTION_ID }}}}
+"""
+    if warm_token_cache:
+        workflow += _azure_token_cache_warmup_step()
+    workflow += f"""      - name: Set up Python
+        uses: {SETUP_PYTHON_ACTION} # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Set up uv
+        uses: {SETUP_UV_ACTION} # v9.0.0
+      - name: Install pinned Foundry optimizer
+        run: uv tool install {shell_quote(request.product_install)}
+      - name: Verify issue-only steward entry point
+        run: foundry-opt steward advance --help
+"""
+    if export_proxy_marker:
+        workflow += """      - name: Export non-secret Foundry Copilot Git proxy marker
+        shell: bash
+        run: printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> "$GITHUB_ENV"
+"""
+    return workflow
 
 
 def generate_change_contents(
@@ -150,66 +280,21 @@ def generate_change_contents(
     OptimizerConfig.model_validate(config)
     config_text = yaml.safe_dump(config, sort_keys=False, width=88)
 
-    workflow_text = f"""name: Copilot Setup Steps
-
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/copilot-setup-steps.yml
-  pull_request:
-    paths:
-      - .github/workflows/copilot-setup-steps.yml
-
-jobs:
-  copilot-setup-steps:
-    runs-on: ubuntu-latest
-    environment: {json.dumps(request.environment_name)}
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - name: Checkout repository
-        uses: {CHECKOUT_ACTION} # v7.0.1
-      - name: Export non-secret Azure OIDC identifiers
-        env:
-          ACTIONS_AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
-          ACTIONS_AZURE_CLIENT_ID: ${{{{ vars.AZURE_CLIENT_ID }}}}
-          ACTIONS_AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
-        shell: bash
-        run: |
-          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_SUBSCRIPTION_ID; do
-            fallback="ACTIONS_${{name}}"
-            value="${{!name:-${{!fallback:-}}}}"
-            if [ -z "$value" ]; then
-              echo "Missing GitHub Agents or Actions variable: $name" >&2
-              exit 1
-            fi
-            printf '%s=%s\\n' "$name" "$value" >> "$GITHUB_ENV"
-          done
-      - name: Sign in to Azure with repository-ID OIDC
-        uses: {AZURE_LOGIN_ACTION} # v3.0.0
-        with:
-          client-id: ${{{{ env.AZURE_CLIENT_ID }}}}
-          tenant-id: ${{{{ env.AZURE_TENANT_ID }}}}
-          subscription-id: ${{{{ env.AZURE_SUBSCRIPTION_ID }}}}
-      - name: Set up Python
-        uses: {SETUP_PYTHON_ACTION} # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Set up uv
-        uses: {SETUP_UV_ACTION} # v9.0.0
-      - name: Install pinned Foundry optimizer
-        run: uv tool install {shell_quote(request.product_install)}
-"""
-    workflow_text += """      - name: Verify issue-only steward entry point
-        run: foundry-opt steward advance --help
-"""
-    legacy_setup_workflow_text = workflow_text
-    workflow_text += """      - name: Export non-secret Foundry Copilot Git proxy marker
-        shell: bash
-        run: printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> "$GITHUB_ENV"
-"""
+    workflow_text = _render_setup_workflow(
+        request,
+        warm_token_cache=True,
+        export_proxy_marker=True,
+    )
+    legacy_setup_workflow_text = _render_setup_workflow(
+        request,
+        warm_token_cache=False,
+        export_proxy_marker=False,
+    )
+    previous_setup_workflow_text = _render_setup_workflow(
+        request,
+        warm_token_cache=False,
+        export_proxy_marker=True,
+    )
 
     contents = {
         Path(".github/foundry-optimizer.yaml"): config_text,
@@ -251,6 +336,15 @@ jobs:
             != digest
         )
     }
+    workflow_name = Path(
+        ".github/workflows/copilot-setup-steps.yml"
+    ).as_posix()
+    previous_setup_digest = hashlib.sha256(
+        previous_setup_workflow_text.encode("utf-8")
+    ).hexdigest()
+    workflow_previous = accepted_previous.setdefault(workflow_name, [])
+    if previous_setup_digest not in workflow_previous:
+        workflow_previous.append(previous_setup_digest)
     obsolete = {
         path.as_posix(): [digest]
         for path, digest in legacy_hashes.items()
@@ -270,6 +364,20 @@ jobs:
         destination[path.as_posix()] = [
             hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         ]
+    previous_setup_normalized = normalize_legacy_generated_content(
+        Path(workflow_name),
+        previous_setup_workflow_text,
+    )
+    if previous_setup_normalized is not None:
+        previous_normalized_digest = hashlib.sha256(
+            previous_setup_normalized.encode("utf-8")
+        ).hexdigest()
+        workflow_normalized = accepted_previous_normalized.setdefault(
+            workflow_name,
+            [],
+        )
+        if previous_normalized_digest not in workflow_normalized:
+            workflow_normalized.append(previous_normalized_digest)
     manifest_path = Path(".github/foundry-optimizer.generated.json")
     contents[manifest_path] = (
         json.dumps(

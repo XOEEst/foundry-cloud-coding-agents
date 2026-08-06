@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -104,6 +105,65 @@ def test_oidc_provider_builds_azure_cli_credential_without_a_secret() -> None:
 
     assert result is credential
     assert calls == ["tenant-value"]
+    assert "AZURE_CLIENT_SECRET" not in environment.requested
+
+
+def test_azure_cli_credential_reads_prefetched_foundry_tokens_from_cli_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from azure.identity._credentials import azure_cli
+
+    tenant_id = "00000000-0000-0000-0000-000000000001"
+    environment = FakeEnvironmentReader(
+        {
+            "AZURE_TENANT_ID": tenant_id,
+            "AZURE_CLIENT_ID": "00000000-0000-0000-0000-000000000002",
+            "AZURE_SUBSCRIPTION_ID": (
+                "00000000-0000-0000-0000-000000000003"
+            ),
+        }
+    )
+    calls: list[tuple[str, ...]] = []
+    resources = (
+        "https://ai.azure.com",
+        "https://cognitiveservices.azure.com",
+    )
+
+    def read_cached_token(command: list[str], timeout: int) -> str:
+        calls.append(tuple(command))
+        resource = command[command.index("--resource") + 1]
+        assert resource in resources
+        assert timeout == 10
+        return json.dumps(
+            {
+                "accessToken": f"unit-test-cache:{resource}",
+                "expires_on": 4_102_444_800,
+            }
+        )
+
+    monkeypatch.setattr(azure_cli, "_run_command", read_cached_token)
+    credential = AzureCliCredentialProvider(environment).create()
+
+    tokens = tuple(
+        credential.get_token(f"{resource}/.default").token
+        for resource in resources
+    )
+
+    assert tokens == tuple(
+        f"unit-test-cache:{resource}" for resource in resources
+    )
+    assert [
+        call[call.index("--resource") + 1]
+        for call in calls
+    ] == list(resources)
+    assert all(call[:4] == (
+        "account",
+        "get-access-token",
+        "--output",
+        "json",
+    ) for call in calls)
+    assert all("--tenant" in call and tenant_id in call for call in calls)
+    assert all("login" not in call for call in calls)
     assert "AZURE_CLIENT_SECRET" not in environment.requested
 
 

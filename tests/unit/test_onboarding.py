@@ -32,6 +32,7 @@ from foundry_opt.onboarding.repository import (
     ChangeSetConflictError,
     ChangeSetWriteError,
     OnboardingPublishError,
+    normalize_legacy_generated_content,
 )
 
 
@@ -372,6 +373,55 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
     assert "Do not commit" in assignment_guidance
 
 
+def test_generated_setup_warms_required_azure_cli_tokens_safely(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    workflow = generate_change_contents(
+        request,
+        FakeDiscovery().discover(request),
+        oidc_subject="repository_id:123",
+    )[Path(".github/workflows/copilot-setup-steps.yml")]
+    steps = yaml.safe_load(workflow)["jobs"]["copilot-setup-steps"]["steps"]
+    names = [step.get("name") for step in steps]
+    login_index = names.index("Sign in to Azure with repository-ID OIDC")
+
+    assert names[login_index + 1] == (
+        "Verify optimizer identity and warm Azure token cache"
+    )
+    warmup = steps[login_index + 1]
+    assert warmup["shell"] == "bash"
+    script = warmup["run"]
+    resources = [
+        line.strip().removeprefix("--resource ").removesuffix(" \\")
+        for line in script.splitlines()
+        if line.strip().startswith("--resource ")
+    ]
+    assert resources == [
+        "https://ai.azure.com",
+        "https://cognitiveservices.azure.com",
+    ]
+    assert "https://ai.azure.com/.default" in script
+    assert "https://cognitiveservices.azure.com/.default" in script
+    assert "https://management.azure.com" not in script
+    assert script.index("active_client_id=") < script.index(
+        "az account get-access-token"
+    )
+    assert "servicePrincipal" in script
+    assert "${active_client_id,,}" in script
+    assert "${AZURE_CLIENT_ID,,}" in script
+    assert script.count("if ! az account get-access-token") == len(resources)
+    assert script.count("--output none") == len(resources)
+    assert script.count(">/dev/null 2>&1") == len(resources)
+    assert script.count("exit 1") >= len(resources) + 1
+    assert "$(az account get-access-token" not in script
+    assert "--query accessToken" not in script
+    assert "accessToken" not in script
+    assert "GITHUB_ENV" not in script
+    assert "GITHUB_OUTPUT" not in script
+    assert "${{" not in script
+
+
 def test_generated_change_set_has_content_addressed_ownership_manifest(
     tmp_path: Path,
 ) -> None:
@@ -422,12 +472,41 @@ def test_generated_change_set_has_content_addressed_ownership_manifest(
         "        run: printf '%s\\n' "
         "'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> \"$GITHUB_ENV\"\n"
     )
-    legacy_workflow = contents[workflow_path].replace(marker_block, "")
+    warmup_start = contents[workflow_path].index(
+        "      - name: Verify optimizer identity and warm Azure token cache\n"
+    )
+    warmup_end = contents[workflow_path].index(
+        "      - name: Set up Python\n",
+        warmup_start,
+    )
+    previous_workflow = (
+        contents[workflow_path][:warmup_start]
+        + contents[workflow_path][warmup_end:]
+    )
+    legacy_workflow = previous_workflow.replace(marker_block, "")
     assert legacy_workflow != contents[workflow_path]
+    assert previous_workflow != contents[workflow_path]
     assert manifest["accepted_previous_sha256"][
         workflow_path.as_posix()
     ] == [
-        hashlib.sha256(legacy_workflow.encode("utf-8")).hexdigest()
+        hashlib.sha256(legacy_workflow.encode("utf-8")).hexdigest(),
+        hashlib.sha256(previous_workflow.encode("utf-8")).hexdigest(),
+    ]
+    normalized_legacy = normalize_legacy_generated_content(
+        workflow_path,
+        legacy_workflow,
+    )
+    normalized_previous = normalize_legacy_generated_content(
+        workflow_path,
+        previous_workflow,
+    )
+    assert normalized_legacy is not None
+    assert normalized_previous is not None
+    assert manifest["accepted_previous_normalized_sha256"][
+        workflow_path.as_posix()
+    ] == [
+        hashlib.sha256(normalized_legacy.encode("utf-8")).hexdigest(),
+        hashlib.sha256(normalized_previous.encode("utf-8")).hexdigest(),
     ]
     assert {
         ".github/workflows/foundry-optimization-control.yml",
