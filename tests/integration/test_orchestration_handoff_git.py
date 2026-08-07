@@ -1560,6 +1560,13 @@ def test_cloud_candidate_designer_persists_result_handoff(
     acknowledgement: str,
 ) -> None:
     repository, origin, base = _repository(tmp_path)
+    _git(repository, "commit", "--allow-empty", "-m", "Initial plan")
+    _git(repository, "push", "origin", "copilot/steward-issue-31")
+    assert _git(repository, "rev-parse", "HEAD^{tree}") == _git(
+        repository,
+        "rev-parse",
+        f"{base}^{{tree}}",
+    )
     (origin / "hooks" / "post-receive").unlink()
     created = CampaignEvent(
         "github-run-1",
@@ -1712,6 +1719,11 @@ def test_cloud_candidate_designer_persists_result_handoff(
     assert handoff.proposed_ref == (
         "refs/heads/foundry-opt/design/issue-31/design-31-1-1"
     )
+    assert _git(
+        repository,
+        "rev-parse",
+        f"{handoff.proposed_revision}^",
+    ) == base
     assert handoff.changed_paths == ("agent/instructions.md",)
     assert handoff.result.result_id == "designer-result-1"
     with pytest.raises(ValueError, match="privacy"):

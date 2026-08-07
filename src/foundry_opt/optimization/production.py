@@ -175,6 +175,7 @@ _SPEC_CAPABILITIES = (
 _DEFAULT_CONFIG_PATH = Path(".github/foundry-optimizer.yaml")
 _COMMIT_LENGTH = 40
 _HEX = "0123456789abcdef"
+_NO_GIT_REPLACEMENTS = {"GIT_NO_REPLACE_OBJECTS": "1"}
 
 
 class UtcClock:
@@ -2595,11 +2596,11 @@ class _ProductionCandidateDesignRepository:
         if request.result_file.resolve() != expected_result:
             raise ValueError("candidate design result path is invalid")
         result.require_matches(intent)
-        head = self._commands.run(
-            ("git", "rev-parse", "HEAD^{commit}"),
-            cwd=root,
-        ).stdout.strip()
-        if head != intent.base_commit:
+        if not _candidate_designer_checkout_matches_base(
+            self._commands,
+            root,
+            intent.base_commit,
+        ):
             raise ValueError("candidate designer checkout base changed")
         result_path = expected_result.relative_to(root)
         changed = _production_changed_paths(self._commands, root, intent)
@@ -2619,15 +2620,23 @@ class _ProductionCandidateDesignRepository:
             )
         ):
             raise ValueError("candidate design changed forbidden paths")
-        index = (
-            root
-            / ".foundry-optimizer"
-            / "design-indexes"
-            / f"{intent.effect_id}.index"
+        index = Path(
+            self._commands.run(
+                (
+                    "git",
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    f"foundry-design-indexes/{intent.effect_id}.index",
+                ),
+                cwd=root,
+                environment=_NO_GIT_REPLACEMENTS,
+            ).stdout.strip()
         )
         index.parent.mkdir(parents=True, exist_ok=True)
         index.unlink(missing_ok=True)
         environment = {
+            **_NO_GIT_REPLACEMENTS,
             "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
             "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
             "GIT_AUTHOR_NAME": "Foundry Candidate Designer",
@@ -2653,11 +2662,33 @@ class _ProductionCandidateDesignRepository:
                 cwd=root,
                 environment=environment,
             )
+            self._commands.run(
+                (
+                    "git",
+                    "reset",
+                    "--quiet",
+                    intent.base_commit,
+                    "--",
+                    result_path.as_posix(),
+                ),
+                cwd=root,
+                environment=environment,
+            )
             tree = self._commands.run(
                 ("git", "write-tree"),
                 cwd=root,
                 environment=environment,
             ).stdout.strip()
+            staged_paths = _production_tree_changed_paths(
+                self._commands,
+                root,
+                intent.base_commit,
+                tree,
+            )
+            if staged_paths != candidate_paths:
+                raise ValueError(
+                    "candidate design changed forbidden paths"
+                )
             commit = self._commands.run(
                 (
                     "git",
@@ -2789,21 +2820,27 @@ class _ProductionCandidateDesigner:
         tree_sha = record.payload.get("tree_sha")
         if not all(isinstance(value, str) for value in (ref, head_commit, tree_sha)):
             raise ValueError("candidate design Git binding is invalid")
+        if _git_replacements_present(self._commands, root):
+            raise ValueError("candidate design Git binding changed")
         self._commands.run(
             ("git", "fetch", "--quiet", "origin", ref),
             cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
         )
         fetched = self._commands.run(
             ("git", "rev-parse", "FETCH_HEAD^{commit}"),
             cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
         ).stdout.strip()
         parent = self._commands.run(
             ("git", "rev-parse", f"{fetched}^"),
             cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
         ).stdout.strip()
         fetched_tree = self._commands.run(
             ("git", "rev-parse", f"{fetched}^{{tree}}"),
             cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
         ).stdout.strip()
         if (
             fetched != head_commit
@@ -2831,6 +2868,7 @@ class _ProductionCandidateDesigner:
                         "--",
                     ),
                     cwd=root,
+                    environment=_NO_GIT_REPLACEMENTS,
                 ).stdout.split("\0")
                 if value
             )
@@ -2854,6 +2892,7 @@ class _ProductionCandidateDesigner:
                 "--",
             ),
             cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
         ).stdout
         current_patch = self._commands.run(
             (
@@ -2865,6 +2904,7 @@ class _ProductionCandidateDesigner:
                 "--",
             ),
             cwd=intent.worktree,
+            environment=_NO_GIT_REPLACEMENTS,
         ).stdout
         if current_patch == remote_patch:
             return (result,)
@@ -2880,6 +2920,7 @@ class _ProductionCandidateDesigner:
                 "-",
             ),
             cwd=intent.worktree,
+            environment=_NO_GIT_REPLACEMENTS,
             input_bytes=remote_patch.encode("utf-8"),
         )
         applied = self._commands.run(
@@ -2892,6 +2933,7 @@ class _ProductionCandidateDesigner:
                 "--",
             ),
             cwd=intent.worktree,
+            environment=_NO_GIT_REPLACEMENTS,
         ).stdout
         if applied != remote_patch:
             raise ValueError("candidate design patch changed during apply")
@@ -2998,6 +3040,75 @@ class _ProductionCandidatePullRequestReader:
         ).snapshots_for(request, bindings)
 
 
+def _candidate_designer_checkout_matches_base(
+    commands: CommandRunner,
+    root: Path,
+    base_commit: str,
+) -> bool:
+    if _git_replacements_present(commands, root):
+        return False
+    try:
+        base = commands.run(
+            ("git", "rev-parse", f"{base_commit}^{{commit}}"),
+            cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout.strip()
+        head = commands.run(
+            ("git", "rev-parse", "HEAD^{commit}"),
+            cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout.strip()
+        if head == base:
+            return True
+        commands.run(
+            ("git", "merge-base", "--is-ancestor", base, head),
+            cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
+        )
+        raw_commit = commands.run(
+            ("git", "cat-file", "-p", head),
+            cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout
+        parents: list[str] = []
+        for line in raw_commit.splitlines():
+            if not line:
+                break
+            if line.startswith("parent "):
+                parents.append(line.removeprefix("parent "))
+        if parents != [base]:
+            return False
+        head_tree = commands.run(
+            ("git", "rev-parse", f"{head}^{{tree}}"),
+            cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout.strip()
+        base_tree = commands.run(
+            ("git", "rev-parse", f"{base}^{{tree}}"),
+            cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout.strip()
+        return head_tree == base_tree
+    except Exception:
+        return False
+
+
+def _git_replacements_present(
+    commands: CommandRunner,
+    root: Path,
+) -> bool:
+    try:
+        return bool(
+            commands.run(
+                ("git", "replace", "--list"),
+                cwd=root,
+                environment=_NO_GIT_REPLACEMENTS,
+            ).stdout.strip()
+        )
+    except Exception:
+        return True
+
+
 def _production_changed_paths(
     commands: CommandRunner,
     root: Path,
@@ -3013,6 +3124,7 @@ def _production_changed_paths(
             "--",
         ),
         cwd=root,
+        environment=_NO_GIT_REPLACEMENTS,
     ).stdout
     untracked = commands.run(
         (
@@ -3023,6 +3135,7 @@ def _production_changed_paths(
             "-z",
         ),
         cwd=root,
+        environment=_NO_GIT_REPLACEMENTS,
     ).stdout
     return tuple(
         Path(value)
@@ -3034,6 +3147,31 @@ def _production_changed_paths(
                 if value
             }
         )
+    )
+
+
+def _production_tree_changed_paths(
+    commands: CommandRunner,
+    root: Path,
+    base_commit: str,
+    tree: str,
+) -> tuple[Path, ...]:
+    return tuple(
+        Path(value)
+        for value in commands.run(
+            (
+                "git",
+                "diff",
+                "--name-only",
+                "-z",
+                base_commit,
+                tree,
+                "--",
+            ),
+            cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout.split("\0")
+        if value
     )
 
 

@@ -503,3 +503,62 @@ def test_candidate_designer_submits_typed_result_through_cli(
     assert service.requests[0].effect_id == "design-42-1-1"
     assert service.requests[0].worker_issue_number == 84
     assert service.requests[0].result_file == result_file
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_exit_code"),
+    (
+        (CandidateDesignSubmissionStatus.WAITING, 0),
+        (CandidateDesignSubmissionStatus.CONFLICT, 1),
+        (CandidateDesignSubmissionStatus.FAILED, 1),
+    ),
+)
+def test_candidate_designer_cli_exit_code_reflects_submission_status(
+    monkeypatch,
+    tmp_path: Path,
+    status: CandidateDesignSubmissionStatus,
+    expected_exit_code: int,
+) -> None:
+    class CandidateDesignService:
+        def submit(self, request):
+            return CandidateDesignSubmissionResult(
+                status,
+                StateRefSnapshot(
+                    "a" * 40,
+                    CampaignState(
+                        42,
+                        1,
+                        1,
+                        CampaignPhase.SPECIFICATION,
+                    ),
+                    (),
+                    (),
+                ),
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_candidate_design_submission_service",
+        lambda: CandidateDesignService(),
+    )
+    monkeypatch.chdir(tmp_path)
+    result_file = tmp_path / "design-result.json"
+    result_file.write_text("{}", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "steward",
+            "candidate-design-result",
+            "--issue",
+            "42",
+            "--effect",
+            "design-42-1-1",
+            "--worker-issue",
+            "84",
+            "--result-file",
+            str(result_file),
+        ],
+    )
+
+    assert result.exit_code == expected_exit_code

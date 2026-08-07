@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from foundry_opt.adapters.commands import SubprocessCommandRunner
 from foundry_opt.orchestration import (
     CampaignPhase,
@@ -14,6 +16,8 @@ from foundry_opt.orchestration import (
 )
 from foundry_opt.orchestration.candidate_workers import (
     CandidateDesignIntent,
+    CandidateDesignPushUnacknowledgedError,
+    CandidateDesignResult,
     CandidateDesignSubmissionRequest,
     CandidateDesignSubmissionService,
     CandidateDesignSubmissionStatus,
@@ -36,6 +40,208 @@ def _git(root: Path, *arguments: str) -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+def _capture_fixture(tmp_path: Path):
+    root = tmp_path / "repository"
+    root.mkdir()
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.name", "Test")
+    _git(root, "config", "user.email", "test@example.com")
+    (root / "agent").mkdir()
+    source = root / "agent" / "instructions.md"
+    source.write_text("baseline\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md")
+    _git(root, "commit", "-m", "baseline")
+    base_commit = _git(root, "rev-parse", "HEAD")
+    result_file = (
+        root
+        / ".foundry-optimizer"
+        / "design-results"
+        / "design-31-1-1.json"
+    )
+    result_file.parent.mkdir(parents=True)
+    result_file.write_text("{}", encoding="utf-8")
+    intent = CandidateDesignIntent(
+        effect_id="design-31-1-1",
+        issue_number=31,
+        generation=1,
+        spec_sha256=SPEC_SHA256,
+        base_commit=base_commit,
+        target="support",
+        candidate_id="candidate-1",
+        slot=1,
+        worktree=root.resolve(),
+        goal="Improve support answers.",
+        edit_paths=(Path("agent"),),
+        allowed_mutations=frozenset({"system_instructions"}),
+        restricted_opt_ins={},
+        baseline_metrics={"quality": 0.5},
+    )
+    result = CandidateDesignResult(
+        effect_id=intent.effect_id,
+        result_id="designer-result-1",
+        issue_number=intent.issue_number,
+        generation=intent.generation,
+        spec_sha256=intent.spec_sha256,
+        base_commit=intent.base_commit,
+        candidate_id=intent.candidate_id,
+        slot=intent.slot,
+        idea_id="idea-1",
+        mutation_class="system_instructions",
+        motivation="Clarify the escalation rule.",
+        lessons=("The baseline omits an escalation rule.",),
+        complexity="small",
+    )
+    request = CandidateDesignSubmissionRequest(
+        repository_root=root.resolve(),
+        issue_number=31,
+        effect_id=intent.effect_id,
+        worker_issue_number=84,
+        result_file=result_file.resolve(),
+    )
+    return root, source, intent, result, request
+
+
+def test_candidate_capture_rejects_initial_plan_with_committed_change(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    source.write_text("initial plan changed the file\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md")
+    _git(root, "commit", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkout base changed"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_disallowed_uncommitted_path(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+    (root / "outside.txt").write_text("forbidden\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="forbidden paths"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_merge_metadata_commit(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "checkout", "-b", "copilot-plan")
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    _git(root, "checkout", "-b", "other-plan", intent.base_commit)
+    _git(root, "commit", "--allow-empty", "-m", "Other plan")
+    _git(root, "merge", "--no-ff", "copilot-plan", "-m", "Merge plans")
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkout base changed"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_unrelated_same_tree_commit(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "checkout", "--orphan", "unrelated-plan")
+    _git(root, "rm", "-rf", ".")
+    (root / "agent").mkdir()
+    source.write_text("baseline\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md")
+    _git(root, "commit", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkout base changed"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_git_replace_rewrites(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    replacement = root / "replacement.txt"
+    replacement.write_text("rewritten baseline\n", encoding="utf-8")
+    original_blob = _git(
+        root,
+        "rev-parse",
+        f"{intent.base_commit}:agent/instructions.md",
+    )
+    replacement_blob = _git(root, "hash-object", "-w", "replacement.txt")
+    replacement.unlink()
+    _git(root, "replace", original_blob, replacement_blob)
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkout base changed"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_git_graft_rewrites(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "checkout", "--orphan", "grafted-plan")
+    _git(root, "rm", "-rf", ".")
+    (root / "agent").mkdir()
+    source.write_text("baseline\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md")
+    _git(root, "commit", "-m", "Initial plan")
+    head = _git(root, "rev-parse", "HEAD")
+    grafts = root / ".git" / "info" / "grafts"
+    grafts.write_text(f"{head} {intent.base_commit}\n", encoding="ascii")
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkout base changed"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_excludes_reserved_files_from_broad_allowed_path(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    intent = replace(intent, edit_paths=(Path("."),))
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    with pytest.raises(
+        CandidateDesignPushUnacknowledgedError
+    ) as captured:
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+    artifact = captured.value.artifact
+    assert artifact.changed_paths == (Path("agent/instructions.md"),)
+    assert _git(
+        root,
+        "diff",
+        "--name-only",
+        intent.base_commit,
+        artifact.head_commit,
+    ) == "agent/instructions.md"
+    assert ".foundry-optimizer" not in _git(
+        root,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        artifact.head_commit,
+    )
 
 
 class Ledger:
