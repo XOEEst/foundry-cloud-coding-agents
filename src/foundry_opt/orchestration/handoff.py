@@ -2742,7 +2742,12 @@ def _timeline_attests_copilot_head(
                 and _exact_copilot_bot(event.get("actor"))
             ]
             connections.extend(
-                _copilot_lead_in(events, start_index, start)
+                _copilot_lead_in(
+                    events,
+                    start_index,
+                    start,
+                    start_actor,
+                )
             )
             later_invalidation = any(
                 event.get("event")
@@ -2787,6 +2792,7 @@ def _copilot_lead_in(
     events: list[Mapping[str, Any]],
     start_index: int,
     start: Mapping[str, Any],
+    start_actor: tuple[int, str],
 ) -> list[Mapping[str, Any]]:
     lead_in: list[Mapping[str, Any]] = []
     for event in reversed(
@@ -2794,7 +2800,7 @@ def _copilot_lead_in(
     ):
         if event.get("event") not in {"assigned", "mentioned", "connected"}:
             break
-        if not _copilot_lead_in_event(event):
+        if not _copilot_lead_in_event(event, start_actor):
             return []
         lead_in.append(event)
     if (
@@ -2819,10 +2825,17 @@ def _copilot_lead_in(
     ]
 
 
-def _copilot_lead_in_event(event: Mapping[str, Any]) -> bool:
+def _copilot_lead_in_event(
+    event: Mapping[str, Any],
+    start_actor: tuple[int, str],
+) -> bool:
     kind = event.get("event")
     if kind == "assigned":
-        return _exact_copilot_bot(event.get("assignee"))
+        assignee = event.get("assignee")
+        return _exact_copilot_bot(event.get("actor")) and (
+            _exact_copilot_bot(assignee)
+            or _timeline_actor_identity(assignee) == start_actor
+        )
     if kind in {"mentioned", "connected"}:
         return _exact_copilot_bot(event.get("actor"))
     return False

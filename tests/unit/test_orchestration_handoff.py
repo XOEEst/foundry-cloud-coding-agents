@@ -565,7 +565,7 @@ def test_github_discovery_paginates_explicitly_and_fails_on_bound() -> None:
         bounded.list_open_pull_requests()
 
 
-def _pr_268_timeline() -> list[dict[str, object]]:
+def _pr_277_timeline() -> list[dict[str, object]]:
     app = {"id": 1143301, "slug": "copilot-swe-agent"}
     copilot = {"id": 198982749, "login": "Copilot", "type": "Bot"}
     owner = {"id": 18523445, "login": "XOEEst", "type": "User"}
@@ -580,14 +580,14 @@ def _pr_268_timeline() -> list[dict[str, object]]:
     ]
     events.extend([
         {
-            "actor": owner,
+            "actor": copilot,
             "assignee": copilot,
             "created_at": "2026-08-06T20:08:00Z",
             "event": "assigned",
         },
         {
-            "actor": owner,
-            "assignee": copilot,
+            "actor": copilot,
+            "assignee": owner,
             "created_at": "2026-08-06T20:08:01Z",
             "event": "assigned",
         },
@@ -634,8 +634,8 @@ def _pr_268_timeline() -> list[dict[str, object]]:
     return events
 
 
-def test_github_discovery_accepts_pr_268_copilot_lead_in() -> None:
-    events = _pr_268_timeline()
+def test_github_discovery_accepts_pr_277_copilot_lead_in() -> None:
+    events = _pr_277_timeline()
     commands = DiscoveryCommands([events])
     gateway = GhHandoffPullRequestGateway(
         commands,
@@ -661,7 +661,7 @@ def test_github_discovery_accepts_pr_268_copilot_lead_in() -> None:
 
 
 def test_github_discovery_binds_head_to_exact_copilot_session() -> None:
-    events = _pr_268_timeline()
+    events = _pr_277_timeline()
     forged = GhHandoffPullRequestGateway(
         DiscoveryCommands(
             [[
@@ -744,7 +744,7 @@ def test_github_discovery_accepts_connection_inside_work_window() -> None:
     ),
 )
 def test_github_discovery_rejects_unbound_connections(case: str) -> None:
-    events = deepcopy(_pr_268_timeline())
+    events = deepcopy(_pr_277_timeline())
     connection = events[11]
     if case == "arbitrary-old":
         events.pop(11)
@@ -795,6 +795,83 @@ def test_github_discovery_rejects_unbound_connections(case: str) -> None:
 @pytest.mark.parametrize(
     "case",
     (
+        "other-user-assignee",
+        "start-actor-assignee-id-mismatch",
+        "start-actor-assignee-login-mismatch",
+        "assignment-actor-id-mismatch",
+        "assignment-actor-login-mismatch",
+        "multiple-unrelated-assignments",
+        "author-performed-assignment",
+    ),
+)
+def test_github_discovery_rejects_inexact_lead_in_assignments(
+    case: str,
+) -> None:
+    events = deepcopy(_pr_277_timeline())
+    assignment = events[9]
+    if case == "other-user-assignee":
+        assignment["assignee"] = {
+            "id": 999,
+            "login": "other-user",
+            "type": "User",
+        }
+    elif case == "start-actor-assignee-id-mismatch":
+        assignment["assignee"] = {
+            "id": 999,
+            "login": "XOEEst",
+            "type": "User",
+        }
+    elif case == "start-actor-assignee-login-mismatch":
+        assignment["assignee"] = {
+            "id": 18523445,
+            "login": "other-user",
+            "type": "User",
+        }
+    elif case == "assignment-actor-id-mismatch":
+        assignment["actor"] = {
+            "id": 1,
+            "login": "Copilot",
+            "type": "Bot",
+        }
+    elif case == "assignment-actor-login-mismatch":
+        assignment["actor"] = {
+            "id": 198982749,
+            "login": "copilot-swe-agent",
+            "type": "Bot",
+        }
+    elif case == "multiple-unrelated-assignments":
+        events.insert(
+            10,
+            {
+                "actor": deepcopy(assignment["actor"]),
+                "assignee": {
+                    "id": 999,
+                    "login": "other-user",
+                    "type": "User",
+                },
+                "created_at": "2026-08-06T20:08:01Z",
+                "event": "assigned",
+            },
+        )
+    elif case == "author-performed-assignment":
+        assignment["actor"] = deepcopy(assignment["assignee"])
+
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        90,
+        "copilot/steward-issue-31",
+        HEAD,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
         "different-finish-id",
         "different-finish-login",
         "different-finish-app",
@@ -807,7 +884,7 @@ def test_github_discovery_rejects_unbound_connections(case: str) -> None:
     ),
 )
 def test_github_discovery_rejects_inexact_work_windows(case: str) -> None:
-    events = deepcopy(_pr_268_timeline())
+    events = deepcopy(_pr_277_timeline())
     if case == "different-finish-id":
         events[15]["actor"] = {
             "id": 1,
