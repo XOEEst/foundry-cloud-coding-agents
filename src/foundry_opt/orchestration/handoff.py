@@ -7,7 +7,7 @@ import hashlib
 from importlib import metadata
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import subprocess
 import sys
@@ -479,7 +479,9 @@ class CandidateDesignHandoff:
             if re.fullmatch(
                 r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*",
                 path,
-            ) is None:
+            ) is None or any(
+                part in {".", ".."} for part in path.split("/")
+            ):
                 raise ValueError("candidate design changed path is invalid")
         if self.handoff_id != _document_sha256(self.payload_document):
             raise ValueError("candidate design content address is invalid")
@@ -3008,7 +3010,24 @@ def _validate_candidate_handoff_privacy(
 
 
 def _path_is_allowed(path: Path, roots: tuple[Path, ...]) -> bool:
-    return any(path == root or root in path.parents for root in roots)
+    raw = str(path)
+    normalized_raw = raw.replace("\\", "/")
+    posix = PurePosixPath(normalized_raw)
+    if (
+        not raw
+        or PureWindowsPath(raw).drive
+        or raw.startswith(("/", "\\"))
+        or any(
+            part in {".", ".."}
+            for part in normalized_raw.split("/")
+        )
+    ):
+        return False
+    normalized = Path(posix.as_posix())
+    return any(
+        normalized == root or root in normalized.parents
+        for root in roots
+    )
 
 
 def _safe_ref_name(value: str) -> bool:

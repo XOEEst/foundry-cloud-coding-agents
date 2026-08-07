@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -61,6 +62,7 @@ from foundry_opt.orchestration.candidate_workers import (
     CandidateWorkerRequest,
     CandidateWorkerService,
     CandidateWorkerStatus,
+    _candidate_design_submission_record,
     _evaluation_intent,
 )
 from foundry_opt.packaging import BundleArtifact, ValidationReport
@@ -2496,6 +2498,187 @@ def test_duplicate_and_reordered_designer_results_use_only_exact_binding(
     )
     assert design_record.payload["result_id"] == "exact-result"
     assert designer.invocations == 0
+
+
+@pytest.mark.parametrize("stale", (False, True), ids=("exact", "stale"))
+def test_resume_rehydrates_submitted_design_before_planning_draft(
+    tmp_path: Path,
+    stale: bool,
+) -> None:
+    ledger = Ledger(_seed_snapshot())
+    initial_repository = Repository(tmp_path)
+    initial_drafts = Drafts()
+    initial_evaluations = Evaluations()
+    dependencies = CandidateWorkerDependencies(
+        repository=initial_repository,
+        designer=DeferredDesigner(),
+        validate=lambda path: ValidationReport((), False),
+        build_bundle=lambda root, output: BundleArtifact(
+            output,
+            "e" * 64,
+            ("agent/instructions.md",),
+            (),
+            1,
+            output.with_suffix(".manifest.json"),
+        ),
+        drafts=initial_drafts,
+        evaluations=initial_evaluations,
+        write_evidence=lambda request: pytest.fail(
+            "candidate design must resume before evidence"
+        ),
+        clock=Clock(),
+    )
+    first = CandidateWorkerService(
+        ledger=ledger,
+        resolver=PlanResolver(_plan()),
+        dependencies=dependencies,
+    ).advance(CandidateWorkerRequest(tmp_path, 31))
+
+    assert first.status is CandidateWorkerStatus.WAITING
+    assert first.code == "candidate_design_pending"
+    result = CandidateDesignResult(
+        effect_id="design-31-1-1",
+        result_id="designer-result-1",
+        issue_number=31,
+        generation=1,
+        spec_sha256=SPEC_SHA256,
+        base_commit=BASE_COMMIT,
+        candidate_id="candidate-1",
+        slot=1,
+        idea_id="idea-1",
+        mutation_class="system_instructions",
+        motivation="Clarify the escalation rule.",
+        lessons=("The baseline omits a required escalation.",),
+        complexity="small",
+    )
+    artifact = CandidateDesignArtifact(
+        "refs/heads/foundry-opt/design/issue-31/design-31-1-1",
+        "c" * 40,
+        "f" * 40,
+        (Path("agent/instructions.md"),),
+    )
+    submitted = _candidate_design_submission_record(
+        ledger.snapshot,
+        "design-31-1-1-submitted",
+        result,
+        artifact,
+        84,
+    )
+    if stale:
+        submitted = replace(
+            submitted,
+            payload={
+                **submitted.payload,
+                "spec_sha256": "d" * 64,
+            },
+        )
+    assigned = OutboxRecord(
+        "design-31-1-1-worker-succeeded",
+        "specialist_work_succeeded",
+        1,
+        ledger.snapshot.state.sequence,
+        {
+            "assigned": True,
+            "created": True,
+            "effect_id": "design-31-1-1-worker",
+            "issue_number": 31,
+            "result_id": "designer-assignment-84",
+            "specialist": "foundry-candidate-designer",
+            "work_kind": "design_candidate",
+            "worker_issue_number": 84,
+        },
+    )
+    ledger.commit(
+        tmp_path,
+        issue_number=31,
+        expected_revision=ledger.snapshot.revision,
+        state=ledger.snapshot.state,
+        outbox=(assigned, submitted),
+    )
+    shutil.rmtree(
+        tmp_path / ".foundry-optimizer" / "worktrees",
+        ignore_errors=True,
+    )
+
+    class RehydratingRepository(Repository):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.rehydrations: list[tuple[str, str, str]] = []
+
+        def rehydrate_worktree(
+            self,
+            repository_root,
+            campaign_id,
+            candidate_id,
+            base_commit,
+            **artifact_binding,
+        ):
+            self.rehydrations.append(
+                (
+                    artifact_binding["source_ref"],
+                    artifact_binding["result_commit"],
+                    artifact_binding["result_tree"],
+                )
+            )
+            self.designed.add(candidate_id)
+            return self.reconcile_worktree(
+                repository_root,
+                campaign_id,
+                candidate_id,
+                base_commit,
+            )
+
+    class ReconciledDesigner:
+        def reconcile(self, intent):
+            return (result,)
+
+        def invoke(self, intent):
+            pytest.fail("a submitted design must not be invoked again")
+
+    class PendingDrafts:
+        def reconcile(self, intent):
+            return initial_drafts.reconcile(intent)
+
+        def create(self, intent):
+            raise CandidateEffectPending("foundry_draft")
+
+    resumed_repository = RehydratingRepository(tmp_path)
+    resumed = CandidateWorkerService(
+        ledger=ledger,
+        resolver=PlanResolver(_plan()),
+        dependencies=CandidateWorkerDependencies(
+            repository=resumed_repository,
+            designer=ReconciledDesigner(),
+            validate=lambda path: ValidationReport((), False),
+            build_bundle=dependencies.build_bundle,
+            drafts=PendingDrafts(),
+            evaluations=initial_evaluations,
+            write_evidence=lambda request: pytest.fail(
+                "draft planning must stop before evidence"
+            ),
+            clock=Clock(),
+        ),
+    ).advance(CandidateWorkerRequest(tmp_path, 31))
+
+    if stale:
+        assert resumed.status is CandidateWorkerStatus.FAILED
+        assert resumed.code == "candidate_worktree_failed"
+        assert resumed.summary == (
+            "Candidate worktree rehydration failed. "
+            "(candidate_design_artifact_stale)"
+        )
+        assert resumed_repository.rehydrations == []
+        return
+    assert resumed.status is CandidateWorkerStatus.WAITING
+    assert resumed.code == "candidate_draft_pending"
+    assert resumed_repository.rehydrations == [
+        (artifact.ref, artifact.head_commit, artifact.tree_sha)
+    ]
+    assert any(
+        record.kind == "candidate_effect_planned"
+        and record.payload.get("effect_kind") == "foundry_draft"
+        for record in resumed.snapshot.outbox
+    )
 
 
 def test_resume_rejects_stale_base_bound_to_durable_reservation(

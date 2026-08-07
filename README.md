@@ -244,6 +244,11 @@ either `policy_approved` or `human_review`.
   not by Actions or direct GitHub API calls, to comply with enterprise policy.
 - The planner materializes exceptional immutable spec PRs; the designer edits
   only reserved worktrees; the applier applies one exact patch without repair.
+- Candidate worktree paths are ephemeral. A resumed steward verifies the
+  state-bound design ref, parent, commit, tree, changed paths, and allow-list,
+  then recreates the deterministic managed worktree before continuing.
+  Rehydration failures retain `candidate_worktree_failed` with a stable
+  `candidate_design_*` detail.
 - Deployment uses a separate OIDC identity and accepts only persisted lineage.
 
 Scheduled reconciliation validates and replays the trusted inbox lifecycle

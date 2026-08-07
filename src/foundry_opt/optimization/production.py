@@ -2820,31 +2820,30 @@ class _ProductionCandidateDesigner:
         tree_sha = record.payload.get("tree_sha")
         if not all(isinstance(value, str) for value in (ref, head_commit, tree_sha)):
             raise ValueError("candidate design Git binding is invalid")
+        if ref != (
+            "refs/heads/foundry-opt/design/"
+            f"issue-{intent.issue_number}/{intent.effect_id}"
+        ):
+            raise ValueError("candidate design Git binding changed")
         if _git_replacements_present(self._commands, root):
             raise ValueError("candidate design Git binding changed")
         self._commands.run(
-            ("git", "fetch", "--quiet", "origin", ref),
+            ("git", "cat-file", "-e", f"{head_commit}^{{commit}}"),
             cwd=root,
             environment=_NO_GIT_REPLACEMENTS,
         )
-        fetched = self._commands.run(
-            ("git", "rev-parse", "FETCH_HEAD^{commit}"),
-            cwd=root,
-            environment=_NO_GIT_REPLACEMENTS,
-        ).stdout.strip()
         parent = self._commands.run(
-            ("git", "rev-parse", f"{fetched}^"),
+            ("git", "rev-parse", f"{head_commit}^"),
             cwd=root,
             environment=_NO_GIT_REPLACEMENTS,
         ).stdout.strip()
         fetched_tree = self._commands.run(
-            ("git", "rev-parse", f"{fetched}^{{tree}}"),
+            ("git", "rev-parse", f"{head_commit}^{{tree}}"),
             cwd=root,
             environment=_NO_GIT_REPLACEMENTS,
         ).stdout.strip()
         if (
-            fetched != head_commit
-            or parent != intent.base_commit
+            parent != intent.base_commit
             or fetched_tree != tree_sha
         ):
             raise ValueError("candidate design Git binding changed")
@@ -2864,7 +2863,7 @@ class _ProductionCandidateDesigner:
                         "--name-only",
                         "-z",
                         intent.base_commit,
-                        fetched,
+                        head_commit,
                         "--",
                     ),
                     cwd=root,
@@ -2888,7 +2887,7 @@ class _ProductionCandidateDesigner:
                 "--binary",
                 "--full-index",
                 intent.base_commit,
-                fetched,
+                head_commit,
                 "--",
             ),
             cwd=root,

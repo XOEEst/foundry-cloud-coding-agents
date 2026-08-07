@@ -7,7 +7,12 @@ import subprocess
 import pytest
 
 from foundry_opt.adapters.campaign_git import CampaignGit
+from foundry_opt.adapters.commands import SubprocessCommandRunner
 from foundry_opt.campaign.models import CampaignLimits
+from foundry_opt.campaign.protocols import (
+    CandidateWorktreeFailureDetail,
+    CandidateWorktreeRehydrationError,
+)
 from foundry_opt.drafts import DraftRecord
 from foundry_opt.evaluation import (
     AgentVersionRef,
@@ -34,16 +39,21 @@ from foundry_opt.orchestration import (
     EventKind,
     GitStateRef,
     OptimizationCampaign,
+    OutboxRecord,
 )
 from foundry_opt.orchestration.candidate_workers import (
+    CandidateDesignArtifact,
     CandidateDesignIntent,
     CandidateDesignResult,
+    CandidateEffectPending,
     CandidateWorkerDependencies,
     CandidateWorkerPlan,
     CandidateWorkerRequest,
     CandidateWorkerService,
     CandidateWorkerStatus,
+    _candidate_design_submission_record,
 )
+from foundry_opt.optimization.production import _ProductionCandidateDesigner
 from foundry_opt.packaging import BundleArtifact, ValidationReport
 
 
@@ -79,6 +89,51 @@ def _repository(tmp_path: Path) -> tuple[Path, str]:
     _run(("git", "remote", "add", "origin", str(origin)), repository)
     _run(("git", "push", "-u", "origin", "main"), repository)
     return repository, _run(("git", "rev-parse", "HEAD"), repository)
+
+
+def _design_sessions(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, str, str, str, str]:
+    origin = tmp_path / "origin.git"
+    session_a = tmp_path / "session-a"
+    session_b = tmp_path / "session-b"
+    _run(("git", "init", "--bare", str(origin)), tmp_path)
+    _run(("git", "init", "-b", "main", str(session_a)), tmp_path)
+    _run(("git", "config", "user.name", "Designer"), session_a)
+    _run(
+        ("git", "config", "user.email", "designer@example.invalid"),
+        session_a,
+    )
+    source = session_a / "agent" / "instructions.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("baseline\n", encoding="utf-8")
+    _run(("git", "add", "."), session_a)
+    _run(("git", "commit", "-m", "baseline"), session_a)
+    base_commit = _run(("git", "rev-parse", "HEAD"), session_a)
+    _run(("git", "remote", "add", "origin", str(origin)), session_a)
+    _run(("git", "push", "-u", "origin", "main"), session_a)
+    source.write_text("candidate\n", encoding="utf-8")
+    _run(("git", "add", "agent/instructions.md"), session_a)
+    _run(("git", "commit", "-m", "candidate design"), session_a)
+    design_commit = _run(("git", "rev-parse", "HEAD"), session_a)
+    design_tree = _run(("git", "rev-parse", "HEAD^{tree}"), session_a)
+    design_ref = (
+        "refs/heads/foundry-opt/design/issue-31/design-31-1-1"
+    )
+    _run(
+        ("git", "push", "origin", f"{design_commit}:{design_ref}"),
+        session_a,
+    )
+    _run(("git", "clone", str(origin), str(session_b)), tmp_path)
+    return (
+        origin,
+        session_a,
+        session_b,
+        base_commit,
+        design_commit,
+        design_tree,
+        design_ref,
+    )
 
 
 class Clock:
@@ -600,3 +655,373 @@ def test_real_worktree_cleanup_resumes_after_process_exit_before_ack(
     )
     worktrees = _run(("git", "worktree", "list", "--porcelain"), repository)
     assert ".foundry-optimizer/worktrees" not in worktrees
+
+
+def test_real_git_rehydrates_exact_design_in_fresh_session(
+    tmp_path: Path,
+) -> None:
+    (
+        _,
+        _,
+        session_b,
+        base_commit,
+        design_commit,
+        design_tree,
+        design_ref,
+    ) = _design_sessions(tmp_path)
+
+    repository = CampaignGit(default_branch=lambda root: "main")
+    worktree = repository.rehydrate_worktree(
+        session_b,
+        "issue-31-g1",
+        "candidate-1",
+        base_commit,
+        source_ref=design_ref,
+        result_commit=design_commit,
+        result_tree=design_tree,
+        changed_paths=(Path("agent/instructions.md"),),
+        allowed_paths=(Path("agent"),),
+    )
+
+    assert _run(("git", "rev-parse", "HEAD"), worktree.path) == design_commit
+    assert _run(("git", "status", "--porcelain"), worktree.path) == ""
+    assert (
+        worktree.path / "agent" / "instructions.md"
+    ).read_text(encoding="utf-8") == "candidate\n"
+
+    (worktree.path / "untracked.txt").write_text(
+        "not durable\n",
+        encoding="utf-8",
+    )
+    reopened = repository.rehydrate_worktree(
+        session_b,
+        "issue-31-g1",
+        "candidate-1",
+        base_commit,
+        source_ref=design_ref,
+        result_commit=design_commit,
+        result_tree=design_tree,
+        changed_paths=(Path("agent/instructions.md"),),
+        allowed_paths=(Path("agent"),),
+    )
+
+    assert reopened == worktree
+    assert not (worktree.path / "untracked.txt").exists()
+    assert _run(("git", "status", "--porcelain"), worktree.path) == ""
+
+
+def test_candidate_worker_fresh_session_rehydrates_to_draft_plan(
+    tmp_path: Path,
+) -> None:
+    (
+        _,
+        session_a,
+        session_b,
+        base_commit,
+        design_commit,
+        design_tree,
+        design_ref,
+    ) = _design_sessions(tmp_path)
+    plan = _plan(base_commit)
+    created = CampaignEvent(
+        "created",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    approved = CampaignEvent(
+        "approved",
+        EventKind.SPEC_POLICY_APPROVED,
+        1,
+        NOW,
+        {"spec_sha256": SPEC_SHA256},
+    )
+    state = OptimizationCampaign().advance(
+        AdvanceRequest(31, None, (created, approved))
+    ).state
+    effect_id = "design-31-1-1"
+    effect_plan = OutboxRecord(
+        effect_id,
+        "candidate_effect_planned",
+        1,
+        state.sequence,
+        {
+            "base_commit": base_commit,
+            "candidate_id": "candidate-1",
+            "effect_id": effect_id,
+            "effect_kind": "candidate_design",
+            "issue_number": 31,
+            "slot": 1,
+            "spec_sha256": SPEC_SHA256,
+        },
+    )
+    reservation = OutboxRecord(
+        "worktree-1-1",
+        "candidate_worktree_reserved",
+        1,
+        state.sequence,
+        {
+            "base_commit": base_commit,
+            "branch": (
+                f"foundry-opt/{plan.campaign_id}/candidate-1"
+            ),
+            "candidate_id": "candidate-1",
+            "issue_number": 31,
+            "slot": 1,
+            "spec_sha256": SPEC_SHA256,
+            "work_kind": "candidate",
+        },
+    )
+    planned = OutboxRecord(
+        f"{effect_id}-worker",
+        "specialist_work_request",
+        1,
+        state.sequence,
+        {
+            "allowed_mutations": ["system_instructions"],
+            "allowed_paths": ["agent"],
+            "base_commit": base_commit,
+            "baseline_metrics": {"quality": 0.5},
+            "branch": (
+                f"foundry-opt/{plan.campaign_id}/candidate-1"
+            ),
+            "candidate_feedback": [],
+            "candidate_id": "candidate-1",
+            "effect_id": effect_id,
+            "goal": plan.goal,
+            "issue_number": 31,
+            "reason": "candidate_design_pending",
+            "restricted_opt_ins": {},
+            "slot": 1,
+            "spec_sha256": SPEC_SHA256,
+            "specialist": "foundry-candidate-designer",
+            "target": "support",
+            "work_kind": "design_candidate",
+        },
+    )
+    assigned = OutboxRecord(
+        f"{effect_id}-worker-succeeded",
+        "specialist_work_succeeded",
+        1,
+        state.sequence,
+        {
+            "assigned": True,
+            "created": True,
+            "effect_id": planned.record_id,
+            "issue_number": 31,
+            "result_id": "designer-assignment-84",
+            "specialist": "foundry-candidate-designer",
+            "work_kind": "design_candidate",
+            "worker_issue_number": 84,
+        },
+    )
+    ledger = GitStateRef()
+    snapshot = ledger.commit(
+        session_a,
+        issue_number=31,
+        expected_revision=None,
+        state=state,
+        inbox=(created, approved),
+        outbox=(effect_plan, reservation, planned, assigned),
+    )
+    design = CandidateDesignResult(
+        effect_id=effect_id,
+        result_id="designer-result-1",
+        issue_number=31,
+        generation=1,
+        spec_sha256=SPEC_SHA256,
+        base_commit=base_commit,
+        candidate_id="candidate-1",
+        slot=1,
+        idea_id="idea-1",
+        mutation_class="system_instructions",
+        motivation="Clarify the escalation rule.",
+        lessons=("The baseline omits a required escalation.",),
+        complexity="small",
+    )
+    artifact = CandidateDesignArtifact(
+        design_ref,
+        design_commit,
+        design_tree,
+        (Path("agent/instructions.md"),),
+    )
+    ledger.commit(
+        session_a,
+        issue_number=31,
+        expected_revision=snapshot.revision,
+        state=snapshot.state,
+        outbox=(
+            _candidate_design_submission_record(
+                snapshot,
+                f"{effect_id}-submitted",
+                design,
+                artifact,
+                84,
+            ),
+        ),
+    )
+
+    class PendingCandidateDrafts(Drafts):
+        def create(self, intent):
+            if intent.subject_id == "candidate-1":
+                raise CandidateEffectPending("foundry_draft")
+            return super().create(intent)
+
+    drafts = PendingCandidateDrafts()
+    evaluations = Evaluations()
+    result = CandidateWorkerService(
+        ledger=GitStateRef(),
+        resolver=Resolver(plan),
+        dependencies=CandidateWorkerDependencies(
+            repository=CampaignGit(default_branch=lambda root: "main"),
+            designer=_ProductionCandidateDesigner(
+                ledger=GitStateRef(),
+                commands=SubprocessCommandRunner(),
+            ),
+            validate=lambda path: ValidationReport((), False),
+            build_bundle=lambda root, output: BundleArtifact(
+                output,
+                "e" * 64,
+                ("agent/instructions.md",),
+                (),
+                1,
+                output.with_suffix(".manifest.json"),
+            ),
+            drafts=drafts,
+            evaluations=evaluations,
+            write_evidence=lambda request: pytest.fail(
+                "draft execution must remain deferred"
+            ),
+            clock=Clock(),
+        ),
+    ).advance(CandidateWorkerRequest(session_b, 31))
+
+    assert result.status is CandidateWorkerStatus.WAITING
+    assert result.code == "candidate_draft_pending"
+    assert drafts.creates == 1
+    assert evaluations.runs == 1
+    assert any(
+        record.kind == "candidate_effect_planned"
+        and record.payload.get("effect_kind") == "foundry_draft"
+        and record.payload.get("candidate_id") == "candidate-1"
+        for record in result.snapshot.outbox
+    )
+    worktree = (
+        session_b
+        / ".foundry-optimizer"
+        / "worktrees"
+        / plan.campaign_id
+        / "candidate-1"
+    )
+    assert _run(("git", "rev-parse", "HEAD"), worktree) == design_commit
+    assert _run(("git", "status", "--porcelain"), worktree) == ""
+    assert (
+        worktree / "agent" / "instructions.md"
+    ).read_text(encoding="utf-8") == "candidate\n"
+
+
+@pytest.mark.parametrize(
+    ("case", "detail"),
+    (
+        (
+            "missing",
+            CandidateWorktreeFailureDetail.ARTIFACT_MISSING,
+        ),
+        (
+            "tree",
+            CandidateWorktreeFailureDetail.ARTIFACT_TAMPERED,
+        ),
+        (
+            "parent",
+            CandidateWorktreeFailureDetail.ARTIFACT_TAMPERED,
+        ),
+        (
+            "paths",
+            CandidateWorktreeFailureDetail.ARTIFACT_TAMPERED,
+        ),
+        (
+            "forbidden",
+            CandidateWorktreeFailureDetail.FORBIDDEN_PATHS,
+        ),
+    ),
+)
+def test_real_git_rehydration_rejects_invalid_design_artifacts(
+    tmp_path: Path,
+    case: str,
+    detail: CandidateWorktreeFailureDetail,
+) -> None:
+    (
+        origin,
+        session_a,
+        session_b,
+        base_commit,
+        design_commit,
+        design_tree,
+        design_ref,
+    ) = _design_sessions(tmp_path)
+    changed_paths = (Path("agent/instructions.md"),)
+    allowed_paths = (Path("agent"),)
+    if case == "missing":
+        _run(
+            (
+                "git",
+                f"--git-dir={origin}",
+                "update-ref",
+                "-d",
+                design_ref,
+            ),
+            tmp_path,
+        )
+    elif case == "tree":
+        design_tree = _run(
+            ("git", "rev-parse", f"{base_commit}^{{tree}}"),
+            session_b,
+        )
+    elif case == "parent":
+        _run(
+            ("git", "commit", "--allow-empty", "-m", "wrong parent"),
+            session_a,
+        )
+        design_commit = _run(("git", "rev-parse", "HEAD"), session_a)
+        design_tree = _run(
+            ("git", "rev-parse", "HEAD^{tree}"),
+            session_a,
+        )
+        _run(
+            (
+                "git",
+                "push",
+                "--force",
+                "origin",
+                f"{design_commit}:{design_ref}",
+            ),
+            session_a,
+        )
+    elif case == "paths":
+        changed_paths = (Path("agent/extra.md"),)
+    elif case == "forbidden":
+        allowed_paths = (Path("tests"),)
+
+    with pytest.raises(
+        CandidateWorktreeRehydrationError
+    ) as captured:
+        CampaignGit(default_branch=lambda root: "main").rehydrate_worktree(
+            session_b,
+            "issue-31-g1",
+            "candidate-1",
+            base_commit,
+            source_ref=design_ref,
+            result_commit=design_commit,
+            result_tree=design_tree,
+            changed_paths=changed_paths,
+            allowed_paths=allowed_paths,
+        )
+
+    assert captured.value.detail is detail
+    assert not (
+        session_b
+        / ".foundry-optimizer"
+        / "worktrees"
+        / "issue-31-g1"
+        / "candidate-1"
+    ).exists()

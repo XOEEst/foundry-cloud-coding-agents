@@ -32,6 +32,7 @@ from foundry_opt.orchestration.handoff import (
     HandoffApplyService,
     HandoffApplyStatus,
     HandoffFinalizer,
+    PayloadHash,
     StewardStateHandoff,
     TrustedHandoffContext,
     TrustedHandoffRequest,
@@ -1726,6 +1727,17 @@ def test_cloud_candidate_designer_persists_result_handoff(
     ) == base
     assert handoff.changed_paths == ("agent/instructions.md",)
     assert handoff.result.result_id == "designer-result-1"
+    with pytest.raises(
+        ValueError,
+        match="candidate design changed path is invalid",
+    ):
+        replace(
+            handoff,
+            changed_paths=("agent/../README.md",),
+            changed_payload_hashes=(
+                PayloadHash("agent/../README.md", "d" * 64),
+            ),
+        )
     with pytest.raises(ValueError, match="privacy"):
         replace(
             handoff,
@@ -1739,23 +1751,27 @@ def test_cloud_candidate_designer_persists_result_handoff(
         "rev-parse",
         f"{head}^2",
     ) == handoff.proposed_revision
+    proxy.disable()
+    _set_normal_github_actions_environment(monkeypatch)
+    actions = tmp_path / "actions"
+    _git(
+        tmp_path,
+        "clone",
+        "--branch",
+        "copilot/steward-issue-31",
+        str(origin),
+        str(actions),
+    )
+    assert _git(actions, "rev-parse", "HEAD") == head
     blob = _git(
-        repository,
+        actions,
         "ls-tree",
         head,
         "--",
         path,
     ).split()[2]
-    proxy.disable()
-    _set_normal_github_actions_environment(monkeypatch)
-    _git(
-        repository,
-        "push",
-        "origin",
-        f"{handoff.proposed_revision}:{handoff.proposed_ref}",
-    )
     request = TrustedHandoffRequest(
-        repository_root=repository,
+        repository_root=actions,
         repository="octo-org/optimizer",
         repository_id=123,
         pull_request_number=91,
@@ -1777,7 +1793,7 @@ def test_cloud_candidate_designer_persists_result_handoff(
     assert duplicate.status is HandoffApplyStatus.ALREADY_APPLIED
     assert (
         _git(
-            repository,
+            actions,
             "ls-remote",
             "--heads",
             "origin",
@@ -1785,7 +1801,7 @@ def test_cloud_candidate_designer_persists_result_handoff(
         ).split()[0]
         == handoff.proposed_revision
     )
-    updated = GitStateRef().load(repository, 31)
+    updated = GitStateRef().load(actions, 31)
     assert updated is not None
     submitted_record = next(
         record

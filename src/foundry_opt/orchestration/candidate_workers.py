@@ -17,6 +17,8 @@ from foundry_opt.campaign.protocols import (
     BundleBuilder,
     CampaignRepository,
     CampaignWorktree,
+    CandidateWorktreeFailureDetail,
+    CandidateWorktreeRehydrationError,
     Clock,
     EvidenceWriter,
     ValidationRunner,
@@ -1447,12 +1449,55 @@ class CandidateWorkerService:
             plan,
             worktree,
         )
+        submitted_design = _submitted_design(
+            snapshot,
+            intent,
+        )
+        if submitted_design is not None:
+            submitted_result, artifact = submitted_design
+            try:
+                worktree = self._deps.repository.rehydrate_worktree(
+                    request.repository_root,
+                    plan.campaign_id,
+                    candidate_id,
+                    plan.base_commit,
+                    source_ref=artifact.ref,
+                    result_commit=artifact.head_commit,
+                    result_tree=artifact.tree_sha,
+                    changed_paths=artifact.changed_paths,
+                    allowed_paths=intent.edit_paths,
+                )
+            except CandidateWorktreeRehydrationError as error:
+                raise _candidate_worktree_rehydration_failure(
+                    snapshot,
+                    error.detail,
+                ) from error
+            if (
+                worktree.candidate_id != candidate_id
+                or worktree.base_commit != plan.base_commit
+                or worktree.branch
+                != f"foundry-opt/{plan.campaign_id}/{candidate_id}"
+                or worktree.path != intent.worktree
+            ):
+                raise _candidate_worktree_rehydration_failure(
+                    snapshot,
+                    CandidateWorktreeFailureDetail.WORKTREE_MISMATCH,
+                )
         design_success_id = f"{intent.effect_id}-succeeded"
         persisted_design = _record(snapshot, design_success_id)
         results = _matching_design_results(
             intent,
             self._deps.designer.reconcile(intent),
         )
+        if (
+            submitted_design is not None
+            and results != (submitted_result,)
+        ):
+            raise _CandidateRecoveryFailure(
+                snapshot,
+                "designer_reconciliation_mismatch",
+                "The submitted candidate design could not be reconciled.",
+            )
         if persisted_design is not None:
             design = _design_from_record(
                 snapshot,
@@ -1473,9 +1518,13 @@ class CandidateWorkerService:
                 raise _CandidateSessionTimeout(snapshot)
             try:
                 design = (
-                    results[0]
-                    if results
-                    else self._deps.designer.invoke(intent)
+                    submitted_result
+                    if submitted_design is not None
+                    else (
+                        results[0]
+                        if results
+                        else self._deps.designer.invoke(intent)
+                    )
                 )
             except CandidateDesignPending:
                 raise _CandidateDesignDeferred(snapshot) from None
@@ -3253,6 +3302,128 @@ def _design_from_record(
             "The persisted candidate design is invalid.",
         ) from error
     return result
+
+
+def _submitted_design(
+    snapshot: StateRefSnapshot,
+    intent: CandidateDesignIntent,
+) -> tuple[CandidateDesignResult, CandidateDesignArtifact] | None:
+    records = tuple(
+        record
+        for record in snapshot.outbox
+        if record.record_id == f"{intent.effect_id}-submitted"
+    )
+    if not records:
+        return None
+    if len(records) != 1:
+        raise _candidate_worktree_rehydration_failure(
+            snapshot,
+            CandidateWorktreeFailureDetail.ARTIFACT_STALE,
+        )
+    record = records[0]
+    expected_fields = {
+        "base_commit",
+        "candidate_id",
+        "changed_paths",
+        "complexity",
+        "effect_id",
+        "head_commit",
+        "idea_id",
+        "issue_number",
+        "lessons",
+        "motivation",
+        "mutation_class",
+        "parent_idea_ids",
+        "ref",
+        "required_opt_ins",
+        "result_id",
+        "slot",
+        "spec_sha256",
+        "tree_sha",
+        "worker_issue_number",
+    }
+    try:
+        worker_issue_number = record.payload["worker_issue_number"]
+        if (
+            record.kind != "candidate_design_submitted"
+            or record.generation != intent.generation
+            or set(record.payload) != expected_fields
+            or type(worker_issue_number) is not int
+            or worker_issue_number < 1
+        ):
+            raise ValueError("candidate design submission is stale")
+        assignments = tuple(
+            item
+            for item in snapshot.outbox
+            if (
+                item.kind == "specialist_work_succeeded"
+                and item.generation == intent.generation
+                and item.payload.get("effect_id")
+                == f"{intent.effect_id}-worker"
+                and item.payload.get("specialist")
+                == "foundry-candidate-designer"
+                and item.payload.get("work_kind") == "design_candidate"
+            )
+        )
+        if (
+            len(assignments) != 1
+            or assignments[0].payload.get("worker_issue_number")
+            != worker_issue_number
+        ):
+            raise ValueError("candidate design assignment is stale")
+        result = CandidateDesignResult(
+            effect_id=str(record.payload["effect_id"]),
+            result_id=str(record.payload["result_id"]),
+            issue_number=int(record.payload["issue_number"]),
+            generation=record.generation,
+            spec_sha256=str(record.payload["spec_sha256"]),
+            base_commit=str(record.payload["base_commit"]),
+            candidate_id=str(record.payload["candidate_id"]),
+            slot=int(record.payload["slot"]),
+            idea_id=str(record.payload["idea_id"]),
+            mutation_class=str(record.payload["mutation_class"]),
+            parent_idea_ids=tuple(record.payload["parent_idea_ids"]),
+            required_opt_ins=frozenset(
+                record.payload["required_opt_ins"]
+            ),
+            motivation=str(record.payload["motivation"]),
+            lessons=tuple(record.payload["lessons"]),
+            complexity=str(record.payload["complexity"]),
+        )
+        result.require_matches(intent)
+        artifact = CandidateDesignArtifact(
+            ref=str(record.payload["ref"]),
+            head_commit=str(record.payload["head_commit"]),
+            tree_sha=str(record.payload["tree_sha"]),
+            changed_paths=tuple(
+                Path(path) for path in record.payload["changed_paths"]
+            ),
+        )
+        if artifact.ref != (
+            "refs/heads/foundry-opt/design/"
+            f"issue-{intent.issue_number}/{intent.effect_id}"
+        ):
+            raise ValueError("candidate design ref is stale")
+    except (KeyError, TypeError, ValueError) as error:
+        raise _candidate_worktree_rehydration_failure(
+            snapshot,
+            CandidateWorktreeFailureDetail.ARTIFACT_STALE,
+        ) from error
+    return result, artifact
+
+
+def _candidate_worktree_rehydration_failure(
+    snapshot: StateRefSnapshot,
+    detail: CandidateWorktreeFailureDetail,
+) -> _CandidateRecoveryFailure:
+    return _CandidateRecoveryFailure(
+        snapshot,
+        "candidate_worktree_failed",
+        (
+            "Candidate worktree rehydration failed. "
+            f"({detail.value})"
+        ),
+    )
 
 
 def _candidate_design_intent(

@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -15,16 +15,27 @@ from foundry_opt.campaign.protocols import (
     ActiveCampaignError,
     CampaignLock,
     CampaignWorktree,
+    CandidateWorktreeFailureDetail,
+    CandidateWorktreeRehydrationError,
     PinnedRepository,
 )
 from foundry_opt.campaign.worktrees import (
     contained_worktree_root,
     require_managed_worktree,
 )
+from foundry_opt.orchestration.git_transport import (
+    fetch_revision,
+    GitTransportError,
+    resolve_safe_fetch_remote,
+)
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_DESIGN_REF = re.compile(
+    r"^refs/heads/foundry-opt/design/issue-[1-9][0-9]*/"
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+)
 
 
 class CampaignGit:
@@ -246,6 +257,124 @@ class CampaignGit:
         self._git(root, "worktree", "prune")
         self._worktrees.pop(path.resolve(), None)
         return self.create_worktree(root, campaign_id, candidate_id, base_commit)
+
+    def rehydrate_worktree(
+        self,
+        repository_root: Path,
+        campaign_id: str,
+        candidate_id: str,
+        base_commit: str,
+        *,
+        source_ref: str,
+        result_commit: str,
+        result_tree: str,
+        changed_paths: tuple[Path, ...],
+        allowed_paths: tuple[Path, ...],
+    ) -> CampaignWorktree:
+        root = _repository_root(repository_root)
+        _identifier(campaign_id, "campaign_id")
+        _identifier(candidate_id, "candidate_id")
+        try:
+            _commit(base_commit)
+            _commit(result_commit)
+            _commit(result_tree)
+            if _DESIGN_REF.fullmatch(source_ref) is None:
+                raise ValueError("candidate design ref is invalid")
+            expected_paths = tuple(
+                _repository_relative_path(path, "changed_path")
+                for path in changed_paths
+            )
+            allowed = tuple(
+                _repository_relative_path(path, "allowed_path")
+                for path in allowed_paths
+            )
+        except ValueError as error:
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.ARTIFACT_TAMPERED
+            ) from error
+        if (
+            not expected_paths
+            or expected_paths != tuple(sorted(set(expected_paths)))
+        ):
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.ARTIFACT_TAMPERED
+            )
+        if not allowed or any(
+            path.parts and path.parts[0] == ".foundry-optimizer"
+            for path in expected_paths
+        ):
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.FORBIDDEN_PATHS
+            )
+        if any(
+            not _path_is_allowed(path, allowed)
+            for path in expected_paths
+        ):
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.FORBIDDEN_PATHS
+            )
+        self._fetch_design_artifact(
+            root,
+            source_ref,
+            result_commit,
+        )
+        self._verify_design_artifact(
+            root,
+            base_commit=base_commit,
+            result_commit=result_commit,
+            result_tree=result_tree,
+            changed_paths=expected_paths,
+        )
+        try:
+            worktree = self.open_worktree(
+                root,
+                campaign_id,
+                candidate_id,
+                base_commit,
+            )
+            if self._worktree_matches_revision(
+                worktree,
+                result_commit,
+                result_tree,
+                expected_paths,
+            ):
+                return worktree
+        except (KeyError, OSError, RuntimeError, ValueError):
+            pass
+        try:
+            worktree = self.reconcile_worktree(
+                root,
+                campaign_id,
+                candidate_id,
+                base_commit,
+            )
+            self._git_without_replacements(
+                worktree.path,
+                "reset",
+                "--hard",
+                "--quiet",
+                result_commit,
+            )
+            self._git(worktree.path, "clean", "-fdx", "--quiet")
+            if not self._worktree_matches_revision(
+                worktree,
+                result_commit,
+                result_tree,
+                expected_paths,
+            ):
+                raise ValueError("candidate design worktree differs")
+        except (
+            CandidateWorktreeRehydrationError,
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            if isinstance(error, CandidateWorktreeRehydrationError):
+                raise
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.WORKTREE_MISMATCH
+            ) from error
+        return worktree
 
     def changed_paths(
         self,
@@ -488,6 +617,182 @@ class CampaignGit:
             raise ValueError("remote default-branch tip is unavailable")
         return matches[0]
 
+    def _fetch_design_artifact(
+        self,
+        root: Path,
+        source_ref: str,
+        result_commit: str,
+    ) -> None:
+        safe_remote = resolve_safe_fetch_remote(root, "origin")
+        if safe_remote is None:
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.ARTIFACT_MISSING
+            )
+        try:
+            fetched = fetch_revision(root, safe_remote, source_ref)
+        except GitTransportError as error:
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.ARTIFACT_MISSING
+            ) from error
+        if fetched != result_commit:
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.ARTIFACT_TAMPERED
+            )
+
+    def _verify_design_artifact(
+        self,
+        root: Path,
+        *,
+        base_commit: str,
+        result_commit: str,
+        result_tree: str,
+        changed_paths: tuple[Path, ...],
+    ) -> None:
+        try:
+            parent_line = self._git_text_without_replacements(
+                root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                result_commit,
+            ).split()
+            tree = self._git_text_without_replacements(
+                root,
+                "rev-parse",
+                f"{result_commit}^{{tree}}",
+            )
+            observed = tuple(
+                _repository_relative_path(
+                    Path(value.decode("utf-8")),
+                    "changed_path",
+                )
+                for value in self._git_without_replacements(
+                    root,
+                    "diff",
+                    "--name-only",
+                    "-z",
+                    base_commit,
+                    result_commit,
+                    "--",
+                ).split(b"\0")
+                if value
+            )
+        except (
+            OSError,
+            RuntimeError,
+            UnicodeDecodeError,
+            ValueError,
+        ) as error:
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.ARTIFACT_MISSING
+            ) from error
+        if (
+            parent_line != [result_commit, base_commit]
+            or tree != result_tree
+            or observed != changed_paths
+        ):
+            raise CandidateWorktreeRehydrationError(
+                CandidateWorktreeFailureDetail.ARTIFACT_TAMPERED
+            )
+        for path in changed_paths:
+            entry = self._git_without_replacements(
+                root,
+                "ls-tree",
+                "-z",
+                result_commit,
+                "--",
+                path.as_posix(),
+            )
+            fields = entry.rstrip(b"\0").split(maxsplit=2)
+            if (
+                len(fields) != 3
+                or fields[0] not in {b"100644", b"100755"}
+                or fields[1] != b"blob"
+                or not fields[2].endswith(
+                    b"\t" + path.as_posix().encode("utf-8")
+                )
+            ):
+                raise CandidateWorktreeRehydrationError(
+                    CandidateWorktreeFailureDetail.ARTIFACT_TAMPERED
+                )
+
+    def _worktree_matches_revision(
+        self,
+        worktree: CampaignWorktree,
+        result_commit: str,
+        result_tree: str,
+        changed_paths: tuple[Path, ...],
+    ) -> bool:
+        path = self._owned(worktree)
+        if (
+            self._git_text_without_replacements(
+                path,
+                "rev-parse",
+                "HEAD^{commit}",
+            )
+            != result_commit
+            or self._git_text_without_replacements(
+                path,
+                "rev-parse",
+                "HEAD^{tree}",
+            )
+            != result_tree
+            or self._git_text(path, "symbolic-ref", "-q", "HEAD")
+            != f"refs/heads/{worktree.branch}"
+            or self._git(path, "status", "--porcelain=v1", "--")
+        ):
+            return False
+        observed = tuple(
+            _repository_relative_path(
+                Path(value.decode("utf-8")),
+                "changed_path",
+            )
+            for value in self._git_without_replacements(
+                path,
+                "diff",
+                "--name-only",
+                "-z",
+                worktree.base_commit,
+                "HEAD",
+                "--",
+            ).split(b"\0")
+            if value
+        )
+        return observed == changed_paths
+
+    def _git_without_replacements(
+        self,
+        cwd: Path,
+        *arguments: str,
+    ) -> bytes:
+        result = subprocess.run(
+            ("git", *arguments),
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            env={**os.environ, "GIT_NO_REPLACE_OBJECTS": "1"},
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+                or "git command failed"
+            )
+        return result.stdout
+
+    def _git_text_without_replacements(
+        self,
+        cwd: Path,
+        *arguments: str,
+    ) -> str:
+        return self._git_without_replacements(
+            cwd,
+            *arguments,
+        ).decode("ascii").strip()
+
 
 def remote_default_branch(repository_root: Path) -> str:
     result = subprocess.run(
@@ -534,6 +839,24 @@ def _repository_root(path: Path) -> Path:
 def _identifier(value: str, field: str) -> None:
     if not _IDENTIFIER.fullmatch(value):
         raise ValueError(f"{field} is invalid")
+
+
+def _repository_relative_path(value: Path, field: str) -> Path:
+    raw = str(value)
+    windows = PureWindowsPath(raw)
+    posix = PurePosixPath(raw.replace("\\", "/"))
+    if (
+        not raw
+        or windows.drive
+        or raw.startswith(("/", "\\"))
+        or ".." in posix.parts
+    ):
+        raise ValueError(f"{field} must be repository-relative")
+    return Path(posix.as_posix())
+
+
+def _path_is_allowed(path: Path, allowed: tuple[Path, ...]) -> bool:
+    return any(path == root or root in path.parents for root in allowed)
 
 
 def _registered_worktrees(repository_root: Path) -> dict[Path, str | None]:

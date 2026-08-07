@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from enum import StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from types import MappingProxyType
@@ -247,6 +248,20 @@ class CampaignStateError(RuntimeError):
         )
 
 
+class CandidateWorktreeFailureDetail(StrEnum):
+    ARTIFACT_MISSING = "candidate_design_artifact_missing"
+    ARTIFACT_TAMPERED = "candidate_design_artifact_tampered"
+    ARTIFACT_STALE = "candidate_design_artifact_stale"
+    FORBIDDEN_PATHS = "candidate_design_artifact_forbidden"
+    WORKTREE_MISMATCH = "candidate_design_worktree_mismatch"
+
+
+class CandidateWorktreeRehydrationError(RuntimeError):
+    def __init__(self, detail: CandidateWorktreeFailureDetail) -> None:
+        self.detail = detail
+        super().__init__(detail.value)
+
+
 class Clock(Protocol):
     def now(self) -> datetime: ...
 
@@ -295,6 +310,20 @@ class CampaignRepository(Protocol):
         campaign_id: str,
         candidate_id: str,
         base_commit: str,
+    ) -> CampaignWorktree: ...
+
+    def rehydrate_worktree(
+        self,
+        repository_root: Path,
+        campaign_id: str,
+        candidate_id: str,
+        base_commit: str,
+        *,
+        source_ref: str,
+        result_commit: str,
+        result_tree: str,
+        changed_paths: tuple[Path, ...],
+        allowed_paths: tuple[Path, ...],
     ) -> CampaignWorktree: ...
 
     def changed_paths(
