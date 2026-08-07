@@ -565,25 +565,77 @@ def test_github_discovery_paginates_explicitly_and_fails_on_bound() -> None:
         bounded.list_open_pull_requests()
 
 
-def test_github_discovery_binds_head_to_exact_copilot_session() -> None:
+def _pr_268_timeline() -> list[dict[str, object]]:
     app = {"id": 1143301, "slug": "copilot-swe-agent"}
-    events = [
+    copilot = {"id": 198982749, "login": "Copilot", "type": "Bot"}
+    owner = {"id": 18523445, "login": "XOEEst", "type": "User"}
+    events: list[dict[str, object]] = [
         {
-            "actor": {"id": 7, "login": "maintainer"},
+            "actor": copilot,
+            "created_at": f"2026-08-06T20:{minute:02d}:00Z",
+            "event": "committed",
+            "sha": f"{minute:040x}",
+        }
+        for minute in range(8)
+    ]
+    events.extend([
+        {
+            "actor": owner,
+            "assignee": copilot,
+            "created_at": "2026-08-06T20:08:00Z",
+            "event": "assigned",
+        },
+        {
+            "actor": owner,
+            "assignee": copilot,
+            "created_at": "2026-08-06T20:08:01Z",
+            "event": "assigned",
+        },
+        {
+            "actor": copilot,
+            "created_at": "2026-08-06T20:08:02Z",
+            "event": "mentioned",
+        },
+        {
+            "actor": copilot,
+            "created_at": "2026-08-06T20:08:03Z",
+            "event": "connected",
+        },
+        {
+            "actor": owner,
+            "created_at": "2026-08-06T20:08:04Z",
             "event": "copilot_work_started",
             "performed_via_github_app": app,
         },
         {
-            "actor": {"id": 198982749, "login": "Copilot"},
-            "event": "connected",
+            "actor": copilot,
+            "created_at": "2026-08-06T20:08:05Z",
+            "event": "committed",
+            "sha": HEAD,
         },
-        {"event": "committed", "sha": HEAD},
         {
-            "actor": {"id": 7, "login": "maintainer"},
+            "actor": copilot,
+            "created_at": "2026-08-06T20:08:06Z",
+            "event": "renamed",
+        },
+        {
+            "actor": owner,
+            "created_at": "2026-08-06T20:08:07Z",
             "event": "copilot_work_finished",
             "performed_via_github_app": app,
         },
-    ]
+        {
+            "actor": owner,
+            "created_at": "2026-08-06T20:08:08Z",
+            "event": "review_requested",
+            "requested_reviewer": copilot,
+        },
+    ])
+    return events
+
+
+def test_github_discovery_accepts_pr_268_copilot_lead_in() -> None:
+    events = _pr_268_timeline()
     commands = DiscoveryCommands([events])
     gateway = GhHandoffPullRequestGateway(
         commands,
@@ -607,12 +659,15 @@ def test_github_discovery_binds_head_to_exact_copilot_session() -> None:
         )
     ]
 
+
+def test_github_discovery_binds_head_to_exact_copilot_session() -> None:
+    events = _pr_268_timeline()
     forged = GhHandoffPullRequestGateway(
         DiscoveryCommands(
             [[
-                *events[:2],
+                *events[:13],
                 {"event": "committed", "sha": "f" * 40},
-                *events[2:],
+                *events[14:],
             ]]
         ),
         Path("repository"),
@@ -635,6 +690,203 @@ def test_github_discovery_binds_head_to_exact_copilot_session() -> None:
             "copilot/steward-issue-31",
             HEAD,
         )
+
+
+def test_github_discovery_accepts_connection_inside_work_window() -> None:
+    app = {"id": 1143301, "slug": "copilot-swe-agent"}
+    owner = {"id": 18523445, "login": "XOEEst", "type": "User"}
+    events = [
+        {
+            "actor": owner,
+            "event": "copilot_work_started",
+            "performed_via_github_app": app,
+        },
+        {
+            "actor": {
+                "id": 198982749,
+                "login": "Copilot",
+                "type": "Bot",
+            },
+            "event": "connected",
+        },
+        {"event": "committed", "sha": HEAD},
+        {
+            "actor": owner,
+            "event": "copilot_work_finished",
+            "performed_via_github_app": app,
+        },
+    ]
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        90,
+        "copilot/steward-issue-31",
+        HEAD,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "arbitrary-old",
+        "after-finish",
+        "unrelated-before-start",
+        "too-many-lead-in-events",
+        "stale-lead-in",
+        "out-of-order-lead-in",
+        "wrong-bot-id",
+        "wrong-bot-login",
+        "multiple-connections",
+    ),
+)
+def test_github_discovery_rejects_unbound_connections(case: str) -> None:
+    events = deepcopy(_pr_268_timeline())
+    connection = events[11]
+    if case == "arbitrary-old":
+        events.pop(11)
+        events.insert(4, connection)
+    elif case == "after-finish":
+        events.pop(11)
+        events.insert(15, connection)
+    elif case == "unrelated-before-start":
+        events.insert(
+            12,
+            {
+                "actor": events[12]["actor"],
+                "created_at": "2026-08-06T20:08:03Z",
+                "event": "labeled",
+            },
+        )
+    elif case == "too-many-lead-in-events":
+        events.insert(8, deepcopy(events[8]))
+    elif case == "stale-lead-in":
+        for index in range(8, 12):
+            events[index]["created_at"] = (
+                f"2026-08-06T20:00:0{index - 8}Z"
+            )
+    elif case == "out-of-order-lead-in":
+        connection["created_at"] = "2026-08-06T20:09:00Z"
+    elif case == "wrong-bot-id":
+        connection["actor"]["id"] = 1
+    elif case == "wrong-bot-login":
+        connection["actor"]["login"] = "copilot-swe-agent"
+    elif case == "multiple-connections":
+        duplicate = deepcopy(connection)
+        duplicate["created_at"] = "2026-08-06T20:08:05Z"
+        events.insert(14, duplicate)
+
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        90,
+        "copilot/steward-issue-31",
+        HEAD,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "different-finish-id",
+        "different-finish-login",
+        "different-finish-app",
+        "different-start-app",
+        "missing-actor-login",
+        "connected-after-finish",
+        "force-push-in-window",
+        "force-push-after-finish",
+        "commit-after-finish",
+    ),
+)
+def test_github_discovery_rejects_inexact_work_windows(case: str) -> None:
+    events = deepcopy(_pr_268_timeline())
+    if case == "different-finish-id":
+        events[15]["actor"] = {
+            "id": 1,
+            "login": "XOEEst",
+            "type": "User",
+        }
+    elif case == "different-finish-login":
+        events[15]["actor"] = {
+            "id": 18523445,
+            "login": "other-user",
+            "type": "User",
+        }
+    elif case == "different-finish-app":
+        events[15]["performed_via_github_app"]["id"] = 1
+    elif case == "different-start-app":
+        events[12]["performed_via_github_app"]["slug"] = "other-app"
+    elif case == "missing-actor-login":
+        actor = {"id": 18523445, "type": "User"}
+        events[12]["actor"] = actor
+        events[15]["actor"] = deepcopy(actor)
+    elif case == "connected-after-finish":
+        events.insert(16, deepcopy(events[11]))
+    elif case == "force-push-in-window":
+        events.insert(14, {"event": "head_ref_force_pushed"})
+    elif case == "force-push-after-finish":
+        events.insert(16, {"event": "head_ref_force_pushed"})
+    elif case == "commit-after-finish":
+        events.insert(16, {"event": "committed", "sha": HEAD})
+
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        90,
+        "copilot/steward-issue-31",
+        HEAD,
+    ) is False
+
+
+def test_github_discovery_rejects_multiple_matching_work_windows() -> None:
+    app = {"id": 1143301, "slug": "copilot-swe-agent"}
+    owner = {"id": 18523445, "login": "XOEEst", "type": "User"}
+    start = {
+        "actor": owner,
+        "event": "copilot_work_started",
+        "performed_via_github_app": app,
+    }
+    events = [
+        start,
+        deepcopy(start),
+        {
+            "actor": {
+                "id": 198982749,
+                "login": "Copilot",
+                "type": "Bot",
+            },
+            "event": "connected",
+        },
+        {"event": "committed", "sha": HEAD},
+        {
+            "actor": owner,
+            "event": "copilot_work_finished",
+            "performed_via_github_app": app,
+        },
+    ]
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        90,
+        "copilot/steward-issue-31",
+        HEAD,
+    ) is False
 
 
 @pytest.mark.parametrize(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 import hashlib
 from importlib import metadata
@@ -58,6 +58,8 @@ _DISCOVERY_PAGE_SIZE = 100
 _DISCOVERY_MAX_PAGES = 2
 _DISCOVERY_LIMIT = 10
 _TIMELINE_MAX_PAGES = 3
+_COPILOT_LEAD_IN_MAX_EVENTS = 4
+_COPILOT_LEAD_IN_MAX_AGE = timedelta(minutes=5)
 _HANDOFF_COMMIT_ENVIRONMENT = {
     "GIT_AUTHOR_NAME": "Foundry Optimizer Handoff",
     "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
@@ -2708,13 +2710,13 @@ def _timeline_attests_copilot_head(
 ) -> bool:
     valid_windows = 0
     for start_index, start in enumerate(events):
+        start_actor = _timeline_actor_identity(start.get("actor"))
         if (
             start.get("event") != "copilot_work_started"
             or not _exact_copilot_app(start.get("performed_via_github_app"))
-            or not isinstance(start.get("actor"), Mapping)
+            or start_actor is None
         ):
             continue
-        start_actor = start["actor"].get("id")
         for finish_index in range(start_index + 1, len(events)):
             finish = events[finish_index]
             if finish.get("event") != "copilot_work_finished":
@@ -2723,8 +2725,8 @@ def _timeline_attests_copilot_head(
                 not _exact_copilot_app(
                     finish.get("performed_via_github_app")
                 )
-                or not isinstance(finish.get("actor"), Mapping)
-                or finish["actor"].get("id") != start_actor
+                or _timeline_actor_identity(finish.get("actor"))
+                != start_actor
             ):
                 break
             window = events[start_index + 1 : finish_index]
@@ -2733,23 +2735,28 @@ def _timeline_attests_copilot_head(
                 for event in window
                 if event.get("event") == "committed"
             ]
-            connected = any(
-                event.get("event") == "connected"
-                and isinstance(event.get("actor"), Mapping)
-                and event["actor"].get("id") == _COPILOT_APP_USER_ID
-                and event["actor"].get("login")
-                in {"Copilot", "copilot-swe-agent[bot]"}
+            connections = [
+                event
                 for event in window
+                if event.get("event") == "connected"
+                and _exact_copilot_bot(event.get("actor"))
+            ]
+            connections.extend(
+                _copilot_lead_in(events, start_index, start)
             )
-            later_head_change = any(
+            later_invalidation = any(
                 event.get("event")
                 in {"committed", "head_ref_force_pushed"}
+                or (
+                    event.get("event") == "connected"
+                    and _exact_copilot_bot(event.get("actor"))
+                )
                 for event in events[finish_index + 1 :]
             )
             if (
                 commits == [revision]
-                and connected
-                and not later_head_change
+                and len(connections) == 1
+                and not later_invalidation
                 and not any(
                     event.get("event") == "head_ref_force_pushed"
                     for event in window
@@ -2758,6 +2765,88 @@ def _timeline_attests_copilot_head(
                 valid_windows += 1
             break
     return valid_windows == 1
+
+
+def _timeline_actor_identity(value: Any) -> tuple[int, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    actor_id = value.get("id")
+    login = value.get("login")
+    if (
+        not isinstance(actor_id, int)
+        or isinstance(actor_id, bool)
+        or actor_id <= 0
+        or not isinstance(login, str)
+        or not login
+    ):
+        return None
+    return actor_id, login
+
+
+def _copilot_lead_in(
+    events: list[Mapping[str, Any]],
+    start_index: int,
+    start: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    lead_in: list[Mapping[str, Any]] = []
+    for event in reversed(
+        events[max(0, start_index - _COPILOT_LEAD_IN_MAX_EVENTS) : start_index]
+    ):
+        if event.get("event") not in {"assigned", "mentioned", "connected"}:
+            break
+        if not _copilot_lead_in_event(event):
+            return []
+        lead_in.append(event)
+    if (
+        not lead_in
+        or (
+            start_index > len(lead_in)
+            and events[start_index - len(lead_in) - 1].get("event")
+            in {"assigned", "mentioned", "connected"}
+        )
+    ):
+        return []
+    ordered = list(reversed(lead_in))
+    times = [_timeline_event_time(event) for event in [*ordered, start]]
+    if (
+        any(value is None for value in times)
+        or times != sorted(times)
+        or times[-1] - times[0] > _COPILOT_LEAD_IN_MAX_AGE
+    ):
+        return []
+    return [
+        event for event in ordered if event.get("event") == "connected"
+    ]
+
+
+def _copilot_lead_in_event(event: Mapping[str, Any]) -> bool:
+    kind = event.get("event")
+    if kind == "assigned":
+        return _exact_copilot_bot(event.get("assignee"))
+    if kind in {"mentioned", "connected"}:
+        return _exact_copilot_bot(event.get("actor"))
+    return False
+
+
+def _exact_copilot_bot(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("id") == _COPILOT_APP_USER_ID
+        and value.get("login") in {"Copilot", "copilot-swe-agent[bot]"}
+        and value.get("type") in {None, "Bot"}
+    )
+
+
+def _timeline_event_time(event: Mapping[str, Any]) -> datetime | None:
+    value = event.get("created_at")
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return None
+    try:
+        return datetime.fromisoformat(
+            value.removesuffix("Z") + "+00:00"
+        )
+    except ValueError:
+        return None
 
 
 def _exact_copilot_app(value: Any) -> bool:
