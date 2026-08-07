@@ -40,11 +40,11 @@ class CampaignLimits:
     transient_retries: int
 
     def __post_init__(self) -> None:
-        if not 1 <= self.deadline_minutes <= 50:
-            raise ValueError("deadline_minutes must be between 1 and 50")
-        if not 1 <= self.candidate_cutoff_minutes <= 40:
+        if not 1 <= self.deadline_minutes <= 240:
+            raise ValueError("deadline_minutes must be between 1 and 240")
+        if not 1 <= self.candidate_cutoff_minutes <= 180:
             raise ValueError(
-                "candidate_cutoff_minutes must be between 1 and 40"
+                "candidate_cutoff_minutes must be between 1 and 180"
             )
         if self.candidate_cutoff_minutes >= self.deadline_minutes:
             raise ValueError(

@@ -226,8 +226,8 @@ class RestrictedOptIns(ConfigModel):
 
 
 class CampaignTiming(ConfigModel):
-    deadline_minutes: int = Field(ge=1, le=50)
-    candidate_cutoff_minutes: int = Field(ge=1, le=40)
+    deadline_minutes: int = Field(ge=1, le=240)
+    candidate_cutoff_minutes: int = Field(ge=1, le=180)
     max_changed_candidates: int = Field(ge=1, le=3)
     transient_retries: int = Field(ge=0, le=1)
 
@@ -239,8 +239,8 @@ class CampaignTiming(ConfigModel):
 
 
 class CampaignOverrides(ConfigModel):
-    deadline_minutes: int | None = Field(default=None, ge=1, le=50)
-    candidate_cutoff_minutes: int | None = Field(default=None, ge=1, le=40)
+    deadline_minutes: int | None = Field(default=None, ge=1, le=240)
+    candidate_cutoff_minutes: int | None = Field(default=None, ge=1, le=180)
     max_changed_candidates: int | None = Field(default=None, ge=1, le=3)
     transient_retries: int | None = Field(default=None, ge=0, le=1)
 

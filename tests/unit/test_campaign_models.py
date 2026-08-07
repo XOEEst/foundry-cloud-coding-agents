@@ -60,10 +60,10 @@ def _candidate(candidate_id: str = "candidate-1") -> CandidateArtifact:
     )
 
 
-def test_campaign_limits_preserve_the_cloud_agent_operating_envelope() -> None:
+def test_campaign_limits_allow_multi_session_campaigns() -> None:
     limits = CampaignLimits(
-        deadline_minutes=50,
-        candidate_cutoff_minutes=40,
+        deadline_minutes=240,
+        candidate_cutoff_minutes=180,
         max_changed_candidates=3,
         transient_retries=1,
     )
@@ -71,9 +71,11 @@ def test_campaign_limits_preserve_the_cloud_agent_operating_envelope() -> None:
     assert limits.max_changed_candidates == 3
 
     with pytest.raises(ValueError):
-        CampaignLimits(51, 40, 3, 1)
+        CampaignLimits(241, 180, 3, 1)
     with pytest.raises(ValueError):
-        CampaignLimits(40, 40, 3, 1)
+        CampaignLimits(240, 181, 3, 1)
+    with pytest.raises(ValueError):
+        CampaignLimits(180, 180, 3, 1)
 
 
 def test_patch_artifact_requires_exact_hashes_and_repository_paths() -> None:

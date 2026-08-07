@@ -509,6 +509,28 @@ def test_load_config_preserves_repository_relative_glob_syntax(
     ]
 
 
+def test_load_config_accepts_multi_session_campaign_timing(
+    tmp_path: Path,
+) -> None:
+    document = _minimal_document()
+    document["campaign"].update(
+        deadline_minutes=240,
+        candidate_cutoff_minutes=180,
+    )
+    document["targets"]["support_agent"]["campaign_overrides"] = {
+        "deadline_minutes": 240,
+        "candidate_cutoff_minutes": 180,
+    }
+
+    config = load_config(_write_document(tmp_path, document))
+
+    assert config.campaign.deadline_minutes == 240
+    assert config.campaign.candidate_cutoff_minutes == 180
+    assert config.targets[
+        "support_agent"
+    ].campaign_overrides.candidate_cutoff_minutes == 180
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -541,14 +563,21 @@ def test_load_config_preserves_repository_relative_glob_syntax(
             "allows mutations disabled by the campaign",
         ),
         (
-            lambda document: document["campaign"].update(deadline_minutes=51),
-            "less than or equal to 50",
+            lambda document: document["campaign"].update(deadline_minutes=241),
+            "less than or equal to 240",
         ),
         (
             lambda document: document["campaign"].update(
-                candidate_cutoff_minutes=50
+                candidate_cutoff_minutes=181
             ),
-            "less than or equal to 40",
+            "less than or equal to 180",
+        ),
+        (
+            lambda document: document["campaign"].update(
+                deadline_minutes=180,
+                candidate_cutoff_minutes=180,
+            ),
+            "candidate_cutoff_minutes must be less than deadline_minutes",
         ),
     ],
 )
