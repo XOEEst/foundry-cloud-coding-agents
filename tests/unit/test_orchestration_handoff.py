@@ -634,6 +634,91 @@ def _pr_277_timeline() -> list[dict[str, object]]:
     return events
 
 
+def _pr_291_timeline() -> list[dict[str, object]]:
+    app = {"id": 1143301, "slug": "copilot-swe-agent"}
+    copilot = {"id": 198982749, "login": "Copilot", "type": "Bot"}
+    owner = {"id": 18523445, "login": "XOEEst", "type": "User"}
+    prior_revisions = (
+        "de08391f5437a4b174eebe62dfee06bc57992f89",
+        "3327902b22533d9843120e6871d901a7a0e14e6b",
+        "08f3974c24924215574861deb619dddbc4e474cd",
+        "1bd77b4cc41da1a79214f219dc7dc0047461bd75",
+        "f1c7048606b1d402f50b954ff58be717bdd6b17b",
+        "e78e07720dfad957f6d50f6db3d214d324191364",
+        "18f0b8548bab2d2316b72259904f116444c3bbe0",
+        "f8da5b1c2c2c94bb50a3e829ff96ea80f11dbb55",
+        "1a9fe00f133dabb5ab6d9c2d96b4a4329afd2363",
+        "db0c89345bbc084ada13221d163a2fc540be01c9",
+        "c5753990f6147be7ac731b3f44a2eb4eeab66afa",
+        "ee5d008df73ed513fad40ed8c945722402734d8f",
+        "402afccccadf0e0ef29309cbce8b2c652a95e677",
+        "282159a967d9046709baf9ce9a93c0cf82a0ee96",
+        "646338728040634607e1cb2337812ef3ac4d52eb",
+        "fd955225fcacc5131d67eb6ab35c03d23c8581c6",
+    )
+    events: list[dict[str, object]] = [
+        {"event": "committed", "sha": revision}
+        for revision in prior_revisions
+    ]
+    events.extend([
+        {
+            "actor": deepcopy(copilot),
+            "assignee": deepcopy(copilot),
+            "created_at": "2026-08-07T06:54:44Z",
+            "event": "assigned",
+        },
+        {
+            "actor": deepcopy(copilot),
+            "assignee": deepcopy(owner),
+            "created_at": "2026-08-07T06:54:44Z",
+            "event": "assigned",
+        },
+        {
+            "actor": deepcopy(copilot),
+            "created_at": "2026-08-07T06:54:45Z",
+            "event": "mentioned",
+        },
+        {
+            "actor": deepcopy(owner),
+            "created_at": "2026-08-07T06:55:21Z",
+            "event": "copilot_work_started",
+            "performed_via_github_app": deepcopy(app),
+        },
+        {
+            "event": "committed",
+            "sha": "7e23fb90056a4994c7dfb18d5b95601c36ac2cee",
+        },
+        {
+            "actor": deepcopy(copilot),
+            "created_at": "2026-08-07T06:57:15Z",
+            "event": "renamed",
+            "rename": {
+                "from": (
+                    "[WIP] Optimize travel policy coverage with final "
+                    "capability loop"
+                ),
+                "to": (
+                    "Persist steward handoff envelope for optimization "
+                    "campaign issue #280"
+                ),
+            },
+        },
+        {
+            "actor": deepcopy(owner),
+            "created_at": "2026-08-07T06:57:31Z",
+            "event": "copilot_work_finished",
+            "performed_via_github_app": deepcopy(app),
+        },
+        {
+            "actor": deepcopy(copilot),
+            "created_at": "2026-08-07T06:57:31Z",
+            "event": "review_requested",
+            "requested_reviewer": deepcopy(owner),
+        },
+    ])
+    return events
+
+
 def test_github_discovery_accepts_pr_277_copilot_lead_in() -> None:
     events = _pr_277_timeline()
     commands = DiscoveryCommands([events])
@@ -658,6 +743,156 @@ def test_github_discovery_accepts_pr_277_copilot_lead_in() -> None:
             "?per_page=100&page=1",
         )
     ]
+
+
+def test_github_discovery_accepts_pr_291_strong_lead_in_without_connection(
+) -> None:
+    events = _pr_291_timeline()
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        291,
+        "copilot/steward-issue-280",
+        "7e23fb90056a4994c7dfb18d5b95601c36ac2cee",
+    ) is True
+
+
+@pytest.mark.parametrize("repeated", ("self-assignment", "mention"))
+def test_github_discovery_accepts_unambiguous_strong_lead_in_repetition(
+    repeated: str,
+) -> None:
+    events = deepcopy(_pr_291_timeline())
+    source_index = 16 if repeated == "self-assignment" else 18
+    duplicate = deepcopy(events[source_index])
+    events.insert(source_index + 1, duplicate)
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        291,
+        "copilot/steward-issue-280",
+        "7e23fb90056a4994c7dfb18d5b95601c36ac2cee",
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing-self-assignment",
+        "missing-owner-assignment",
+        "missing-mention",
+        "duplicate-owner-assignment",
+        "owner-before-self-assignment",
+        "mention-before-owner-assignment",
+        "wrong-self-assignment-actor",
+        "wrong-self-assignee",
+        "wrong-owner-assignment-actor",
+        "wrong-owner-assignee",
+        "wrong-mention-actor",
+        "unrelated-lead-in-event",
+        "stale-lead-in",
+        "out-of-order-lead-in",
+        "unbounded-lead-in",
+        "nested-work-start",
+        "interleaved-unrelated-finish",
+        "connected-outside-window",
+        "extra-window-commit",
+        "force-push-in-window",
+        "commit-after-finish",
+        "force-push-after-finish",
+    ),
+)
+def test_github_discovery_rejects_inexact_zero_connection_lead_in(
+    case: str,
+) -> None:
+    events = deepcopy(_pr_291_timeline())
+    if case == "missing-self-assignment":
+        events.pop(16)
+    elif case == "missing-owner-assignment":
+        events.pop(17)
+    elif case == "missing-mention":
+        events.pop(18)
+    elif case == "duplicate-owner-assignment":
+        events.insert(18, deepcopy(events[17]))
+    elif case == "owner-before-self-assignment":
+        events[16], events[17] = events[17], events[16]
+    elif case == "mention-before-owner-assignment":
+        events[17], events[18] = events[18], events[17]
+    elif case == "wrong-self-assignment-actor":
+        events[16]["actor"]["id"] = 1
+    elif case == "wrong-self-assignee":
+        events[16]["assignee"]["login"] = "copilot-swe-agent[bot]"
+    elif case == "wrong-owner-assignment-actor":
+        events[17]["actor"]["login"] = "copilot-swe-agent[bot]"
+    elif case == "wrong-owner-assignee":
+        events[17]["assignee"]["id"] = 1
+    elif case == "wrong-mention-actor":
+        events[18]["actor"]["type"] = "User"
+    elif case == "unrelated-lead-in-event":
+        events.insert(
+            19,
+            {
+                "actor": deepcopy(events[18]["actor"]),
+                "created_at": "2026-08-07T06:54:46Z",
+                "event": "labeled",
+            },
+        )
+    elif case == "stale-lead-in":
+        events[16]["created_at"] = "2026-08-07T06:49:00Z"
+    elif case == "out-of-order-lead-in":
+        events[18]["created_at"] = "2026-08-07T06:56:00Z"
+    elif case == "unbounded-lead-in":
+        events.insert(17, deepcopy(events[16]))
+        events.insert(18, deepcopy(events[16]))
+    elif case == "nested-work-start":
+        events.insert(20, deepcopy(events[19]))
+    elif case == "interleaved-unrelated-finish":
+        prior_start = deepcopy(events[19])
+        prior_start["created_at"] = "2026-08-07T06:53:00Z"
+        unrelated_finish = deepcopy(events[22])
+        unrelated_finish["actor"] = {
+            "id": 999,
+            "login": "other-user",
+            "type": "User",
+        }
+        unrelated_finish["created_at"] = "2026-08-07T06:53:30Z"
+        events[16:16] = [prior_start, unrelated_finish]
+    elif case == "connected-outside-window":
+        events.insert(
+            8,
+            {
+                "actor": deepcopy(events[16]["actor"]),
+                "created_at": "2026-08-07T06:30:00Z",
+                "event": "connected",
+            },
+        )
+    elif case == "extra-window-commit":
+        events.insert(21, {"event": "committed", "sha": "f" * 40})
+    elif case == "force-push-in-window":
+        events.insert(21, {"event": "head_ref_force_pushed"})
+    elif case == "commit-after-finish":
+        events.insert(23, {"event": "committed", "sha": "f" * 40})
+    elif case == "force-push-after-finish":
+        events.insert(23, {"event": "head_ref_force_pushed"})
+
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        291,
+        "copilot/steward-issue-280",
+        "7e23fb90056a4994c7dfb18d5b95601c36ac2cee",
+    ) is False
 
 
 def test_github_discovery_binds_head_to_exact_copilot_session() -> None:

@@ -2730,37 +2730,56 @@ def _timeline_attests_copilot_head(
             ):
                 break
             window = events[start_index + 1 : finish_index]
+            overlapping_work_start = _timeline_has_overlapping_work_start(
+                events,
+                start_index,
+                finish_index,
+            )
             commits = [
                 event.get("sha")
                 for event in window
                 if event.get("event") == "committed"
             ]
-            connections = [
+            window_connections = [
                 event
                 for event in window
                 if event.get("event") == "connected"
-                and _exact_copilot_bot(event.get("actor"))
             ]
-            connections.extend(
-                _copilot_lead_in(
-                    events,
-                    start_index,
-                    start,
-                    start_actor,
+            lead_in_connections, strong_lead_in = _copilot_lead_in(
+                events,
+                start_index,
+                start,
+                start_actor,
+            )
+            connections = [*window_connections, *lead_in_connections]
+            timeline_connections = [
+                event
+                for event in events
+                if event.get("event") == "connected"
+            ]
+            exact_connection = (
+                len(timeline_connections) == 1
+                and any(
+                    connection is timeline_connections[0]
+                    for connection in connections
                 )
+                and _exact_copilot_timeline_bot(
+                    timeline_connections[0].get("actor")
+                )
+            )
+            strong_zero_connection = (
+                not timeline_connections and strong_lead_in
             )
             later_invalidation = any(
                 event.get("event")
                 in {"committed", "head_ref_force_pushed"}
-                or (
-                    event.get("event") == "connected"
-                    and _exact_copilot_bot(event.get("actor"))
-                )
+                or event.get("event") == "connected"
                 for event in events[finish_index + 1 :]
             )
             if (
                 commits == [revision]
-                and len(connections) == 1
+                and (exact_connection or strong_zero_connection)
+                and not overlapping_work_start
                 and not later_invalidation
                 and not any(
                     event.get("event") == "head_ref_force_pushed"
@@ -2770,6 +2789,37 @@ def _timeline_attests_copilot_head(
                 valid_windows += 1
             break
     return valid_windows == 1
+
+
+def _timeline_has_overlapping_work_start(
+    events: list[Mapping[str, Any]],
+    start_index: int,
+    finish_index: int,
+) -> bool:
+    active_starts: list[tuple[int, str]] = []
+    for event in events[:start_index]:
+        actor = _timeline_actor_identity(event.get("actor"))
+        if (
+            event.get("event") == "copilot_work_started"
+            and _exact_copilot_app(event.get("performed_via_github_app"))
+            and actor is not None
+        ):
+            active_starts.append(actor)
+        elif (
+            event.get("event") == "copilot_work_finished"
+            and _exact_copilot_app(event.get("performed_via_github_app"))
+            and actor is not None
+        ):
+            for index in range(len(active_starts) - 1, -1, -1):
+                if active_starts[index] == actor:
+                    active_starts.pop(index)
+                    break
+    return bool(active_starts) or any(
+        event.get("event") == "copilot_work_started"
+        and _exact_copilot_app(event.get("performed_via_github_app"))
+        and _timeline_actor_identity(event.get("actor")) is not None
+        for event in events[start_index + 1 : finish_index]
+    )
 
 
 def _timeline_actor_identity(value: Any) -> tuple[int, str] | None:
@@ -2793,15 +2843,13 @@ def _copilot_lead_in(
     start_index: int,
     start: Mapping[str, Any],
     start_actor: tuple[int, str],
-) -> list[Mapping[str, Any]]:
+) -> tuple[list[Mapping[str, Any]], bool]:
     lead_in: list[Mapping[str, Any]] = []
     for event in reversed(
         events[max(0, start_index - _COPILOT_LEAD_IN_MAX_EVENTS) : start_index]
     ):
         if event.get("event") not in {"assigned", "mentioned", "connected"}:
             break
-        if not _copilot_lead_in_event(event, start_actor):
-            return []
         lead_in.append(event)
     if (
         not lead_in
@@ -2811,34 +2859,76 @@ def _copilot_lead_in(
             in {"assigned", "mentioned", "connected"}
         )
     ):
-        return []
+        return [], False
     ordered = list(reversed(lead_in))
+    kinds = [
+        _copilot_lead_in_event_kind(event, start_actor)
+        for event in ordered
+    ]
+    if any(kind is None for kind in kinds):
+        return [], False
     times = [_timeline_event_time(event) for event in [*ordered, start]]
     if (
         any(value is None for value in times)
         or times != sorted(times)
         or times[-1] - times[0] > _COPILOT_LEAD_IN_MAX_AGE
     ):
-        return []
-    return [
-        event for event in ordered if event.get("event") == "connected"
-    ]
+        return [], False
+    owner_index = (
+        kinds.index("owner-assigned")
+        if kinds.count("owner-assigned") == 1
+        else -1
+    )
+    strong_lead_in = (
+        owner_index > 0
+        and owner_index < len(kinds) - 1
+        and all(kind == "self-assigned" for kind in kinds[:owner_index])
+        and all(kind == "mentioned" for kind in kinds[owner_index + 1 :])
+    )
+    return (
+        [
+            event
+            for event, kind in zip(ordered, kinds, strict=True)
+            if kind == "connected"
+        ],
+        strong_lead_in,
+    )
 
 
-def _copilot_lead_in_event(
+def _copilot_lead_in_event_kind(
     event: Mapping[str, Any],
     start_actor: tuple[int, str],
-) -> bool:
+) -> str | None:
     kind = event.get("event")
     if kind == "assigned":
         assignee = event.get("assignee")
-        return _exact_copilot_bot(event.get("actor")) and (
-            _exact_copilot_bot(assignee)
-            or _timeline_actor_identity(assignee) == start_actor
-        )
-    if kind in {"mentioned", "connected"}:
-        return _exact_copilot_bot(event.get("actor"))
-    return False
+        if not _exact_copilot_timeline_bot(event.get("actor")):
+            return None
+        if _exact_copilot_timeline_bot(assignee):
+            return "self-assigned"
+        if _timeline_actor_identity(assignee) == start_actor:
+            return "owner-assigned"
+        return None
+    if (
+        kind == "mentioned"
+        and _exact_copilot_timeline_bot(event.get("actor"))
+    ):
+        return "mentioned"
+    if (
+        kind == "connected"
+        and _exact_copilot_timeline_bot(event.get("actor"))
+    ):
+        return "connected"
+    return None
+
+
+def _exact_copilot_timeline_bot(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("id") == _COPILOT_APP_USER_ID
+        and value.get("login") == "Copilot"
+        and value.get("type") == "Bot"
+    )
 
 
 def _exact_copilot_bot(value: Any) -> bool:
