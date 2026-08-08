@@ -59,9 +59,11 @@ _COPILOT_APP_USER_ID = 198982749
 _DISCOVERY_PAGE_SIZE = 100
 _DISCOVERY_MAX_PAGES = 2
 _DISCOVERY_LIMIT = 10
+_HANDOFF_MAX_FILES = 99
 _TIMELINE_MAX_PAGES = 3
 _COPILOT_LEAD_IN_MAX_EVENTS = 4
 _COPILOT_LEAD_IN_MAX_AGE = timedelta(minutes=5)
+_COPILOT_SESSION_MAX_COMMITS = 20
 _CANDIDATE_SESSION_MAX_COMMITS = 10
 _CANDIDATE_FILE_MODES = frozenset({"100644", "100755"})
 _NO_GIT_REPLACEMENTS = {"GIT_NO_REPLACE_OBJECTS": "1"}
@@ -877,11 +879,14 @@ class GhHandoffPullRequestGateway:
                 "api",
                 (
                     f"repos/{self._repository}/pulls/{number}/files"
-                    "?per_page=2"
+                    "?per_page=100"
                 ),
             )
         )
-        if not isinstance(value, list):
+        if (
+            not isinstance(value, list)
+            or len(value) > _HANDOFF_MAX_FILES
+        ):
             raise HandoffEventError("GitHub pull request files are invalid")
         result: list[Mapping[str, Any]] = []
         for item in value:
@@ -1239,30 +1244,51 @@ def _trusted_handoff_request_from_live(
             "handoff head lacks a Copilot session attestation"
         )
     files = gateway.get_pull_request_files(live_identity["number"])
-    if len(files) != 1:
-        raise HandoffEventError(
-            "handoff pull request must change exactly one file"
-        )
-    file = files[0]
-    if not isinstance(file, Mapping):
-        raise HandoffEventError("handoff pull request file is invalid")
-    path = file.get("filename")
-    blob = file.get("sha")
-    if (
-        not isinstance(path, str)
-        or re.fullmatch(
+    if not files or len(files) > _HANDOFF_MAX_FILES:
+        raise HandoffEventError("handoff pull request files are invalid")
+    validated_files: list[tuple[str, str]] = []
+    handoff_files: list[tuple[str, str]] = []
+    for file in files:
+        if not isinstance(file, Mapping):
+            raise HandoffEventError("handoff pull request file is invalid")
+        file_path = file.get("filename")
+        file_blob = file.get("sha")
+        if (
+            not isinstance(file_path, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*",
+                file_path,
+            )
+            is None
+            or any(part in {".", ".."} for part in file_path.split("/"))
+            or not isinstance(file_blob, str)
+            or _COMMIT.fullmatch(file_blob) is None
+            or file.get("status") not in {"added", "modified"}
+            or file.get("previous_filename") is not None
+        ):
+            raise HandoffEventError("handoff pull request file is invalid")
+        validated_files.append((file_path, file_blob))
+        if re.fullmatch(
             r"\.foundry-optimizer/handoffs/(?:steward|designer)/"
             r"issue-[1-9][0-9]*/g[1-9][0-9]*/"
             r"[0-9a-f]{64}\.json",
-            path,
-        )
-        is None
-        or not isinstance(blob, str)
-        or re.fullmatch(r"[0-9a-f]{40}", blob) is None
-        or file.get("status") not in {"added", "modified"}
-        or file.get("previous_filename") is not None
+            file_path,
+        ) is not None:
+            handoff_files.append((file_path, file_blob))
+    if (
+        len(set(path for path, _ in validated_files))
+        != len(validated_files)
+        or len(handoff_files) != 1
     ):
-        raise HandoffEventError("handoff pull request file is invalid")
+        raise HandoffEventError("handoff pull request files are invalid")
+    path, blob = handoff_files[0]
+    if (
+        path.startswith(".foundry-optimizer/handoffs/steward/")
+        and len(validated_files) != 1
+    ):
+        raise HandoffEventError(
+            "steward handoff pull request must change exactly one file"
+        )
     fetched_base = gateway.fetch_revision(live_identity["base_revision"])
     if fetched_base != live_identity["base_revision"]:
         raise HandoffEventError("handoff pull request fetch is not exact")
@@ -1692,6 +1718,16 @@ class HandoffApplyService:
             or handoff.proposed_revision != proposed_revision
         ):
             raise HandoffError("handoff session binding is invalid")
+        expected_base_paths = (
+            (request.handoff_path, *handoff.changed_paths)
+            if isinstance(handoff, CandidateDesignHandoff)
+            else (request.handoff_path,)
+        )
+        if (
+            len(base_paths) != len(expected_base_paths)
+            or set(base_paths) != set(expected_base_paths)
+        ):
+            raise HandoffError("handoff pull request changed other paths")
         author = _git_text(
             root,
             "show",
@@ -1855,19 +1891,10 @@ class HandoffApplyService:
             handoff.proposed_revision,
             proposed_entries,
         )
-        hashes = tuple(
-            PayloadHash(
-                path,
-                hashlib.sha256(
-                    _run(
-                        root,
-                        "git",
-                        "show",
-                        f"{handoff.proposed_revision}:{path}",
-                    ).stdout
-                ).hexdigest(),
-            )
-            for path in changed
+        hashes = _candidate_payload_hashes(
+            root,
+            handoff.proposed_revision,
+            changed,
         )
         if hashes != handoff.changed_payload_hashes:
             raise HandoffError("candidate design payload hashes differ")
@@ -1925,6 +1952,18 @@ class HandoffApplyService:
         ):
             raise HandoffError(
                 "candidate design session path is not allowed"
+            )
+        session_changed = tuple(path for path, _, _ in session_entries)
+        if session_changed != handoff.changed_paths or (
+            _candidate_payload_hashes(
+                root,
+                session_parent,
+                session_changed,
+            )
+            != handoff.changed_payload_hashes
+        ):
+            raise HandoffError(
+                "candidate design session payload differs"
             )
         if any(
             not _path_is_allowed(Path(path), intent.edit_paths)
@@ -2852,7 +2891,14 @@ def _timeline_attests_copilot_head(
                 for event in events[finish_index + 1 :]
             )
             if (
-                commits == [revision]
+                0 < len(commits) <= _COPILOT_SESSION_MAX_COMMITS
+                and all(
+                    isinstance(commit, str)
+                    and _COMMIT.fullmatch(commit) is not None
+                    for commit in commits
+                )
+                and len(set(commits)) == len(commits)
+                and commits[-1] == revision
                 and (exact_connection or strong_zero_connection)
                 and not overlapping_work_start
                 and not later_invalidation
@@ -3185,6 +3231,28 @@ def _candidate_diff_entries(
     if any(values[index:]):
         raise HandoffError("candidate design diff is invalid")
     return tuple(entries)
+
+
+def _candidate_payload_hashes(
+    root: Path,
+    revision: str,
+    paths: tuple[str, ...],
+) -> tuple[PayloadHash, ...]:
+    return tuple(
+        PayloadHash(
+            path,
+            hashlib.sha256(
+                _run(
+                    root,
+                    "git",
+                    "show",
+                    f"{revision}:{path}",
+                    environment=_NO_GIT_REPLACEMENTS,
+                ).stdout
+            ).hexdigest(),
+        )
+        for path in paths
+    )
 
 
 def _validate_candidate_tree_entries(

@@ -313,6 +313,52 @@ def test_dispatch_retry_still_requires_exact_single_handoff_file() -> None:
         )
 
 
+def test_dispatch_retry_accepts_designer_handoff_declared_payload_files(
+) -> None:
+    pull_request = _live_copilot_pull_request(
+        90,
+        created_at="2026-08-05T20:54:42Z",
+    )
+    gateway = DiscoveryGateway([pull_request])
+    designer_path = (
+        ".foundry-optimizer/handoffs/designer/issue-31/g1/"
+        + "d" * 64
+        + ".json"
+    )
+    gateway.files[90] = [
+        {
+            "filename": designer_path,
+            "sha": BLOB,
+            "status": "added",
+        },
+        {
+            "filename": "agent/main.py",
+            "sha": "e" * 40,
+            "status": "modified",
+        },
+        {
+            "filename": "tests/test_agent_unit.py",
+            "sha": "f" * 40,
+            "status": "modified",
+        },
+    ]
+
+    requests = discover_trusted_handoff_requests(
+        TrustedHandoffContext(
+            "workflow_dispatch",
+            "octo-org/optimizer",
+            123,
+            "trunk",
+        ),
+        Path("repository"),
+        gateway,
+        requested_pull_request=90,
+    )
+
+    assert len(requests) == 1
+    assert requests[0].handoff_path == designer_path
+
+
 def test_trusted_event_accepts_only_current_exact_copilot_handoff() -> None:
     gateway = Gateway()
 
@@ -478,7 +524,7 @@ def test_github_handoff_gateway_never_checks_out_or_executes_pr_content() -> Non
     assert (
         "gh",
         "api",
-        "repos/octo-org/optimizer/pulls/90/files?per_page=2",
+        "repos/octo-org/optimizer/pulls/90/files?per_page=100",
     ) in arguments
     assert all("--paginate" not in call for call in arguments)
     assert all("checkout" not in call for call in arguments)
@@ -717,6 +763,150 @@ def _pr_291_timeline() -> list[dict[str, object]]:
         },
     ])
     return events
+
+
+def _pr_449_timeline() -> list[dict[str, object]]:
+    app = {"id": 1143301, "slug": "copilot-swe-agent"}
+    copilot = {"id": 198982749, "login": "Copilot", "type": "Bot"}
+    owner = {"id": 18523445, "login": "XOEEst", "type": "User"}
+    return [
+        {
+            "event": "committed",
+            "sha": "51b6d7870fc9c6469aa26378dd16edfc34b31c8a",
+        },
+        {
+            "event": "committed",
+            "sha": "570bfbfa8476089676b1ccc152354668dc7fb360",
+        },
+        {
+            "actor": deepcopy(copilot),
+            "assignee": deepcopy(copilot),
+            "created_at": "2026-08-08T21:42:18Z",
+            "event": "assigned",
+        },
+        {
+            "actor": deepcopy(copilot),
+            "assignee": deepcopy(owner),
+            "created_at": "2026-08-08T21:42:18Z",
+            "event": "assigned",
+        },
+        {
+            "actor": deepcopy(copilot),
+            "created_at": "2026-08-08T21:42:20Z",
+            "event": "mentioned",
+        },
+        {
+            "actor": deepcopy(owner),
+            "created_at": "2026-08-08T21:42:31Z",
+            "event": "copilot_work_started",
+            "performed_via_github_app": deepcopy(app),
+        },
+        {
+            "actor": deepcopy(copilot),
+            "created_at": "2026-08-08T21:42:31Z",
+            "event": "connected",
+        },
+        {
+            "event": "committed",
+            "sha": "29ec71a98e7e3121105a25d02c2ecdd1d41a77e7",
+        },
+        {
+            "event": "committed",
+            "sha": "82fa79186b0ccde5f1942ac858c6859ffe3d3b13",
+        },
+        {
+            "actor": deepcopy(copilot),
+            "created_at": "2026-08-08T21:50:15Z",
+            "event": "renamed",
+        },
+        {
+            "actor": deepcopy(copilot),
+            "created_at": "2026-08-08T21:50:25Z",
+            "event": "review_requested",
+            "requested_reviewer": deepcopy(owner),
+        },
+        {
+            "actor": deepcopy(owner),
+            "created_at": "2026-08-08T21:50:25Z",
+            "event": "copilot_work_finished",
+            "performed_via_github_app": deepcopy(app),
+        },
+    ]
+
+
+def test_github_discovery_accepts_pr_449_commits_ending_at_head() -> None:
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([_pr_449_timeline()]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        449,
+        "copilot/foundry-optdesign-428-1-1-worker",
+        "82fa79186b0ccde5f1942ac858c6859ffe3d3b13",
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "head-not-last",
+        "commit-after-finish",
+        "force-push-in-window",
+        "force-push-after-finish",
+        "too-many-commits",
+        "duplicate-commit",
+        "uppercase-commit",
+        "short-commit",
+        "non-hex-commit",
+        "non-string-commit",
+    ),
+)
+def test_github_discovery_rejects_invalid_pr_449_commit_sequence(
+    case: str,
+) -> None:
+    events = deepcopy(_pr_449_timeline())
+    if case == "head-not-last":
+        events.insert(9, {"event": "committed", "sha": "c" * 40})
+    elif case == "commit-after-finish":
+        events.append({"event": "committed", "sha": "c" * 40})
+    elif case == "force-push-in-window":
+        events.insert(9, {"event": "head_ref_force_pushed"})
+    elif case == "force-push-after-finish":
+        events.append({"event": "head_ref_force_pushed"})
+    elif case == "too-many-commits":
+        events[7:9] = [
+            {"event": "committed", "sha": f"{index:040x}"}
+            for index in range(1, 21)
+        ] + [
+            {
+                "event": "committed",
+                "sha": "82fa79186b0ccde5f1942ac858c6859ffe3d3b13",
+            }
+        ]
+    elif case == "duplicate-commit":
+        events.insert(8, deepcopy(events[7]))
+    elif case == "uppercase-commit":
+        events[7]["sha"] = "A" * 40
+    elif case == "short-commit":
+        events[7]["sha"] = "a" * 39
+    elif case == "non-hex-commit":
+        events[7]["sha"] = "g" * 40
+    elif case == "non-string-commit":
+        events[7]["sha"] = 29
+
+    gateway = GhHandoffPullRequestGateway(
+        DiscoveryCommands([events]),
+        Path("repository"),
+        "octo-org/optimizer",
+    )
+
+    assert gateway.head_has_copilot_session_attestation(
+        449,
+        "copilot/foundry-optdesign-428-1-1-worker",
+        "82fa79186b0ccde5f1942ac858c6859ffe3d3b13",
+    ) is False
 
 
 def test_github_discovery_accepts_pr_277_copilot_lead_in() -> None:
