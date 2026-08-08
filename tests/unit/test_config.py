@@ -106,6 +106,45 @@ def _write_document(tmp_path: Path, document: dict) -> Path:
     return _write_config(tmp_path, yaml.safe_dump(document, sort_keys=False))
 
 
+@pytest.mark.parametrize("transient_retries", [0, 1, 3])
+def test_campaign_transient_retries_accepts_supported_values(
+    tmp_path: Path,
+    transient_retries: int,
+) -> None:
+    document = _minimal_document()
+    document["campaign"]["transient_retries"] = transient_retries
+
+    config = load_config(_write_document(tmp_path, document))
+
+    assert config.campaign.transient_retries == transient_retries
+
+
+def test_campaign_transient_retries_rejects_values_above_three(
+    tmp_path: Path,
+) -> None:
+    document = _minimal_document()
+    document["campaign"]["transient_retries"] = 4
+
+    with pytest.raises(ConfigLoadError):
+        load_config(_write_document(tmp_path, document))
+
+
+def test_campaign_override_allows_three_transient_retries(
+    tmp_path: Path,
+) -> None:
+    document = _minimal_document()
+    document["targets"]["support_agent"]["campaign_overrides"] = {
+        "transient_retries": 3
+    }
+
+    config = load_config(_write_document(tmp_path, document))
+
+    assert (
+        config.targets["support_agent"].campaign_overrides.transient_retries
+        == 3
+    )
+
+
 def test_agent_runtime_defaults_to_inherit_and_allows_explicit_override(
     tmp_path: Path,
 ) -> None:

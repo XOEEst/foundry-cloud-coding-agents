@@ -229,7 +229,7 @@ class CampaignTiming(ConfigModel):
     deadline_minutes: int = Field(ge=1, le=240)
     candidate_cutoff_minutes: int = Field(ge=1, le=180)
     max_changed_candidates: int = Field(ge=1, le=3)
-    transient_retries: int = Field(ge=0, le=1)
+    transient_retries: int = Field(ge=0, le=3)
 
     @model_validator(mode="after")
     def validate_cutoff_precedes_deadline(self) -> CampaignTiming:
@@ -242,7 +242,7 @@ class CampaignOverrides(ConfigModel):
     deadline_minutes: int | None = Field(default=None, ge=1, le=240)
     candidate_cutoff_minutes: int | None = Field(default=None, ge=1, le=180)
     max_changed_candidates: int | None = Field(default=None, ge=1, le=3)
-    transient_retries: int | None = Field(default=None, ge=0, le=1)
+    transient_retries: int | None = Field(default=None, ge=0, le=3)
 
     @model_validator(mode="after")
     def validate_optional_cutoff(self) -> CampaignOverrides:

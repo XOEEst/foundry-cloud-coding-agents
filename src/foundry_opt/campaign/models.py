@@ -52,8 +52,8 @@ class CampaignLimits:
             )
         if not 1 <= self.max_changed_candidates <= 3:
             raise ValueError("max_changed_candidates must be between 1 and 3")
-        if not 0 <= self.transient_retries <= 1:
-            raise ValueError("transient_retries must be zero or one")
+        if not 0 <= self.transient_retries <= 3:
+            raise ValueError("transient_retries must be between 0 and 3")
 
 
 @dataclass(frozen=True)

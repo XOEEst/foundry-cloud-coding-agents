@@ -78,6 +78,20 @@ def test_campaign_limits_allow_multi_session_campaigns() -> None:
         CampaignLimits(180, 180, 3, 1)
 
 
+@pytest.mark.parametrize("transient_retries", [0, 1, 3])
+def test_campaign_limits_allow_supported_transient_retries(
+    transient_retries: int,
+) -> None:
+    limits = CampaignLimits(50, 40, 1, transient_retries)
+
+    assert limits.transient_retries == transient_retries
+
+
+def test_campaign_limits_reject_more_than_three_transient_retries() -> None:
+    with pytest.raises(ValueError):
+        CampaignLimits(50, 40, 1, 4)
+
+
 def test_patch_artifact_requires_exact_hashes_and_repository_paths() -> None:
     artifact = _patch()
 
