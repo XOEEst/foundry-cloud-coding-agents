@@ -113,6 +113,7 @@ from foundry_opt.orchestration.steward import (
     StewardAdvanceService,
 )
 from foundry_opt.orchestration.git_state import (
+    candidate_design_loopback_handoff_session,
     GitStateRef,
     is_verified_copilot_git_proxy,
     StateRefError,
@@ -2714,8 +2715,7 @@ class _ProductionCandidateDesignRepository:
                 tree_sha=tree,
                 changed_paths=candidate_paths,
             )
-            proxy_context = is_verified_copilot_git_proxy(root)
-            if proxy_context:
+            if candidate_design_loopback_handoff_session(root) is not None:
                 raise CandidateDesignPushUnacknowledgedError(
                     artifact
                 )

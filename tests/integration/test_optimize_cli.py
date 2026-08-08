@@ -519,6 +519,16 @@ def test_candidate_designer_cli_exit_code_reflects_submission_status(
     status: CandidateDesignSubmissionStatus,
     expected_exit_code: int,
 ) -> None:
+    code = {
+        CandidateDesignSubmissionStatus.WAITING: (
+            "candidate_design_handoff_created"
+        ),
+        CandidateDesignSubmissionStatus.CONFLICT: "state_ref_conflict",
+        CandidateDesignSubmissionStatus.FAILED: (
+            "candidate_design_capture_failed"
+        ),
+    }[status]
+
     class CandidateDesignService:
         def submit(self, request):
             return CandidateDesignSubmissionResult(
@@ -534,6 +544,7 @@ def test_candidate_designer_cli_exit_code_reflects_submission_status(
                     (),
                     (),
                 ),
+                code,
             )
 
     monkeypatch.setattr(
@@ -562,3 +573,9 @@ def test_candidate_designer_cli_exit_code_reflects_submission_status(
     )
 
     assert result.exit_code == expected_exit_code
+    assert json.loads(result.stdout) == {
+        "code": code,
+        "issue_number": 42,
+        "revision": "a" * 40,
+        "status": status.value,
+    }

@@ -17,12 +17,14 @@ from uuid import uuid4
 from foundry_opt import __version__
 from foundry_opt.adapters.commands import CommandExitError
 from foundry_opt.orchestration.git_state import (
+    candidate_design_loopback_handoff_session,
     GitStateRef,
     StateRefConflictError,
     StateRefError,
     StateRefProposal,
     StateRefPushUnacknowledgedError,
     StateRefSnapshot,
+    VerifiedCopilotGitProxySession,
     verified_copilot_git_proxy_session,
 )
 from foundry_opt.orchestration.git_transport import (
@@ -2010,7 +2012,7 @@ class CloudHandoffStore:
     ) -> HandoffReceipt:
         result.require_matches(intent)
         root = repository_root.expanduser().resolve()
-        session = _cloud_session(root, self._remote)
+        session = _candidate_design_cloud_session(root, self._remote)
         existing = _existing_handoff_content(root, session.base_revision)
         if existing is not None:
             path, content = existing
@@ -2303,11 +2305,29 @@ def _cloud_session(root: Path, remote: str) -> _CloudSession:
     verified = verified_copilot_git_proxy_session(root, remote)
     if verified is None:
         raise HandoffError("verified Copilot git proxy is unavailable")
+    return _validated_cloud_session(verified)
+
+
+def _candidate_design_cloud_session(
+    root: Path,
+    remote: str,
+) -> _CloudSession:
+    verified = candidate_design_loopback_handoff_session(root, remote)
+    if verified is None:
+        raise HandoffError("candidate design handoff session is unavailable")
+    return _validated_cloud_session(verified)
+
+
+def _validated_cloud_session(
+    verified: VerifiedCopilotGitProxySession,
+) -> _CloudSession:
     if _BRANCH.fullmatch(verified.branch) is None:
         raise HandoffError("native Copilot session branch is invalid")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     if _REPOSITORY.fullmatch(repository) is None:
         raise HandoffError("Copilot cloud repository marker is unavailable")
+    if _COMMIT.fullmatch(verified.head_revision) is None:
+        raise HandoffError("Copilot cloud session revision is invalid")
     return _CloudSession(
         branch=verified.branch,
         base_revision=verified.head_revision,

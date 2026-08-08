@@ -9,10 +9,11 @@ from math import isfinite
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 from types import MappingProxyType
 from typing import Any, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from foundry_opt.orchestration.campaign import OptimizationCampaign
@@ -410,6 +411,10 @@ class VerifiedCopilotGitProxySession:
 
 
 class StateRefError(RuntimeError):
+    pass
+
+
+class CandidateDesignLoopbackError(StateRefError):
     pass
 
 
@@ -2276,6 +2281,26 @@ def _state_ref(issue_number: int) -> str:
     return f"refs/heads/foundry-opt/state/issue-{issue_number}"
 
 
+def candidate_design_loopback_handoff_session(
+    repository_root: Path,
+    remote: str = "origin",
+) -> VerifiedCopilotGitProxySession | None:
+    """Identify the narrow Copilot loopback context that must use handoff.
+
+    Candidate design refs carry unpublished product changes. A loopback Git
+    proxy can acknowledge a private ref without publishing it, so an attached
+    native Copilot branch must route through the Actions-validated handoff even
+    when optional runtime markers are unavailable. Exact repository URL and
+    branch validation intentionally limit false positives to that safer path.
+    """
+    try:
+        root = _repository_root(repository_root)
+        _identifier(remote, "remote")
+    except (StateRefError, ValueError):
+        return None
+    return _candidate_design_loopback_handoff_session(root, remote)
+
+
 def is_verified_copilot_git_proxy(
     repository_root: Path,
     remote: str = "origin",
@@ -2347,6 +2372,17 @@ def _verified_copilot_git_proxy_session(
     )
     if not trusted_markers:
         return None
+    try:
+        return _candidate_design_loopback_handoff_session(root, remote)
+    except CandidateDesignLoopbackError:
+        return None
+
+
+def _candidate_design_loopback_handoff_session(
+    root: Path,
+    remote: str,
+) -> VerifiedCopilotGitProxySession | None:
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
     remote_url = configured_remote_url(root, remote)
     if remote_url is None:
         return None
@@ -2355,33 +2391,69 @@ def _verified_copilot_git_proxy_session(
         hostname = parsed.hostname
         port = parsed.port
     except ValueError:
+        if re.match(
+            r"^https?://(?:localhost|127(?:\.[0-9]{1,3}){3}|\[::1)",
+            remote_url,
+            re.IGNORECASE,
+        ):
+            raise CandidateDesignLoopbackError(
+                "candidate design loopback remote is malformed"
+            )
         return None
-    try:
-        loopback = hostname == "localhost" or (
-            hostname is not None and ip_address(hostname).is_loopback
-        )
-    except ValueError:
-        loopback = False
+    if hostname is not None and "%" in hostname:
+        if re.search(r"%(?![0-9A-Fa-f]{2})", hostname):
+            raise CandidateDesignLoopbackError(
+                "candidate design loopback remote is malformed"
+            )
+        hostname = unquote(hostname)
+        if "%" in hostname:
+            raise CandidateDesignLoopbackError(
+                "candidate design loopback remote is malformed"
+            )
+    loopback = _is_loopback_host(hostname)
+    if parsed.scheme not in {"http", "https"} or not loopback:
+        return None
     if (
-        parsed.scheme not in {"http", "https"}
+        _GITHUB_REPOSITORY.fullmatch(repository) is None
         or parsed.username is not None
         or parsed.password is not None
-        or not loopback
         or port is None
         or port < 1
         or parsed.query
         or parsed.fragment
+        or parsed.path != f"/{repository}"
     ):
-        return None
-    if parsed.path != f"/{repository}":
-        return None
+        raise CandidateDesignLoopbackError(
+            "candidate design loopback remote is invalid"
+        )
     branch = _native_copilot_branch(root, remote_url)
     if branch is None:
-        return None
+        raise CandidateDesignLoopbackError(
+            "candidate design loopback branch is invalid"
+        )
     return VerifiedCopilotGitProxySession(
         remote_url=remote_url,
         branch=branch[0],
         head_revision=branch[1],
+    )
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    if hostname is None:
+        return False
+    normalized = hostname.rstrip(".").lower()
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        address = ip_address(normalized)
+    except ValueError:
+        try:
+            address = ip_address(socket.inet_aton(normalized))
+        except (OSError, ValueError):
+            return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address.is_loopback or (
+        mapped is not None and mapped.is_loopback
     )
 
 

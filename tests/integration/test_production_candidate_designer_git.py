@@ -22,6 +22,10 @@ from foundry_opt.orchestration.candidate_workers import (
     CandidateDesignSubmissionService,
     CandidateDesignSubmissionStatus,
 )
+from foundry_opt.orchestration.git_state import (
+    CandidateDesignLoopbackError,
+    candidate_design_loopback_handoff_session,
+)
 from foundry_opt.optimization.production import (
     _ProductionCandidateDesigner,
     _ProductionCandidateDesignRepository,
@@ -242,6 +246,124 @@ def test_candidate_capture_excludes_reserved_files_from_broad_allowed_path(
         "--name-only",
         artifact.head_commit,
     )
+
+
+def test_candidate_capture_forces_marker_independent_loopback_handoff(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "checkout", "-b", "copilot/foundry-opt-design-candidate-345")
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    _git(
+        root,
+        "remote",
+        "add",
+        "origin",
+        "http://127.0.0.1:49152/microsoft-foundry/luffy-test-agents-repo",
+    )
+    monkeypatch.setenv(
+        "GITHUB_REPOSITORY",
+        "microsoft-foundry/luffy-test-agents-repo",
+    )
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv(
+        "FOUNDRY_OPT_COPILOT_GIT_PROXY",
+        raising=False,
+    )
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    with pytest.raises(CandidateDesignPushUnacknowledgedError):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    (
+        "http://127.0.0.1:49152/octo-org/optimizer",
+        "http://127.1:49152/octo-org/optimizer",
+        "http://2130706433:49152/octo-org/optimizer",
+        "http://0x7f000001:49152/octo-org/optimizer",
+        "http://0177.0.0.1:49152/octo-org/optimizer",
+        "https://localhost:49152/octo-org/optimizer",
+        "http://local%68ost:49152/octo-org/optimizer",
+        "http://127%2e0%2e0%2e1:49152/octo-org/optimizer",
+        "http://localhost.:49152/octo-org/optimizer",
+        "http://proxy.localhost:49152/octo-org/optimizer",
+        "http://[::1]:49152/octo-org/optimizer",
+        "http://[::ffff:127.0.0.1]:49152/octo-org/optimizer",
+    ),
+)
+def test_candidate_loopback_handoff_detector_accepts_exact_native_context(
+    tmp_path: Path,
+    monkeypatch,
+    remote_url: str,
+) -> None:
+    root, _, _, _, _ = _capture_fixture(tmp_path)
+    _git(root, "checkout", "-b", "copilot/session")
+    _git(root, "remote", "add", "origin", remote_url)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
+
+    session = candidate_design_loopback_handoff_session(root)
+
+    assert session is not None
+    assert session.branch == "copilot/session"
+    assert session.remote_url == remote_url
+
+
+@pytest.mark.parametrize(
+    ("remote_url", "branch"),
+    (
+        ("http://127.0.0.1/octo-org/optimizer", "copilot/session"),
+        ("http://127.0.0.1:49152/octo-org/other", "copilot/session"),
+        ("http://[::1", "copilot/session"),
+        ("http://127.0.0.1:49152/octo-org/optimizer", "main"),
+    ),
+)
+def test_candidate_capture_rejects_invalid_loopback_context(
+    tmp_path: Path,
+    monkeypatch,
+    remote_url: str,
+    branch: str,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    if branch != "main":
+        _git(root, "checkout", "-b", branch)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    _git(root, "remote", "add", "origin", remote_url)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "octo-org/optimizer")
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    with pytest.raises(CandidateDesignLoopbackError):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_directly_pushes_to_normal_git_remote(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git(remote, "init", "--bare")
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    _git(root, "remote", "add", "origin", str(remote))
+    source.write_text("candidate design\n", encoding="utf-8")
+
+    artifact = _ProductionCandidateDesignRepository(
+        SubprocessCommandRunner()
+    ).capture(request, intent, result)
+
+    assert _git(
+        root,
+        "ls-remote",
+        "--heads",
+        "origin",
+        artifact.ref,
+    ).split()[0] == artifact.head_commit
 
 
 class Ledger:

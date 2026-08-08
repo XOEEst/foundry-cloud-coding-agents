@@ -40,6 +40,7 @@ from foundry_opt.orchestration.handoff import (
 )
 from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 from foundry_opt.orchestration.git_state import (
+    candidate_design_loopback_handoff_session,
     is_verified_copilot_git_proxy,
 )
 from foundry_opt.orchestration.steward import (
@@ -1039,6 +1040,29 @@ def test_detached_copilot_branch_requires_wrapper_identity_markers(
         assert is_verified_copilot_git_proxy(repository) is False, actor
 
 
+def test_candidate_design_loopback_handoff_accepts_validated_wrapper_branch(
+    tmp_path: Path,
+    monkeypatch,
+    copilot_git_proxy,
+) -> None:
+    repository, origin, _ = _repository(tmp_path)
+    copilot_git_proxy.install(
+        repository,
+        origin,
+        acknowledgement="proposed",
+    )
+    _set_live_copilot_environment(monkeypatch)
+    monkeypatch.delenv("GITHUB_ACTIONS")
+    head = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "checkout", "--detach", head)
+
+    session = candidate_design_loopback_handoff_session(repository)
+
+    assert session is not None
+    assert session.branch == "copilot/steward-issue-31"
+    assert session.head_revision == head
+
+
 def test_attached_copilot_branch_requires_matching_wrapper_branch(
     tmp_path: Path,
     monkeypatch,
@@ -1551,18 +1575,31 @@ def test_competing_valid_state_handoff_fails_closed(
 
 
 @pytest.mark.parametrize(
-    "acknowledgement",
-    ("absent", "expected", "proposed", "unrelated"),
+    ("acknowledgement", "runtime_context"),
+    (
+        ("absent", "verified"),
+        ("expected", "verified"),
+        ("proposed", "verified"),
+        ("unrelated", "verified"),
+        ("proposed", "live-fallback"),
+        ("proposed", "minimal-fallback"),
+    ),
 )
 def test_cloud_candidate_designer_persists_result_handoff(
     tmp_path: Path,
     monkeypatch,
     copilot_git_proxy,
     acknowledgement: str,
+    runtime_context: str,
 ) -> None:
     repository, origin, base = _repository(tmp_path)
+    session_branch = "copilot/steward-issue-31"
+    if runtime_context == "live-fallback":
+        session_branch = "copilot/foundry-opt-design-candidate-345"
+        _git(repository, "branch", "-m", session_branch)
+        _git(repository, "push", "-u", "origin", session_branch)
     _git(repository, "commit", "--allow-empty", "-m", "Initial plan")
-    _git(repository, "push", "origin", "copilot/steward-issue-31")
+    _git(repository, "push", "origin", session_branch)
     assert _git(repository, "rev-parse", "HEAD^{tree}") == _git(
         repository,
         "rev-parse",
@@ -1636,6 +1673,13 @@ def test_cloud_candidate_designer_persists_result_handoff(
         acknowledgement=acknowledgement,
     )
     _set_live_copilot_environment(monkeypatch)
+    monkeypatch.setenv("GITHUB_AGENT_BRANCH_NAME", session_branch)
+    if runtime_context == "live-fallback":
+        monkeypatch.delenv("GITHUB_ACTIONS")
+    elif runtime_context == "minimal-fallback":
+        for name in LIVE_COPILOT_ENVIRONMENT:
+            if name != "GITHUB_REPOSITORY":
+                monkeypatch.delenv(name, raising=False)
     (repository / "agent" / "instructions.md").write_text(
         "candidate\n",
         encoding="utf-8",
@@ -1714,6 +1758,7 @@ def test_cloud_candidate_designer_persists_result_handoff(
 
     assert handoff.issue_number == 31
     assert handoff.generation == 1
+    assert handoff.session_branch == session_branch
     assert handoff.expected_prior_revision == current.revision
     assert handoff.effect_id == "design-31-1-1"
     assert handoff.worker_issue_number == 84
@@ -1758,7 +1803,7 @@ def test_cloud_candidate_designer_persists_result_handoff(
         tmp_path,
         "clone",
         "--branch",
-        "copilot/steward-issue-31",
+        session_branch,
         str(origin),
         str(actions),
     )
@@ -1780,7 +1825,7 @@ def test_cloud_candidate_designer_persists_result_handoff(
         base_ref="main",
         base_revision=base,
         head_repository="octo-org/optimizer",
-        head_ref="copilot/steward-issue-31",
+        head_ref=session_branch,
         head_revision=head,
         handoff_path=path,
         handoff_blob=blob,

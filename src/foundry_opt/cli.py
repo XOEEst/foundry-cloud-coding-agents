@@ -283,19 +283,13 @@ def steward_candidate_design_result(
         "revision": result.snapshot.revision,
         "status": result.status.value,
     }
-    if json_output:
-        typer.echo(
-            json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
+    typer.echo(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
         )
-    else:
-        typer.echo(
-            "Candidate design "
-            f"{result.status.value}: {redact(result.code or 'recorded')}"
-        )
+    )
     raise typer.Exit(
         0
         if result.status
