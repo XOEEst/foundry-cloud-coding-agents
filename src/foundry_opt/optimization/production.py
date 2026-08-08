@@ -177,6 +177,9 @@ _DEFAULT_CONFIG_PATH = Path(".github/foundry-optimizer.yaml")
 _COMMIT_LENGTH = 40
 _HEX = "0123456789abcdef"
 _NO_GIT_REPLACEMENTS = {"GIT_NO_REPLACE_OBJECTS": "1"}
+_CANDIDATE_DESIGN_MAX_SESSION_COMMITS = 10
+_CANDIDATE_DESIGN_FILE_MODES = frozenset({"100644", "100755"})
+_CANDIDATE_DESIGN_RESERVED_ROOT = ".foundry-optimizer"
 
 
 class UtcClock:
@@ -2597,28 +2600,58 @@ class _ProductionCandidateDesignRepository:
         if request.result_file.resolve() != expected_result:
             raise ValueError("candidate design result path is invalid")
         result.require_matches(intent)
-        if not _candidate_designer_checkout_matches_base(
+        session_commits = _candidate_designer_checkout_commits(
             self._commands,
             root,
             intent.base_commit,
-        ):
+        )
+        if session_commits is None:
             raise ValueError("candidate designer checkout base changed")
         result_path = expected_result.relative_to(root)
-        changed = _production_changed_paths(self._commands, root, intent)
-        candidate_paths = tuple(
-            path for path in changed if path != result_path
+        head_commit = (
+            session_commits[-1]
+            if session_commits
+            else intent.base_commit
         )
-        if (
-            not candidate_paths
-            or any(
-                not _path_is_allowed(path, intent.edit_paths)
-                for path in candidate_paths
+        parent = intent.base_commit
+        for commit in session_commits:
+            entries = _production_diff_entries(
+                self._commands,
+                root,
+                parent,
+                commit,
             )
-            or any(
-                path != result_path
-                and not _path_is_allowed(path, intent.edit_paths)
-                for path in changed
+            if not _candidate_design_tree_entries_are_allowed(
+                self._commands,
+                root,
+                commit,
+                entries,
+                intent.edit_paths,
+            ):
+                raise ValueError("candidate design changed forbidden paths")
+            parent = commit
+        committed_entries = _production_diff_entries(
+            self._commands,
+            root,
+            intent.base_commit,
+            head_commit,
+        )
+        if not _candidate_design_tree_entries_are_allowed(
+            self._commands,
+            root,
+            head_commit,
+            committed_entries,
+            intent.edit_paths,
+        ):
+            raise ValueError("candidate design changed forbidden paths")
+        dirty_paths = _production_changed_paths(self._commands, root)
+        if any(
+            path != result_path
+            and (
+                _candidate_design_path_is_reserved(path)
+                or not _path_is_allowed(path, intent.edit_paths)
             )
+            for path in dirty_paths
         ):
             raise ValueError("candidate design changed forbidden paths")
         index = Path(
@@ -2670,7 +2703,7 @@ class _ProductionCandidateDesignRepository:
                     "--quiet",
                     intent.base_commit,
                     "--",
-                    result_path.as_posix(),
+                    _CANDIDATE_DESIGN_RESERVED_ROOT,
                 ),
                 cwd=root,
                 environment=environment,
@@ -2686,7 +2719,26 @@ class _ProductionCandidateDesignRepository:
                 intent.base_commit,
                 tree,
             )
-            if staged_paths != candidate_paths:
+            staged_entries = _production_diff_entries(
+                self._commands,
+                root,
+                intent.base_commit,
+                tree,
+            )
+            staged_entry_paths = tuple(
+                sorted(path for path, _, _, _ in staged_entries)
+            )
+            if (
+                not staged_paths
+                or staged_paths != staged_entry_paths
+                or not _candidate_design_tree_entries_are_allowed(
+                    self._commands,
+                    root,
+                    tree,
+                    staged_entries,
+                    intent.edit_paths,
+                )
+            ):
                 raise ValueError(
                     "candidate design changed forbidden paths"
                 )
@@ -2713,7 +2765,7 @@ class _ProductionCandidateDesignRepository:
                 ref=ref,
                 head_commit=commit,
                 tree_sha=tree,
-                changed_paths=candidate_paths,
+                changed_paths=staged_paths,
             )
             if candidate_design_loopback_handoff_session(root) is not None:
                 raise CandidateDesignPushUnacknowledgedError(
@@ -2872,11 +2924,28 @@ class _ProductionCandidateDesigner:
                 if value
             )
         )
+        observed_entries = _production_diff_entries(
+            self._commands,
+            root,
+            intent.base_commit,
+            head_commit,
+        )
         if (
             observed_changed != expected_changed
+            or observed_changed
+            != tuple(
+                sorted(path for path, _, _, _ in observed_entries)
+            )
             or any(
                 not _path_is_allowed(path, intent.edit_paths)
                 for path in observed_changed
+            )
+            or not _candidate_design_tree_entries_are_allowed(
+                self._commands,
+                root,
+                head_commit,
+                observed_entries,
+                intent.edit_paths,
             )
         ):
             raise ValueError("candidate design changed paths are invalid")
@@ -3039,13 +3108,13 @@ class _ProductionCandidatePullRequestReader:
         ).snapshots_for(request, bindings)
 
 
-def _candidate_designer_checkout_matches_base(
+def _candidate_designer_checkout_commits(
     commands: CommandRunner,
     root: Path,
     base_commit: str,
-) -> bool:
+) -> tuple[str, ...] | None:
     if _git_replacements_present(commands, root):
-        return False
+        return None
     try:
         base = commands.run(
             ("git", "rev-parse", f"{base_commit}^{{commit}}"),
@@ -3057,39 +3126,31 @@ def _candidate_designer_checkout_matches_base(
             cwd=root,
             environment=_NO_GIT_REPLACEMENTS,
         ).stdout.strip()
-        if head == base:
-            return True
-        commands.run(
-            ("git", "merge-base", "--is-ancestor", base, head),
-            cwd=root,
-            environment=_NO_GIT_REPLACEMENTS,
-        )
-        raw_commit = commands.run(
-            ("git", "cat-file", "-p", head),
-            cwd=root,
-            environment=_NO_GIT_REPLACEMENTS,
-        ).stdout
-        parents: list[str] = []
-        for line in raw_commit.splitlines():
-            if not line:
-                break
-            if line.startswith("parent "):
-                parents.append(line.removeprefix("parent "))
-        if parents != [base]:
-            return False
-        head_tree = commands.run(
-            ("git", "rev-parse", f"{head}^{{tree}}"),
-            cwd=root,
-            environment=_NO_GIT_REPLACEMENTS,
-        ).stdout.strip()
-        base_tree = commands.run(
-            ("git", "rev-parse", f"{base}^{{tree}}"),
-            cwd=root,
-            environment=_NO_GIT_REPLACEMENTS,
-        ).stdout.strip()
-        return head_tree == base_tree
+        if base != base_commit:
+            return None
+        commits: list[str] = []
+        current = head
+        while current != base:
+            if len(commits) >= _CANDIDATE_DESIGN_MAX_SESSION_COMMITS:
+                return None
+            raw_commit = commands.run(
+                ("git", "cat-file", "commit", current),
+                cwd=root,
+                environment=_NO_GIT_REPLACEMENTS,
+            ).stdout
+            parents: list[str] = []
+            for line in raw_commit.splitlines():
+                if not line:
+                    break
+                if line.startswith("parent "):
+                    parents.append(line.removeprefix("parent "))
+            if len(parents) != 1:
+                return None
+            commits.append(current)
+            current = parents[0]
+        return tuple(reversed(commits))
     except Exception:
-        return False
+        return None
 
 
 def _git_replacements_present(
@@ -3111,20 +3172,36 @@ def _git_replacements_present(
 def _production_changed_paths(
     commands: CommandRunner,
     root: Path,
-    intent: Any,
 ) -> tuple[Path, ...]:
-    tracked = commands.run(
-        (
-            "git",
-            "diff",
-            "--name-only",
-            "-z",
-            intent.base_commit,
-            "--",
-        ),
-        cwd=root,
-        environment=_NO_GIT_REPLACEMENTS,
-    ).stdout
+    tracked = tuple(
+        commands.run(
+            arguments,
+            cwd=root,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout
+        for arguments in (
+            (
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                "--cached",
+                "HEAD",
+                "--",
+            ),
+            (
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                "--",
+            ),
+        )
+    )
     untracked = commands.run(
         (
             "git",
@@ -3141,7 +3218,7 @@ def _production_changed_paths(
         for value in sorted(
             {
                 value
-                for document in (tracked, untracked)
+                for document in (*tracked, untracked)
                 for value in document.split("\0")
                 if value
             }
@@ -3156,22 +3233,125 @@ def _production_tree_changed_paths(
     tree: str,
 ) -> tuple[Path, ...]:
     return tuple(
-        Path(value)
-        for value in commands.run(
+        sorted(
+            Path(value)
+            for value in commands.run(
+                (
+                    "git",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    base_commit,
+                    tree,
+                    "--",
+                ),
+                cwd=root,
+                environment=_NO_GIT_REPLACEMENTS,
+            ).stdout.split("\0")
+            if value
+        )
+    )
+
+
+def _production_diff_entries(
+    commands: CommandRunner,
+    root: Path,
+    before: str,
+    after: str,
+) -> tuple[tuple[Path, str, str, str], ...]:
+    raw = commands.run(
+        (
+            "git",
+            "diff",
+            "--raw",
+            "-z",
+            "--no-abbrev",
+            "--no-ext-diff",
+            "--no-renames",
+            before,
+            after,
+            "--",
+        ),
+        cwd=root,
+        environment=_NO_GIT_REPLACEMENTS,
+    ).stdout
+    values = raw.split("\0")
+    entries: list[tuple[Path, str, str, str]] = []
+    index = 0
+    while index < len(values) and values[index]:
+        if index + 1 >= len(values):
+            raise ValueError("candidate design Git diff is invalid")
+        fields = values[index].split()
+        path = values[index + 1]
+        if (
+            len(fields) != 5
+            or not fields[0].startswith(":")
+            or not path
+        ):
+            raise ValueError("candidate design Git diff is invalid")
+        entries.append(
+            (
+                Path(path),
+                fields[0].removeprefix(":"),
+                fields[1],
+                fields[4],
+            )
+        )
+        index += 2
+    if any(values[index:]):
+        raise ValueError("candidate design Git diff is invalid")
+    return tuple(entries)
+
+
+def _candidate_design_path_is_reserved(path: Path) -> bool:
+    return bool(
+        path.parts
+        and path.parts[0].casefold()
+        == _CANDIDATE_DESIGN_RESERVED_ROOT.casefold()
+    )
+
+
+def _candidate_design_tree_entries_are_allowed(
+    commands: CommandRunner,
+    root: Path,
+    revision: str,
+    entries: tuple[tuple[Path, str, str, str], ...],
+    allowed: tuple[Path, ...],
+) -> bool:
+    for path, _, new_mode, _ in entries:
+        if (
+            _candidate_design_path_is_reserved(path)
+            or not _path_is_allowed(path, allowed)
+            or new_mode not in _CANDIDATE_DESIGN_FILE_MODES
+        ):
+            return False
+        raw = commands.run(
             (
                 "git",
-                "diff",
-                "--name-only",
+                "ls-tree",
                 "-z",
-                base_commit,
-                tree,
+                revision,
                 "--",
+                f":(literal){path.as_posix()}",
             ),
             cwd=root,
             environment=_NO_GIT_REPLACEMENTS,
-        ).stdout.split("\0")
-        if value
-    )
+        ).stdout
+        records = tuple(value for value in raw.split("\0") if value)
+        if len(records) != 1 or "\t" not in records[0]:
+            return False
+        metadata, observed_path = records[0].split("\t", 1)
+        fields = metadata.split()
+        if (
+            len(fields) != 3
+            or fields[0] != new_mode
+            or fields[1] != "blob"
+            or observed_path != path.as_posix()
+        ):
+            return False
+    return True
 
 
 def _path_is_allowed(path: Path, allowed: tuple[Path, ...]) -> bool:

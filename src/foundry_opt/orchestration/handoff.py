@@ -62,6 +62,9 @@ _DISCOVERY_LIMIT = 10
 _TIMELINE_MAX_PAGES = 3
 _COPILOT_LEAD_IN_MAX_EVENTS = 4
 _COPILOT_LEAD_IN_MAX_AGE = timedelta(minutes=5)
+_CANDIDATE_SESSION_MAX_COMMITS = 10
+_CANDIDATE_FILE_MODES = frozenset({"100644", "100755"})
+_NO_GIT_REPLACEMENTS = {"GIT_NO_REPLACE_OBJECTS": "1"}
 _HANDOFF_COMMIT_ENVIRONMENT = {
     "GIT_AUTHOR_NAME": "Foundry Optimizer Handoff",
     "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
@@ -1641,9 +1644,15 @@ class HandoffApplyService:
             ).splitlines()
             if line
         )
+        candidate_handoff_path = request.handoff_path.startswith(
+            ".foundry-optimizer/handoffs/designer/"
+        )
         if (
             first_parent_paths != (request.handoff_path,)
-            or base_paths != (request.handoff_path,)
+            or (
+                not candidate_handoff_path
+                and base_paths != (request.handoff_path,)
+            )
         ):
             raise HandoffError("handoff pull request changed other paths")
         tree_line = _git_text(
@@ -1722,7 +1731,13 @@ class HandoffApplyService:
         ):
             raise HandoffError("handoff product identity is invalid")
         if isinstance(handoff, CandidateDesignHandoff):
-            self._validate_candidate(root, handoff, proposed_revision)
+            self._validate_candidate(
+                root,
+                handoff,
+                proposed_revision,
+                session_parent,
+                effective_base_revision,
+            )
             return handoff
         self._validate_state(root, handoff)
         return handoff
@@ -1797,6 +1812,8 @@ class HandoffApplyService:
         root: Path,
         handoff: CandidateDesignHandoff,
         proposed_revision: str,
+        session_parent: str,
+        effective_base_revision: str,
     ) -> None:
         from foundry_opt.orchestration.candidate_workers import (
             _candidate_design_intent,
@@ -1804,6 +1821,8 @@ class HandoffApplyService:
 
         if proposed_revision != handoff.proposed_revision:
             raise HandoffError("candidate design proposal binding is invalid")
+        if effective_base_revision != handoff.result.base_commit:
+            raise HandoffError("candidate design base is invalid")
         parent_line = _git_text(
             root,
             "rev-list",
@@ -1823,19 +1842,19 @@ class HandoffApplyService:
             f"{handoff.proposed_revision}^{{tree}}",
         ) != handoff.proposed_tree:
             raise HandoffError("candidate design tree binding is invalid")
-        changed = tuple(
-            line
-            for line in _git_text(
-                root,
-                "diff",
-                "--name-only",
-                handoff.result.base_commit,
-                handoff.proposed_revision,
-            ).splitlines()
-            if line
+        proposed_entries = _candidate_diff_entries(
+            root,
+            handoff.result.base_commit,
+            handoff.proposed_revision,
         )
+        changed = tuple(path for path, _, _ in proposed_entries)
         if changed != handoff.changed_paths:
             raise HandoffError("candidate design changed paths differ")
+        _validate_candidate_tree_entries(
+            root,
+            handoff.proposed_revision,
+            proposed_entries,
+        )
         hashes = tuple(
             PayloadHash(
                 path,
@@ -1873,6 +1892,40 @@ class HandoffApplyService:
             raise HandoffError("candidate design intent is unavailable")
         intent = _candidate_design_intent(root, planned[0])
         handoff.result.require_matches(intent)
+        session_commits = _candidate_session_commits(
+            root,
+            handoff.result.base_commit,
+            session_parent,
+        )
+        parent = handoff.result.base_commit
+        for commit in session_commits:
+            entries = _candidate_diff_entries(root, parent, commit)
+            _validate_candidate_tree_entries(root, commit, entries)
+            if any(
+                not _path_is_allowed(Path(path), intent.edit_paths)
+                for path, _, _ in entries
+            ):
+                raise HandoffError(
+                    "candidate design session path is not allowed"
+                )
+            parent = commit
+        session_entries = _candidate_diff_entries(
+            root,
+            handoff.result.base_commit,
+            session_parent,
+        )
+        _validate_candidate_tree_entries(
+            root,
+            session_parent,
+            session_entries,
+        )
+        if any(
+            not _path_is_allowed(Path(path), intent.edit_paths)
+            for path, _, _ in session_entries
+        ):
+            raise HandoffError(
+                "candidate design session path is not allowed"
+            )
         if any(
             not _path_is_allowed(Path(path), intent.edit_paths)
             for path in handoff.changed_paths
@@ -3027,6 +3080,148 @@ def _validate_candidate_handoff_privacy(
             raise ValueError(
                 "candidate design handoff privacy validation failed"
             )
+
+
+def _candidate_session_commits(
+    root: Path,
+    base_revision: str,
+    head_revision: str,
+) -> tuple[str, ...]:
+    if _git_text(
+        root,
+        "replace",
+        "--list",
+        environment=_NO_GIT_REPLACEMENTS,
+    ):
+        raise HandoffError("candidate design replacements are invalid")
+    base = _git_text(
+        root,
+        "rev-parse",
+        f"{base_revision}^{{commit}}",
+        environment=_NO_GIT_REPLACEMENTS,
+    )
+    head = _git_text(
+        root,
+        "rev-parse",
+        f"{head_revision}^{{commit}}",
+        environment=_NO_GIT_REPLACEMENTS,
+    )
+    if base != base_revision or head != head_revision:
+        raise HandoffError("candidate design session binding is invalid")
+    commits: list[str] = []
+    current = head
+    while current != base:
+        if len(commits) >= _CANDIDATE_SESSION_MAX_COMMITS:
+            raise HandoffError("candidate design session is too long")
+        raw_commit = _run(
+            root,
+            "git",
+            "cat-file",
+            "commit",
+            current,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout
+        parents: list[str] = []
+        for line in raw_commit.splitlines():
+            if not line:
+                break
+            if line.startswith(b"parent "):
+                parents.append(line.removeprefix(b"parent ").decode("ascii"))
+        if len(parents) != 1:
+            raise HandoffError(
+                "candidate design session ancestry is invalid"
+            )
+        commits.append(current)
+        current = parents[0]
+    return tuple(reversed(commits))
+
+
+def _candidate_diff_entries(
+    root: Path,
+    before: str,
+    after: str,
+) -> tuple[tuple[str, str, str], ...]:
+    raw = _run(
+        root,
+        "git",
+        "diff",
+        "--raw",
+        "-z",
+        "--no-abbrev",
+        "--no-ext-diff",
+        "--no-renames",
+        before,
+        after,
+        "--",
+        environment=_NO_GIT_REPLACEMENTS,
+    ).stdout
+    values = raw.split(b"\0")
+    entries: list[tuple[str, str, str]] = []
+    index = 0
+    while index < len(values) and values[index]:
+        if index + 1 >= len(values):
+            raise HandoffError("candidate design diff is invalid")
+        fields = values[index].split()
+        path = values[index + 1]
+        if (
+            len(fields) != 5
+            or not fields[0].startswith(b":")
+            or not path
+        ):
+            raise HandoffError("candidate design diff is invalid")
+        try:
+            entries.append(
+                (
+                    path.decode("utf-8"),
+                    fields[1].decode("ascii"),
+                    fields[4].decode("ascii"),
+                )
+            )
+        except UnicodeDecodeError as error:
+            raise HandoffError(
+                "candidate design diff path is invalid"
+            ) from error
+        index += 2
+    if any(values[index:]):
+        raise HandoffError("candidate design diff is invalid")
+    return tuple(entries)
+
+
+def _validate_candidate_tree_entries(
+    root: Path,
+    revision: str,
+    entries: tuple[tuple[str, str, str], ...],
+) -> None:
+    for path, mode, _ in entries:
+        parts = PurePosixPath(path).parts
+        if (
+            not parts
+            or parts[0].casefold() == ".foundry-optimizer"
+            or mode not in _CANDIDATE_FILE_MODES
+        ):
+            raise HandoffError("candidate design tree entry is invalid")
+        raw = _run(
+            root,
+            "git",
+            "ls-tree",
+            "-z",
+            revision,
+            "--",
+            f":(literal){path}",
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout
+        records = tuple(value for value in raw.split(b"\0") if value)
+        if len(records) != 1 or b"\t" not in records[0]:
+            raise HandoffError("candidate design tree entry is invalid")
+        metadata, observed_path = records[0].split(b"\t", 1)
+        fields = metadata.split()
+        if (
+            len(fields) != 3
+            or fields[0].decode("ascii") != mode
+            or fields[1] != b"blob"
+            or observed_path != path.encode("utf-8")
+        ):
+            raise HandoffError("candidate design tree entry is invalid")
 
 
 def _path_is_allowed(path: Path, roots: tuple[Path, ...]) -> bool:

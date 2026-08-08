@@ -1605,6 +1605,14 @@ def test_cloud_candidate_designer_persists_result_handoff(
         "rev-parse",
         f"{base}^{{tree}}",
     )
+    (repository / "agent" / "instructions.md").write_text(
+        "candidate\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "agent/instructions.md")
+    _git(repository, "commit", "-m", "Commit candidate design")
+    candidate_revision = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "push", "origin", session_branch)
     (origin / "hooks" / "post-receive").unlink()
     created = CampaignEvent(
         "github-run-1",
@@ -1680,10 +1688,6 @@ def test_cloud_candidate_designer_persists_result_handoff(
         for name in LIVE_COPILOT_ENVIRONMENT:
             if name != "GITHUB_REPOSITORY":
                 monkeypatch.delenv(name, raising=False)
-    (repository / "agent" / "instructions.md").write_text(
-        "candidate\n",
-        encoding="utf-8",
-    )
     result_file = (
         repository
         / ".foundry-optimizer"
@@ -1732,12 +1736,13 @@ def test_cloud_candidate_designer_persists_result_handoff(
     assert _git(repository, "status", "--porcelain") == ""
     assert (
         repository / "agent" / "instructions.md"
-    ).read_text(encoding="utf-8") == "baseline\n"
+    ).read_text(encoding="utf-8") == "candidate\n"
     assert result_file.exists() is False
     assert proxy.real_revision(
         "refs/heads/foundry-opt/design/issue-31/design-31-1-1"
     ) is None
     head = _git(repository, "rev-parse", "HEAD")
+    assert _git(repository, "rev-parse", f"{head}^") == candidate_revision
     path = _git(
         repository,
         "diff-tree",

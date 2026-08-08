@@ -55,7 +55,8 @@ def _capture_fixture(tmp_path: Path):
     (root / "agent").mkdir()
     source = root / "agent" / "instructions.md"
     source.write_text("baseline\n", encoding="utf-8")
-    _git(root, "add", "agent/instructions.md")
+    (root / "outside.txt").write_text("outside baseline\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md", "outside.txt")
     _git(root, "commit", "-m", "baseline")
     base_commit = _git(root, "rev-parse", "HEAD")
     result_file = (
@@ -107,16 +108,226 @@ def _capture_fixture(tmp_path: Path):
     return root, source, intent, result, request
 
 
-def test_candidate_capture_rejects_initial_plan_with_committed_change(
+def test_candidate_capture_normalizes_committed_candidate_edits(
     tmp_path: Path,
 ) -> None:
     root, source, intent, result, request = _capture_fixture(tmp_path)
-    source.write_text("initial plan changed the file\n", encoding="utf-8")
-    _git(root, "add", "agent/instructions.md")
-    _git(root, "commit", "-m", "Initial plan")
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
     source.write_text("candidate design\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md")
+    _git(root, "commit", "-m", "Commit candidate design")
+
+    with pytest.raises(
+        CandidateDesignPushUnacknowledgedError
+    ) as captured:
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+    artifact = captured.value.artifact
+    assert artifact.changed_paths == (Path("agent/instructions.md"),)
+    assert _git(root, "rev-parse", f"{artifact.head_commit}^") == (
+        intent.base_commit
+    )
+    assert _git(
+        root,
+        "show",
+        f"{artifact.head_commit}:agent/instructions.md",
+    ) == "candidate design"
+    assert _git(root, "rev-parse", "HEAD") != artifact.head_commit
+
+
+def test_candidate_capture_combines_committed_and_uncommitted_edits(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("committed candidate design\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md")
+    _git(root, "commit", "-m", "Commit candidate design")
+    source.write_text("final candidate design\n", encoding="utf-8")
+    extra = root / "agent" / "examples.md"
+    extra.write_text("new example\n", encoding="utf-8")
+
+    with pytest.raises(
+        CandidateDesignPushUnacknowledgedError
+    ) as captured:
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+    artifact = captured.value.artifact
+    assert artifact.changed_paths == (
+        Path("agent/examples.md"),
+        Path("agent/instructions.md"),
+    )
+    assert _git(
+        root,
+        "show",
+        f"{artifact.head_commit}:agent/instructions.md",
+    ) == "final candidate design"
+    assert _git(
+        root,
+        "show",
+        f"{artifact.head_commit}:agent/examples.md",
+    ) == "new example"
+
+
+def test_candidate_capture_accepts_ten_first_parent_commits(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    for index in range(1, 10):
+        source.write_text(f"candidate design {index}\n", encoding="utf-8")
+        _git(root, "add", "agent/instructions.md")
+        _git(root, "commit", "-m", f"Candidate edit {index}")
+
+    with pytest.raises(
+        CandidateDesignPushUnacknowledgedError
+    ) as captured:
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+    assert captured.value.artifact.changed_paths == (
+        Path("agent/instructions.md"),
+    )
+
+
+def test_candidate_capture_rejects_more_than_ten_commits(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    for index in range(1, 11):
+        source.write_text(f"candidate design {index}\n", encoding="utf-8")
+        _git(root, "add", "agent/instructions.md")
+        _git(root, "commit", "-m", f"Candidate edit {index}")
 
     with pytest.raises(ValueError, match="checkout base changed"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_committed_forbidden_path(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+    (root / "outside.txt").write_text("forbidden edit\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md", "outside.txt")
+    _git(root, "commit", "-m", "Commit candidate and forbidden edits")
+
+    with pytest.raises(ValueError, match="forbidden paths"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+@pytest.mark.parametrize("operation", ("delete", "rename"))
+def test_candidate_capture_rejects_committed_forbidden_path_removal(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+    if operation == "delete":
+        (root / "outside.txt").unlink()
+    else:
+        _git(root, "mv", "outside.txt", "agent/imported.txt")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-m", f"Candidate {operation}")
+
+    with pytest.raises(ValueError, match="forbidden paths"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_committed_result_file(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    intent = replace(intent, edit_paths=(Path("."),))
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+    _git(
+        root,
+        "add",
+        "agent/instructions.md",
+        request.result_file.relative_to(root).as_posix(),
+    )
+    _git(root, "commit", "-m", "Commit candidate and result")
+
+    with pytest.raises(ValueError, match="forbidden paths"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_dirty_reserved_handoff_file(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    intent = replace(intent, edit_paths=(Path("."),))
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+    handoff = root / ".foundry-optimizer" / "handoffs" / "candidate.json"
+    handoff.parent.mkdir(parents=True)
+    handoff.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="forbidden paths"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+@pytest.mark.parametrize("mode", ("120000", "160000"))
+def test_candidate_capture_rejects_committed_non_file_entries(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md")
+    if mode == "120000":
+        entry = root / "entry.txt"
+        entry.write_text("outside.txt", encoding="utf-8")
+        object_id = _git(root, "hash-object", "-w", "entry.txt")
+        entry.unlink()
+    else:
+        object_id = intent.base_commit
+    _git(
+        root,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"{mode},{object_id},agent/non-file",
+    )
+    _git(root, "commit", "-m", "Commit non-file entry")
+
+    with pytest.raises(ValueError, match="forbidden paths"):
+        _ProductionCandidateDesignRepository(
+            SubprocessCommandRunner()
+        ).capture(request, intent, result)
+
+
+def test_candidate_capture_rejects_final_content_reverted_to_base(
+    tmp_path: Path,
+) -> None:
+    root, source, intent, result, request = _capture_fixture(tmp_path)
+    _git(root, "commit", "--allow-empty", "-m", "Initial plan")
+    source.write_text("candidate design\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md")
+    _git(root, "commit", "-m", "Commit candidate design")
+    source.write_text("baseline\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="forbidden paths"):
         _ProductionCandidateDesignRepository(
             SubprocessCommandRunner()
         ).capture(request, intent, result)
@@ -161,7 +372,8 @@ def test_candidate_capture_rejects_unrelated_same_tree_commit(
     _git(root, "rm", "-rf", ".")
     (root / "agent").mkdir()
     source.write_text("baseline\n", encoding="utf-8")
-    _git(root, "add", "agent/instructions.md")
+    (root / "outside.txt").write_text("outside baseline\n", encoding="utf-8")
+    _git(root, "add", "agent/instructions.md", "outside.txt")
     _git(root, "commit", "-m", "Initial plan")
     source.write_text("candidate design\n", encoding="utf-8")
 
