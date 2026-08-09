@@ -202,11 +202,61 @@ class FakeCredentialProvider:
 
 
 class FakeProjectClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        evaluator_schemas: Mapping[
+            tuple[str, str], Mapping[str, object]
+        ]
+        | None = None,
+    ) -> None:
         self.closed = 0
+        self.beta = _FakeBeta(evaluator_schemas or {})
 
     def close(self) -> None:
         self.closed += 1
+
+
+class _FakeEvaluatorDefinition:
+    def __init__(self, data_schema: Mapping[str, object]) -> None:
+        self.data_schema = data_schema
+
+
+class _FakeEvaluatorVersion:
+    def __init__(self, data_schema: Mapping[str, object]) -> None:
+        self.definition = _FakeEvaluatorDefinition(data_schema)
+
+
+class _FakeEvaluators:
+    def __init__(
+        self,
+        schemas: Mapping[tuple[str, str], Mapping[str, object]],
+    ) -> None:
+        self._schemas = schemas
+        self.calls: list[tuple[str, str]] = []
+
+    def get_version(self, name: str, version: str) -> _FakeEvaluatorVersion:
+        self.calls.append((name, version))
+        return _FakeEvaluatorVersion(
+            self._schemas.get(
+                (name, version),
+                {
+                    "type": "object",
+                    "required": ["query", "response"],
+                    "properties": {
+                        "query": {"type": "string"},
+                        "response": {"type": "string"},
+                    },
+                },
+            )
+        )
+
+
+class _FakeBeta:
+    def __init__(
+        self,
+        schemas: Mapping[tuple[str, str], Mapping[str, object]],
+    ) -> None:
+        self.evaluators = _FakeEvaluators(schemas)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +428,154 @@ def test_custom_evaluators_receive_model_and_threshold_parameters() -> None:
         "deployment_name": "gpt-5-mini",
         "threshold": 0.8,
         "pass_threshold": 0.8,
+    }
+
+
+def test_custom_evaluator_schema_fields_are_mapped_from_dataset_items() -> None:
+    transport = FakeTransport()
+    client = FakeProjectClient(
+        {
+            ("quality", "1"): {
+                "type": "object",
+                "required": ["query", "expected_decision", "response"],
+                "properties": {
+                    "query": {"type": "string"},
+                    "expected_decision": {"type": "string"},
+                    "policy_tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "response": {"type": "string"},
+                },
+            }
+        }
+    )
+    binder, _client, _provider = _binder(transport, client=client)
+
+    binder(_spec(), _assets(_spec()))(
+        _subject(), DatasetSplit.DEVELOPMENT, 1
+    )
+
+    configuration = transport.created_definitions[0]["configuration"]
+    (criterion,) = configuration["testing_criteria"]
+    assert criterion["data_mapping"] == {
+        "expected_decision": "{{item.expected_decision}}",
+        "policy_tags": "{{item.policy_tags}}",
+        "query": "{{item.query}}",
+        "response": "{{sample.output_text}}",
+    }
+    assert configuration["data_source_config"]["item_schema"] == {
+        "type": "object",
+        "properties": {
+            "expected_decision": {"type": "string"},
+            "policy_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "query": {"type": "string"},
+        },
+        "required": ["expected_decision", "query"],
+    }
+
+
+def test_evaluator_schema_is_resolved_once_per_pinned_version() -> None:
+    transport = FakeTransport()
+    client = FakeProjectClient()
+    binder, _client, _provider = _binder(transport, client=client)
+    evaluate = binder(_spec(), _assets(_spec()))
+
+    evaluate(_subject("baseline"), DatasetSplit.DEVELOPMENT, 1)
+    evaluate(_subject("candidate-1"), DatasetSplit.DEVELOPMENT, 1)
+
+    assert client.beta.evaluators.calls == [("quality", "1")]
+
+
+def test_evaluator_schema_without_properties_fails_closed() -> None:
+    transport = FakeTransport()
+    client = FakeProjectClient(
+        {
+            ("quality", "1"): {
+                "type": "object",
+                "required": ["query", "response"],
+            }
+        }
+    )
+    binder, _client, _provider = _binder(transport, client=client)
+
+    with pytest.raises(
+        OptimizationEvaluationError,
+        match="data schema properties are invalid",
+    ):
+        binder(_spec(), _assets(_spec()))(
+            _subject(), DatasetSplit.DEVELOPMENT, 1
+        )
+
+
+def test_evaluator_mapping_uses_only_fields_declared_by_catalog_schema() -> None:
+    transport = FakeTransport()
+    client = FakeProjectClient(
+        {
+            ("quality", "1"): {
+                "type": "object",
+                "required": ["ground_truth", "response"],
+                "properties": {
+                    "ground_truth": {"type": "string"},
+                    "response": {"type": "string"},
+                },
+            }
+        }
+    )
+    binder, _client, _provider = _binder(transport, client=client)
+
+    binder(_spec(), _assets(_spec()))(
+        _subject(), DatasetSplit.DEVELOPMENT, 1
+    )
+
+    configuration = transport.created_definitions[0]["configuration"]
+    (criterion,) = configuration["testing_criteria"]
+    assert criterion["data_mapping"] == {
+        "ground_truth": "{{item.ground_truth}}",
+        "response": "{{sample.output_text}}",
+    }
+    assert configuration["data_source_config"]["item_schema"] == {
+        "type": "object",
+        "properties": {
+            "ground_truth": {"type": "string"},
+            "query": {"type": "string"},
+        },
+        "required": ["ground_truth", "query"],
+    }
+
+
+def test_single_evaluator_query_schema_is_not_treated_as_a_conflict() -> None:
+    transport = FakeTransport()
+    client = FakeProjectClient(
+        {
+            ("quality", "1"): {
+                "type": "object",
+                "required": ["query", "response"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The user request.",
+                    },
+                    "response": {"type": "string"},
+                },
+            }
+        }
+    )
+    binder, _client, _provider = _binder(transport, client=client)
+
+    binder(_spec(), _assets(_spec()))(
+        _subject(), DatasetSplit.DEVELOPMENT, 1
+    )
+
+    item_schema = transport.created_definitions[0]["configuration"][
+        "data_source_config"
+    ]["item_schema"]
+    assert item_schema["properties"]["query"] == {
+        "type": "string",
+        "description": "The user request.",
     }
 
 
@@ -659,6 +857,39 @@ def test_fingerprint_binds_spec_dataset_and_evaluator_identities() -> None:
         )
     )
     assert _dev_fingerprint(other_dataset) != fingerprint
+
+
+def test_fingerprint_binds_resolved_evaluator_data_schema() -> None:
+    spec = _spec()
+
+    def fingerprint(schema: Mapping[str, object]) -> str:
+        transport = FakeTransport()
+        client = FakeProjectClient({("quality", "1"): schema})
+        binder, _client, _provider = _binder(transport, client=client)
+        binder(spec, _assets(spec))(
+            _subject(), DatasetSplit.DEVELOPMENT, 1
+        )
+        return str(transport.created_definitions[0]["fingerprint"])
+
+    base_schema = {
+        "type": "object",
+        "required": ["query", "response"],
+        "properties": {
+            "query": {"type": "string"},
+            "response": {"type": "string"},
+        },
+    }
+    extended_schema = {
+        "type": "object",
+        "required": ["query", "expected_decision", "response"],
+        "properties": {
+            "query": {"type": "string"},
+            "expected_decision": {"type": "string"},
+            "response": {"type": "string"},
+        },
+    }
+
+    assert fingerprint(extended_schema) != fingerprint(base_schema)
 
 
 # ---------------------------------------------------------------------------
