@@ -42,7 +42,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from time import sleep as _default_sleep
@@ -91,7 +92,8 @@ __all__ = [
 
 _EVALUATOR_TYPE = "azure_ai_evaluator"
 _SCHEMA_VERSION = "1"
-_FINGERPRINT_SCHEME = "opt-eval-2"
+_FINGERPRINT_SCHEME = "opt-eval-3"
+_DATA_FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 EvaluationRunner = Callable[
@@ -123,6 +125,15 @@ class _TransportFactory(Protocol):
     ) -> EvaluationTransport: ...
 
 
+class _EvaluatorSchemaResolver(Protocol):
+    def __call__(
+        self,
+        project_client: Any,
+        evaluator_name: str,
+        evaluator_version: str,
+    ) -> dict[str, object]: ...
+
+
 def _create_project_client(endpoint: str, credential: Any) -> Any:
     # Imported lazily so importing this module never forces the Azure SDK to
     # load in environments that only build definition requests or fingerprints.
@@ -137,6 +148,26 @@ def _create_transport(
     return FoundryEvaluationTransport(
         project_client, project_endpoint=endpoint
     )
+
+
+def _resolve_evaluator_data_schema(
+    project_client: Any,
+    evaluator_name: str,
+    evaluator_version: str,
+) -> dict[str, object]:
+    beta = getattr(project_client, "beta", None)
+    evaluators = getattr(beta, "evaluators", None)
+    get_version = getattr(evaluators, "get_version", None)
+    if not callable(get_version):
+        return _default_evaluator_data_schema()
+    record = get_version(evaluator_name, evaluator_version)
+    definition = getattr(record, "definition", None)
+    if isinstance(record, dict):
+        definition = record.get("definition", definition)
+    data_schema = getattr(definition, "data_schema", None)
+    if isinstance(definition, dict):
+        data_schema = definition.get("data_schema", data_schema)
+    return _normalized_evaluator_data_schema(data_schema)
 
 
 def build_evaluation_policy(spec: OptimizationSpec) -> EvaluationPolicy:
@@ -214,6 +245,9 @@ class OptimizationEvaluationBinder:
         max_pages: int = 1000,
         sleep: Callable[[float], None] = _default_sleep,
         evaluator_model_deployment: str | None = None,
+        evaluator_schema_resolver: _EvaluatorSchemaResolver = (
+            _resolve_evaluator_data_schema
+        ),
     ) -> None:
         if not project_endpoint or not project_endpoint.strip():
             raise ValueError("project_endpoint is required")
@@ -225,6 +259,10 @@ class OptimizationEvaluationBinder:
         self._page_size = page_size
         self._max_pages = max_pages
         self._sleep = sleep
+        self._evaluator_schema_resolver = evaluator_schema_resolver
+        self._evaluator_schema_cache: dict[
+            tuple[str, str], dict[str, object]
+        ] = {}
         if (
             evaluator_model_deployment is not None
             and not evaluator_model_deployment.strip()
@@ -260,6 +298,12 @@ class OptimizationEvaluationBinder:
             transport = self._transport_factory(
                 project_client, self._project_endpoint
             )
+            evaluator_schemas = {
+                evaluator.asset_id: self._evaluator_data_schema(
+                    project_client, evaluator
+                )
+                for evaluator in plan.evaluators
+            }
             gateway = EvaluationGateway(
                 transport,
                 poll_policy=self._poll_policy,
@@ -268,7 +312,11 @@ class OptimizationEvaluationBinder:
                 sleep=self._sleep,
             )
             definition = self._create_or_reuse_definition(
-                gateway, plan, split, dataset
+                gateway,
+                plan,
+                split,
+                dataset,
+                evaluator_schemas,
             )
             run = self._create_and_poll(
                 gateway, definition, plan, subject, split, dataset, attempt
@@ -290,24 +338,44 @@ class OptimizationEvaluationBinder:
             _close_quietly(project_client)
             _close_quietly(credential)
 
+    def _evaluator_data_schema(
+        self,
+        project_client: Any,
+        evaluator: _FoundryAsset,
+    ) -> dict[str, object]:
+        key = (_evaluator_catalog_name(evaluator), evaluator.version)
+        cached = self._evaluator_schema_cache.get(key)
+        if cached is not None:
+            return cached
+        schema = self._evaluator_schema_resolver(
+            project_client,
+            key[0],
+            key[1],
+        )
+        self._evaluator_schema_cache[key] = schema
+        return schema
+
     def _create_or_reuse_definition(
         self,
         gateway: EvaluationGateway,
         plan: _EvaluationPlan,
         split: DatasetSplit,
         dataset: _FoundryAsset,
+        evaluator_schemas: dict[str, dict[str, object]],
     ) -> EvaluationDefinition:
         fingerprint = plan.fingerprint(
             split,
             dataset,
             self._evaluator_model_deployment,
+            evaluator_schemas,
         )
         request = EvaluationDefinitionRequest(
             name=plan.definition_name(split),
             evaluator_type=_EVALUATOR_TYPE,
             schema_version=_SCHEMA_VERSION,
             configuration=plan.definition_configuration(
-                self._evaluator_model_deployment
+                self._evaluator_model_deployment,
+                evaluator_schemas,
             ),
             fingerprint=fingerprint,
         )
@@ -452,14 +520,42 @@ class _EvaluationPlan:
     def definition_configuration(
         self,
         evaluator_model_deployment: str | None = None,
+        evaluator_schemas: dict[str, dict[str, object]] | None = None,
     ) -> dict[str, object]:
         # One testing criterion per approved metric: the criterion name is the
         # metric name (so provider results map straight onto the metric
         # policy), and evaluator_name is the catalog name of the single
         # evaluator that produces that metric. Its exact remote identity stays
         # in evaluator_reference for immutable lineage.
+        schemas = evaluator_schemas or {
+            evaluator.asset_id: _default_evaluator_data_schema()
+            for evaluator in self.evaluators
+        }
         testing_criteria = []
+        item_properties: dict[str, object] = {}
+        required_item_fields = {"query"}
         for metric, evaluator in self.metric_evaluators:
+            schema = schemas[evaluator.asset_id]
+            properties, required = _evaluator_data_fields(schema)
+            data_mapping = {
+                field: (
+                    "{{sample.output_text}}"
+                    if field == "response"
+                    else f"{{{{item.{field}}}}}"
+                )
+                for field in sorted(properties)
+            }
+            for field, field_schema in properties.items():
+                if field == "response":
+                    continue
+                existing = item_properties.get(field)
+                if existing is not None and existing != field_schema:
+                    raise OptimizationEvaluationError(
+                        "approved evaluators define conflicting schemas for "
+                        f"dataset field {field!r}"
+                    )
+                item_properties[field] = field_schema
+            required_item_fields.update(required - {"response"})
             criterion: dict[str, object] = {
                 "type": _EVALUATOR_TYPE,
                 "name": metric,
@@ -472,10 +568,7 @@ class _EvaluationPlan:
                     "remote_id": evaluator.remote_id,
                     "content_sha256": evaluator.content_sha256,
                 },
-                "data_mapping": {
-                    "query": "{{item.query}}",
-                    "response": "{{sample.output_text}}",
-                },
+                "data_mapping": data_mapping,
             }
             if evaluator_model_deployment is not None:
                 threshold = self.policy.metric(metric).threshold
@@ -485,6 +578,7 @@ class _EvaluationPlan:
                     "pass_threshold": threshold,
                 }
             testing_criteria.append(criterion)
+        item_properties.setdefault("query", {"type": "string"})
         normalization = {
             metric: (
                 {"type": "pass_fail"}
@@ -502,8 +596,11 @@ class _EvaluationPlan:
                 "type": "custom",
                 "item_schema": {
                     "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
+                    "properties": {
+                        field: item_properties[field]
+                        for field in sorted(item_properties)
+                    },
+                    "required": sorted(required_item_fields),
                 },
             },
             "testing_criteria": testing_criteria,
@@ -530,7 +627,12 @@ class _EvaluationPlan:
         split: DatasetSplit,
         dataset: _FoundryAsset,
         evaluator_model_deployment: str | None = None,
+        evaluator_schemas: dict[str, dict[str, object]] | None = None,
     ) -> str:
+        schemas = evaluator_schemas or {
+            evaluator.asset_id: _default_evaluator_data_schema()
+            for evaluator in self.evaluators
+        }
         payload = {
             "scheme": _FINGERPRINT_SCHEME,
             "spec_sha256": self.spec_sha256,
@@ -546,6 +648,10 @@ class _EvaluationPlan:
                 for evaluator in self.evaluators
             ],
             "evaluator_model_deployment": evaluator_model_deployment,
+            "evaluator_data_schemas": {
+                asset_id: schemas[asset_id]
+                for asset_id in sorted(schemas)
+            },
         }
         digest = hashlib.sha256(
             json.dumps(
@@ -655,6 +761,96 @@ def _evaluator_catalog_name(evaluator: _FoundryAsset) -> str:
             f"approved evaluator {evaluator.asset_id!r} has no catalog name"
         )
     return evaluator.name
+
+
+def _default_evaluator_data_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "required": ["query", "response"],
+        "properties": {
+            "query": {"type": "string"},
+            "response": {"type": "string"},
+        },
+    }
+
+
+def _normalized_evaluator_data_schema(value: object) -> dict[str, object]:
+    if value is None:
+        return _default_evaluator_data_schema()
+    if not isinstance(value, Mapping):
+        model_dump = getattr(value, "model_dump", None)
+        if not callable(model_dump):
+            raise OptimizationEvaluationError(
+                "the Foundry evaluator data schema is invalid"
+            )
+        value = model_dump(mode="json")
+    try:
+        schema = json.loads(json.dumps(dict(value), sort_keys=True))
+    except (TypeError, ValueError) as error:
+        raise OptimizationEvaluationError(
+            "the Foundry evaluator data schema is not JSON-compatible"
+        ) from error
+    if not isinstance(schema, dict):
+        raise OptimizationEvaluationError(
+            "the Foundry evaluator data schema is invalid"
+        )
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        raise OptimizationEvaluationError(
+            "the Foundry evaluator data schema properties are invalid"
+        )
+    required = schema.get("required")
+    if required is None:
+        required = []
+    if (
+        not isinstance(required, list)
+        or any(not isinstance(field, str) for field in required)
+    ):
+        raise OptimizationEvaluationError(
+            "the Foundry evaluator required data fields are invalid"
+        )
+    schema["type"] = "object"
+    schema["properties"] = properties
+    schema["required"] = sorted(set(required))
+    _evaluator_data_fields(schema)
+    return schema
+
+
+def _evaluator_data_fields(
+    schema: Mapping[str, object],
+) -> tuple[dict[str, object], set[str]]:
+    raw_properties = schema.get("properties")
+    raw_required = schema.get("required")
+    if not isinstance(raw_properties, Mapping) or not isinstance(
+        raw_required, Sequence
+    ):
+        raise OptimizationEvaluationError(
+            "the Foundry evaluator data schema is invalid"
+        )
+    properties: dict[str, object] = {}
+    for field, field_schema in raw_properties.items():
+        if (
+            not isinstance(field, str)
+            or not _DATA_FIELD.fullmatch(field)
+            or not isinstance(field_schema, Mapping)
+        ):
+            raise OptimizationEvaluationError(
+                "the Foundry evaluator data schema contains an unsupported "
+                "field"
+            )
+        properties[field] = json.loads(
+            json.dumps(dict(field_schema), sort_keys=True)
+        )
+    required = {
+        field
+        for field in raw_required
+        if isinstance(field, str) and field in properties
+    }
+    if len(required) != len(raw_required):
+        raise OptimizationEvaluationError(
+            "the Foundry evaluator required data fields are invalid"
+        )
+    return properties, required
 
 
 def _metric_policy_fingerprint(policy: Any) -> dict[str, object]:
