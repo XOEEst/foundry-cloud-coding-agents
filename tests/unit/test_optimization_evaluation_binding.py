@@ -478,6 +478,145 @@ def test_custom_evaluator_schema_fields_are_mapped_from_dataset_items() -> None:
     }
 
 
+def test_compatible_evaluator_field_annotations_do_not_conflict() -> None:
+    spec = _spec(
+        metrics={
+            "advisory_safety": _metric(threshold=1.0),
+            "policy_coverage": _metric(threshold=0.7),
+        },
+        evaluators=(
+            _evaluator_provenance(
+                "evaluator-advisory-safety",
+                name="advisory-safety",
+                remote_id="foundry:advisory-safety:1",
+                metrics=("advisory_safety",),
+            ),
+            _evaluator_provenance(
+                "evaluator-policy-coverage",
+                name="policy-coverage",
+                remote_id="foundry:policy-coverage:1",
+                metrics=("policy_coverage",),
+            ),
+        ),
+    )
+    transport = FakeTransport(
+        pages=[
+            [
+                _item(
+                    scores=(
+                        _score("advisory_safety", 1.0),
+                        _score("policy_coverage", 0.8),
+                    )
+                )
+            ]
+        ]
+    )
+    client = FakeProjectClient(
+        {
+            ("advisory-safety", "1"): {
+                "type": "object",
+                "required": ["query", "response"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Synthetic user request.",
+                    },
+                    "response": {"type": "string"},
+                },
+            },
+            ("policy-coverage", "1"): {
+                "type": "object",
+                "required": ["query", "response"],
+                "properties": {
+                    "expected_decision": {"type": "string"},
+                    "policy_tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "query": {"type": "string"},
+                    "response": {"type": "string"},
+                },
+            },
+        }
+    )
+    binder, _client, _provider = _binder(transport, client=client)
+
+    binder(spec, _assets(spec))(
+        _subject(), DatasetSplit.DEVELOPMENT, 1
+    )
+
+    configuration = transport.created_definitions[0]["configuration"]
+    criteria = {
+        criterion["name"]: criterion
+        for criterion in configuration["testing_criteria"]
+    }
+    assert criteria["policy_coverage"]["data_mapping"] == {
+        "expected_decision": "{{item.expected_decision}}",
+        "policy_tags": "{{item.policy_tags}}",
+        "query": "{{item.query}}",
+        "response": "{{sample.output_text}}",
+    }
+    assert configuration["data_source_config"]["item_schema"][
+        "properties"
+    ]["query"] == {
+        "type": "string",
+        "description": "Synthetic user request.",
+    }
+
+
+def test_incompatible_evaluator_field_schemas_fail_closed() -> None:
+    spec = _spec(
+        metrics={
+            "advisory_safety": _metric(threshold=1.0),
+            "policy_coverage": _metric(threshold=0.7),
+        },
+        evaluators=(
+            _evaluator_provenance(
+                "evaluator-advisory-safety",
+                name="advisory-safety",
+                remote_id="foundry:advisory-safety:1",
+                metrics=("advisory_safety",),
+            ),
+            _evaluator_provenance(
+                "evaluator-policy-coverage",
+                name="policy-coverage",
+                remote_id="foundry:policy-coverage:1",
+                metrics=("policy_coverage",),
+            ),
+        ),
+    )
+    transport = FakeTransport()
+    client = FakeProjectClient(
+        {
+            ("advisory-safety", "1"): {
+                "type": "object",
+                "required": ["query", "response"],
+                "properties": {
+                    "query": {"type": "string"},
+                    "response": {"type": "string"},
+                },
+            },
+            ("policy-coverage", "1"): {
+                "type": "object",
+                "required": ["query", "response"],
+                "properties": {
+                    "query": {"type": "integer"},
+                    "response": {"type": "string"},
+                },
+            },
+        }
+    )
+    binder, _client, _provider = _binder(transport, client=client)
+
+    with pytest.raises(
+        OptimizationEvaluationError,
+        match="conflicting schemas.*'query'",
+    ):
+        binder(spec, _assets(spec))(
+            _subject(), DatasetSplit.DEVELOPMENT, 1
+        )
+
+
 def test_evaluator_schema_is_resolved_once_per_pinned_version() -> None:
     transport = FakeTransport()
     client = FakeProjectClient()
