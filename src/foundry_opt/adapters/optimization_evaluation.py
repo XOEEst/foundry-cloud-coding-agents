@@ -94,6 +94,18 @@ _EVALUATOR_TYPE = "azure_ai_evaluator"
 _SCHEMA_VERSION = "1"
 _FINGERPRINT_SCHEME = "opt-eval-3"
 _DATA_FIELD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SCHEMA_ANNOTATION_FIELDS = frozenset(
+    {
+        "$comment",
+        "default",
+        "deprecated",
+        "description",
+        "examples",
+        "readOnly",
+        "title",
+        "writeOnly",
+    }
+)
 
 
 EvaluationRunner = Callable[
@@ -549,12 +561,16 @@ class _EvaluationPlan:
                 if field == "response":
                     continue
                 existing = item_properties.get(field)
-                if existing is not None and existing != field_schema:
+                if existing is not None and not _compatible_field_schemas(
+                    existing,
+                    field_schema,
+                ):
                     raise OptimizationEvaluationError(
                         "approved evaluators define conflicting schemas for "
                         f"dataset field {field!r}"
                     )
-                item_properties[field] = field_schema
+                if existing is None:
+                    item_properties[field] = field_schema
             required_item_fields.update(required - {"response"})
             criterion: dict[str, object] = {
                 "type": _EVALUATOR_TYPE,
@@ -851,6 +867,27 @@ def _evaluator_data_fields(
             "the Foundry evaluator required data fields are invalid"
         )
     return properties, required
+
+
+def _compatible_field_schemas(
+    left: object,
+    right: object,
+) -> bool:
+    return _schema_validation_contract(left) == _schema_validation_contract(
+        right
+    )
+
+
+def _schema_validation_contract(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _schema_validation_contract(item)
+            for key, item in value.items()
+            if key not in _SCHEMA_ANNOTATION_FIELDS
+        }
+    if isinstance(value, list):
+        return [_schema_validation_contract(item) for item in value]
+    return value
 
 
 def _metric_policy_fingerprint(policy: Any) -> dict[str, object]:
