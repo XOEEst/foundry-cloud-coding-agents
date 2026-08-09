@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,8 @@ from foundry_opt.orchestration import (
     StateRefPushUnacknowledgedError,
 )
 from foundry_opt.orchestration.candidate_workers import (
+    CandidateDesignArtifact,
+    CandidateDesignResult,
     CandidateDesignSubmissionRequest,
     CandidateDesignSubmissionService,
     CandidateDesignSubmissionStatus,
@@ -37,6 +40,7 @@ from foundry_opt.orchestration.handoff import (
     TrustedHandoffContext,
     TrustedHandoffRequest,
     discover_trusted_handoff_requests,
+    trusted_handoff_request_from_payload,
 )
 from foundry_opt.orchestration.issue_intake import GitIssueEventInbox
 from foundry_opt.orchestration.git_state import (
@@ -155,6 +159,381 @@ def _install_proxy_hook(origin: Path) -> None:
         newline="\n",
     )
     hook.chmod(0o755)
+
+
+def _commit_tree(
+    repository: Path,
+    tree: str,
+    parents: tuple[str, ...],
+    message: str,
+    *,
+    author_name: str,
+    author_email: str,
+    author_date: str | None = None,
+    committer_name: str | None = None,
+) -> str:
+    environment = {
+        **os.environ,
+        "GIT_AUTHOR_EMAIL": author_email,
+        "GIT_AUTHOR_NAME": author_name,
+        "GIT_COMMITTER_EMAIL": author_email,
+        "GIT_COMMITTER_NAME": committer_name or author_name,
+    }
+    if author_date is not None:
+        environment["GIT_AUTHOR_DATE"] = author_date
+        environment["GIT_COMMITTER_DATE"] = author_date
+    arguments = ["git", "commit-tree", tree]
+    for parent in parents:
+        arguments.extend(("-p", parent))
+    return subprocess.run(
+        arguments,
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        input=f"{message}\n".encode(),
+        env=environment,
+    ).stdout.decode("ascii").strip()
+
+
+def _payload_hashes(
+    repository: Path,
+    revision: str,
+    paths: tuple[str, ...],
+) -> tuple[PayloadHash, ...]:
+    return tuple(
+        PayloadHash(
+            path,
+            hashlib.sha256(
+                subprocess.run(
+                    ("git", "show", f"{revision}:{path}"),
+                    cwd=repository,
+                    check=True,
+                    capture_output=True,
+                ).stdout
+            ).hexdigest(),
+        )
+        for path in paths
+    )
+
+
+def _pr_509_candidate_handoff_fixture(
+    tmp_path: Path,
+    *,
+    candidate_author: str = "Foundry Candidate Designer",
+    candidate_committer: str | None = None,
+    candidate_message: str = "Capture candidate design design-490-1-1",
+) -> tuple[
+    Path,
+    Path,
+    str,
+    str,
+    CandidateDesignHandoff,
+    TrustedHandoffRequest,
+]:
+    repository, origin, _ = _repository(tmp_path)
+    (origin / "hooks" / "post-receive").unlink()
+    session_branch = "copilot/foundry-opt-design-candidate-490"
+    _git(repository, "branch", "-m", session_branch)
+    (repository / "agent" / "main.py").write_text(
+        "baseline agent\n",
+        encoding="utf-8",
+    )
+    (repository / "tests").mkdir()
+    (repository / "tests" / "test_agent_unit.py").write_text(
+        "baseline test\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "agent/main.py", "tests/test_agent_unit.py")
+    _git(repository, "commit", "-m", "PR 509 pinned base")
+    base = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "push", "origin", f"{base}:refs/heads/main")
+    _git(repository, "push", "-u", "origin", session_branch)
+    _git(repository, "commit", "--allow-empty", "-m", "Initial plan")
+    session_parent = _git(repository, "rev-parse", "HEAD")
+    _git(repository, "push", "origin", session_branch)
+
+    created = CampaignEvent(
+        "github-31292399713",
+        EventKind.ISSUE_CREATED,
+        1,
+        NOW,
+    )
+    state = OptimizationCampaign().advance(
+        AdvanceRequest(490, None, (created,))
+    ).state
+    planned = OutboxRecord(
+        "design-490-1-1-worker",
+        "specialist_work_request",
+        1,
+        state.sequence,
+        {
+            "allowed_mutations": ["python_logic"],
+            "allowed_paths": ["agent", "tests"],
+            "base_commit": base,
+            "baseline_metrics": {"quality": 0.5},
+            "branch": "foundry-opt/issue-490-g1/candidate-1",
+            "candidate_feedback": [],
+            "candidate_id": "candidate-1",
+            "effect_id": "design-490-1-1",
+            "goal": (
+                "Improve policy coverage without weakening safety behavior."
+            ),
+            "issue_number": 490,
+            "reason": "candidate_design_pending",
+            "restricted_opt_ins": {},
+            "slot": 1,
+            "spec_sha256": "a" * 64,
+            "specialist": "foundry-candidate-designer",
+            "target": "support",
+            "work_kind": "design_candidate",
+        },
+    )
+    assigned = OutboxRecord(
+        "design-490-1-1-worker-succeeded",
+        "specialist_work_succeeded",
+        1,
+        state.sequence,
+        {
+            "assigned": True,
+            "created": True,
+            "effect_id": planned.record_id,
+            "issue_number": 490,
+            "result_id": "designer-assignment-508",
+            "specialist": "foundry-candidate-designer",
+            "work_kind": "design_candidate",
+            "worker_issue_number": 508,
+        },
+    )
+    snapshot = GitStateRef().commit(
+        repository,
+        issue_number=490,
+        expected_revision=None,
+        state=state,
+        inbox=(created,),
+        outbox=(planned, assigned),
+    )
+    assert GitIssueEventInbox(repository).append(490, created) is True
+    source_inbox_revision = _git(
+        repository,
+        "ls-remote",
+        "--heads",
+        "origin",
+        "refs/heads/foundry-opt/inbox/issue-490",
+    ).split()[0]
+
+    changed_paths = ("agent/main.py", "tests/test_agent_unit.py")
+    (repository / "agent" / "main.py").write_text(
+        "candidate agent\n",
+        encoding="utf-8",
+    )
+    (repository / "tests" / "test_agent_unit.py").write_text(
+        "candidate test\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", *changed_paths)
+    proposed_tree = _git(repository, "write-tree")
+    _git(repository, "reset", "--hard", session_parent)
+    proposed_revision = _commit_tree(
+        repository,
+        proposed_tree,
+        (base,),
+        candidate_message,
+        author_name=candidate_author,
+        author_email="foundry-opt@example.invalid",
+        author_date="2000-01-01T00:00:00Z",
+        committer_name=candidate_committer,
+    )
+    changed_hashes = _payload_hashes(
+        repository,
+        proposed_revision,
+        changed_paths,
+    )
+    result = CandidateDesignResult(
+        effect_id="design-490-1-1",
+        result_id="design-490-1-1-result-candidate-1",
+        issue_number=490,
+        generation=1,
+        spec_sha256="a" * 64,
+        base_commit=base,
+        candidate_id="candidate-1",
+        slot=1,
+        idea_id="explicit-policy-category-wording",
+        mutation_class="python_logic",
+        motivation="Clarify the applied policy category.",
+        lessons=("Keep existing safety behavior unchanged.",),
+        complexity="low",
+    )
+    request_model = CandidateDesignSubmissionRequest(
+        repository.resolve(),
+        490,
+        "design-490-1-1",
+        508,
+        (
+            repository
+            / ".foundry-optimizer"
+            / "design-results"
+            / "design-490-1-1.json"
+        ).resolve(),
+    )
+    version, product_commit = handoff_module._product_identity()
+    handoff = CandidateDesignHandoff.create(
+        snapshot=snapshot,
+        source_inbox_revision=source_inbox_revision,
+        request=request_model,
+        result=result,
+        artifact=CandidateDesignArtifact(
+            ref=(
+                "refs/heads/foundry-opt/design/"
+                "issue-490/design-490-1-1"
+            ),
+            head_commit=proposed_revision,
+            tree_sha=proposed_tree,
+            changed_paths=tuple(Path(path) for path in changed_paths),
+        ),
+        product_version=version,
+        product_commit=product_commit,
+        session_branch=session_branch,
+        session_base_revision=session_parent,
+        changed_payload_hashes=changed_hashes,
+    )
+    handoff_path = repository / handoff.path
+    handoff_path.parent.mkdir(parents=True)
+    handoff_path.write_bytes(handoff.content)
+    _git(repository, "add", handoff.path)
+    envelope_tree = _git(repository, "write-tree")
+    handoff_blob = _git(repository, "rev-parse", f":{handoff.path}")
+    head = _commit_tree(
+        repository,
+        envelope_tree,
+        (session_parent, proposed_revision),
+        (
+            "Foundry internal designer handoff issue-490\n\n"
+            f"Foundry-Handoff-ID: {handoff.handoff_id}\n"
+            f"Foundry-Handoff-Path: {handoff.path}\n"
+            f"Foundry-Handoff-Blob: {handoff_blob}"
+        ),
+        author_name="Foundry Optimizer Handoff",
+        author_email="foundry-opt@example.invalid",
+    )
+    _git(repository, "reset", "--hard", head)
+    _git(repository, "push", "--force", "origin", session_branch)
+    request = TrustedHandoffRequest(
+        repository_root=repository,
+        repository="octo-org/optimizer",
+        repository_id=123,
+        pull_request_number=509,
+        author_login="copilot-swe-agent[bot]",
+        base_repository="octo-org/optimizer",
+        base_ref="main",
+        base_revision=base,
+        head_repository="octo-org/optimizer",
+        head_ref=session_branch,
+        head_revision=head,
+        handoff_path=handoff.path,
+        handoff_blob=handoff_blob,
+    )
+    return repository, origin, base, head, handoff, request
+
+
+def _rebuild_pr_509_handoff(
+    repository: Path,
+    base: str,
+    original: CandidateDesignHandoff,
+    *,
+    proposed_revision: str | None = None,
+    proposed_tree: str | None = None,
+    proposed_ref: str | None = None,
+    changed_paths: tuple[str, ...] | None = None,
+    changed_hashes: tuple[PayloadHash, ...] | None = None,
+    result: CandidateDesignResult | None = None,
+    session_parent: str | None = None,
+    head_proposed_parent: str | None = None,
+    final_tree_revision: str | None = None,
+) -> tuple[CandidateDesignHandoff, TrustedHandoffRequest]:
+    proposed_revision = proposed_revision or original.proposed_revision
+    proposed_tree = proposed_tree or original.proposed_tree
+    changed_paths = changed_paths or original.changed_paths
+    changed_hashes = changed_hashes or original.changed_payload_hashes
+    session_parent = session_parent or original.session_base_revision
+    snapshot = GitStateRef().load(repository, original.issue_number)
+    assert snapshot is not None
+    request_model = CandidateDesignSubmissionRequest(
+        repository.resolve(),
+        original.issue_number,
+        original.effect_id,
+        original.worker_issue_number,
+        (
+            repository
+            / ".foundry-optimizer"
+            / "design-results"
+            / f"{original.effect_id}.json"
+        ).resolve(),
+    )
+    handoff = CandidateDesignHandoff.create(
+        snapshot=snapshot,
+        source_inbox_revision=original.source_inbox_revision,
+        request=request_model,
+        result=result or original.result,
+        artifact=CandidateDesignArtifact(
+            ref=proposed_ref or original.proposed_ref,
+            head_commit=proposed_revision,
+            tree_sha=proposed_tree,
+            changed_paths=tuple(Path(path) for path in changed_paths),
+        ),
+        product_version=original.product_version,
+        product_commit=original.product_commit,
+        session_branch=original.session_branch,
+        session_base_revision=session_parent,
+        changed_payload_hashes=changed_hashes,
+    )
+    _git(repository, "reset", "--hard", session_parent)
+    if final_tree_revision is not None:
+        _git(repository, "read-tree", final_tree_revision)
+    handoff_path = repository / handoff.path
+    handoff_path.parent.mkdir(parents=True)
+    handoff_path.write_bytes(handoff.content)
+    _git(repository, "add", handoff.path)
+    envelope_tree = _git(repository, "write-tree")
+    handoff_blob = _git(repository, "rev-parse", f":{handoff.path}")
+    head = _commit_tree(
+        repository,
+        envelope_tree,
+        (
+            session_parent,
+            head_proposed_parent or proposed_revision,
+        ),
+        (
+            "Foundry internal designer handoff issue-490\n\n"
+            f"Foundry-Handoff-ID: {handoff.handoff_id}\n"
+            f"Foundry-Handoff-Path: {handoff.path}\n"
+            f"Foundry-Handoff-Blob: {handoff_blob}"
+        ),
+        author_name="Foundry Optimizer Handoff",
+        author_email="foundry-opt@example.invalid",
+    )
+    _git(repository, "reset", "--hard", head)
+    _git(
+        repository,
+        "push",
+        "--force",
+        "origin",
+        f"{head}:refs/heads/{handoff.session_branch}",
+    )
+    return handoff, TrustedHandoffRequest(
+        repository_root=repository,
+        repository="octo-org/optimizer",
+        repository_id=123,
+        pull_request_number=509,
+        author_login="copilot-swe-agent[bot]",
+        base_repository="octo-org/optimizer",
+        base_ref="main",
+        base_revision=base,
+        head_repository="octo-org/optimizer",
+        head_ref=handoff.session_branch,
+        head_revision=head,
+        handoff_path=handoff.path,
+        handoff_blob=handoff_blob,
+    )
 
 
 def test_cloud_steward_persists_one_content_addressed_handoff(
@@ -1585,7 +1964,7 @@ def test_competing_valid_state_handoff_fails_closed(
         ("proposed", "minimal-fallback"),
     ),
 )
-def test_cloud_candidate_designer_persists_result_handoff(
+def test_cloud_candidate_designer_persists_envelope_only_result_handoff(
     tmp_path: Path,
     monkeypatch,
     copilot_git_proxy,
@@ -1736,7 +2115,7 @@ def test_cloud_candidate_designer_persists_result_handoff(
     assert _git(repository, "status", "--porcelain") == ""
     assert (
         repository / "agent" / "instructions.md"
-    ).read_text(encoding="utf-8") == "candidate\n"
+    ).read_text(encoding="utf-8") == "baseline\n"
     assert result_file.exists() is False
     assert proxy.real_revision(
         "refs/heads/foundry-opt/design/issue-31/design-31-1-1"
@@ -1745,11 +2124,9 @@ def test_cloud_candidate_designer_persists_result_handoff(
     assert _git(repository, "rev-parse", f"{head}^") == candidate_revision
     path = _git(
         repository,
-        "diff-tree",
-        "--no-commit-id",
+        "diff",
         "--name-only",
-        "-r",
-        f"{head}^1",
+        base,
         head,
     )
     handoff = CandidateDesignHandoff.from_bytes(
@@ -1801,6 +2178,13 @@ def test_cloud_candidate_designer_persists_result_handoff(
         "rev-parse",
         f"{head}^2",
     ) == handoff.proposed_revision
+    assert _git(
+        repository,
+        "diff",
+        "--name-only",
+        base,
+        head,
+    ) == path
     proxy.disable()
     _set_normal_github_actions_environment(monkeypatch)
     actions = tmp_path / "actions"
@@ -1862,3 +2246,461 @@ def test_cloud_candidate_designer_persists_result_handoff(
     assert submitted_record.payload["head_commit"] == (
         handoff.proposed_revision
     )
+
+
+def test_pr_509_candidate_handoff_applies_envelope_only_proposal(
+    tmp_path: Path,
+) -> None:
+    repository, _, base, head, handoff, request = (
+        _pr_509_candidate_handoff_fixture(tmp_path)
+    )
+
+    assert _git(
+        repository,
+        "diff",
+        "--name-only",
+        base,
+        head,
+    ) == handoff.path
+    assert _git(
+        repository,
+        "diff",
+        "--name-only",
+        base,
+        handoff.proposed_revision,
+    ).splitlines() == list(handoff.changed_paths)
+
+    applied = HandoffApplyService().apply(request)
+
+    assert applied.status is HandoffApplyStatus.APPLIED
+    assert (
+        _git(
+            repository,
+            "ls-remote",
+            "--heads",
+            "origin",
+            handoff.proposed_ref,
+        ).split()[0]
+        == handoff.proposed_revision
+    )
+    assert applied.snapshot is not None
+    submitted = next(
+        record
+        for record in applied.snapshot.outbox
+        if record.record_id == "design-490-1-1-submitted"
+    )
+    assert submitted.payload["head_commit"] == handoff.proposed_revision
+
+
+def test_candidate_apply_publishes_exact_design_before_state_result(
+    tmp_path: Path,
+) -> None:
+    repository, _, _, _, handoff, request = (
+        _pr_509_candidate_handoff_fixture(tmp_path)
+    )
+    delegate = GitStateRef()
+
+    class ObservingLedger:
+        def load(self, root: Path, issue_number: int):
+            return delegate.load(root, issue_number)
+
+        def commit(self, root: Path, **kwargs):
+            assert (
+                _git(
+                    repository,
+                    "ls-remote",
+                    "--heads",
+                    "origin",
+                    handoff.proposed_ref,
+                ).split()[0]
+                == handoff.proposed_revision
+            )
+            return delegate.commit(root, **kwargs)
+
+    applied = HandoffApplyService(
+        ledger=ObservingLedger(),
+    ).apply(request)
+
+    assert applied.status is HandoffApplyStatus.APPLIED
+
+
+@pytest.mark.parametrize(
+    ("candidate_author", "candidate_committer", "candidate_message"),
+    (
+        (
+            "Untrusted Candidate",
+            None,
+            "Capture candidate design design-490-1-1",
+        ),
+        (
+            "Foundry Candidate Designer",
+            "Untrusted Committer",
+            "Capture candidate design design-490-1-1",
+        ),
+        (
+            "Foundry Candidate Designer",
+            None,
+            "Capture a different candidate",
+        ),
+    ),
+)
+def test_candidate_handoff_rejects_non_normalized_proposed_commit(
+    tmp_path: Path,
+    candidate_author: str,
+    candidate_committer: str | None,
+    candidate_message: str,
+) -> None:
+    _, _, _, _, _, request = _pr_509_candidate_handoff_fixture(
+        tmp_path,
+        candidate_author=candidate_author,
+        candidate_committer=candidate_committer,
+        candidate_message=candidate_message,
+    )
+
+    applied = HandoffApplyService().apply(request)
+
+    assert applied.status is HandoffApplyStatus.INVALID
+    assert applied.code == "handoff_validation_failed"
+
+
+def test_pr_509_request_fetches_exact_head_and_proposed_commit(
+    tmp_path: Path,
+) -> None:
+    repository, _, base, head, handoff, fixture_request = (
+        _pr_509_candidate_handoff_fixture(tmp_path)
+    )
+    pull_request = {
+        "base": {
+            "ref": "main",
+            "repo": {"full_name": "octo-org/optimizer"},
+            "sha": base,
+        },
+        "body": None,
+        "head": {
+            "ref": fixture_request.head_ref,
+            "repo": {"full_name": "octo-org/optimizer"},
+            "sha": head,
+        },
+        "merged": False,
+        "number": 509,
+        "state": "open",
+        "title": "[internal] Foundry candidate designer result handoff",
+        "user": {"login": "copilot-swe-agent[bot]"},
+        "created_at": "2026-08-09T04:22:46Z",
+    }
+
+    class Pr509Gateway:
+        def __init__(self) -> None:
+            self.fetched: list[str] = []
+
+        def get_pull_request(self, number: int):
+            assert number == 509
+            return pull_request
+
+        def get_pull_request_files(self, number: int):
+            assert number == 509
+            return [{
+                "filename": handoff.path,
+                "sha": fixture_request.handoff_blob,
+                "status": "added",
+            }]
+
+        def fetch_revision(self, revision: str) -> str:
+            self.fetched.append(revision)
+            return revision
+
+        def head_has_copilot_session_attestation(
+            self,
+            number: int,
+            branch: str,
+            revision: str,
+        ) -> bool:
+            return True
+
+    gateway = Pr509Gateway()
+    payload = {
+        "action": "opened",
+        "pull_request": pull_request,
+        "repository": {
+            "default_branch": "main",
+            "full_name": "octo-org/optimizer",
+            "id": 123,
+        },
+        "sender": {
+            "html_url": "https://github.com/apps/copilot-swe-agent",
+            "id": 198982749,
+            "login": "Copilot",
+            "type": "Bot",
+        },
+    }
+
+    request = trusted_handoff_request_from_payload(
+        payload,
+        TrustedHandoffContext(
+            "pull_request_target",
+            "octo-org/optimizer",
+            123,
+            "main",
+        ),
+        repository,
+        gateway,
+    )
+
+    assert request.head_revision == head
+    assert gateway.fetched == [base, head, handoff.proposed_revision]
+
+
+def test_candidate_handoff_rejects_unreachable_proposed_commit(
+    tmp_path: Path,
+) -> None:
+    repository, _, base, _, original, _ = (
+        _pr_509_candidate_handoff_fixture(tmp_path)
+    )
+    _git(repository, "reset", "--hard", base)
+    (repository / "agent" / "main.py").write_text(
+        "unreachable candidate agent\n",
+        encoding="utf-8",
+    )
+    (repository / "tests" / "test_agent_unit.py").write_text(
+        "unreachable candidate test\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", *original.changed_paths)
+    unreachable_tree = _git(repository, "write-tree")
+    _git(repository, "reset", "--hard", original.session_base_revision)
+    unreachable = _commit_tree(
+        repository,
+        unreachable_tree,
+        (base,),
+        "Capture candidate design design-490-1-1",
+        author_name="Foundry Candidate Designer",
+        author_email="foundry-opt@example.invalid",
+        author_date="2000-01-01T00:00:00Z",
+    )
+    _, request = _rebuild_pr_509_handoff(
+        repository,
+        base,
+        original,
+        proposed_revision=unreachable,
+        proposed_tree=unreachable_tree,
+        changed_hashes=_payload_hashes(
+            repository,
+            unreachable,
+            original.changed_paths,
+        ),
+        head_proposed_parent=original.proposed_revision,
+    )
+
+    applied = HandoffApplyService().apply(request)
+
+    assert applied.status is HandoffApplyStatus.INVALID
+
+
+def test_candidate_handoff_rejects_hidden_unrelated_ancestry(
+    tmp_path: Path,
+) -> None:
+    repository, _, base, _, original, _ = (
+        _pr_509_candidate_handoff_fixture(tmp_path)
+    )
+    _git(repository, "reset", "--hard", original.session_base_revision)
+    (repository / "README.md").write_text(
+        "hidden unrelated change\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "Hidden unrelated change")
+    _git(repository, "restore", f"--source={base}", "--", "README.md")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "Restore unrelated change")
+    restored_session = _git(repository, "rev-parse", "HEAD")
+    assert _git(repository, "rev-parse", "HEAD^{tree}") == _git(
+        repository,
+        "rev-parse",
+        f"{base}^{{tree}}",
+    )
+    _, request = _rebuild_pr_509_handoff(
+        repository,
+        base,
+        original,
+        session_parent=restored_session,
+    )
+
+    applied = HandoffApplyService().apply(request)
+
+    assert applied.status is HandoffApplyStatus.INVALID
+
+
+@pytest.mark.parametrize(
+    "tampering",
+    ("parent", "tree", "hash", "result", "ref"),
+)
+def test_candidate_handoff_rejects_proposal_binding_tampering(
+    tmp_path: Path,
+    tampering: str,
+) -> None:
+    repository, _, base, _, original, _ = (
+        _pr_509_candidate_handoff_fixture(tmp_path)
+    )
+    kwargs: dict[str, object] = {}
+    if tampering == "parent":
+        _git(repository, "reset", "--hard", base)
+        _git(repository, "commit", "--allow-empty", "-m", "Hidden parent")
+        hidden_parent = _git(repository, "rev-parse", "HEAD")
+        wrong_parent = _commit_tree(
+            repository,
+            original.proposed_tree,
+            (hidden_parent,),
+            "Capture candidate design design-490-1-1",
+            author_name="Foundry Candidate Designer",
+            author_email="foundry-opt@example.invalid",
+            author_date="2000-01-01T00:00:00Z",
+        )
+        kwargs["proposed_revision"] = wrong_parent
+    elif tampering == "tree":
+        kwargs["proposed_tree"] = _git(
+            repository,
+            "rev-parse",
+            f"{base}^{{tree}}",
+        )
+    elif tampering == "hash":
+        kwargs["changed_hashes"] = (
+            PayloadHash("agent/main.py", "0" * 64),
+            original.changed_payload_hashes[1],
+        )
+    elif tampering == "result":
+        kwargs["result"] = replace(
+            original.result,
+            candidate_id="candidate-2",
+        )
+    else:
+        kwargs["proposed_ref"] = (
+            "refs/heads/foundry-opt/design/issue-490/other-result"
+        )
+    _, request = _rebuild_pr_509_handoff(
+        repository,
+        base,
+        original,
+        **kwargs,
+    )
+
+    applied = HandoffApplyService().apply(request)
+
+    assert applied.status is HandoffApplyStatus.INVALID
+
+
+def test_candidate_handoff_rejects_envelope_plus_source_file(
+    tmp_path: Path,
+) -> None:
+    repository, _, base, _, original, _ = (
+        _pr_509_candidate_handoff_fixture(tmp_path)
+    )
+    _, request = _rebuild_pr_509_handoff(
+        repository,
+        base,
+        original,
+        final_tree_revision=original.proposed_revision,
+    )
+    changed = _git(
+        repository,
+        "diff",
+        "--name-only",
+        base,
+        request.head_revision,
+    ).splitlines()
+    assert changed == [request.handoff_path, *original.changed_paths]
+
+    applied = HandoffApplyService().apply(request)
+
+    assert applied.status is HandoffApplyStatus.INVALID
+
+
+@pytest.mark.parametrize(
+    "tampering",
+    ("extra", "deleted", "renamed", "symlink", "submodule"),
+)
+def test_candidate_handoff_rejects_unsafe_proposed_tree(
+    tmp_path: Path,
+    tampering: str,
+) -> None:
+    repository, _, base, _, original, _ = (
+        _pr_509_candidate_handoff_fixture(tmp_path)
+    )
+    _git(repository, "reset", "--hard", base)
+    changed_paths = original.changed_paths
+    changed_hashes = original.changed_payload_hashes
+    if tampering == "extra":
+        (repository / "agent" / "main.py").write_text(
+            "candidate agent\n",
+            encoding="utf-8",
+        )
+        (repository / "tests" / "test_agent_unit.py").write_text(
+            "candidate test\n",
+            encoding="utf-8",
+        )
+        (repository / "README.md").write_text(
+            "unexpected candidate file\n",
+            encoding="utf-8",
+        )
+        _git(repository, "add", *changed_paths, "README.md")
+    elif tampering == "deleted":
+        _git(repository, "rm", "agent/main.py")
+        changed_paths = ("agent/main.py",)
+        changed_hashes = (PayloadHash("agent/main.py", "0" * 64),)
+    elif tampering == "renamed":
+        _git(repository, "mv", "agent/main.py", "agent/renamed.py")
+        changed_paths = ("agent/main.py", "agent/renamed.py")
+        changed_hashes = tuple(
+            PayloadHash(path, "0" * 64) for path in changed_paths
+        )
+    else:
+        if tampering == "symlink":
+            object_id = subprocess.run(
+                ("git", "hash-object", "-w", "--stdin"),
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                input=b"../README.md",
+            ).stdout.decode("ascii").strip()
+            mode = "120000"
+        else:
+            object_id = base
+            mode = "160000"
+        _git(
+            repository,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"{mode},{object_id},agent/main.py",
+        )
+        changed_paths = ("agent/main.py",)
+        changed_hashes = (PayloadHash("agent/main.py", "0" * 64),)
+    proposed_tree = _git(repository, "write-tree")
+    _git(repository, "reset", "--hard", original.session_base_revision)
+    proposed_revision = _commit_tree(
+        repository,
+        proposed_tree,
+        (base,),
+        "Capture candidate design design-490-1-1",
+        author_name="Foundry Candidate Designer",
+        author_email="foundry-opt@example.invalid",
+        author_date="2000-01-01T00:00:00Z",
+    )
+    if tampering == "extra":
+        changed_hashes = _payload_hashes(
+            repository,
+            proposed_revision,
+            changed_paths,
+        )
+    _, request = _rebuild_pr_509_handoff(
+        repository,
+        base,
+        original,
+        proposed_revision=proposed_revision,
+        proposed_tree=proposed_tree,
+        changed_paths=changed_paths,
+        changed_hashes=changed_hashes,
+    )
+
+    applied = HandoffApplyService().apply(request)
+
+    assert applied.status is HandoffApplyStatus.INVALID

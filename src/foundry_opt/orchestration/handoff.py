@@ -66,6 +66,10 @@ _COPILOT_LEAD_IN_MAX_AGE = timedelta(minutes=5)
 _COPILOT_SESSION_MAX_COMMITS = 20
 _CANDIDATE_SESSION_MAX_COMMITS = 10
 _CANDIDATE_FILE_MODES = frozenset({"100644", "100755"})
+_CANDIDATE_COMMIT_IDENTITY = (
+    "Foundry Candidate Designer <foundry-opt@example.invalid> "
+    "946684800 +0000"
+)
 _NO_GIT_REPLACEMENTS = {"GIT_NO_REPLACE_OBJECTS": "1"}
 _HANDOFF_COMMIT_ENVIRONMENT = {
     "GIT_AUTHOR_NAME": "Foundry Optimizer Handoff",
@@ -1278,23 +1282,44 @@ def _trusted_handoff_request_from_live(
     if (
         len(set(path for path, _ in validated_files))
         != len(validated_files)
+        or len(validated_files) != 1
         or len(handoff_files) != 1
     ):
-        raise HandoffEventError("handoff pull request files are invalid")
-    path, blob = handoff_files[0]
-    if (
-        path.startswith(".foundry-optimizer/handoffs/steward/")
-        and len(validated_files) != 1
-    ):
         raise HandoffEventError(
-            "steward handoff pull request must change exactly one file"
+            "handoff pull request must change exactly one file"
         )
+    path, blob = handoff_files[0]
     fetched_base = gateway.fetch_revision(live_identity["base_revision"])
     if fetched_base != live_identity["base_revision"]:
         raise HandoffEventError("handoff pull request fetch is not exact")
     fetched_head = gateway.fetch_revision(live_identity["head_revision"])
     if fetched_head != live_identity["head_revision"]:
         raise HandoffEventError("handoff pull request fetch is not exact")
+    if path.startswith(".foundry-optimizer/handoffs/designer/"):
+        try:
+            candidate = CandidateDesignHandoff.from_bytes(
+                _run(
+                    repository_root.expanduser().resolve(),
+                    "git",
+                    "show",
+                    f"{live_identity['head_revision']}:{path}",
+                ).stdout
+            )
+        except (HandoffError, ValueError) as error:
+            raise HandoffEventError(
+                "candidate design handoff is invalid"
+            ) from error
+        if candidate.path != path:
+            raise HandoffEventError(
+                "candidate design handoff path is invalid"
+            )
+        fetched_proposed = gateway.fetch_revision(
+            candidate.proposed_revision
+        )
+        if fetched_proposed != candidate.proposed_revision:
+            raise HandoffEventError(
+                "candidate design handoff fetch is not exact"
+            )
     return TrustedHandoffRequest(
         repository_root=repository_root,
         repository=context.repository,
@@ -1653,9 +1678,12 @@ class HandoffApplyService:
             for line in _git_text(
                 root,
                 "diff",
+                "--no-ext-diff",
+                "--no-renames",
                 "--name-only",
                 session_parent,
                 request.head_revision,
+                environment=_NO_GIT_REPLACEMENTS,
             ).splitlines()
             if line
         )
@@ -1664,9 +1692,12 @@ class HandoffApplyService:
             for line in _git_text(
                 root,
                 "diff",
+                "--no-ext-diff",
+                "--no-renames",
                 "--name-only",
                 effective_base_revision,
                 request.head_revision,
+                environment=_NO_GIT_REPLACEMENTS,
             ).splitlines()
             if line
         )
@@ -1674,10 +1705,10 @@ class HandoffApplyService:
             ".foundry-optimizer/handoffs/designer/"
         )
         if (
-            first_parent_paths != (request.handoff_path,)
+            base_paths != (request.handoff_path,)
             or (
                 not candidate_handoff_path
-                and base_paths != (request.handoff_path,)
+                and first_parent_paths != (request.handoff_path,)
             )
         ):
             raise HandoffError("handoff pull request changed other paths")
@@ -1690,6 +1721,7 @@ class HandoffApplyService:
         ).split()
         if (
             len(tree_line) != 4
+            or tree_line[0] != "100644"
             or tree_line[1] != "blob"
             or tree_line[2] != request.handoff_blob
             or tree_line[3] != request.handoff_path
@@ -1718,16 +1750,6 @@ class HandoffApplyService:
             or handoff.proposed_revision != proposed_revision
         ):
             raise HandoffError("handoff session binding is invalid")
-        expected_base_paths = (
-            (request.handoff_path, *handoff.changed_paths)
-            if isinstance(handoff, CandidateDesignHandoff)
-            else (request.handoff_path,)
-        )
-        if (
-            len(base_paths) != len(expected_base_paths)
-            or set(base_paths) != set(expected_base_paths)
-        ):
-            raise HandoffError("handoff pull request changed other paths")
         author = _git_text(
             root,
             "show",
@@ -1859,6 +1881,25 @@ class HandoffApplyService:
             raise HandoffError("candidate design proposal binding is invalid")
         if effective_base_revision != handoff.result.base_commit:
             raise HandoffError("candidate design base is invalid")
+        expected_commit = (
+            f"tree {handoff.proposed_tree}\n"
+            f"parent {handoff.result.base_commit}\n"
+            f"author {_CANDIDATE_COMMIT_IDENTITY}\n"
+            f"committer {_CANDIDATE_COMMIT_IDENTITY}\n"
+            "\n"
+            f"Capture candidate design {handoff.effect_id}\n"
+        ).encode("utf-8")
+        if _run(
+            root,
+            "git",
+            "cat-file",
+            "commit",
+            handoff.proposed_revision,
+            environment=_NO_GIT_REPLACEMENTS,
+        ).stdout != expected_commit:
+            raise HandoffError(
+                "candidate design normalized commit is invalid"
+            )
         parent_line = _git_text(
             root,
             "rev-list",
@@ -1919,6 +1960,11 @@ class HandoffApplyService:
             raise HandoffError("candidate design intent is unavailable")
         intent = _candidate_design_intent(root, planned[0])
         handoff.result.require_matches(intent)
+        if handoff.proposed_ref != (
+            "refs/heads/foundry-opt/design/"
+            f"issue-{handoff.issue_number}/{handoff.effect_id}"
+        ):
+            raise HandoffError("candidate design ref binding is invalid")
         session_commits = _candidate_session_commits(
             root,
             handoff.result.base_commit,
@@ -1952,18 +1998,6 @@ class HandoffApplyService:
         ):
             raise HandoffError(
                 "candidate design session path is not allowed"
-            )
-        session_changed = tuple(path for path, _, _ in session_entries)
-        if session_changed != handoff.changed_paths or (
-            _candidate_payload_hashes(
-                root,
-                session_parent,
-                session_changed,
-            )
-            != handoff.changed_payload_hashes
-        ):
-            raise HandoffError(
-                "candidate design session payload differs"
             )
         if any(
             not _path_is_allowed(Path(path), intent.edit_paths)
@@ -2179,6 +2213,7 @@ class CloudHandoffStore:
             proposed_revision=handoff.proposed_revision,
             issue_number=handoff.issue_number,
             label="designer",
+            tree_revision=result.base_commit,
         )
 
     def _commit_handoff(
@@ -2209,6 +2244,7 @@ class CloudHandoffStore:
         proposed_revision: str,
         issue_number: int,
         label: str,
+        tree_revision: str | None = None,
     ) -> HandoffReceipt:
         existing_paths = tuple(
             line
@@ -2277,7 +2313,7 @@ class CloudHandoffStore:
                 root,
                 "git",
                 "read-tree",
-                session.base_revision,
+                tree_revision or session.base_revision,
                 environment=environment,
             )
             blob = _run(
@@ -2366,7 +2402,14 @@ class CloudHandoffStore:
         except HandoffError:
             artifact_path.unlink(missing_ok=True)
             raise
-        _run(root, "git", "reset", "--mixed", "--quiet", commit)
+        _run(
+            root,
+            "git",
+            "reset",
+            "--hard" if tree_revision is not None else "--mixed",
+            "--quiet",
+            commit,
+        )
         try:
             pushed = isolated_compare_and_swap_push(
                 root,

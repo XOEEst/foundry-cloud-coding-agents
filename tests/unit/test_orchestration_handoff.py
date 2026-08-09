@@ -313,7 +313,7 @@ def test_dispatch_retry_still_requires_exact_single_handoff_file() -> None:
         )
 
 
-def test_dispatch_retry_accepts_designer_handoff_declared_payload_files(
+def test_dispatch_retry_rejects_designer_handoff_with_payload_files(
 ) -> None:
     pull_request = _live_copilot_pull_request(
         90,
@@ -343,20 +343,18 @@ def test_dispatch_retry_accepts_designer_handoff_declared_payload_files(
         },
     ]
 
-    requests = discover_trusted_handoff_requests(
-        TrustedHandoffContext(
-            "workflow_dispatch",
-            "octo-org/optimizer",
-            123,
-            "trunk",
-        ),
-        Path("repository"),
-        gateway,
-        requested_pull_request=90,
-    )
-
-    assert len(requests) == 1
-    assert requests[0].handoff_path == designer_path
+    with pytest.raises(HandoffEventError, match="exactly one"):
+        discover_trusted_handoff_requests(
+            TrustedHandoffContext(
+                "workflow_dispatch",
+                "octo-org/optimizer",
+                123,
+                "trunk",
+            ),
+            Path("repository"),
+            gateway,
+            requested_pull_request=90,
+        )
 
 
 def test_trusted_event_accepts_only_current_exact_copilot_handoff() -> None:

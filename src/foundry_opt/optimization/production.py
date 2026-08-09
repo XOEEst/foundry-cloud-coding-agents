@@ -2752,10 +2752,10 @@ class _ProductionCandidateDesignRepository:
                 ),
                 cwd=root,
                 environment=environment,
-                input_text=(
+                input_bytes=(
                     "Capture candidate design "
                     f"{intent.effect_id}\n"
-                ),
+                ).encode("utf-8"),
             ).stdout.strip()
             ref = (
                 "refs/heads/foundry-opt/design/"
