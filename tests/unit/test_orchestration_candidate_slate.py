@@ -101,8 +101,18 @@ def test_required_check_display_names_are_preserved() -> None:
         worker_issue_number=84,
         required_checks=plan.required_checks,
     )
+    record = OutboxRecord(
+        "applier-display-check",
+        "applier_worker_issue_planned",
+        generation=2,
+        sequence=1,
+        payload={"required_checks": list(plan.required_checks)},
+    )
 
     assert "Foundry exact candidate check" in body
+    assert record.payload["required_checks"] == [
+        "Foundry exact candidate check"
+    ]
 
 
 def test_applier_worker_result_is_bound_to_the_exact_candidate() -> None:
