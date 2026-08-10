@@ -430,7 +430,6 @@ class GhCandidatePullRequestReader:
                 "gh",
                 "repo",
                 "view",
-                "--repo",
                 self._repository,
                 "--json",
                 "defaultBranchRef",
