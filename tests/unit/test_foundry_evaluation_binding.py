@@ -973,6 +973,25 @@ def test_provider_normalized_score_is_not_replaced_by_raw_scale() -> None:
     assert score["normalized_score"] == 0.75
 
 
+def test_completed_grader_error_is_not_persisted_as_a_zero_score() -> None:
+    item = _list_single_item(
+        {
+            "name": "quality",
+            "score": 0.0,
+            "passed": False,
+            "label": "fail",
+            "sample": {
+                "error": {
+                    "message": "An error occurred during grading",
+                }
+            },
+        }
+    )
+
+    assert item["scores"] == []
+    assert item["error"] == "Evaluator quality errored."
+
+
 def test_criterion_names_remain_distinct_when_metrics_match() -> None:
     item = _list_single_item(
         [
