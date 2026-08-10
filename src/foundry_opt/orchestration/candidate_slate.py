@@ -1832,7 +1832,10 @@ def verify_candidate_pull_request(
         return _invalid("default_branch_advanced")
     if snapshot.base_commit != binding.base_commit:
         return _invalid("base_changed")
-    if snapshot.head_parent_commit != binding.base_commit:
+    if (
+        snapshot.state is not CandidatePullRequestState.MERGED
+        and snapshot.head_parent_commit != binding.base_commit
+    ):
         return _invalid("head_parent_changed")
     if snapshot.head_tree_sha != binding.tree_sha:
         return _invalid("result_tree_mismatch")
