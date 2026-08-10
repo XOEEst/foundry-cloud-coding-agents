@@ -77,6 +77,7 @@ def _repository(tmp_path: Path) -> tuple[Path, str, str, str, bytes]:
 class GithubCommands:
     def __init__(self, responses: list[str]) -> None:
         self.responses = responses
+        self.calls: list[tuple[str, ...]] = []
 
     def run(
         self,
@@ -87,6 +88,7 @@ class GithubCommands:
         input_text: str | None = None,
         input_bytes: bytes | None = None,
     ) -> CommandResult:
+        self.calls.append(tuple(arguments))
         return CommandResult(0, self.responses.pop(0), "")
 
 
@@ -161,6 +163,14 @@ def test_native_candidate_pr_reader_uses_exact_git_patch_and_tree(
     assert snapshot.patch_sha256 == binding.patch_sha256
     assert snapshot.changed_paths == binding.changed_paths
     assert snapshot.marker == candidate_pr_marker(binding)
+    assert commands.calls[0] == (
+        "gh",
+        "repo",
+        "view",
+        "octo-org/optimizer",
+        "--json",
+        "defaultBranchRef",
+    )
 
 
 def test_merged_candidate_reader_accepts_exact_merge_on_default_branch(
