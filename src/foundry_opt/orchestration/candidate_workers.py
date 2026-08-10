@@ -1848,10 +1848,13 @@ class CandidateWorkerService:
                     },
                 ),
             ),
-            objects=(
-                StateObject(
-                    f"objects/patches/{patch.sha256}.patch",
-                    patch_content,
+            objects=_new_state_objects(
+                snapshot,
+                (
+                    StateObject(
+                        f"objects/patches/{patch.sha256}.patch",
+                        patch_content,
+                    ),
                 ),
             ),
         )

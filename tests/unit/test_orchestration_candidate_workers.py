@@ -657,11 +657,15 @@ class Ledger:
         existing_records = {
             record.record_id for record in self.snapshot.outbox
         }
+        existing_objects = {item.path for item in self.snapshot.objects}
         assert not existing_events.intersection(
             event.event_id for event in inbox
         )
         assert not existing_records.intersection(
             record.record_id for record in outbox
+        )
+        assert not existing_objects.intersection(
+            item.path for item in kwargs.get("objects", ())
         )
         self.commits += 1
         self.snapshot = StateRefSnapshot(
