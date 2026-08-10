@@ -710,6 +710,19 @@ _CODE_SOURCE = (
     "    return {'quality': 1.0}\n"
 )
 _CODE_CONTENT = {Path("evaluators/quality.py"): _CODE_SOURCE.encode("utf-8")}
+_STRING_CHECK_SPEC = {
+    "schema_version": "1",
+    "name": "acceptance-policy-coverage",
+    "kind": "string_check",
+    "category": "quality",
+    "scoring_type": "continuous",
+    "metric": "policy_coverage",
+    "direction": "maximize",
+    "threshold": 0.7,
+    "input": "{{sample.output_text}}",
+    "operation": "ilike",
+    "reference": "Policy categories:",
+}
 
 
 def test_register_evaluator_rejects_multiple_files() -> None:
@@ -834,6 +847,32 @@ def test_register_evaluator_creates_code_based_definition() -> None:
     assert evaluator_version.definition.type == "code"
     assert evaluator_version.definition.code_text == _CODE_SOURCE
     assert evaluator_version.definition.entry_point == "quality.py"
+
+
+def test_register_string_check_returns_direct_grader_identity() -> None:
+    gateway = EvaluationAssetRegistrationGateway(
+        _PROJECT_ENDPOINT,
+        FakeCredentialProvider(),
+        client_factory=lambda *_args: pytest.fail(
+            "direct string-check graders must not call the evaluator catalog"
+        ),
+    )
+
+    identity = gateway.register(
+        kind=AssetKind.EVALUATOR,
+        name="policy-coverage-evaluator",
+        version="v1",
+        content={
+            Path("evaluators/policy-coverage.json"): json.dumps(
+                _STRING_CHECK_SPEC
+            ).encode("utf-8")
+        },
+    )
+
+    assert identity.name == "policy-coverage-evaluator"
+    assert identity.version == "v1"
+    assert identity.remote_id.startswith("openai-grader:string-check:")
+    assert identity.content_sha256 is not None
 
 
 def test_register_evaluator_is_idempotent_for_identical_content() -> None:

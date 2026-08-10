@@ -32,6 +32,7 @@ from foundry_opt.evaluation import (
     evaluate_with_repeat,
 )
 from foundry_opt.evidence import EvaluationAssetReference
+from foundry_opt.openai_graders import OpenAIStringCheckGrader
 from foundry_opt.optimization.models import (
     ApprovalGate,
     AssetKind,
@@ -615,6 +616,41 @@ def test_incompatible_evaluator_field_schemas_fail_closed() -> None:
         binder(spec, _assets(spec))(
             _subject(), DatasetSplit.DEVELOPMENT, 1
         )
+
+
+def test_openai_string_check_compiles_direct_testing_criterion() -> None:
+    grader = OpenAIStringCheckGrader(
+        input="{{sample.output_text}}",
+        operation="ilike",
+        reference="Policy categories:",
+    )
+    spec = _spec(
+        evaluators=(
+            _evaluator_provenance(
+                "evaluator-quality",
+                name="policy-coverage",
+                remote_id=grader.remote_id,
+            ),
+        )
+    )
+    transport = FakeTransport()
+    binder, _client, _provider = _binder(transport)
+
+    binder(spec, _assets(spec))(
+        _subject(), DatasetSplit.DEVELOPMENT, 1
+    )
+
+    assert transport.created_definitions[0]["configuration"][
+        "testing_criteria"
+    ] == [
+        {
+            "type": "string_check",
+            "name": "quality",
+            "input": "{{sample.output_text}}",
+            "operation": "ilike",
+            "reference": "Policy categories:",
+        }
+    ]
 
 
 def test_evaluator_schema_is_resolved_once_per_pinned_version() -> None:
