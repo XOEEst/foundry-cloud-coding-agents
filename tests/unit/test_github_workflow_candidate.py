@@ -27,6 +27,22 @@ from foundry_opt.github_workflow import (
 )
 
 
+def test_candidate_policy_validates_required_check_display_names() -> None:
+    policy = CandidatePullRequestPolicy(
+        mode=CandidateMergeMode.HUMAN,
+        deployment_allowed=False,
+        required_checks=("Foundry exact candidate check",),
+    )
+
+    assert policy.required_checks == ("Foundry exact candidate check",)
+    with pytest.raises(ValueError, match="candidate policy checks"):
+        CandidatePullRequestPolicy(
+            mode=CandidateMergeMode.HUMAN,
+            deployment_allowed=False,
+            required_checks=("Foundry exact candidate check ",),
+        )
+
+
 class FakePatchApplier:
     def __init__(
         self,

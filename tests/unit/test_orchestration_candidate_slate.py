@@ -74,6 +74,37 @@ def _binding() -> CandidateBinding:
     )
 
 
+def test_required_check_display_names_are_preserved() -> None:
+    required_checks = ("Foundry exact candidate check",)
+    plan = CandidateSlatePlan(
+        issue_number=31,
+        generation=2,
+        repository="octo-org/optimizer",
+        default_branch="main",
+        spec_sha256="a" * 64,
+        base_commit="b" * 40,
+        evaluation_policy=EvaluationPolicy(
+            (
+                MetricPolicy(
+                    "quality",
+                    MetricDirection.MAXIMIZE,
+                    0.8,
+                    0.05,
+                ),
+            )
+        ),
+        required_checks=required_checks,
+    )
+
+    body = candidate_pr_body(
+        _binding(),
+        worker_issue_number=84,
+        required_checks=plan.required_checks,
+    )
+
+    assert "Foundry exact candidate check" in body
+
+
 def test_applier_worker_result_is_bound_to_the_exact_candidate() -> None:
     binding = _binding()
     intent = ApplierWorkerIntent(

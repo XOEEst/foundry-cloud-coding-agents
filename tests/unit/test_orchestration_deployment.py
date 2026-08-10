@@ -24,6 +24,7 @@ from foundry_opt.orchestration import (
     StewardAdvanceStatus,
 )
 from foundry_opt.orchestration.deployment import (
+    DeploymentBinding,
     DeploymentBridgeStatus,
     DeploymentDispatchClaimRecorder,
     DeploymentDispatchClaimStatus,
@@ -84,6 +85,30 @@ def _binding(candidate_id: str = "candidate-1") -> CandidateBinding:
         allowed_paths=(Path("agent"),),
         changed_paths=(Path("agent/instructions.md"),),
     )
+
+
+def test_deployment_accepts_required_check_display_names() -> None:
+    required_checks = ("Foundry exact candidate check",)
+    plan = replace(_plan(), required_checks=required_checks)
+    binding = DeploymentBinding(
+        issue_number=ISSUE,
+        generation=GENERATION,
+        spec_sha256=SPEC,
+        candidate_pull_request_number=101,
+        candidate_issue_number=84,
+        candidate_id="candidate-1",
+        draft_id="draft-candidate-1",
+        merge_actor="maintainer",
+        required_checks=required_checks,
+        merge_commit=MERGE,
+        tree_sha=TREE,
+        patch_sha256=PATCH,
+        bundle_sha256=BUNDLE,
+        evidence_sha256=EVIDENCE,
+    )
+
+    assert plan.required_checks == required_checks
+    assert binding.required_checks == required_checks
 
 
 def _snapshot() -> StateRefSnapshot:
