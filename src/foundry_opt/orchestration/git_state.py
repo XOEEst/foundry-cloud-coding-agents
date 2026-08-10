@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
+from foundry_opt.check_names import require_check_name
 from foundry_opt.orchestration.campaign import OptimizationCampaign
 from foundry_opt.orchestration.git_transport import (
     compare_and_swap_push,
@@ -372,10 +373,10 @@ _IDENTIFIER_LIST_FIELDS = frozenset(
         "depends_on_effect_ids",
         "allowed_mutations",
         "parent_idea_ids",
-        "required_checks",
         "required_opt_ins",
     }
 )
+_CHECK_NAME_LIST_FIELDS = frozenset({"required_checks"})
 _REDACTED_TEXT_FIELDS = frozenset(
     {"complexity", "motivation"}
 )
@@ -2023,6 +2024,19 @@ def _validate_payload_value(key: str, value: Any) -> None:
             raise StateRefPrivacyError(
                 f"{key} must contain unique paths"
             )
+        return
+    if key in _CHECK_NAME_LIST_FIELDS:
+        if not isinstance(value, list):
+            raise StateRefPrivacyError(f"{key} must be a check name list")
+        try:
+            for item in value:
+                require_check_name(item, key)
+        except ValueError as error:
+            raise StateRefPrivacyError(
+                f"{key} must be a check name list"
+            ) from error
+        if len(set(value)) != len(value):
+            raise StateRefPrivacyError(f"{key} must contain unique values")
         return
     if key in _IDENTIFIER_LIST_FIELDS:
         if not isinstance(value, list):
