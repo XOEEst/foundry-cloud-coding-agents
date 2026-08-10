@@ -79,6 +79,7 @@ from foundry_opt.evaluation import (
     normalize_evaluation,
 )
 from foundry_opt.evidence import EvaluationAssetReference
+from foundry_opt.openai_graders import OpenAIStringCheckGrader
 from foundry_opt.optimization.models import OptimizationSpec
 
 __all__ = [
@@ -355,6 +356,10 @@ class OptimizationEvaluationBinder:
         project_client: Any,
         evaluator: _FoundryAsset,
     ) -> dict[str, object]:
+        if OpenAIStringCheckGrader.from_remote_id(
+            evaluator.remote_id
+        ) is not None:
+            return _default_evaluator_data_schema()
         key = (_evaluator_catalog_name(evaluator), evaluator.version)
         cached = self._evaluator_schema_cache.get(key)
         if cached is not None:
@@ -547,6 +552,20 @@ class _EvaluationPlan:
         item_properties: dict[str, object] = {}
         required_item_fields = {"query"}
         for metric, evaluator in self.metric_evaluators:
+            string_check = OpenAIStringCheckGrader.from_remote_id(
+                evaluator.remote_id
+            )
+            if string_check is not None:
+                testing_criteria.append(
+                    {
+                        "type": "string_check",
+                        "name": metric,
+                        "input": string_check.input,
+                        "operation": string_check.operation,
+                        "reference": string_check.reference,
+                    }
+                )
+                continue
             schema = schemas[evaluator.asset_id]
             properties, required = _evaluator_data_fields(schema)
             data_mapping = {

@@ -140,6 +140,7 @@ from azure.core.exceptions import (
 )
 
 from foundry_opt.adapters.foundry import AzureCredentialProvider
+from foundry_opt.openai_graders import OpenAIStringCheckGrader
 from foundry_opt.optimization.assets import AssetIdentity
 from foundry_opt.optimization.models import AssetKind
 
@@ -407,6 +408,14 @@ class EvaluationAssetRegistrationGateway:
         if kind is AssetKind.EVALUATOR:
             path, data = _single_evaluator_file(content)
             definition, metadata = _parse_evaluator_definition(path, data)
+            if isinstance(definition, OpenAIStringCheckGrader):
+                content_sha256 = hashlib.sha256(data).hexdigest()
+                return AssetIdentity(
+                    remote_id=definition.remote_id,
+                    name=name,
+                    version=version,
+                    content_sha256=content_sha256,
+                )
             return self._register_evaluator(name, version, data, definition, metadata)
         raise ValueError(f"unsupported asset kind: {kind!r}")
 
@@ -710,7 +719,7 @@ def _evaluator_identity_metadata(record: Any) -> dict[str, Any]:
 def _parse_evaluator_definition(
     path: Path,
     data: bytes,
-) -> tuple[EvaluatorDefinition, dict[str, Any]]:
+) -> tuple[EvaluatorDefinition | OpenAIStringCheckGrader, dict[str, Any]]:
     suffix = path.suffix.lower()
     if suffix == ".json":
         return _parse_prompt_evaluator_json(data)
@@ -731,6 +740,8 @@ def _parse_prompt_evaluator_json(
         return _parse_repo_prompt_spec(spec)
     if kind == "rubric":
         return _parse_repo_rubric_spec(spec)
+    if kind == "string_check":
+        return _parse_repo_string_check_spec(spec)
     if kind is not None:
         raise FoundryAssetContentError(
             f"unsupported custom evaluator JSON 'kind': {kind!r}"
@@ -861,6 +872,22 @@ def _parse_repo_prompt_spec(
         metrics={metric_name: _repo_metric(spec)},
     )
     return definition, _repo_metadata(spec)
+
+
+def _parse_repo_string_check_spec(
+    spec: Mapping[str, Any],
+) -> tuple[OpenAIStringCheckGrader, dict[str, Any]]:
+    _repo_metric_name(spec)
+    _repo_metric(spec)
+    try:
+        grader = OpenAIStringCheckGrader(
+            input=spec.get("input"),
+            operation=spec.get("operation"),
+            reference=spec.get("reference"),
+        )
+    except ValueError as error:
+        raise FoundryAssetContentError(str(error)) from error
+    return grader, _repo_metadata(spec)
 
 
 def _parse_rubric_dimension(raw: Any) -> dict[str, Any]:
