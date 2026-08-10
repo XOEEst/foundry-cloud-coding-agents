@@ -1113,6 +1113,15 @@ def _scores(
                 f"Foundry evaluator result status {status!r} has unknown "
                 "semantics."
             )
+        result_sample = result.get("sample")
+        if result_sample is not None:
+            sample = _provider_mapping(
+                result_sample,
+                "evaluator result sample",
+            )
+            if _provider_error(sample.get("error")) is not None:
+                errors.append(f"Evaluator {metric} errored.")
+                continue
         raw_score = result.get("score")
         if raw_score is not None and not isinstance(
             raw_score,
