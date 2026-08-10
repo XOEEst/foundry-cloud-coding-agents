@@ -184,7 +184,7 @@ def test_native_copilot_pull_request_verifies_exact_candidate() -> None:
     assert result.reason is None
 
 
-def test_merged_candidate_allows_default_tip_to_be_exact_merge() -> None:
+def test_merged_candidate_uses_exact_merge_not_copilot_head_parent() -> None:
     binding = _binding()
     snapshot = CandidatePullRequestSnapshot(
         pull_request_number=91,
@@ -197,7 +197,7 @@ def test_merged_candidate_allows_default_tip_to_be_exact_merge() -> None:
         current_default_commit="8" * 40,
         base_commit=binding.base_commit,
         head_commit="1" * 40,
-        head_parent_commit=binding.base_commit,
+        head_parent_commit="7" * 40,
         head_tree_sha=binding.tree_sha,
         patch_sha256=binding.patch_sha256,
         changed_paths=binding.changed_paths,
