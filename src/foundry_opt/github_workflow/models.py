@@ -9,6 +9,7 @@ from typing import Mapping
 from urllib.parse import urlparse
 
 from foundry_opt.campaign import CampaignReport, CandidateArtifact
+from foundry_opt.check_names import require_check_name
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -103,8 +104,8 @@ class CandidatePullRequestPolicy:
                 )
         if len(self.required_checks) != len(set(self.required_checks)):
             raise ValueError("candidate policy checks must be unique")
-        if any(not check.strip() for check in self.required_checks):
-            raise ValueError("candidate policy checks must not be empty")
+        for check in self.required_checks:
+            require_check_name(check, "candidate policy checks entry")
         if (
             self.mode is CandidateMergeMode.HUMAN
             and self.deployment_allowed

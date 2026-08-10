@@ -15,6 +15,7 @@ from pydantic import (
     model_validator,
 )
 
+from foundry_opt.check_names import require_check_name
 from foundry_opt.security import reject_secret_content
 
 
@@ -152,8 +153,8 @@ class AutomationPolicy(ConfigModel):
             raise ValueError("merge_actor must be an identifier")
         if len(self.required_checks) != len(set(self.required_checks)):
             raise ValueError("required_checks must be unique")
-        if any(not check.strip() for check in self.required_checks):
-            raise ValueError("required_checks must not contain empty values")
+        for check in self.required_checks:
+            require_check_name(check, "required_checks entry")
         return self
 
 

@@ -5,12 +5,29 @@ import pytest
 import yaml
 
 from foundry_opt.config.loader import ConfigLoadError, load_config
+from foundry_opt.config.models import AutomationPolicy
 
 
 def _write_config(tmp_path: Path, content: str) -> Path:
     path = tmp_path / "foundry-optimizer.yaml"
     path.write_text(dedent(content), encoding="utf-8")
     return path
+
+
+def test_automation_policy_validates_required_check_display_names() -> None:
+    policy = AutomationPolicy(
+        required_checks=("Foundry exact candidate check",)
+    )
+
+    assert policy.required_checks == ("Foundry exact candidate check",)
+    with pytest.raises(ValueError, match="required_checks"):
+        AutomationPolicy(required_checks=("Foundry exact candidate check ",))
+    with pytest.raises(ValueError, match="required_checks"):
+        AutomationPolicy(required_checks=("x" * 101,))
+    with pytest.raises(ValueError, match="required_checks"):
+        AutomationPolicy(required_checks=("Foundry\ncheck",))
+    with pytest.raises(ValueError, match="required_checks"):
+        AutomationPolicy(required_checks=("Foundry\u009bcheck",))
 
 
 def _minimal_document() -> dict:

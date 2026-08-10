@@ -10,6 +10,7 @@ import re
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 
+from foundry_opt.check_names import require_check_name
 from foundry_opt.evaluation import EvaluationPolicy
 from foundry_opt.orchestration.campaign import OptimizationCampaign
 from foundry_opt.orchestration.git_state import (
@@ -226,7 +227,7 @@ class CandidateSlatePlan:
         ):
             raise ValueError("required_checks must be non-empty and unique")
         for check in self.required_checks:
-            _identifier(check, "required check")
+            require_check_name(check, "required check name")
 
     @property
     def campaign_id(self) -> str:
@@ -1766,7 +1767,7 @@ def candidate_pr_body(
     if len(set(required_checks)) != len(required_checks):
         raise ValueError("required_checks must be unique")
     for check in required_checks:
-        _identifier(check, "required check")
+        require_check_name(check, "required check name")
     changed = "\n".join(
         f"- `{path.as_posix()}`" for path in binding.changed_paths
     )

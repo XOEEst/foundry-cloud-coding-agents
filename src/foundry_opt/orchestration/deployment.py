@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Callable, Mapping, Protocol
 from urllib.parse import urlsplit
 
+from foundry_opt.check_names import require_check_name
 from foundry_opt.deployment import (
     DEPLOYMENT_OIDC_CLIENT_ID,
     DeploymentTrigger,
@@ -203,7 +204,7 @@ class DeploymentPlan:
         if not checks or len(set(checks)) != len(checks):
             raise ValueError("required_checks must be non-empty and unique")
         for check in checks:
-            _identifier(check, "required check")
+            require_check_name(check, "required check name")
         object.__setattr__(self, "required_checks", checks)
         _positive(self.max_attempts, "max_attempts")
         _positive(self.timeout_seconds, "timeout_seconds")
@@ -304,7 +305,7 @@ class DeploymentBinding:
         if not checks or len(set(checks)) != len(checks):
             raise ValueError("required_checks must be non-empty and unique")
         for check in checks:
-            _identifier(check, "required check")
+            require_check_name(check, "required check name")
         object.__setattr__(self, "required_checks", checks)
         for value, field_name in (
             (self.spec_sha256, "spec_sha256"),
