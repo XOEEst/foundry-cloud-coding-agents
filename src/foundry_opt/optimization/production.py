@@ -3029,6 +3029,7 @@ class _ProductionCandidateSlatePlanResolver:
         from foundry_opt.orchestration.candidate_slate import (
             CandidateSlatePlan,
         )
+        from foundry_opt.orchestration.models import CampaignPhase
 
         root = request.repository_root
         config = load_config(root / self._config_path)
@@ -3057,7 +3058,14 @@ class _ProductionCandidateSlatePlanResolver:
         pinned = CampaignGit(
             default_branch=_git_remote_default_branch
         ).pin_default_branch(root)
-        if pinned.commit != spec.base_commit:
+        if (
+            pinned.commit != spec.base_commit
+            and state.phase
+            not in {
+                CampaignPhase.AWAITING_SELECTION,
+                CampaignPhase.DEPLOYMENT,
+            }
+        ):
             raise ValueError("candidate slate base commit changed")
         required_checks = tuple(
             dict.fromkeys(
