@@ -57,6 +57,7 @@ from foundry_opt.optimization.production import (
     _ProductionPostDeploymentEvaluationEffects,
     _RegistrationGateway,
     _candidate_assets_registration_plan,
+    _post_deployment_candidate_base_commit,
     build_issue_optimization_dependencies,
     build_optimization_command_service,
     build_production_steward_candidate_selection,
@@ -811,6 +812,42 @@ def test_copilot_post_deployment_reconcile_never_calls_foundry(
     )
 
     assert effects.reconcile(intent) is None
+
+
+def test_post_deployment_base_uses_exact_candidate_artifact_binding() -> None:
+    plan = OutboxRecord(
+        record_id="applier-31-candidate-1",
+        kind="applier_worker_issue_planned",
+        generation=3,
+        sequence=9,
+        payload={
+            "base_commit": BASE_COMMIT,
+            "binding_sha256": "1" * 64,
+            "bundle_sha256": "2" * 64,
+            "candidate_id": "candidate-1",
+            "draft_id": "draft-selected",
+            "patch_sha256": "3" * 64,
+            "spec_sha256": "4" * 64,
+            "tree_sha": "5" * 40,
+        },
+    )
+    snapshot = SimpleNamespace(outbox=(plan,))
+    intent = SimpleNamespace(
+        binding=SimpleNamespace(
+            binding_sha256="6" * 64,
+            bundle_sha256="2" * 64,
+            candidate_id="candidate-1",
+            draft_id="draft-selected",
+            patch_sha256="3" * 64,
+            spec_sha256="4" * 64,
+            tree_sha="5" * 40,
+        )
+    )
+
+    assert (
+        _post_deployment_candidate_base_commit(snapshot, intent)
+        == BASE_COMMIT
+    )
 
 
 def test_actions_capability_executor_registers_exact_persisted_assets(

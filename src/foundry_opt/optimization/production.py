@@ -4059,18 +4059,10 @@ class _ProductionPostDeploymentEvaluationEffects:
             intent.binding.generation,
             intent.binding.spec_sha256,
         )
-        plans = tuple(
-            record
-            for record in snapshot.outbox
-            if (
-                record.kind == "applier_worker_issue_planned"
-                and record.payload.get("binding_sha256")
-                == intent.binding.binding_sha256
-            )
+        base_commit = _post_deployment_candidate_base_commit(
+            snapshot,
+            intent,
         )
-        if len(plans) != 1:
-            raise ValueError("candidate base commit is unavailable")
-        base_commit = str(plans[0].payload["base_commit"])
         campaign_id = (
             f"issue-{intent.binding.issue_number}-"
             f"g{intent.binding.generation}-"
@@ -4110,6 +4102,40 @@ class _ProductionPostDeploymentEvaluationEffects:
             project_endpoint=endpoint,
             spec=spec,
         )
+
+
+def _post_deployment_candidate_base_commit(
+    snapshot: Any,
+    intent: Any,
+) -> str:
+    binding = intent.binding
+    plans = tuple(
+        record
+        for record in snapshot.outbox
+        if (
+            record.kind == "applier_worker_issue_planned"
+            and record.payload.get("bundle_sha256")
+            == binding.bundle_sha256
+            and record.payload.get("candidate_id")
+            == binding.candidate_id
+            and record.payload.get("draft_id") == binding.draft_id
+            and record.payload.get("patch_sha256")
+            == binding.patch_sha256
+            and record.payload.get("spec_sha256")
+            == binding.spec_sha256
+            and record.payload.get("tree_sha") == binding.tree_sha
+        )
+    )
+    if len(plans) != 1:
+        raise ValueError("candidate base commit is unavailable")
+    base_commit = plans[0].payload.get("base_commit")
+    if (
+        not isinstance(base_commit, str)
+        or len(base_commit) != 40
+        or any(character not in "0123456789abcdef" for character in base_commit)
+    ):
+        raise ValueError("candidate base commit is unavailable")
+    return base_commit
 
 
 class ProductionDeploymentOrchestration:
