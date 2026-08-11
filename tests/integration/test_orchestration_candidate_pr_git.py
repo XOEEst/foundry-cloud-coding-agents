@@ -121,7 +121,7 @@ def test_native_candidate_pr_reader_uses_exact_git_patch_and_tree(
             json.dumps(
                 [
                     {
-                        "author": {"login": "copilot-swe-agent[bot]"},
+                        "author": {"login": "app/copilot-swe-agent"},
                         "baseRefName": "main",
                         "body": body,
                         "headRefOid": head,
@@ -158,6 +158,7 @@ def test_native_candidate_pr_reader_uses_exact_git_patch_and_tree(
     assert len(snapshots) == 1
     snapshot = snapshots[0]
     assert snapshot.state is CandidatePullRequestState.OPEN
+    assert snapshot.author == "copilot-swe-agent[bot]"
     assert snapshot.head_parent_commit == base
     assert snapshot.head_tree_sha == tree
     assert snapshot.patch_sha256 == binding.patch_sha256

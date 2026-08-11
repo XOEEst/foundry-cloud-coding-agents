@@ -731,11 +731,14 @@ class GhCandidatePullRequestReader:
                 r"Candidate worker issue: #([1-9][0-9]*)",
             )
         )
+        author_login = str(author["login"])
+        if author_login == "app/copilot-swe-agent":
+            author_login = "copilot-swe-agent[bot]"
         return CandidatePullRequestSnapshot(
             pull_request_number=number,
             worker_issue_number=worker_issue,
             state=state,
-            author=str(author["login"]),
+            author=author_login,
             draft=item.get("isDraft"),
             base_ref_name=str(item.get("baseRefName", "")),
             current_default_branch=current_default_branch,
