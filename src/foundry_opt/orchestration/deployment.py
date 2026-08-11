@@ -1516,6 +1516,13 @@ class DeploymentWorkflowBridge:
                     DeploymentBridgeStatus.WAITING,
                     reason="deployment_workflow_not_observed",
                 )
+            observed = self._gateway.find(intent)
+            if observed is not None:
+                observed.require_matches(intent)
+                return DeploymentBridgeResult(
+                    DeploymentBridgeStatus.OBSERVED,
+                    observed,
+                )
             try:
                 claim = self._claimer.claim(intent)
             except RuntimeError:

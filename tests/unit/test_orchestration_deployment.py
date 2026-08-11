@@ -426,8 +426,8 @@ def test_dispatch_ack_loss_reconciles_without_dispatching_twice() -> None:
 
     assert first.status is DeploymentBridgeStatus.WAITING
     assert first.reason == "deployment_dispatch_ack_unknown"
-    assert second.status is DeploymentBridgeStatus.WAITING
-    assert second.reason == "deployment_dispatch_ack_pending"
+    assert second.status is DeploymentBridgeStatus.OBSERVED
+    assert second.result == gateway.result
     assert gateway.dispatches == 1
 
 
