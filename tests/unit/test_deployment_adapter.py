@@ -340,7 +340,10 @@ def test_publish_uses_source_zip_contract_and_inherits_pinned_base(
         marker not in publish_call.url.casefold()
         for marker in ("routing", "endpoint", "acr")
     )
-    assert "Foundry-Features" not in publish_call.headers
+    assert (
+        publish_call.headers["Foundry-Features"]
+        == "DraftAgents=V1Preview"
+    )
     assert (
         publish_call.headers["x-ms-code-zip-sha256"]
         == request.bundle.sha256
