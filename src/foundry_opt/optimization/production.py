@@ -3625,12 +3625,11 @@ class _ProductionDeploymentPlanResolver:
                 "repo",
                 "view",
                 "--json",
-                "nameWithOwner,databaseId,defaultBranchRef",
+                "nameWithOwner,defaultBranchRef",
             ),
             root,
         )
         repository = repository_document.get("nameWithOwner")
-        repository_id = repository_document.get("databaseId")
         default_ref = repository_document.get("defaultBranchRef")
         default_branch = (
             default_ref.get("name")
@@ -3639,12 +3638,22 @@ class _ProductionDeploymentPlanResolver:
         )
         if (
             not isinstance(repository, str)
-            or type(repository_id) is not int
             or not isinstance(default_branch, str)
         ):
             raise ValueError("GitHub repository identity is unavailable")
         if spec.repository != repository:
             raise ValueError("deployment repository changed")
+        repository_id = _production_json(
+            self._commands,
+            (
+                "gh",
+                "api",
+                f"repos/{repository}",
+            ),
+            root,
+        ).get("id")
+        if type(repository_id) is not int:
+            raise ValueError("GitHub repository ID is unavailable")
         workflow_path = Path(str(environment.deployment_workflow.path))
         workflow_document = _production_json(
             self._commands,
