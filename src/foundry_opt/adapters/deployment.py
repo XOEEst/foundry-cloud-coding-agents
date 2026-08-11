@@ -47,6 +47,7 @@ from foundry_opt.drafts.models import project_endpoint_components
 
 
 _API_VERSION = "v1"
+_DRAFT_PREVIEW_HEADER = "DraftAgents=V1Preview"
 _MAX_ZIP_BYTES = 250 * 1024 * 1024
 _LINEAGE_PROVENANCE_KEY = "foundry-opt-lineage-sha256"
 
@@ -165,6 +166,7 @@ class DeploymentGateway:
             headers = {
                 "Accept": "application/json",
                 "Content-Type": content_type,
+                "Foundry-Features": _DRAFT_PREVIEW_HEADER,
                 "Idempotency-Key": _idempotency_key(
                     request,
                     metadata_json,
