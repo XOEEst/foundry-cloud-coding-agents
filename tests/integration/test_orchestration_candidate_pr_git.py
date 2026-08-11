@@ -178,6 +178,33 @@ def test_merged_candidate_reader_accepts_exact_merge_on_default_branch(
     tmp_path: Path,
 ) -> None:
     repository, base, head, tree, patch = _repository(tmp_path)
+    _run(("git", "switch", "candidate"), repository)
+    _run(("git", "reset", "--hard", base), repository)
+    _run(("git", "commit", "--allow-empty", "-m", "Initial plan"), repository)
+    source = repository / "agent" / "instructions.md"
+    source.write_text("candidate\n", encoding="utf-8")
+    _run(("git", "add", "."), repository)
+    _run(("git", "commit", "-m", "candidate"), repository)
+    head = _run(("git", "rev-parse", "HEAD"), repository).decode().strip()
+    tree = _run(
+        ("git", "rev-parse", "HEAD^{tree}"),
+        repository,
+    ).decode().strip()
+    patch = _run(
+        ("git", "diff", "--binary", "--full-index", base, head, "--"),
+        repository,
+    )
+    _run(
+        (
+            "git",
+            "push",
+            "--force",
+            "origin",
+            f"{head}:refs/pull/91/head",
+        ),
+        repository,
+    )
+    _run(("git", "switch", "main"), repository)
     _run(("git", "merge", "--no-ff", "candidate", "-m", "merge"), repository)
     merge = _run(("git", "rev-parse", "HEAD"), repository).decode().strip()
     _run(("git", "push", "origin", "main"), repository)
@@ -245,6 +272,8 @@ def test_merged_candidate_reader_accepts_exact_merge_on_default_branch(
     )
 
     assert snapshot.current_default_commit == merge
+    assert snapshot.base_commit == base
+    assert snapshot.head_parent_commit != base
     assert snapshot.merge_parent_commit == base
     assert snapshot.merge_tree_sha == tree
     assert snapshot.merge_reachable_from_default is True

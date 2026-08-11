@@ -743,7 +743,11 @@ class GhCandidatePullRequestReader:
             base_ref_name=str(item.get("baseRefName", "")),
             current_default_branch=current_default_branch,
             current_default_commit=current_default_commit,
-            base_commit=parent,
+            base_commit=(
+                merge_parent_commit
+                if state is CandidatePullRequestState.MERGED
+                else parent
+            ),
             head_commit=fetched,
             head_parent_commit=parent,
             head_tree_sha=tree,
