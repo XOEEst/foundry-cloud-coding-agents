@@ -141,31 +141,36 @@ def _render_auth_probe(result: AuthProbeResult) -> str:
         for item in result.token_acquisition
     )
     foundry = result.foundry_connectivity
-    return "\n".join(
+    lines = [
+        f"Environment: {result.environment_kind.value}",
         (
-            f"Environment: {result.environment_kind.value}",
-            (
-                "OIDC request variables present: "
-                f"{str(result.oidc_request_variables.present).lower()}"
-            ),
-            (
-                "Azure principal: "
-                f"{result.azure_principal.principal_type}; "
-                "configured client match="
-                f"{str(result.azure_principal.client_match).lower()}"
-            ),
-            f"Token acquisition: {tokens}",
-            (
-                "Foundry read-only connectivity: "
-                f"{str(foundry.read_only_access_success).lower()}"
-            ),
-            "Refresh/reacquisition: unknown",
-            (
-                "Direct operations eligible: "
-                f"{str(result.direct_operations_eligible).lower()}"
-            ),
+            "OIDC request variables present: "
+            f"{str(result.oidc_request_variables.present).lower()}"
+        ),
+        (
+            "Azure principal: "
+            f"{result.azure_principal.principal_type}; "
+            "configured client match="
+            f"{str(result.azure_principal.client_match).lower()}"
+        ),
+        f"Token acquisition: {tokens}",
+        (
+            "Foundry read-only connectivity: "
+            f"{str(foundry.read_only_access_success).lower()}"
+        ),
+        f"Refresh/reacquisition: {result.refresh_reacquisition.status}",
+        (
+            "Direct operations eligible: "
+            f"{str(result.direct_operations_eligible).lower()}"
+        ),
+    ]
+    if result.errors:
+        lines.append("Errors:")
+        lines.extend(
+            f"- [{redact(error.code)}] {redact(error.message)}"
+            for error in result.errors
         )
-    )
+    return "\n".join(lines)
 
 
 @auth_app.command("probe")
@@ -185,7 +190,10 @@ def auth_probe(
         ),
     ] = False,
 ) -> None:
-    """Probe current product-side Azure OIDC readiness without printing tokens."""
+    """Probe product-side Azure OIDC readiness without printing tokens.
+
+    Exit status 1 means the probe is incomplete or not eligible.
+    """
     if scope != AUTH_PROBE_SCOPE:
         typer.echo(
             "Authentication probe input error: unsupported scope.",

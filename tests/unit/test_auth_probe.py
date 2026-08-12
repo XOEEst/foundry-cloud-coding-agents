@@ -82,7 +82,11 @@ class FakeFoundryGateway:
         )
 
 
-def _write_config(root: Path) -> None:
+def _write_config(
+    root: Path,
+    *,
+    authentication: str = "oidc",
+) -> None:
     path = root / ".github" / "foundry-optimizer.yaml"
     path.parent.mkdir(parents=True)
     path.write_text(
@@ -92,7 +96,7 @@ def _write_config(root: Path) -> None:
                 "default_environment": "acceptance",
                 "environments": {
                     "acceptance": {
-                        "authentication": "oidc",
+                        "authentication": authentication,
                         "project_endpoint": (
                             "https://example.services.ai.azure.com/api/projects/demo"
                         ),
@@ -289,6 +293,145 @@ def test_probe_rejects_spoofed_post_setup_markers(tmp_path: Path) -> None:
     assert result.direct_operations_eligible is False
 
 
+def test_probe_rejects_a_user_principal_without_acquiring_tokens(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    credential = FakeCredential()
+    foundry = FakeFoundryGateway()
+
+    result = OidcProbe(
+        environment=_post_setup_environment(),
+        command_runner=FakeCommands(
+            {
+                "tenant": "tenant",
+                "subscription": "subscription",
+                "client": "client",
+                "userType": "user",
+            }
+        ),
+        credential_provider=FakeCredentialProvider(credential),
+        foundry_gateway=foundry,
+    ).run(
+        AuthProbeRequest(
+            repository_root=tmp_path,
+            scope="copilot-optimizer",
+        )
+    )
+
+    assert result.azure_principal.principal_type == "user"
+    assert result.azure_principal.client_match is False
+    assert all(not item.attempted for item in result.token_acquisition)
+    assert result.foundry_connectivity.attempted is False
+    assert credential.scopes == []
+    assert foundry.endpoints == []
+    assert result.direct_operations_eligible is False
+
+
+def test_probe_stops_before_foundry_when_token_acquisition_fails(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    credential = FakeCredential({"https://ai.azure.com/.default"})
+    foundry = FakeFoundryGateway()
+
+    result = OidcProbe(
+        environment=_post_setup_environment(),
+        command_runner=FakeCommands(
+            {
+                "tenant": "tenant",
+                "subscription": "subscription",
+                "client": "client",
+                "userType": "servicePrincipal",
+            }
+        ),
+        credential_provider=FakeCredentialProvider(credential),
+        foundry_gateway=foundry,
+    ).run(
+        AuthProbeRequest(
+            repository_root=tmp_path,
+            scope="copilot-optimizer",
+        )
+    )
+
+    assert [item.success for item in result.token_acquisition] == [False, True]
+    assert result.foundry_connectivity.attempted is False
+    assert result.foundry_connectivity.read_only_access_success is False
+    assert foundry.endpoints == []
+    assert result.direct_operations_eligible is False
+
+
+def test_probe_rejects_non_oidc_foundry_configuration(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path, authentication="client_secret")
+    foundry = FakeFoundryGateway()
+
+    result = OidcProbe(
+        environment=_post_setup_environment(),
+        command_runner=FakeCommands(
+            {
+                "tenant": "tenant",
+                "subscription": "subscription",
+                "client": "client",
+                "userType": "servicePrincipal",
+            }
+        ),
+        credential_provider=FakeCredentialProvider(FakeCredential()),
+        foundry_gateway=foundry,
+    ).run(
+        AuthProbeRequest(
+            repository_root=tmp_path,
+            scope="copilot-optimizer",
+        )
+    )
+
+    assert result.foundry_connectivity.authentication_mode == "client_secret"
+    assert result.foundry_connectivity.attempted is False
+    assert foundry.endpoints == []
+    assert any(
+        error.code == "foundry_authentication_not_oidc"
+        for error in result.errors
+    )
+    assert result.direct_operations_eligible is False
+
+
+def test_probe_rejects_principal_identifier_mismatch(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    credential = FakeCredential()
+    foundry = FakeFoundryGateway()
+
+    result = OidcProbe(
+        environment=_post_setup_environment(),
+        command_runner=FakeCommands(
+            {
+                "tenant": "other-tenant",
+                "subscription": "other-subscription",
+                "client": "other-client",
+                "userType": "servicePrincipal",
+            }
+        ),
+        credential_provider=FakeCredentialProvider(credential),
+        foundry_gateway=foundry,
+    ).run(
+        AuthProbeRequest(
+            repository_root=tmp_path,
+            scope="copilot-optimizer",
+        )
+    )
+
+    assert result.azure_principal.client_match is False
+    assert result.azure_principal.tenant_match is False
+    assert result.azure_principal.subscription_match is False
+    assert all(not item.attempted for item in result.token_acquisition)
+    assert result.foundry_connectivity.attempted is False
+    assert credential.scopes == []
+    assert foundry.endpoints == []
+    assert result.direct_operations_eligible is False
+
+
 def test_probe_never_exposes_request_tokens_or_credential_errors(
     tmp_path: Path,
 ) -> None:
@@ -318,6 +461,42 @@ def test_probe_never_exposes_request_tokens_or_credential_errors(
     assert result.azure_principal.available is False
     assert result.direct_operations_eligible is False
     assert all(error.message for error in result.errors)
+
+
+def test_probe_redacts_actual_injected_secret_markers(
+    tmp_path: Path,
+) -> None:
+    request_marker = "request-token-" + "marker-123"
+    cache_marker = "azure-cache-" + "marker-456"
+    credential_marker = "credential-" + "marker-789"
+    environment = _post_setup_environment()
+    environment.values["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = (
+        "eyJ" + request_marker + ".header.signature"
+    )
+
+    result = OidcProbe(
+        environment=environment,
+        command_runner=FakeCommands(
+            RuntimeError(f"{'pass' + 'word'}={cache_marker}")
+        ),
+        credential_provider=FakeCredentialProvider(
+            RuntimeError(
+                f"{'Authori' + 'zation'}: "
+                f"{'Bear' + 'er'} {credential_marker}"
+            )
+        ),
+        foundry_gateway=FakeFoundryGateway(),
+    ).run(
+        AuthProbeRequest(
+            repository_root=tmp_path,
+            scope="copilot-optimizer",
+        )
+    )
+
+    document = json.dumps(result.to_dict(), sort_keys=True)
+    assert request_marker not in document
+    assert cache_marker not in document
+    assert credential_marker not in document
 
 
 def test_probe_requires_configured_read_only_foundry_connectivity(

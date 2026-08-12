@@ -10,6 +10,7 @@ from foundry_opt.auth.probe import (
     EnvironmentKind,
     FoundryConnectivityProbe,
     OidcRequestVariablesProbe,
+    ProbeError,
     RefreshReacquisitionProbe,
     TokenAcquisitionProbe,
 )
@@ -94,3 +95,81 @@ def test_auth_probe_does_not_echo_an_invalid_scope() -> None:
     assert result.exit_code == 2
     assert "unsupported scope" in result.stderr
     assert secret_scope not in result.output
+
+
+def test_auth_probe_human_output_redacts_errors_and_renders_refresh_status(
+    monkeypatch,
+) -> None:
+    secret_code = "github_" + "pat_" + ("A" * 24)
+    secret_marker = "human-output-" + "secret-marker"
+    expected = AuthProbeResult(
+        scope="copilot-optimizer",
+        environment_kind=EnvironmentKind.COPILOT_AGENT_POST_SETUP,
+        oidc_request_variables=OidcRequestVariablesProbe(
+            request_url_present=True,
+            request_token_present=True,
+        ),
+        azure_principal=AzurePrincipalProbe(
+            available=False,
+            principal_type="unknown",
+            client_match=False,
+        ),
+        token_acquisition=(
+            TokenAcquisitionProbe(
+                resource="ai.azure.com",
+                success=False,
+                attempted=False,
+            ),
+            TokenAcquisitionProbe(
+                resource="cognitiveservices.azure.com",
+                success=False,
+                attempted=False,
+            ),
+        ),
+        foundry_connectivity=FoundryConnectivityProbe(
+            configured=True,
+            firewall_reachable=None,
+            read_only_access_success=False,
+            attempted=False,
+        ),
+        refresh_reacquisition=RefreshReacquisitionProbe(
+            status="delayed_probe_pending",
+        ),
+        direct_operations_eligible=False,
+        errors=(
+            ProbeError(
+                code=secret_code,
+                message=(
+                    f"{'Authori' + 'zation'}: "
+                    f"{'Bear' + 'er'} {secret_marker}"
+                ),
+            ),
+        ),
+    )
+
+    class StubProbe:
+        def run(self, request):
+            return expected
+
+    monkeypatch.setattr(cli, "build_auth_probe", lambda: StubProbe())
+
+    result = runner.invoke(
+        app,
+        ["auth", "probe", "--scope", "copilot-optimizer"],
+    )
+
+    assert result.exit_code == 1
+    assert "Refresh/reacquisition: delayed_probe_pending" in result.stdout
+    assert "Errors:" in result.stdout
+    assert "[REDACTED]" in result.stdout
+    assert secret_code not in result.output
+    assert secret_marker not in result.output
+
+
+def test_auth_probe_help_documents_exit_one_meaning() -> None:
+    result = runner.invoke(app, ["auth", "probe", "--help"])
+
+    assert result.exit_code == 0
+    assert "Exit status 1 means the probe is incomplete or not eligible." in (
+        result.stdout
+    )
