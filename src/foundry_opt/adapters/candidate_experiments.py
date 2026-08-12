@@ -172,6 +172,8 @@ class FoundryCandidateExperimentOperation:
             draft_id=draft.version_id,
             evaluation_id=result.run.evaluation_id,
             run_id=result.run.run_id,
+            bundle_sha256=request.bundle_sha256,
+            evidence_sha256=request.evidence_sha256,
             operation_sha256=(
                 CandidateExperimentOperation.from_request(request).sha256
             ),
@@ -231,6 +233,10 @@ def _validate_result_lineage(
         result.operation_sha256 != persisted.sha256
         or result.idempotency_key
         != persisted.operation.idempotency_key
+        or result.bundle_sha256
+        != persisted.operation.bundle_sha256
+        or result.evidence_sha256
+        != persisted.operation.evidence_sha256
     ):
         raise ValueError(
             "candidate experiment result lineage does not match the "
@@ -245,6 +251,10 @@ def _validate_plan(
     draft = plan.draft_request
     if plan.patch_sha256 != request.patch_sha256:
         raise ValueError("candidate experiment patch binding changed")
+    if plan.draft_request.bundle.sha256 != request.bundle_sha256:
+        raise ValueError("candidate experiment bundle binding changed")
+    if plan.evidence_sha256 != request.evidence_sha256:
+        raise ValueError("candidate experiment evidence binding changed")
     if draft.idempotency_key != request.idempotency_key:
         raise ValueError("candidate experiment draft idempotency changed")
     if draft.subject != request.candidate_id:
@@ -304,6 +314,8 @@ def _bound_result(
         draft_id=_redacted(result.draft_id),
         evaluation_id=_redacted(result.evaluation_id),
         run_id=_redacted(result.run_id),
+        bundle_sha256=result.bundle_sha256,
+        evidence_sha256=result.evidence_sha256,
         operation_sha256=result.operation_sha256,
         idempotency_key=result.idempotency_key,
     )

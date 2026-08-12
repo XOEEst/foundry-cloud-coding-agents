@@ -1,23 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 from typing import Protocol
 
 from foundry_opt.adapters.commands import CommandError
 from foundry_opt.orchestration.candidate_experiments import (
     CandidateExperimentAdapter,
-    CandidateExperimentRequest,
     CandidateExperimentResult,
 )
-from foundry_opt.orchestration.candidate_search import (
-    BoundedCandidateSearch,
-    CandidateSearchSummary,
-)
+from foundry_opt.orchestration.candidate_search import CandidateSearchSummary
 from foundry_opt.orchestration.public_evidence import (
     AlternativeResult,
     EvidenceMergeGate,
@@ -50,6 +45,14 @@ _REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
 )
+_COMMIT_ENVIRONMENT = {
+    "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+    "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
+    "GIT_AUTHOR_NAME": "Foundry Optimizer Workspace",
+    "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+    "GIT_COMMITTER_EMAIL": "foundry-opt@example.invalid",
+    "GIT_COMMITTER_NAME": "Foundry Optimizer Workspace",
+}
 
 
 class TrustedWorkspaceSelector(Protocol):
@@ -66,6 +69,287 @@ class WorkspacePullRequestFinalizer(Protocol):
         pull_request: WorkspacePullRequest,
         projection: PullRequestProjection,
     ) -> WorkspacePullRequest: ...
+
+
+@dataclass(frozen=True)
+class WorkspaceExactPatchResult:
+    commit_sha: str
+    tree_sha: str
+    changed_paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[0-9a-f]{40}", self.commit_sha) is None:
+            raise ValueError("workspace exact commit is invalid")
+        if re.fullmatch(r"[0-9a-f]{40}", self.tree_sha) is None:
+            raise ValueError("workspace exact tree is invalid")
+        object.__setattr__(self, "changed_paths", tuple(self.changed_paths))
+
+
+class WorkspaceExactBranchPublisher(Protocol):
+    def publish(
+        self,
+        repository_root: Path,
+        pull_request: WorkspacePullRequest,
+        candidate: WorkspaceCandidate,
+    ) -> WorkspaceExactPatchResult: ...
+
+
+class GitWorkspaceExactBranchPublisher:
+    def __init__(
+        self,
+        commands: CommandRunner,
+        *,
+        remote: str = "origin",
+    ) -> None:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", remote) is None:
+            raise ValueError("workspace exact remote is invalid")
+        self._commands = commands
+        self._remote = remote
+
+    def publish(
+        self,
+        repository_root: Path,
+        pull_request: WorkspacePullRequest,
+        candidate: WorkspaceCandidate,
+    ) -> WorkspaceExactPatchResult:
+        root = repository_root.resolve(strict=True)
+        branch_ref = f"refs/heads/{pull_request.branch}"
+        remote_head = self._remote_head(root, branch_ref)
+        if remote_head is None:
+            raise RuntimeError("workspace branch does not exist")
+        existing = self._existing_exact(
+            root,
+            remote_head,
+            pull_request,
+            candidate,
+        )
+        if existing is not None:
+            return existing
+        worktree = (
+            root
+            / ".fw"
+            / (
+                f"w{pull_request.issue_number}-"
+                f"{candidate.experiment.idempotency_key[:8]}"
+            )
+        )
+        self._remove_worktree(root, worktree)
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._run(
+                ("git", "worktree", "add", "--detach", str(worktree),
+                 pull_request.base_commit),
+                root,
+            )
+            if self._run(
+                (
+                    "git",
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ),
+                worktree,
+            ).stdout:
+                raise RuntimeError("workspace exact worktree is not clean")
+            self._run(
+                ("git", "apply", "--check", "--binary", "--index", "-"),
+                worktree,
+                input_bytes=candidate.exact_patch,
+            )
+            self._run(
+                (
+                    "git",
+                    "apply",
+                    "--binary",
+                    "--index",
+                    "--whitespace=nowarn",
+                    "-",
+                ),
+                worktree,
+                input_bytes=candidate.exact_patch,
+            )
+            changed_paths = tuple(
+                item
+                for item in self._run(
+                    (
+                        "git",
+                        "diff",
+                        "--cached",
+                        "--name-only",
+                        "-z",
+                    ),
+                    worktree,
+                ).stdout.split("\0")
+                if item
+            )
+            if (
+                not changed_paths
+                or set(changed_paths) != set(candidate.changed_paths)
+                or len(changed_paths) != len(candidate.changed_paths)
+            ):
+                raise RuntimeError(
+                    "workspace exact changed paths do not match"
+                )
+            tree = self._run(("git", "write-tree"), worktree).stdout.strip()
+            if tree != candidate.expected_tree:
+                raise RuntimeError("workspace exact tree does not match")
+            commit = self._run(
+                (
+                    "git",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    pull_request.base_commit,
+                    "-m",
+                    (
+                        "Apply selected optimization candidate "
+                        f"for issue-{pull_request.issue_number}"
+                    ),
+                ),
+                worktree,
+                environment=_COMMIT_ENVIRONMENT,
+            ).stdout.strip()
+            self._run(("git", "reset", "--hard", commit), worktree)
+            verified_tree = self._run(
+                ("git", "rev-parse", "--verify", "HEAD^{tree}"),
+                worktree,
+            ).stdout.strip()
+            if (
+                verified_tree != candidate.expected_tree
+                or self._run(
+                    (
+                        "git",
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    ),
+                    worktree,
+                ).stdout
+            ):
+                raise RuntimeError("workspace exact commit is unverified")
+            self._run(
+                (
+                    "git",
+                    "push",
+                    f"--force-with-lease={branch_ref}:{remote_head}",
+                    self._remote,
+                    f"{commit}:{branch_ref}",
+                ),
+                root,
+            )
+            if self._remote_head(root, branch_ref) != commit:
+                raise RuntimeError("workspace exact branch push is unverified")
+            return WorkspaceExactPatchResult(
+                commit_sha=commit,
+                tree_sha=verified_tree,
+                changed_paths=changed_paths,
+            )
+        except CommandError as error:
+            raise RuntimeError(
+                "workspace exact branch publication failed"
+            ) from error
+        finally:
+            self._remove_worktree(root, worktree)
+
+    def _existing_exact(
+        self,
+        root: Path,
+        commit: str,
+        pull_request: WorkspacePullRequest,
+        candidate: WorkspaceCandidate,
+    ) -> WorkspaceExactPatchResult | None:
+        try:
+            self._run(
+                ("git", "fetch", "--no-tags", self._remote, commit),
+                root,
+            )
+            tree = self._run(
+                ("git", "rev-parse", "--verify", f"{commit}^{{tree}}"),
+                root,
+            ).stdout.strip()
+            parent = self._run(
+                ("git", "rev-parse", "--verify", f"{commit}^"),
+                root,
+            ).stdout.strip()
+            changed_paths = tuple(
+                item
+                for item in self._run(
+                    (
+                        "git",
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "-r",
+                        "-z",
+                        commit,
+                    ),
+                    root,
+                ).stdout.split("\0")
+                if item
+            )
+        except CommandError:
+            return None
+        if (
+            parent != pull_request.base_commit
+            or tree != candidate.expected_tree
+            or set(changed_paths) != set(candidate.changed_paths)
+            or len(changed_paths) != len(candidate.changed_paths)
+        ):
+            return None
+        return WorkspaceExactPatchResult(
+            commit_sha=commit,
+            tree_sha=tree,
+            changed_paths=changed_paths,
+        )
+
+    def _remote_head(self, root: Path, branch_ref: str) -> str | None:
+        result = self._run(
+            ("git", "ls-remote", "--heads", self._remote, branch_ref),
+            root,
+        ).stdout.strip()
+        if not result:
+            return None
+        fields = result.split()
+        if (
+            len(fields) != 2
+            or fields[1] != branch_ref
+            or re.fullmatch(r"[0-9a-f]{40}", fields[0]) is None
+        ):
+            raise RuntimeError("workspace remote branch is invalid")
+        return fields[0]
+
+    def _remove_worktree(self, root: Path, worktree: Path) -> None:
+        try:
+            self._run(
+                ("git", "worktree", "remove", "--force", str(worktree)),
+                root,
+            )
+        except CommandError:
+            pass
+        if worktree.exists():
+            shutil.rmtree(worktree)
+        try:
+            self._run(("git", "worktree", "prune"), root)
+        except CommandError:
+            pass
+        parent = worktree.parent
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+
+    def _run(
+        self,
+        arguments: tuple[str, ...],
+        cwd: Path,
+        *,
+        input_bytes: bytes | None = None,
+        environment: dict[str, str] | None = None,
+    ):
+        return self._commands.run(
+            arguments,
+            cwd=cwd,
+            input_bytes=input_bytes,
+            environment=environment,
+        )
 
 
 class PlanningWorkspacePullRequestFinalizer:
@@ -118,34 +402,64 @@ class GhWorkspacePullRequestFinalizer:
             )
         )
         try:
-            self._commands.run(
-                (
-                    "gh",
-                    "pr",
-                    "edit",
-                    str(pull_request.number),
-                    "--repo",
-                    self._repository,
-                    "--title",
-                    projection.title,
-                    "--body-file",
-                    "-",
-                ),
-                cwd=repository_root,
-                input_text=body,
+            current = json.loads(
+                self._commands.run(
+                    (
+                        "gh",
+                        "pr",
+                        "view",
+                        str(pull_request.number),
+                        "--repo",
+                        self._repository,
+                        "--json",
+                        "number,headRefName,title,body,isDraft,state",
+                    ),
+                    cwd=repository_root,
+                ).stdout
             )
-            self._commands.run(
-                (
-                    "gh",
-                    "pr",
-                    "ready",
-                    str(pull_request.number),
-                    "--repo",
-                    self._repository,
-                ),
-                cwd=repository_root,
-            )
-        except CommandError as error:
+            if (
+                not isinstance(current, dict)
+                or current.get("number") != pull_request.number
+                or current.get("headRefName") != pull_request.branch
+                or current.get("state") != "OPEN"
+                or not isinstance(current.get("isDraft"), bool)
+            ):
+                raise RuntimeError(
+                    "workspace pull request identity changed"
+                )
+            if (
+                current.get("title") != projection.title
+                or current.get("body") != body
+            ):
+                self._commands.run(
+                    (
+                        "gh",
+                        "pr",
+                        "edit",
+                        str(pull_request.number),
+                        "--repo",
+                        self._repository,
+                        "--title",
+                        projection.title,
+                        "--body-file",
+                        "-",
+                    ),
+                    cwd=repository_root,
+                    input_text=body,
+                )
+            if current["isDraft"]:
+                self._commands.run(
+                    (
+                        "gh",
+                        "pr",
+                        "ready",
+                        str(pull_request.number),
+                        "--repo",
+                        self._repository,
+                    ),
+                    cwd=repository_root,
+                )
+        except (CommandError, json.JSONDecodeError) as error:
             raise RuntimeError(
                 "workspace pull request finalization failed"
             ) from error
@@ -165,20 +479,7 @@ class WorkspaceCandidateCoordinatorResult:
     snapshot: WorkspaceSnapshot
     workspace_pull_request: WorkspacePullRequest
     report: OptimizationReport
-
-
-class _CapturingRunner:
-    def __init__(self, runner: CandidateExperimentAdapter) -> None:
-        self._runner = runner
-        self.results: list[CandidateExperimentResult] = []
-
-    def evaluate(
-        self,
-        request: CandidateExperimentRequest,
-    ) -> CandidateExperimentResult:
-        result = self._runner.evaluate(request)
-        self.results.append(result)
-        return result
+    recorded: bool
 
 
 class WorkspaceCandidateCoordinator:
@@ -188,6 +489,7 @@ class WorkspaceCandidateCoordinator:
         store: WorkspaceStore,
         runner: CandidateExperimentAdapter,
         selector: TrustedWorkspaceSelector,
+        exact_publisher: WorkspaceExactBranchPublisher,
         candidate_count: int,
         finalizer: WorkspacePullRequestFinalizer | None = None,
         renderer: PublicEvidenceRenderer | None = None,
@@ -201,6 +503,7 @@ class WorkspaceCandidateCoordinator:
         self._store = store
         self._runner = runner
         self._selector = selector
+        self._exact_publisher = exact_publisher
         self._candidate_count = candidate_count
         self._finalizer = (
             finalizer
@@ -245,11 +548,12 @@ class WorkspaceCandidateCoordinator:
                     ),
                 ),
             )
-        capture = _CapturingRunner(self._runner)
-        experiments = BoundedCandidateSearch(
-            runner=capture,
-            max_candidates=self._candidate_count,
-        ).evaluate(tuple(item.experiment for item in candidates))
+        experiments, snapshot = self._evaluate_candidates(
+            request,
+            candidates,
+            snapshot,
+            pull_request,
+        )
         if len(experiments) != self._candidate_count:
             raise ValueError("workspace candidate evaluation stopped early")
         decision = self._selector.select(
@@ -270,6 +574,18 @@ class WorkspaceCandidateCoordinator:
             or not set(decision.eligible_candidate_ids) <= set(by_id)
         ):
             raise ValueError("workspace selector changed candidate binding")
+        selected = by_id[decision.selected_candidate_id]
+        exact = self._exact_publisher.publish(
+            request.repository_root,
+            pull_request,
+            selected,
+        )
+        if (
+            exact.tree_sha != selected.expected_tree
+            or set(exact.changed_paths) != set(selected.changed_paths)
+            or len(exact.changed_paths) != len(selected.changed_paths)
+        ):
+            raise ValueError("workspace exact candidate tree is unverified")
         if (
             not decision.required_checks
             or any(
@@ -280,7 +596,6 @@ class WorkspaceCandidateCoordinator:
             raise ValueError(
                 "workspace selection requires successful trusted checks"
             )
-        selected = by_id[decision.selected_candidate_id]
         compact = tuple(
             CandidateSummary(
                 candidate_id=item.experiment.candidate_id,
@@ -298,31 +613,41 @@ class WorkspaceCandidateCoordinator:
             )
             for item in candidates
         )
-        external_ids = tuple(
-            operation_id
-            for result in capture.results
-            for operation_id in (
-                result.draft_id,
-                result.evaluation_id,
-                result.run_id,
-            )
-        )
-        if len(external_ids) != len(set(external_ids)):
-            raise ValueError(
-                "workspace candidate operation IDs must be unique"
-            )
-        committed = self._store.commit(
-            expected_revision=snapshot.revision,
-            update=WorkspaceUpdate(
-                issue_number=request.issue.number,
-                phase=WorkspacePhase.AWAITING_SELECTION,
-                workspace_pull_request_number=pull_request.number,
-                semantic_event="experiments_completed",
-                candidates=compact,
-                selected_patch=selected.exact_patch,
-                external_operation_ids=external_ids,
+        recorded = snapshot.phase is not WorkspacePhase.AWAITING_SELECTION
+        external_ids = (
+            *snapshot.external_operation_ids,
+            (
+                f"{selected.experiment.candidate_id}:patch:"
+                f"{selected.experiment.patch_sha256}"
             ),
+            (
+                f"{selected.experiment.candidate_id}:tree:"
+                f"{selected.expected_tree}"
+            ),
+            f"workspace_commit:{exact.commit_sha}",
         )
+        external_ids = tuple(dict.fromkeys(external_ids))
+        committed = (
+            self._store.commit(
+                expected_revision=snapshot.revision,
+                update=WorkspaceUpdate(
+                    issue_number=request.issue.number,
+                    phase=WorkspacePhase.AWAITING_SELECTION,
+                    workspace_pull_request_number=pull_request.number,
+                    semantic_event="experiments_completed",
+                    candidates=compact,
+                    selected_patch=selected.exact_patch,
+                    external_operation_ids=external_ids,
+                ),
+            )
+            if recorded
+            else snapshot
+        )
+        if not recorded and (
+            committed.candidates != compact
+            or committed.selected_patch != selected.exact_patch
+        ):
+            raise ValueError("workspace committed selection changed")
         report = self._report(
             request=request,
             snapshot=committed,
@@ -353,7 +678,89 @@ class WorkspaceCandidateCoordinator:
             snapshot=committed,
             workspace_pull_request=finalized,
             report=report,
+            recorded=recorded,
         )
+
+    def _evaluate_candidates(
+        self,
+        request: WorkspaceRequest,
+        candidates: tuple[WorkspaceCandidate, ...],
+        snapshot: WorkspaceSnapshot,
+        pull_request: WorkspacePullRequest,
+    ) -> tuple[tuple[CandidateSearchSummary, ...], WorkspaceSnapshot]:
+        completed = {item.candidate_id: item for item in snapshot.candidates}
+        summaries: list[CandidateSearchSummary] = []
+        for candidate in candidates:
+            candidate_id = candidate.experiment.candidate_id
+            prepared = candidate.experiment_result
+            existing = completed.get(candidate_id)
+            if existing is None:
+                result = self._runner.evaluate(candidate.experiment)
+                if result != prepared:
+                    raise ValueError(
+                        "workspace experiment result changed prepared lineage"
+                    )
+                operation_ids = _experiment_operation_ids(
+                    candidate_id,
+                    result,
+                )
+                if set(operation_ids) & set(
+                    snapshot.external_operation_ids
+                ):
+                    raise ValueError(
+                        "workspace candidate operation IDs must be unique"
+                    )
+                partial = (
+                    *snapshot.candidates,
+                    CandidateSummary(
+                        candidate_id=candidate_id,
+                        metrics=result.metrics,
+                        eligible=False,
+                        selected=False,
+                    ),
+                )
+                snapshot = self._store.commit(
+                    expected_revision=snapshot.revision,
+                    update=WorkspaceUpdate(
+                        issue_number=request.issue.number,
+                        phase=WorkspacePhase.EVALUATING,
+                        workspace_pull_request_number=pull_request.number,
+                        semantic_event=(
+                            f"candidate_experiment_completed_{candidate_id}"
+                        ),
+                        candidates=partial,
+                        selected_patch=snapshot.selected_patch,
+                        external_operation_ids=(
+                            *snapshot.external_operation_ids,
+                            *operation_ids,
+                        ),
+                    ),
+                )
+                completed[candidate_id] = partial[-1]
+            elif existing.metrics != prepared.metrics:
+                raise ValueError(
+                    "workspace persisted experiment result changed"
+                )
+            expected_ids = set(
+                _experiment_operation_ids(candidate_id, prepared)
+            )
+            if not expected_ids <= set(snapshot.external_operation_ids):
+                raise ValueError(
+                    "workspace persisted experiment lineage is incomplete"
+                )
+            summaries.append(
+                CandidateSearchSummary(
+                    candidate_id=candidate_id,
+                    patch_sha256=candidate.experiment.patch_sha256,
+                    bundle_sha256=prepared.bundle_sha256,
+                    evidence_sha256=prepared.evidence_sha256,
+                    idempotency_key=candidate.experiment.idempotency_key,
+                    executor=prepared.executor,
+                    metrics=prepared.metrics,
+                    guardrails=prepared.guardrails,
+                )
+            )
+        return tuple(summaries), snapshot
 
     @staticmethod
     def _report(
@@ -380,25 +787,6 @@ class WorkspaceCandidateCoordinator:
             for item in experiments
             if item.candidate_id == selected_state.candidate_id
         )
-        evidence = _canonical_digest(
-            {
-                "candidates": [
-                    {
-                        "candidate_id": item.candidate_id,
-                        "eligible": item.eligible,
-                        "metrics": dict(item.metrics),
-                        "selected": item.selected,
-                    }
-                    for item in snapshot.candidates
-                ],
-                "external_operation_ids": list(
-                    snapshot.external_operation_ids
-                ),
-            }
-        )
-        bundle = hashlib.sha256(
-            evidence.encode("ascii") + (snapshot.selected_patch or b"")
-        ).hexdigest()
         policy = context.policy
         return OptimizationReport(
             issue_number=request.issue.number,
@@ -440,30 +828,33 @@ class WorkspaceCandidateCoordinator:
             spec_sha256=context.spec_sha256,
             base_commit=request.issue.base_commit,
             patch_sha256=selected.experiment.patch_sha256,
-            evidence_sha256=evidence,
-            bundle_sha256=bundle,
+            evidence_sha256=selected_experiment.evidence_sha256,
+            bundle_sha256=selected_experiment.bundle_sha256,
             expected_tree=selected.expected_tree,
             required_checks=decision.required_checks,
             merge_gate=EvidenceMergeGate.ELIGIBLE,
         )
 
 
-def _canonical_digest(value: Mapping[str, object]) -> str:
-    payload = json.dumps(
-        value,
-        ensure_ascii=True,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
+def _experiment_operation_ids(
+    candidate_id: str,
+    result: CandidateExperimentResult,
+) -> tuple[str, ...]:
+    return (
+        result.draft_id,
+        result.evaluation_id,
+        result.run_id,
+        f"{candidate_id}:bundle:{result.bundle_sha256}",
+        f"{candidate_id}:evidence:{result.evidence_sha256}",
+    )
 __all__ = [
     "PlanningWorkspacePullRequestFinalizer",
+    "GitWorkspaceExactBranchPublisher",
     "GhWorkspacePullRequestFinalizer",
     "TrustedWorkspaceSelector",
     "WorkspaceCandidateCoordinator",
     "WorkspaceCandidateCoordinatorResult",
+    "WorkspaceExactBranchPublisher",
+    "WorkspaceExactPatchResult",
     "WorkspacePullRequestFinalizer",
 ]

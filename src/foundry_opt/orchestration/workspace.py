@@ -11,6 +11,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 from foundry_opt.evaluation import EvaluationPolicy
 from foundry_opt.orchestration.candidate_experiments import (
     CandidateExperimentRequest,
+    CandidateExperimentResult,
 )
 from foundry_opt.orchestration.public_evidence import (
     FoundryOperation,
@@ -89,6 +90,7 @@ class WorkspaceIssue:
 @dataclass(frozen=True)
 class WorkspaceCandidate:
     experiment: CandidateExperimentRequest
+    experiment_result: CandidateExperimentResult
     exact_patch: bytes
     summary: str
     changed_paths: tuple[str, ...]
@@ -104,6 +106,18 @@ class WorkspaceCandidate:
             != self.experiment.patch_sha256
         ):
             raise ValueError("workspace candidate patch binding changed")
+        result = self.experiment_result
+        if (
+            result.candidate_id != self.experiment.candidate_id
+            or result.bundle_sha256 != self.experiment.bundle_sha256
+            or result.evidence_sha256 != self.experiment.evidence_sha256
+            or (
+                result.idempotency_key is not None
+                and result.idempotency_key
+                != self.experiment.idempotency_key
+            )
+        ):
+            raise ValueError("workspace candidate result binding changed")
         if (
             not isinstance(self.summary, str)
             or not self.summary.strip()
@@ -199,6 +213,66 @@ class WorkspaceSelectionDecision:
 
 
 @dataclass(frozen=True)
+class WorkspaceOperation:
+    trigger: WorkspaceTrigger
+    operation_id: str
+    workspace_pull_request_number: int
+    candidate_id: str
+    patch_sha256: str
+    bundle_sha256: str
+    evidence_sha256: str
+    predecessor_operation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.trigger not in {
+            WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+            WorkspaceTrigger.RETENTION_COMPLETED,
+        }:
+            raise ValueError("workspace operation trigger is invalid")
+        if (
+            re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}",
+                self.operation_id,
+            )
+            is None
+        ):
+            raise ValueError("workspace operation ID is invalid")
+        if (
+            type(self.workspace_pull_request_number) is not int
+            or self.workspace_pull_request_number < 1
+        ):
+            raise ValueError("workspace operation pull request is invalid")
+        if re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            self.candidate_id,
+        ) is None:
+            raise ValueError("workspace operation candidate is invalid")
+        for value, name in (
+            (self.patch_sha256, "patch"),
+            (self.bundle_sha256, "bundle"),
+            (self.evidence_sha256, "evidence"),
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(
+                    f"workspace operation {name} digest is invalid"
+                )
+        if (
+            self.trigger is WorkspaceTrigger.RETENTION_COMPLETED
+            and (
+                self.predecessor_operation_id is None
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}",
+                    self.predecessor_operation_id,
+                )
+                is None
+            )
+        ):
+            raise ValueError(
+                "workspace retention predecessor operation is invalid"
+            )
+
+
+@dataclass(frozen=True)
 class WorkspaceRequest:
     repository_root: Path
     issue: WorkspaceIssue
@@ -206,6 +280,7 @@ class WorkspaceRequest:
     workspace_pull_request: WorkspacePullRequest | None = None
     candidates: tuple[WorkspaceCandidate, ...] = ()
     report_context: WorkspaceReportContext | None = None
+    operation: WorkspaceOperation | None = None
 
 
 @dataclass(frozen=True)
@@ -359,7 +434,7 @@ class OptimizationWorkspace:
                     "workspace_state_commit",
                     "workspace_pr_finalize",
                 ),
-                recorded=True,
+                recorded=outcome.recorded,
                 issue_status_projection_intent=(
                     self._projection(
                         issue.number,
@@ -517,6 +592,7 @@ class OptimizationWorkspace:
     ) -> WorkspaceResult:
         if snapshot is None:
             raise ValueError("workspace transition is not allowed")
+        operation_id = self._validated_operation(request, snapshot)
         transitions = {
             (
                 WorkspacePhase.AWAITING_SELECTION,
@@ -533,6 +609,54 @@ class OptimizationWorkspace:
         }
         phase = transitions.get((snapshot.phase, request.trigger))
         if phase is None:
+            duplicate_phases = {
+                WorkspaceTrigger.PULL_REQUEST_MERGED: {
+                    WorkspacePhase.DEPLOYMENT,
+                    WorkspacePhase.RETENTION,
+                    WorkspacePhase.COMPLETED,
+                },
+                WorkspaceTrigger.DEPLOYMENT_COMPLETED: {
+                    WorkspacePhase.RETENTION,
+                    WorkspacePhase.COMPLETED,
+                },
+                WorkspaceTrigger.RETENTION_COMPLETED: {
+                    WorkspacePhase.COMPLETED,
+                },
+            }
+            if snapshot.phase in duplicate_phases.get(
+                request.trigger,
+                set(),
+            ):
+                if (
+                    operation_id is not None
+                    and operation_id
+                    not in snapshot.external_operation_ids
+                ):
+                    raise ValueError(
+                        "workspace duplicate operation is not recorded"
+                    )
+                pull_request = self._resolved_pull_request(
+                    request.issue,
+                    request.workspace_pull_request,
+                    snapshot.workspace_pull_request_number,
+                    selected=True,
+                )
+                return WorkspaceResult(
+                    phase=snapshot.phase,
+                    workspace_pull_request=pull_request,
+                    planned_effect_kinds=(),
+                    recorded=False,
+                    issue_status_projection_intent=self._projection(
+                        request.issue.number,
+                        snapshot.phase,
+                        pull_request.number,
+                    ),
+                    next_action=self._next_action(
+                        request.issue.number,
+                        snapshot.phase,
+                        pull_request.number,
+                    ),
+                )
             raise ValueError("workspace transition is not allowed")
         pull_request = self._resolved_pull_request(
             request.issue,
@@ -547,6 +671,14 @@ class OptimizationWorkspace:
                 pull_request=pull_request,
                 phase=phase,
                 snapshot=snapshot,
+                external_operation_ids=(
+                    (
+                        *snapshot.external_operation_ids,
+                        operation_id,
+                    )
+                    if operation_id is not None
+                    else snapshot.external_operation_ids
+                ),
             ),
         )
         return WorkspaceResult(
@@ -565,6 +697,62 @@ class OptimizationWorkspace:
                 pull_request.number,
             ),
         )
+
+    @staticmethod
+    def _validated_operation(
+        request: WorkspaceRequest,
+        snapshot: WorkspaceSnapshot,
+    ) -> str | None:
+        if request.trigger is WorkspaceTrigger.PULL_REQUEST_MERGED:
+            if request.operation is not None:
+                raise ValueError(
+                    "workspace merge transition cannot carry an operation"
+                )
+            return None
+        operation = request.operation
+        if operation is None or operation.trigger is not request.trigger:
+            raise ValueError(
+                "workspace transition requires a trusted operation result"
+            )
+        selected = tuple(
+            item for item in snapshot.candidates if item.selected
+        )
+        patch = snapshot.selected_patch
+        if (
+            len(selected) != 1
+            or patch is None
+            or operation.workspace_pull_request_number
+            != snapshot.workspace_pull_request_number
+            or operation.candidate_id != selected[0].candidate_id
+            or hashlib.sha256(patch).hexdigest()
+            != operation.patch_sha256
+        ):
+            raise ValueError("workspace operation selection lineage changed")
+        markers = {
+            (
+                f"{operation.candidate_id}:patch:"
+                f"{operation.patch_sha256}"
+            ),
+            (
+                f"{operation.candidate_id}:bundle:"
+                f"{operation.bundle_sha256}"
+            ),
+            (
+                f"{operation.candidate_id}:evidence:"
+                f"{operation.evidence_sha256}"
+            ),
+        }
+        if not markers <= set(snapshot.external_operation_ids):
+            raise ValueError("workspace operation lineage is incomplete")
+        if (
+            request.trigger is WorkspaceTrigger.RETENTION_COMPLETED
+            and operation.predecessor_operation_id
+            not in snapshot.external_operation_ids
+        ):
+            raise ValueError(
+                "workspace retention predecessor is not recorded"
+            )
+        return operation.operation_id
 
     @staticmethod
     def _resolved_pull_request(
@@ -664,6 +852,7 @@ class OptimizationWorkspace:
         pull_request: WorkspacePullRequest,
         phase: WorkspacePhase,
         snapshot: WorkspaceSnapshot | None,
+        external_operation_ids: tuple[str, ...] | None = None,
     ) -> WorkspaceUpdate:
         from foundry_opt.orchestration.workspace_store import WorkspaceUpdate
 
@@ -677,9 +866,13 @@ class OptimizationWorkspace:
                 snapshot.selected_patch if snapshot is not None else None
             ),
             external_operation_ids=(
-                snapshot.external_operation_ids
-                if snapshot is not None
-                else ()
+                external_operation_ids
+                if external_operation_ids is not None
+                else (
+                    snapshot.external_operation_ids
+                    if snapshot is not None
+                    else ()
+                )
             ),
         )
 

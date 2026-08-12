@@ -44,6 +44,8 @@ def _request() -> CandidateExperimentRequest:
         issue_number=31,
         candidate_id="candidate-1",
         patch_sha256="1" * 64,
+        bundle_sha256="5" * 64,
+        evidence_sha256="6" * 64,
         idempotency_key="2" * 64,
     )
 
@@ -57,6 +59,8 @@ def _result(executor: str) -> CandidateExperimentResult:
         draft_id="draft-123",
         evaluation_id="eval-123",
         run_id="evalrun-123",
+        bundle_sha256="5" * 64,
+        evidence_sha256="6" * 64,
     )
 
 

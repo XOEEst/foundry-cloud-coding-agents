@@ -1,0 +1,129 @@
+import pytest
+from pathlib import Path
+
+from foundry_opt.orchestration import (
+    TrustedWorkspaceOperationContext,
+    WorkspaceTrigger,
+    normalize_workspace_operation,
+)
+
+
+def _payload() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "deployment_result",
+        "status": "completed",
+        "issue_number": 31,
+        "workspace_pull_request_number": 104,
+        "operation_id": "deployment-123",
+        "candidate_id": "candidate-2",
+        "patch_sha256": "a" * 64,
+        "bundle_sha256": "b" * 64,
+        "evidence_sha256": "c" * 64,
+        "predecessor_operation_id": None,
+        "repository": {
+            "full_name": "octo-org/optimizer",
+            "id": 123,
+        },
+    }
+
+
+def _context() -> TrustedWorkspaceOperationContext:
+    return TrustedWorkspaceOperationContext(
+        delivery_id="delivery-123",
+        repository="octo-org/optimizer",
+        repository_id=123,
+    )
+
+
+def test_trusted_workspace_operation_normalizes_completed_lineage() -> None:
+    event = normalize_workspace_operation(_payload(), _context())
+
+    assert event.issue_number == 31
+    assert event.operation.trigger is WorkspaceTrigger.DEPLOYMENT_COMPLETED
+    assert event.operation.operation_id == "deployment-123"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("status", "running", "not completed"),
+        ("workspace_pull_request_number", 105, "lineage"),
+        ("bundle_sha256", "d" * 64, "lineage"),
+    ),
+)
+def test_lifecycle_rejects_forged_trusted_operation_lineage(
+    field: str,
+    value,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+    import hashlib
+
+    from foundry_opt.orchestration import (
+        CandidateSummary,
+        InMemoryWorkspaceStore,
+        OptimizationWorkspace,
+        WorkspaceIssue,
+        WorkspacePhase,
+        WorkspacePullRequest,
+        WorkspaceRequest,
+        WorkspaceUpdate,
+    )
+
+    payload = _payload()
+    payload[field] = value
+    if field == "status":
+        with pytest.raises(ValueError, match=message):
+            normalize_workspace_operation(payload, _context())
+        return
+    operation = normalize_workspace_operation(payload, _context()).operation
+    patch = b"selected"
+    patch_sha = hashlib.sha256(patch).hexdigest()
+    store = InMemoryWorkspaceStore()
+    issue = WorkspaceIssue(31, "[Optimize] X", "body", "f" * 40)
+    pr = WorkspacePullRequest(
+        104,
+        31,
+        "foundry-opt/workspace/issue-31",
+        "[Optimize] #31 selected candidate",
+        False,
+        True,
+        "f" * 40,
+    )
+    store.commit(
+        expected_revision=None,
+        update=WorkspaceUpdate(
+            issue_number=31,
+            phase=WorkspacePhase.DEPLOYMENT,
+            workspace_pull_request_number=104,
+            semantic_event="merged",
+            candidates=(
+                CandidateSummary(
+                    "candidate-2",
+                    {"quality": 1.0},
+                    True,
+                    True,
+                ),
+            ),
+            selected_patch=patch,
+            external_operation_ids=(
+                f"candidate-2:patch:{patch_sha}",
+                f"candidate-2:bundle:{'b' * 64}",
+                f"candidate-2:evidence:{'c' * 64}",
+            ),
+        ),
+    )
+    operation = replace(operation, patch_sha256=patch_sha)
+
+    with pytest.raises(ValueError, match=message):
+        OptimizationWorkspace(store=store).advance(
+            WorkspaceRequest(
+                repository_root=tmp_path,
+                issue=issue,
+                trigger=WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+                workspace_pull_request=pr,
+                operation=operation,
+            )
+        )

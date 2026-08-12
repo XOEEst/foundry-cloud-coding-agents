@@ -12,13 +12,36 @@ from foundry_opt.adapters.commands import (
     SubprocessCommandRunner,
 )
 from foundry_opt.adapters.github import github_repository_from_remote_url
+from foundry_opt.config import load_config
+from foundry_opt.config.models import (
+    MetricDirection as ConfigMetricDirection,
+    UndefinedBehavior as ConfigUndefinedBehavior,
+)
+from foundry_opt.evaluation import (
+    EvaluationPolicy,
+    MetricDirection,
+    MetricPolicy,
+    UndefinedBehavior,
+)
+from foundry_opt.orchestration.candidate_experiments import (
+    CandidateExperimentAdapter,
+)
 from foundry_opt.orchestration.workspace import (
     OptimizationWorkspace,
+    WorkspaceCandidate,
     WorkspaceIssue,
+    WorkspaceOperation,
     WorkspacePullRequest,
+    WorkspaceReportContext,
     WorkspaceRequest,
     WorkspaceResult,
     WorkspaceTrigger,
+)
+from foundry_opt.orchestration.workspace_coordinator import (
+    GhWorkspacePullRequestFinalizer,
+    GitWorkspaceExactBranchPublisher,
+    TrustedWorkspaceSelector,
+    WorkspaceCandidateCoordinator,
 )
 from foundry_opt.orchestration.workspace_github import (
     GhWorkspacePullRequests,
@@ -29,6 +52,18 @@ from foundry_opt.orchestration.workspace_intake import (
     NormalizedWorkspaceEvent,
     TrustedWorkspaceEventContext,
     normalize_workspace_event,
+)
+from foundry_opt.orchestration.workspace_manifest import (
+    PreparedCandidateResultRunner,
+    parse_workspace_experiment_manifest,
+)
+from foundry_opt.orchestration.workspace_policy import (
+    ConfiguredWorkspaceSelector,
+)
+from foundry_opt.orchestration.workspace_operations import (
+    NormalizedWorkspaceOperation,
+    TrustedWorkspaceOperationContext,
+    normalize_workspace_operation,
 )
 from foundry_opt.preflight.interfaces import CommandRunner
 from foundry_opt.security import reject_secret_content
@@ -54,6 +89,12 @@ class WorkspaceAdvanceRequest:
     workspace_pull_request: WorkspacePullRequest | None = None
     expected_repository: str | None = None
     trusted_repository_id: int | None = None
+    candidates: tuple[WorkspaceCandidate, ...] = ()
+    report_context: WorkspaceReportContext | None = None
+    candidate_count: int | None = None
+    experiment_runner: CandidateExperimentAdapter | None = None
+    selector: TrustedWorkspaceSelector | None = None
+    operation: WorkspaceOperation | None = None
 
     def __post_init__(self) -> None:
         if type(self.issue_number) is not int or self.issue_number < 1:
@@ -101,6 +142,28 @@ class WorkspaceIntakeResult:
 
 
 @dataclass(frozen=True)
+class WorkspaceOperationIntakeResult:
+    event: NormalizedWorkspaceOperation
+    workspace: WorkspaceResult
+
+    @property
+    def exit_code(self) -> int:
+        return 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event": {
+                "delivery_id": self.event.delivery_id,
+                "operation_id": self.event.operation.operation_id,
+                "repository": self.event.repository,
+                "repository_id": self.event.repository_id,
+                "trigger": self.event.operation.trigger.value,
+            },
+            "workspace": self.workspace.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class _RepositoryContext:
     repository: str
     default_branch: str
@@ -115,15 +178,45 @@ def build_production_workspace(
     repository: str,
     base_branch: str,
     commands: CommandRunner | None = None,
+    candidate_count: int | None = None,
+    experiment_runner: CandidateExperimentAdapter | None = None,
+    selector: TrustedWorkspaceSelector | None = None,
 ) -> OptimizationWorkspace:
     runner = commands or SubprocessCommandRunner()
+    store = GitWorkspaceStore(repository_root)
+    candidate_coordinator = None
+    configured = (
+        candidate_count,
+        experiment_runner,
+        selector,
+    )
+    if any(item is not None for item in configured):
+        if any(item is None for item in configured):
+            raise ValueError(
+                "workspace candidate production wiring is incomplete"
+            )
+        assert candidate_count is not None
+        assert experiment_runner is not None
+        assert selector is not None
+        candidate_coordinator = WorkspaceCandidateCoordinator(
+            store=store,
+            runner=experiment_runner,
+            selector=selector,
+            exact_publisher=GitWorkspaceExactBranchPublisher(runner),
+            candidate_count=candidate_count,
+            finalizer=GhWorkspacePullRequestFinalizer(
+                runner,
+                repository=repository,
+            ),
+        )
     return OptimizationWorkspace(
-        store=GitWorkspaceStore(repository_root),
+        store=store,
         pull_requests=GhWorkspacePullRequests(
             runner,
             repository=repository,
             base_branch=base_branch,
         ),
+        candidate_coordinator=candidate_coordinator,
     )
 
 
@@ -142,6 +235,32 @@ class ProductionWorkspaceService:
         self._workspace_factory = workspace_factory
 
     def advance(self, request: WorkspaceAdvanceRequest) -> WorkspaceResult:
+        if (
+            request.trigger is WorkspaceTrigger.PULL_REQUEST_MERGED
+            and (
+                request.workspace_pull_request is None
+                or request.expected_repository is None
+                or request.trusted_repository_id is None
+            )
+        ):
+            raise ProductionWorkspaceError(
+                "workspace merge requires trusted event intake"
+            )
+        if (
+            request.trigger
+            in {
+                WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+                WorkspaceTrigger.RETENTION_COMPLETED,
+            }
+            and (
+                request.operation is None
+                or request.expected_repository is None
+                or request.trusted_repository_id is None
+            )
+        ):
+            raise ProductionWorkspaceError(
+                "workspace lifecycle requires trusted operation intake"
+            )
         root = request.repository_root.expanduser().resolve()
         context = self._repository_context(root)
         if (
@@ -179,6 +298,14 @@ class ProductionWorkspaceService:
             base_commit = pull_request.base_commit
         elif existing is not None:
             number, base_commit = existing
+            if (
+                request.base_commit is not None
+                and request.base_commit.casefold()
+                != base_commit.casefold()
+            ):
+                raise ProductionWorkspaceError(
+                    "workspace manifest base does not match workspace PR"
+                )
             selected = request.trigger in {
                 WorkspaceTrigger.PULL_REQUEST_MERGED,
                 WorkspaceTrigger.DEPLOYMENT_COMPLETED,
@@ -213,6 +340,9 @@ class ProductionWorkspaceService:
             repository=context.repository,
             base_branch=context.default_branch,
             commands=self._commands,
+            candidate_count=request.candidate_count,
+            experiment_runner=request.experiment_runner,
+            selector=request.selector,
         )
         return workspace.advance(
             WorkspaceRequest(
@@ -225,6 +355,77 @@ class ProductionWorkspaceService:
                 ),
                 trigger=request.trigger,
                 workspace_pull_request=pull_request,
+                candidates=request.candidates,
+                report_context=request.report_context,
+                operation=request.operation,
+            )
+        )
+
+    def complete_experiments(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        repository_root: Path,
+    ) -> WorkspaceResult:
+        root = repository_root.expanduser().resolve()
+        target_name = payload.get("target")
+        if not isinstance(target_name, str):
+            raise ProductionWorkspaceError(
+                "workspace manifest target is invalid"
+            )
+        config = load_config(
+            root / ".github" / "foundry-optimizer.yaml"
+        )
+        target = config.targets.get(target_name)
+        if target is None:
+            raise ProductionWorkspaceError(
+                "workspace manifest target is not configured"
+            )
+        policy = _evaluation_policy(target.metrics)
+        manifest = parse_workspace_experiment_manifest(
+            payload,
+            policy=policy,
+        )
+        candidate_count = (
+            target.campaign_overrides.max_changed_candidates
+            if (
+                target.campaign_overrides is not None
+                and target.campaign_overrides.max_changed_candidates
+                is not None
+            )
+            else config.campaign.max_changed_candidates
+        )
+        if len(manifest.candidates) != candidate_count:
+            raise ProductionWorkspaceError(
+                "workspace manifest does not contain configured candidates"
+            )
+        if not config.automation_policy.required_checks:
+            raise ProductionWorkspaceError(
+                "workspace selection requires configured checks"
+            )
+        context = self._repository_context(root)
+        selector = ConfiguredWorkspaceSelector(
+            self._commands,
+            repository_root=root,
+            repository=context.repository,
+            required_checks=tuple(
+                config.automation_policy.required_checks
+            ),
+        )
+        return self.advance(
+            WorkspaceAdvanceRequest(
+                repository_root=root,
+                issue_number=manifest.issue_number,
+                trigger=WorkspaceTrigger.EXPERIMENTS_COMPLETED,
+                base_commit=manifest.base_commit,
+                expected_repository=context.repository,
+                candidates=manifest.candidates,
+                report_context=manifest.report_context,
+                candidate_count=candidate_count,
+                experiment_runner=PreparedCandidateResultRunner(
+                    manifest.candidates
+                ),
+                selector=selector,
             )
         )
 
@@ -253,6 +454,29 @@ class ProductionWorkspaceService:
             )
         )
         return WorkspaceIntakeResult(event=event, workspace=result)
+
+    def ingest_operation(
+        self,
+        payload: Mapping[str, Any],
+        context: TrustedWorkspaceOperationContext,
+        *,
+        repository_root: Path,
+    ) -> WorkspaceOperationIntakeResult:
+        event = normalize_workspace_operation(payload, context)
+        result = self.advance(
+            WorkspaceAdvanceRequest(
+                repository_root=repository_root,
+                issue_number=event.issue_number,
+                trigger=event.operation.trigger,
+                expected_repository=event.repository,
+                trusted_repository_id=event.repository_id,
+                operation=event.operation,
+            )
+        )
+        return WorkspaceOperationIntakeResult(
+            event=event,
+            workspace=result,
+        )
 
     def _repository_context(self, root: Path) -> _RepositoryContext:
         try:
@@ -512,3 +736,31 @@ class ProductionWorkspaceService:
                 "workspace GitHub response is invalid"
             )
         return value
+
+
+def _evaluation_policy(
+    configured: Mapping[str, Any],
+) -> EvaluationPolicy:
+    return EvaluationPolicy(
+        metrics=tuple(
+            MetricPolicy(
+                name=name,
+                direction=(
+                    MetricDirection.MAXIMIZE
+                    if value.direction
+                    is ConfigMetricDirection.MAXIMIZE
+                    else MetricDirection.MINIMIZE
+                ),
+                threshold=value.threshold,
+                materiality=value.materiality,
+                hard_guardrail=value.hard_guardrail,
+                undefined_behavior=(
+                    UndefinedBehavior.FAIL
+                    if value.undefined_behavior
+                    is ConfigUndefinedBehavior.FAIL
+                    else UndefinedBehavior.IGNORE
+                ),
+            )
+            for name, value in configured.items()
+        )
+    )

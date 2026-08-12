@@ -19,6 +19,7 @@ from foundry_opt.orchestration import (
 )
 from foundry_opt.orchestration.workspace_github import GhWorkspacePullRequests
 from foundry_opt.orchestration.workspace_production import (
+    ProductionWorkspaceError,
     ProductionWorkspaceService,
 )
 from foundry_opt.preflight.interfaces import CommandResult
@@ -64,6 +65,37 @@ def test_production_builder_uses_git_state_and_gh_pull_requests(
     assert isinstance(workspace, OptimizationWorkspace)
     assert isinstance(workspace._store, GitWorkspaceStore)
     assert isinstance(workspace._pull_requests, GhWorkspacePullRequests)
+
+
+def test_production_builder_wires_candidate_coordinator(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ("git", "init", "-b", "main"),
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+    class Runner:
+        def evaluate(self, request):
+            raise AssertionError("not evaluated while building")
+
+    class Selector:
+        def select(self, request):
+            raise AssertionError("not selected while building")
+
+    workspace = build_production_workspace(
+        tmp_path,
+        repository="octo-org/optimizer",
+        base_branch="main",
+        commands=FakeCommands({}),
+        candidate_count=2,
+        experiment_runner=Runner(),
+        selector=Selector(),
+    )
+
+    assert workspace._candidate_coordinator is not None
 
 
 def test_production_service_loads_issue_and_reuses_recorded_pr(
@@ -174,6 +206,35 @@ def test_production_service_loads_issue_and_reuses_recorded_pr(
 
     assert recording.request.issue.base_commit == "a" * 40
     assert recording.request.issue.number == 31
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    (
+        WorkspaceTrigger.PULL_REQUEST_MERGED,
+        WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+        WorkspaceTrigger.RETENTION_COMPLETED,
+    ),
+)
+def test_production_service_rejects_direct_trusted_lifecycle_triggers(
+    tmp_path: Path,
+    trigger: WorkspaceTrigger,
+) -> None:
+    service = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+        workspace_factory=lambda **_: pytest.fail(
+            "unsafe lifecycle trigger reached workspace"
+        ),
+    )
+
+    with pytest.raises(ProductionWorkspaceError, match="trusted"):
+        service.advance(
+            WorkspaceAdvanceRequest(
+                repository_root=tmp_path,
+                issue_number=31,
+                trigger=trigger,
+            )
+        )
 
 
 def test_production_service_finds_workspace_pr_during_search_lag(

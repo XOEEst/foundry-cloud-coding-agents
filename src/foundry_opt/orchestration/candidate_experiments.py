@@ -85,6 +85,8 @@ class CandidateExperimentRequest:
     issue_number: int
     candidate_id: str
     patch_sha256: str
+    bundle_sha256: str
+    evidence_sha256: str
     idempotency_key: str
 
     def __post_init__(self) -> None:
@@ -96,6 +98,8 @@ class CandidateExperimentRequest:
             raise ValueError("issue_number must be positive")
         _identifier(self.candidate_id, "candidate_id")
         _sha256(self.patch_sha256, "patch_sha256")
+        _sha256(self.bundle_sha256, "bundle_sha256")
+        _sha256(self.evidence_sha256, "evidence_sha256")
         _sha256(self.idempotency_key, "idempotency_key")
 
 
@@ -108,6 +112,8 @@ class CandidateExperimentResult:
     draft_id: str
     evaluation_id: str
     run_id: str
+    bundle_sha256: str
+    evidence_sha256: str
     operation_sha256: str | None = None
     idempotency_key: str | None = None
 
@@ -126,6 +132,8 @@ class CandidateExperimentResult:
             (self.run_id, "run_id"),
         ):
             _safe_text(value, name)
+        _sha256(self.bundle_sha256, "result bundle_sha256")
+        _sha256(self.evidence_sha256, "result evidence_sha256")
         if (self.operation_sha256 is None) != (
             self.idempotency_key is None
         ):
@@ -142,8 +150,10 @@ class CandidateExperimentOperation:
     issue_number: int
     candidate_id: str
     patch_sha256: str
+    bundle_sha256: str
+    evidence_sha256: str
     idempotency_key: str
-    schema_version: int = field(default=1, init=False)
+    schema_version: int = field(default=2, init=False)
     kind: str = field(default="candidate_experiment", init=False)
 
     def __post_init__(self) -> None:
@@ -151,6 +161,8 @@ class CandidateExperimentOperation:
             issue_number=self.issue_number,
             candidate_id=self.candidate_id,
             patch_sha256=self.patch_sha256,
+            bundle_sha256=self.bundle_sha256,
+            evidence_sha256=self.evidence_sha256,
             idempotency_key=self.idempotency_key,
         )
 
@@ -163,12 +175,16 @@ class CandidateExperimentOperation:
             issue_number=request.issue_number,
             candidate_id=request.candidate_id,
             patch_sha256=request.patch_sha256,
+            bundle_sha256=request.bundle_sha256,
+            evidence_sha256=request.evidence_sha256,
             idempotency_key=request.idempotency_key,
         )
 
     def to_dict(self) -> dict[str, int | str]:
         return {
             "candidate_id": self.candidate_id,
+            "bundle_sha256": self.bundle_sha256,
+            "evidence_sha256": self.evidence_sha256,
             "idempotency_key": self.idempotency_key,
             "issue_number": self.issue_number,
             "kind": self.kind,
@@ -215,6 +231,7 @@ EvaluationRunner = Callable[
 @dataclass(frozen=True)
 class CandidateExperimentPlan:
     patch_sha256: str
+    evidence_sha256: str
     draft_request: DraftRequest
     split: DatasetSplit
     policy: EvaluationPolicy
@@ -222,6 +239,7 @@ class CandidateExperimentPlan:
 
     def __post_init__(self) -> None:
         _sha256(self.patch_sha256, "candidate plan patch_sha256")
+        _sha256(self.evidence_sha256, "candidate plan evidence_sha256")
         if self.split is not DatasetSplit.DEVELOPMENT:
             raise ValueError(
                 "candidate experiments may only use development data"

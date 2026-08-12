@@ -131,9 +131,16 @@ def _normalize_pull_request_event(
     payload: Mapping[str, Any],
     context: TrustedWorkspaceEventContext,
 ) -> NormalizedWorkspaceEvent:
-    if payload.get("action") not in _PULL_REQUEST_ACTIONS:
+    action = payload.get("action")
+    raw_pull_request = payload.get("pull_request")
+    merged = (
+        action == "closed"
+        and isinstance(raw_pull_request, Mapping)
+        and raw_pull_request.get("merged") is True
+    )
+    if action not in _PULL_REQUEST_ACTIONS and not merged:
         raise ValueError("workspace pull request action is not supported")
-    pull_request = payload.get("pull_request")
+    pull_request = raw_pull_request
     if not isinstance(pull_request, Mapping):
         raise ValueError("workspace pull request payload is invalid")
     number = _positive_integer(
@@ -146,11 +153,14 @@ def _normalize_pull_request_event(
     head_repository = (
         head.get("repo") if isinstance(head, Mapping) else None
     )
+    expected_draft = not merged
+    expected_state = "closed" if merged else "open"
     if (
         not isinstance(body, str)
         or not isinstance(title, str)
-        or pull_request.get("draft") is not True
-        or pull_request.get("state") != "open"
+        or pull_request.get("draft") is not expected_draft
+        or pull_request.get("state") != expected_state
+        or (merged and pull_request.get("merged") is not True)
         or not isinstance(head, Mapping)
         or not isinstance(head_repository, Mapping)
         or head_repository.get("full_name") != context.repository
@@ -165,7 +175,12 @@ def _normalize_pull_request_event(
     issue_number = int(marker[0])
     branch = f"foundry-opt/workspace/issue-{issue_number}"
     expected_title = (
-        f"[Optimize] #{issue_number} workspace - draft, not yet selectable"
+        f"[Optimize] #{issue_number} selected candidate"
+        if merged
+        else (
+            f"[Optimize] #{issue_number} workspace - "
+            "draft, not yet selectable"
+        )
     )
     if (
         workspace_pull_request_marker(issue_number) not in body
@@ -180,14 +195,18 @@ def _normalize_pull_request_event(
         repository=context.repository,
         repository_id=context.repository_id,
         issue_number=issue_number,
-        trigger=WorkspaceTrigger.CONTINUE,
+        trigger=(
+            WorkspaceTrigger.PULL_REQUEST_MERGED
+            if merged
+            else WorkspaceTrigger.CONTINUE
+        ),
         base_commit=commit,
         workspace_pull_request=WorkspacePullRequest(
             number=number,
             issue_number=issue_number,
             branch=branch,
             title=expected_title,
-            draft=True,
+            draft=not merged,
             reuse_existing=True,
             base_commit=commit,
         ),

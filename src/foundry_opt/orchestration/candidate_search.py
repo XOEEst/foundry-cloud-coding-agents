@@ -15,6 +15,8 @@ from foundry_opt.orchestration.candidate_experiments import (
 class CandidateSearchSummary:
     candidate_id: str
     patch_sha256: str
+    bundle_sha256: str
+    evidence_sha256: str
     idempotency_key: str
     executor: str
     metrics: Mapping[str, float]
@@ -83,6 +85,8 @@ class BoundedCandidateSearch:
                 CandidateSearchSummary(
                     candidate_id=request.candidate_id,
                     patch_sha256=request.patch_sha256,
+                    bundle_sha256=result.bundle_sha256,
+                    evidence_sha256=result.evidence_sha256,
                     idempotency_key=request.idempotency_key,
                     executor=result.executor,
                     metrics=result.metrics,

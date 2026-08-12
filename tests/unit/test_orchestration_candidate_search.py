@@ -13,6 +13,8 @@ def _request(index: int) -> CandidateExperimentRequest:
         issue_number=31,
         candidate_id=f"candidate-{index}",
         patch_sha256=f"{index:x}" * 64,
+        bundle_sha256=f"{index + 3:x}" * 64,
+        evidence_sha256=f"{index + 5:x}" * 64,
         idempotency_key=f"{index + 8:x}" * 64,
     )
 
@@ -34,6 +36,8 @@ class RecordingRunner:
             draft_id=f"draft-{request.candidate_id}",
             evaluation_id=f"eval-{request.candidate_id}",
             run_id=f"run-{request.candidate_id}",
+            bundle_sha256=request.bundle_sha256,
+            evidence_sha256=request.evidence_sha256,
         )
 
 
@@ -47,6 +51,8 @@ def test_bounded_candidate_search_is_sequential_and_returns_safe_summaries() -> 
     assert [summary.candidate_id for summary in summaries] == runner.calls
     assert isinstance(summaries[0], CandidateSearchSummary)
     assert summaries[0].patch_sha256 == "1" * 64
+    assert summaries[0].bundle_sha256 == "4" * 64
+    assert summaries[0].evidence_sha256 == "6" * 64
     assert summaries[0].idempotency_key == "9" * 64
     assert summaries[0].metrics == {"quality": 1.0}
     assert summaries[0].guardrails == {"safety": "pass"}

@@ -163,13 +163,6 @@ def workspace_advance(
         int,
         typer.Option("--issue", min=1, help="Optimization issue number."),
     ],
-    trigger: Annotated[
-        str,
-        typer.Option(
-            "--trigger",
-            help="Trusted lifecycle trigger to apply.",
-        ),
-    ] = "continue",
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Emit a stable JSON result."),
@@ -179,15 +172,11 @@ def workspace_advance(
     from foundry_opt.orchestration.workspace_production import (
         WorkspaceAdvanceRequest,
     )
-    from foundry_opt.orchestration.workspace import WorkspaceTrigger
-
     try:
-        lifecycle_trigger = WorkspaceTrigger(trigger)
         result = build_workspace_service().advance(
             WorkspaceAdvanceRequest(
                 repository_root=Path.cwd(),
                 issue_number=issue_number,
-                trigger=lifecycle_trigger,
             )
         )
     except (RuntimeError, ValueError, OSError) as error:
@@ -293,6 +282,131 @@ def workspace_intake(
     else:
         typer.echo(
             f"Workspace event {result.event.delivery_id}: "
+            f"{result.workspace.phase.value}"
+        )
+
+
+@workspace_app.command("experiments-complete")
+def workspace_experiments_complete(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    manifest_path: Annotated[
+        Path,
+        typer.Option(
+            "--manifest",
+            exists=True,
+            dir_okay=False,
+            help="Privacy-safe prepared candidate manifest JSON.",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Reconcile prepared experiments into the same workspace PR."""
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("workspace manifest must be a JSON object")
+        if payload.get("issue_number") != issue_number:
+            raise ValueError(
+                "workspace manifest issue does not match --issue"
+            )
+        result = build_workspace_service().complete_experiments(
+            payload,
+            repository_root=Path.cwd(),
+        )
+    except (
+        ConfigLoadError,
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace {result.phase.value}: experiments reconciled"
+        )
+
+
+@workspace_app.command("operation-complete")
+def workspace_operation_complete(
+    result_path: Annotated[
+        Path,
+        typer.Option(
+            "--result",
+            exists=True,
+            dir_okay=False,
+            help="Trusted deployment or retention result JSON.",
+        ),
+    ],
+    delivery_id: Annotated[
+        str,
+        typer.Option("--delivery-id", help="Trusted delivery identifier."),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Ingest a trusted completed deployment or retention operation."""
+    from foundry_opt.orchestration.workspace_operations import (
+        TrustedWorkspaceOperationContext,
+    )
+
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "workspace operation result must be a JSON object"
+            )
+        result = build_workspace_service().ingest_operation(
+            payload,
+            TrustedWorkspaceOperationContext(
+                delivery_id=delivery_id,
+                repository=repository,
+                repository_id=repository_id,
+            ),
+            repository_root=Path.cwd(),
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace operation {result.event.operation.operation_id}: "
             f"{result.workspace.phase.value}"
         )
 

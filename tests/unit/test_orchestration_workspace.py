@@ -1,4 +1,5 @@
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from foundry_opt.orchestration import (
     InMemoryWorkspaceStore,
     OptimizationWorkspace,
     WorkspaceIssue,
+    WorkspaceOperation,
     WorkspacePhase,
     WorkspacePullRequest,
     WorkspaceRequest,
@@ -383,6 +385,10 @@ def test_lifecycle_triggers_advance_same_workspace_and_preserve_selection(
         )
     ).workspace_pull_request
     assert draft is not None
+    selected_patch = b"selected patch"
+    patch_sha256 = hashlib.sha256(selected_patch).hexdigest()
+    bundle_sha256 = "b" * 64
+    evidence_sha256 = "e" * 64
     store.commit(
         expected_revision=store.load(31).revision,
         update=WorkspaceUpdate(
@@ -398,8 +404,13 @@ def test_lifecycle_triggers_advance_same_workspace_and_preserve_selection(
                     selected=True,
                 ),
             ),
-            selected_patch=b"selected patch",
-            external_operation_ids=("evaluation-2",),
+            selected_patch=selected_patch,
+            external_operation_ids=(
+                "evaluation-2",
+                f"candidate-2:patch:{patch_sha256}",
+                f"candidate-2:bundle:{bundle_sha256}",
+                f"candidate-2:evidence:{evidence_sha256}",
+            ),
         ),
     )
     selected = replace(
@@ -416,12 +427,46 @@ def test_lifecycle_triggers_advance_same_workspace_and_preserve_selection(
             workspace_pull_request=selected,
         )
     )
+    duplicate_deployment = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=issue,
+            trigger=WorkspaceTrigger.PULL_REQUEST_MERGED,
+            workspace_pull_request=selected,
+        )
+    )
     retention = workspace.advance(
         WorkspaceRequest(
             repository_root=tmp_path,
             issue=issue,
             trigger=WorkspaceTrigger.DEPLOYMENT_COMPLETED,
             workspace_pull_request=selected,
+            operation=WorkspaceOperation(
+                trigger=WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+                operation_id="deployment-123",
+                workspace_pull_request_number=104,
+                candidate_id="candidate-2",
+                patch_sha256=patch_sha256,
+                bundle_sha256=bundle_sha256,
+                evidence_sha256=evidence_sha256,
+            ),
+        )
+    )
+    duplicate_retention = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=issue,
+            trigger=WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+            workspace_pull_request=selected,
+            operation=WorkspaceOperation(
+                trigger=WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+                operation_id="deployment-123",
+                workspace_pull_request_number=104,
+                candidate_id="candidate-2",
+                patch_sha256=patch_sha256,
+                bundle_sha256=bundle_sha256,
+                evidence_sha256=evidence_sha256,
+            ),
         )
     )
     completed = workspace.advance(
@@ -430,19 +475,54 @@ def test_lifecycle_triggers_advance_same_workspace_and_preserve_selection(
             issue=issue,
             trigger=WorkspaceTrigger.RETENTION_COMPLETED,
             workspace_pull_request=selected,
+            operation=WorkspaceOperation(
+                trigger=WorkspaceTrigger.RETENTION_COMPLETED,
+                operation_id="retention-123",
+                workspace_pull_request_number=104,
+                candidate_id="candidate-2",
+                patch_sha256=patch_sha256,
+                bundle_sha256=bundle_sha256,
+                evidence_sha256=evidence_sha256,
+                predecessor_operation_id="deployment-123",
+            ),
+        )
+    )
+    duplicate_completed = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=issue,
+            trigger=WorkspaceTrigger.RETENTION_COMPLETED,
+            workspace_pull_request=selected,
+            operation=WorkspaceOperation(
+                trigger=WorkspaceTrigger.RETENTION_COMPLETED,
+                operation_id="retention-123",
+                workspace_pull_request_number=104,
+                candidate_id="candidate-2",
+                patch_sha256=patch_sha256,
+                bundle_sha256=bundle_sha256,
+                evidence_sha256=evidence_sha256,
+                predecessor_operation_id="deployment-123",
+            ),
         )
     )
 
     assert deployment.phase is WorkspacePhase.DEPLOYMENT
+    assert duplicate_deployment.phase is WorkspacePhase.DEPLOYMENT
+    assert duplicate_deployment.recorded is False
     assert deployment.next_action.kind.value == "deploy_selected_candidate"
     assert retention.phase is WorkspacePhase.RETENTION
+    assert duplicate_retention.phase is WorkspacePhase.RETENTION
+    assert duplicate_retention.recorded is False
     assert retention.next_action.kind.value == "complete_retention"
     assert completed.phase is WorkspacePhase.COMPLETED
+    assert duplicate_completed.phase is WorkspacePhase.COMPLETED
+    assert duplicate_completed.recorded is False
     assert completed.next_action.kind.value == "none"
     final = store.load(31)
     assert final.candidates[0].selected is True
-    assert final.selected_patch == b"selected patch"
-    assert final.external_operation_ids == ("evaluation-2",)
+    assert final.selected_patch == selected_patch
+    assert "deployment-123" in final.external_operation_ids
+    assert "retention-123" in final.external_operation_ids
 
 
 def test_lifecycle_rejects_out_of_order_trigger(

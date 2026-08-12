@@ -35,6 +35,7 @@ from foundry_opt.orchestration.workspace import (
     WorkspaceIssueStatusProjectionIntent,
     WorkspaceNextAction,
     WorkspaceNextActionKind,
+    WorkspaceOperation,
     WorkspacePhase,
     WorkspacePullRequest,
     WorkspaceReportContext,
@@ -46,10 +47,13 @@ from foundry_opt.orchestration.workspace import (
 )
 from foundry_opt.orchestration.workspace_coordinator import (
     GhWorkspacePullRequestFinalizer,
+    GitWorkspaceExactBranchPublisher,
     PlanningWorkspacePullRequestFinalizer,
     TrustedWorkspaceSelector,
     WorkspaceCandidateCoordinator,
     WorkspaceCandidateCoordinatorResult,
+    WorkspaceExactBranchPublisher,
+    WorkspaceExactPatchResult,
     WorkspacePullRequestFinalizer,
 )
 from foundry_opt.orchestration.workspace_intake import (
@@ -63,8 +67,22 @@ from foundry_opt.orchestration.workspace_production import (
     ProductionWorkspaceService,
     WorkspaceAdvanceRequest,
     WorkspaceIntakeResult,
+    WorkspaceOperationIntakeResult,
     build_production_workspace,
     build_production_workspace_service,
+)
+from foundry_opt.orchestration.workspace_manifest import (
+    PreparedCandidateResultRunner,
+    WorkspaceExperimentManifest,
+    parse_workspace_experiment_manifest,
+)
+from foundry_opt.orchestration.workspace_operations import (
+    NormalizedWorkspaceOperation,
+    TrustedWorkspaceOperationContext,
+    normalize_workspace_operation,
+)
+from foundry_opt.orchestration.workspace_policy import (
+    ConfiguredWorkspaceSelector,
 )
 from foundry_opt.orchestration.workspace_store import (
     AuditBundle,
@@ -408,6 +426,7 @@ __all__ = [
     "GhCandidateSupersessionGateway",
     "GhMergedSpecApprovalReader",
     "GhWorkspacePullRequestFinalizer",
+    "GitWorkspaceExactBranchPublisher",
     "GitPinnedAssetReader",
     "GitTransportMergedSpecApprovalReader",
     "GitStateRef",
@@ -465,6 +484,8 @@ __all__ = [
     "WorkspaceCandidate",
     "WorkspaceCandidateCoordinator",
     "WorkspaceCandidateCoordinatorResult",
+    "WorkspaceExactBranchPublisher",
+    "WorkspaceExactPatchResult",
     "WorkspaceCompletedError",
     "WorkspaceConflictError",
     "WorkspaceCorruptionError",
@@ -472,6 +493,7 @@ __all__ = [
     "WorkspacePhase",
     "WorkspaceNextAction",
     "WorkspaceNextActionKind",
+    "WorkspaceOperation",
     "WorkspacePullRequestFinalizer",
     "WorkspacePrivacyError",
     "WorkspacePullRequest",
@@ -495,11 +517,19 @@ __all__ = [
     "WorkspaceAdvanceRequest",
     "WorkspaceEventKind",
     "WorkspaceIntakeResult",
+    "WorkspaceOperationIntakeResult",
+    "WorkspaceExperimentManifest",
+    "PreparedCandidateResultRunner",
+    "ConfiguredWorkspaceSelector",
+    "NormalizedWorkspaceOperation",
+    "TrustedWorkspaceOperationContext",
     "build_production_workspace",
     "build_production_workspace_service",
     "PlanningWorkspacePullRequestFinalizer",
     "TrustedWorkspaceSelector",
     "normalize_workspace_event",
+    "normalize_workspace_operation",
+    "parse_workspace_experiment_manifest",
     "candidate_pr_body",
     "candidate_pr_marker",
     "candidate_pull_request_event_from_payload",

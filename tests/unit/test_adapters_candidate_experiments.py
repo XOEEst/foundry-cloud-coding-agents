@@ -40,11 +40,17 @@ from foundry_opt.orchestration.candidate_experiments import (
 from foundry_opt.packaging import BundleArtifact
 
 
-def _request(candidate_id: str = "candidate-1") -> CandidateExperimentRequest:
+def _request(
+    candidate_id: str = "candidate-1",
+    *,
+    bundle_sha256: str = "5" * 64,
+) -> CandidateExperimentRequest:
     return CandidateExperimentRequest(
         issue_number=31,
         candidate_id=candidate_id,
         patch_sha256="1" * 64,
+        bundle_sha256=bundle_sha256,
+        evidence_sha256="6" * 64,
         idempotency_key="2" * 64,
     )
 
@@ -61,6 +67,8 @@ def _result(
         draft_id="draft-123",
         evaluation_id="eval-123",
         run_id="run-123",
+        bundle_sha256="5" * 64,
+        evidence_sha256="6" * 64,
         operation_sha256=(
             operation.sha256 if operation is not None else None
         ),
@@ -250,6 +258,8 @@ def test_actions_adapter_dispatches_one_consolidated_idempotent_operation() -> N
                 draft_id="draft-123",
                 evaluation_id="eval-123",
                 run_id="run-123",
+                bundle_sha256="5" * 64,
+                evidence_sha256="6" * 64,
                 operation_sha256=operation.sha256,
                 idempotency_key=operation.idempotency_key,
             ),
@@ -263,17 +273,21 @@ def test_actions_adapter_dispatches_one_consolidated_idempotent_operation() -> N
     assert persisted_operation.idempotency_key == _request().idempotency_key
     assert persisted_operation.to_dict() == {
         "candidate_id": "candidate-1",
+        "bundle_sha256": "5" * 64,
+        "evidence_sha256": "6" * 64,
         "idempotency_key": "2" * 64,
         "issue_number": 31,
         "kind": "candidate_experiment",
         "patch_sha256": "1" * 64,
-        "schema_version": 1,
+        "schema_version": 2,
     }
     assert gateway.dispatched == [gateway.reconciled[0]]
     assert gateway.reconciled[0] == gateway.reconciled[1]
     assert result.executor == "actions_oidc"
     assert result.operation_sha256 == operation.sha256
     assert result.idempotency_key == operation.idempotency_key
+    assert result.bundle_sha256 == "5" * 64
+    assert result.evidence_sha256 == "6" * 64
     assert result.guardrails == {
         "safety": "pass Authorization: Bearer [REDACTED]"
     }
@@ -313,8 +327,36 @@ def test_actions_adapter_rejects_result_outside_persisted_lineage(
                 draft_id="draft-123",
                 evaluation_id="eval-123",
                 run_id="run-123",
+                bundle_sha256="5" * 64,
+                evidence_sha256="6" * 64,
                 operation_sha256=operation_sha256,
                 idempotency_key=idempotency_key,
+            )
+        ]
+    )
+
+    with pytest.raises(ValueError, match="lineage"):
+        ActionsCandidateExperimentAdapter(gateway).evaluate(_request())
+
+    assert gateway.dispatched == []
+
+
+def test_actions_adapter_rejects_result_with_changed_content_lineage() -> None:
+    operation = CandidateExperimentOperation.from_request(_request())
+    gateway = RecordingActionsGateway(
+        [
+            CandidateExperimentResult(
+                candidate_id="candidate-1",
+                executor="actions_oidc",
+                metrics={"quality": 0.75},
+                guardrails={"safety": "pass"},
+                draft_id="draft-123",
+                evaluation_id="eval-123",
+                run_id="run-123",
+                bundle_sha256="7" * 64,
+                evidence_sha256="6" * 64,
+                operation_sha256=operation.sha256,
+                idempotency_key=operation.idempotency_key,
             )
         ]
     )
@@ -486,6 +528,7 @@ def test_foundry_operation_reuses_draft_and_evaluation_adapters_without_raw_rows
         draft_gateway=draft_gateway,
         resolve_plan=lambda request: CandidateExperimentPlan(
             patch_sha256=request.patch_sha256,
+            evidence_sha256=request.evidence_sha256,
             draft_request=draft_request,
             split=DatasetSplit.DEVELOPMENT,
             policy=policy,
@@ -494,7 +537,8 @@ def test_foundry_operation_reuses_draft_and_evaluation_adapters_without_raw_rows
         executor="direct_oidc",
     )
 
-    result = operation.evaluate(_request())
+    request = _request(bundle_sha256=bundle.sha256)
+    result = operation.evaluate(request)
 
     assert draft_gateway.requests == [draft_request]
     subject, split, attempt = observed[0]
@@ -504,8 +548,10 @@ def test_foundry_operation_reuses_draft_and_evaluation_adapters_without_raw_rows
     assert attempt == 1
     assert result.metrics == {"quality": 0.75, "safety": 1.0}
     assert result.guardrails == {"safety": "pass"}
-    expected_operation = CandidateExperimentOperation.from_request(_request())
+    expected_operation = CandidateExperimentOperation.from_request(request)
     assert result.operation_sha256 == expected_operation.sha256
     assert result.idempotency_key == expected_operation.idempotency_key
+    assert result.bundle_sha256 == bundle.sha256
+    assert result.evidence_sha256 == "6" * 64
     assert not hasattr(result, "cases")
     assert not hasattr(result, "usage")

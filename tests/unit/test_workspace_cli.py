@@ -78,7 +78,7 @@ def test_workspace_advance_emits_stable_json(
     }
 
 
-def test_workspace_advance_accepts_explicit_lifecycle_trigger(
+def test_workspace_advance_rejects_direct_lifecycle_trigger(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -86,8 +86,7 @@ def test_workspace_advance_accepts_explicit_lifecycle_trigger(
 
     class Service:
         def advance(self, request: WorkspaceAdvanceRequest):
-            assert request.trigger is WorkspaceTrigger.DEPLOYMENT_COMPLETED
-            return _result()
+            raise AssertionError("unsafe lifecycle trigger reached service")
 
     monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
 
@@ -104,15 +103,111 @@ def test_workspace_advance_accepts_explicit_lifecycle_trigger(
         ],
     )
 
-    assert completed.exit_code == 0
+    assert completed.exit_code == 2
 
 
-def test_workspace_help_exposes_advance_and_intake() -> None:
+def test_workspace_help_exposes_production_lifecycle_commands() -> None:
     completed = runner.invoke(app, ["workspace", "--help"])
 
     assert completed.exit_code == 0
     assert "advance" in completed.stdout
     assert "intake" in completed.stdout
+    assert "experiments-complete" in completed.stdout
+    assert "operation-complete" in completed.stdout
+
+
+def test_workspace_experiments_complete_ingests_manifest(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    manifest = tmp_path / "candidates.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "issue_number": 31,
+                "target": "support-agent",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Service:
+        def complete_experiments(self, payload, *, repository_root):
+            assert payload["target"] == "support-agent"
+            assert repository_root == tmp_path
+            return _result()
+
+    monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "experiments-complete",
+            "--issue",
+            "31",
+            "--manifest",
+            str(manifest),
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout) == _result().to_dict()
+
+
+def test_workspace_operation_complete_uses_trusted_context(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    operation = tmp_path / "operation.json"
+    operation.write_text(
+        json.dumps({"schema_version": 1, "operation_id": "deploy-1"}),
+        encoding="utf-8",
+    )
+
+    class IntakeResult:
+        def to_dict(self):
+            return {"event": {"operation_id": "deploy-1"}}
+
+    class Service:
+        def ingest_operation(
+            self,
+            payload,
+            context,
+            *,
+            repository_root,
+        ):
+            assert payload["operation_id"] == "deploy-1"
+            assert context.repository == "octo-org/optimizer"
+            assert context.repository_id == 123
+            assert repository_root == tmp_path
+            return IntakeResult()
+
+    monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "operation-complete",
+            "--result",
+            str(operation),
+            "--delivery-id",
+            "delivery-123",
+            "--repository",
+            "octo-org/optimizer",
+            "--repository-id",
+            "123",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["event"]["operation_id"] == "deploy-1"
 
 
 def test_workspace_intake_normalizes_trusted_event_through_service(

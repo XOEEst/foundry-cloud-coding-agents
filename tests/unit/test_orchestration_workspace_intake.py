@@ -85,6 +85,78 @@ def test_trusted_workspace_pr_event_normalizes_same_pr_continuation() -> None:
     assert event.workspace_pull_request.base_commit == "a" * 40
 
 
+def test_trusted_merged_workspace_pr_normalizes_deployment_transition() -> None:
+    body = "\n".join(
+        (
+            workspace_pull_request_marker(31),
+            workspace_pull_request_base_marker("a" * 40),
+        )
+    )
+
+    event = normalize_workspace_event(
+        {
+            "action": "closed",
+            "pull_request": {
+                "number": 104,
+                "title": "[Optimize] #31 selected candidate",
+                "body": body,
+                "draft": False,
+                "state": "closed",
+                "merged": True,
+                "head": {
+                    "ref": "foundry-opt/workspace/issue-31",
+                    "repo": {"full_name": "octo-org/optimizer"},
+                },
+            },
+            "repository": {
+                "full_name": "octo-org/optimizer",
+                "id": 123,
+            },
+        },
+        _context("pull_request"),
+    )
+
+    assert event.trigger is WorkspaceTrigger.PULL_REQUEST_MERGED
+    assert event.workspace_pull_request is not None
+    assert event.workspace_pull_request.number == 104
+    assert event.workspace_pull_request.draft is False
+
+
+def test_closed_unmerged_workspace_pr_fails_closed() -> None:
+    import pytest
+
+    body = "\n".join(
+        (
+            workspace_pull_request_marker(31),
+            workspace_pull_request_base_marker("a" * 40),
+        )
+    )
+
+    with pytest.raises(ValueError, match="action"):
+        normalize_workspace_event(
+            {
+                "action": "closed",
+                "pull_request": {
+                    "number": 104,
+                    "title": "[Optimize] #31 selected candidate",
+                    "body": body,
+                    "draft": False,
+                    "state": "closed",
+                    "merged": False,
+                    "head": {
+                        "ref": "foundry-opt/workspace/issue-31",
+                        "repo": {"full_name": "octo-org/optimizer"},
+                    },
+                },
+                "repository": {
+                    "full_name": "octo-org/optimizer",
+                    "id": 123,
+                },
+            },
+            _context("pull_request"),
+        )
+
+
 def test_workspace_intake_rejects_a_repository_mismatch() -> None:
     import pytest
 
