@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -44,11 +46,18 @@ cli.build_workspace_service = lambda: Service()
 sys.argv = ["foundry-opt", "workspace", "advance", "--issue", "31", "--json"]
 cli.app()
 """
+    repository_root = Path(__file__).parents[2]
+    environment = {
+        **os.environ,
+        "PYTHONPATH": str(repository_root / "src"),
+    }
     completed = subprocess.run(
         [sys.executable, "-c", "import sys\n" + script],
         capture_output=True,
         text=True,
         check=False,
+        cwd=repository_root,
+        env=environment,
     )
 
     assert completed.returncode == 0

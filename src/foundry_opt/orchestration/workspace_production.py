@@ -53,6 +53,7 @@ class WorkspaceAdvanceRequest:
     base_commit: str | None = None
     workspace_pull_request: WorkspacePullRequest | None = None
     expected_repository: str | None = None
+    trusted_repository_id: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.issue_number) is not int or self.issue_number < 1:
@@ -67,6 +68,14 @@ class WorkspaceAdvanceRequest:
             and _REPOSITORY.fullmatch(self.expected_repository) is None
         ):
             raise ValueError("workspace repository is invalid")
+        if (
+            self.trusted_repository_id is not None
+            and (
+                type(self.trusted_repository_id) is not int
+                or self.trusted_repository_id < 1
+            )
+        ):
+            raise ValueError("workspace repository ID is invalid")
 
 
 @dataclass(frozen=True)
@@ -143,6 +152,15 @@ class ProductionWorkspaceService:
             raise ProductionWorkspaceError(
                 "trusted workspace repository does not match origin"
             )
+        if request.trusted_repository_id is not None:
+            actual_repository_id = self._repository_id(
+                root,
+                context.repository,
+            )
+            if actual_repository_id != request.trusted_repository_id:
+                raise ProductionWorkspaceError(
+                    "trusted workspace repository ID does not match GitHub"
+                )
         issue = self._issue(root, context.repository, request.issue_number)
         existing = self._existing_workspace_pull_request(
             root,
@@ -222,6 +240,7 @@ class ProductionWorkspaceService:
                 base_commit=event.base_commit,
                 workspace_pull_request=event.workspace_pull_request,
                 expected_repository=event.repository,
+                trusted_repository_id=event.repository_id,
             )
         )
         return WorkspaceIntakeResult(event=event, workspace=result)
@@ -269,6 +288,28 @@ class ProductionWorkspaceService:
                 "workspace repository metadata is invalid"
             )
         return _RepositoryContext(repository, default_branch)
+
+    def _repository_id(self, root: Path, repository: str) -> int:
+        try:
+            value = self._commands.run(
+                (
+                    "gh",
+                    "api",
+                    f"repos/{repository}",
+                    "--jq",
+                    ".id",
+                ),
+                cwd=root,
+            ).stdout.strip()
+        except CommandError as error:
+            raise ProductionWorkspaceError(
+                "workspace repository ID is unavailable"
+            ) from error
+        if not value.isdecimal() or int(value) < 1:
+            raise ProductionWorkspaceError(
+                "workspace repository ID is invalid"
+            )
+        return int(value)
 
     def _issue(
         self,
@@ -318,40 +359,70 @@ class ProductionWorkspaceService:
         repository: str,
         issue_number: int,
     ) -> tuple[int, str] | None:
-        try:
-            value = self._json_list(
+        branch = f"foundry-opt/workspace/issue-{issue_number}"
+        commands = (
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repository,
+                "--state",
+                "all",
+                "--head",
+                branch,
+                "--json",
+                "number,body",
+                "--limit",
+                "2",
+            ),
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repository,
+                "--state",
+                "all",
+                "--search",
                 (
-                    "gh",
-                    "pr",
-                    "list",
-                    "--repo",
-                    repository,
-                    "--state",
-                    "all",
-                    "--search",
-                    (
-                        '"foundry-opt:workspace-pr:'
-                        f'issue-{issue_number}:v1" in:body'
-                    ),
-                    "--json",
-                    "number,body",
-                    "--limit",
-                    "2",
+                    '"foundry-opt:workspace-pr:'
+                    f'issue-{issue_number}:v1" in:body'
                 ),
-                root,
-            )
+                "--json",
+                "number,body",
+                "--limit",
+                "2",
+            ),
+        )
+        matches: dict[int, dict[str, Any]] = {}
+        try:
+            for command in commands:
+                values = self._json_list(command, root)
+                for item in values:
+                    number = item.get("number")
+                    if type(number) is not int or number < 1:
+                        raise ProductionWorkspaceError(
+                            "workspace pull request lookup is invalid"
+                        )
+                    previous = matches.get(number)
+                    if previous is not None and previous != item:
+                        raise ProductionWorkspaceError(
+                            "workspace pull request lookup is inconsistent"
+                        )
+                    matches[number] = item
         except CommandError as error:
             raise ProductionWorkspaceError(
                 "workspace pull request lookup failed"
             ) from error
-        if len(value) > 1:
+        if len(matches) > 1:
             raise ProductionWorkspaceError(
                 "multiple workspace pull requests found"
             )
-        if not value:
+        if not matches:
             return None
-        number = value[0].get("number")
-        body = value[0].get("body")
+        number, match = next(iter(matches.items()))
+        body = match.get("body")
         if type(number) is not int or number < 1 or not isinstance(body, str):
             raise ProductionWorkspaceError(
                 "workspace pull request lookup is invalid"

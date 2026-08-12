@@ -6,9 +6,12 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+import pytest
+
 from foundry_opt.orchestration import (
     GitWorkspaceStore,
     OptimizationWorkspace,
+    TrustedWorkspaceEventContext,
     WorkspaceAdvanceRequest,
     WorkspacePhase,
     WorkspaceTrigger,
@@ -115,6 +118,21 @@ def test_production_service_loads_issue_and_reuses_recorded_pr(
                 "octo-org/optimizer",
                 "--state",
                 "all",
+                "--head",
+                "foundry-opt/workspace/issue-31",
+                "--json",
+                "number,body",
+                "--limit",
+                "2",
+            ): json.dumps([{"number": 104, "body": body}]),
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                "octo-org/optimizer",
+                "--state",
+                "all",
                 "--search",
                 '"foundry-opt:workspace-pr:issue-31:v1" in:body',
                 "--json",
@@ -156,3 +174,238 @@ def test_production_service_loads_issue_and_reuses_recorded_pr(
 
     assert recording.request.issue.base_commit == "a" * 40
     assert recording.request.issue.number == 31
+
+
+def test_production_service_finds_workspace_pr_during_search_lag(
+    tmp_path: Path,
+) -> None:
+    body = "\n".join(
+        (
+            "<!-- foundry-opt:workspace-pr:issue-31:v1 -->",
+            f"<!-- foundry-opt:workspace-base:{'a' * 40} -->",
+        )
+    )
+    repository_responses = {
+        ("git", "remote", "get-url", "origin"): (
+            "https://github.com/octo-org/optimizer.git\n"
+        ),
+        (
+            "gh",
+            "repo",
+            "view",
+            "octo-org/optimizer",
+            "--json",
+            "nameWithOwner,defaultBranchRef",
+        ): json.dumps(
+            {
+                "nameWithOwner": "octo-org/optimizer",
+                "defaultBranchRef": {"name": "main"},
+            }
+        ),
+        (
+            "gh",
+            "issue",
+            "view",
+            "31",
+            "--repo",
+            "octo-org/optimizer",
+            "--json",
+            "number,title,body,state",
+        ): json.dumps(
+            {
+                "number": 31,
+                "title": "[Optimize] Improve policy coverage",
+                "body": "Improve policy coverage.",
+                "state": "OPEN",
+            }
+        ),
+        (
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            "octo-org/optimizer",
+            "--state",
+            "all",
+            "--head",
+            "foundry-opt/workspace/issue-31",
+            "--json",
+            "number,body",
+            "--limit",
+            "2",
+        ): json.dumps([{"number": 104, "body": body}]),
+        (
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            "octo-org/optimizer",
+            "--state",
+            "all",
+            "--search",
+            '"foundry-opt:workspace-pr:issue-31:v1" in:body',
+            "--json",
+            "number,body",
+            "--limit",
+            "2",
+        ): "[]",
+    }
+    recording: dict[str, Any] = {}
+
+    class Workspace:
+        def advance(self, request):
+            recording["request"] = request
+            from foundry_opt.orchestration import WorkspaceResult
+
+            return WorkspaceResult(
+                phase=WorkspacePhase.SPECIFICATION,
+                workspace_pull_request=request.workspace_pull_request,
+                planned_effect_kinds=("workspace_pr_sync",),
+            )
+
+    ProductionWorkspaceService(
+        commands=FakeCommands(repository_responses),
+        workspace_factory=lambda **_: Workspace(),
+    ).advance(
+        WorkspaceAdvanceRequest(
+            repository_root=tmp_path,
+            issue_number=31,
+        )
+    )
+
+    assert recording["request"].workspace_pull_request.number == 104
+    assert recording["request"].issue.base_commit == "a" * 40
+
+
+def test_workspace_intake_rejects_trusted_repository_id_mismatch(
+    tmp_path: Path,
+) -> None:
+    commands = FakeCommands(
+        {
+            ("git", "remote", "get-url", "origin"): (
+                "https://github.com/octo-org/optimizer.git\n"
+            ),
+            (
+                "gh",
+                "repo",
+                "view",
+                "octo-org/optimizer",
+                "--json",
+                "nameWithOwner,defaultBranchRef",
+            ): json.dumps(
+                {
+                    "nameWithOwner": "octo-org/optimizer",
+                    "defaultBranchRef": {"name": "main"},
+                }
+            ),
+            (
+                "gh",
+                "api",
+                "repos/octo-org/optimizer",
+                "--jq",
+                ".id",
+            ): "999\n",
+        }
+    )
+    service = ProductionWorkspaceService(
+        commands=commands,
+        workspace_factory=lambda **_: pytest.fail(
+            "workspace must not be built after repository ID mismatch"
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="repository ID does not match",
+    ):
+        service.ingest(
+            {
+                "action": "opened",
+                "issue": {
+                    "number": 31,
+                    "title": "[Optimize] Improve policy coverage",
+                    "body": "Improve policy coverage.",
+                },
+                "repository": {
+                    "full_name": "octo-org/optimizer",
+                    "id": 123,
+                },
+            },
+            TrustedWorkspaceEventContext(
+                event_name="issues",
+                delivery_id="delivery-123",
+                repository="octo-org/optimizer",
+                repository_id=123,
+            ),
+            base_commit="a" * 40,
+            repository_root=tmp_path,
+        )
+
+
+def test_existing_workspace_pr_discovery_rejects_inconsistent_results(
+    tmp_path: Path,
+) -> None:
+    marker = "<!-- foundry-opt:workspace-pr:issue-31:v1 -->"
+    commands = FakeCommands(
+        {
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                "octo-org/optimizer",
+                "--state",
+                "all",
+                "--head",
+                "foundry-opt/workspace/issue-31",
+                "--json",
+                "number,body",
+                "--limit",
+                "2",
+            ): json.dumps(
+                [
+                    {
+                        "number": 104,
+                        "body": (
+                            f"{marker}\n"
+                            f"<!-- foundry-opt:workspace-base:{'a' * 40} -->"
+                        ),
+                    }
+                ]
+            ),
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                "octo-org/optimizer",
+                "--state",
+                "all",
+                "--search",
+                '"foundry-opt:workspace-pr:issue-31:v1" in:body',
+                "--json",
+                "number,body",
+                "--limit",
+                "2",
+            ): json.dumps(
+                [
+                    {
+                        "number": 104,
+                        "body": (
+                            f"{marker}\n"
+                            f"<!-- foundry-opt:workspace-base:{'b' * 40} -->"
+                        ),
+                    }
+                ]
+            ),
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="inconsistent"):
+        ProductionWorkspaceService(
+            commands=commands
+        )._existing_workspace_pull_request(
+            tmp_path,
+            "octo-org/optimizer",
+            31,
+        )
