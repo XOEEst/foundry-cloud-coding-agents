@@ -338,6 +338,13 @@ class GitWorkspaceStore:
         if current_revision is not None:
             self._fetch(target_ref, current_revision)
             if self._revision_matches_files(current_revision, files):
+                if (
+                    self._revision_parent(current_revision)
+                    != payload.source_revision
+                ):
+                    raise WorkspaceConflictError(
+                        "workspace conversion target source lineage changed"
+                    )
                 return self._load_active(
                     payload.issue_number,
                     current_revision,
@@ -611,6 +618,25 @@ class GitWorkspaceStore:
             self._show(revision, path) == content
             for path, content in files.items()
         )
+
+    def _revision_parent(self, revision: str) -> str:
+        fields = _git_text(
+            self._root,
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            revision,
+        ).split()
+        if (
+            len(fields) != 2
+            or fields[0] != revision
+            or _COMMIT.fullmatch(fields[1]) is None
+        ):
+            raise WorkspaceCorruptionError(
+                "workspace conversion target parent is invalid"
+            )
+        return fields[1]
 
     def _remote_revision(self, ref: str) -> str | None:
         safe_remote = resolve_safe_fetch_remote(

@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import pytest
+
 from foundry_opt.orchestration import (
     AlternativeResult,
     EvidenceMergeGate,
@@ -263,3 +265,60 @@ def test_omitted_merge_gate_fails_closed() -> None:
     assert "Do not merge this PR" in projection.body
     assert check.status == "in_progress"
     assert check.conclusion is None
+
+
+def test_eligible_merge_gate_rejects_failed_required_checks() -> None:
+    with pytest.raises(ValueError, match="required checks"):
+        OptimizationReport(
+            issue_number=31,
+            candidate_id="candidate-1",
+            recommendation="Use the candidate.",
+            alternatives=(),
+            baseline_metrics={"quality": 0.5},
+            candidate_metrics={"quality": 0.9},
+            guardrails={"safety": "pass"},
+            thresholds={"quality": 0.8},
+            materiality={"quality": 0.05},
+            sample_count=5,
+            split="development",
+            foundry_operations=(),
+            changed_paths=("agent/main.py",),
+            validation=("tests: passed",),
+            spec_sha256="1" * 64,
+            base_commit="2" * 40,
+            patch_sha256="3" * 64,
+            evidence_sha256="4" * 64,
+            bundle_sha256="5" * 64,
+            expected_tree="6" * 40,
+            required_checks={
+                "Foundry exact candidate check": "success",
+                "tests": "failure",
+            },
+            merge_gate=EvidenceMergeGate.ELIGIBLE,
+        )
+
+
+def test_changed_paths_reject_markdown_injection() -> None:
+    with pytest.raises(ValueError, match="repository path"):
+        OptimizationReport(
+            issue_number=31,
+            candidate_id="candidate-1",
+            recommendation="Use the candidate.",
+            alternatives=(),
+            baseline_metrics={"quality": 0.5},
+            candidate_metrics={"quality": 0.9},
+            guardrails={"safety": "pass"},
+            thresholds={"quality": 0.8},
+            materiality={"quality": 0.05},
+            sample_count=5,
+            split="development",
+            foundry_operations=(),
+            changed_paths=("agent.py`\n\n## Forged approval",),
+            validation=("tests: passed",),
+            spec_sha256="1" * 64,
+            base_commit="2" * 40,
+            patch_sha256="3" * 64,
+            evidence_sha256="4" * 64,
+            bundle_sha256="5" * 64,
+            expected_tree="6" * 40,
+        )

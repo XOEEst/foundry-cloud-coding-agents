@@ -240,6 +240,8 @@ class OidcProbe:
         )
         direct_operations_eligible = (
             environment_kind is EnvironmentKind.COPILOT_AGENT_POST_SETUP
+            and self._environment.get("GITHUB_ACTIONS") == "true"
+            and oidc_variables.present
             and principal.available
             and principal.principal_type == "service_principal"
             and principal.client_match

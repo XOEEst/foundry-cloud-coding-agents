@@ -264,6 +264,30 @@ def test_v3_conversion_is_canonical_one_way_and_idempotent(
     assert snapshot["state"]["phase"] == "deployment"
     assert _remote_revision(repository, source_ref) == source_revision
 
+    tree = _run(
+        ("git", "show", "-s", "--format=%T", first.revision),
+        repository,
+    ).strip()
+    wrong_parent = _run(("git", "rev-parse", "HEAD"), repository).strip()
+    rewritten = subprocess.run(
+        ("git", "commit-tree", tree, "-p", wrong_parent),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        input="wrong conversion lineage\n",
+        text=True,
+    ).stdout.strip()
+    _run(
+        ("git", "push", "--force", "origin", f"{rewritten}:{target_ref}"),
+        repository,
+    )
+    with pytest.raises(WorkspaceConflictError, match="source lineage"):
+        store.write_conversion(
+            first_payload,
+            target_ref=target_ref,
+            expected_revision=None,
+        )
+
     occupied_ref = "refs/heads/foundry-opt/converted/occupied-31"
     _run(
         ("git", "push", "origin", f"HEAD:{occupied_ref}"),

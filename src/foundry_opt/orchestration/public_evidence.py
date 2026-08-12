@@ -171,6 +171,12 @@ class OptimizationReport:
                 raise ValueError(f"{name} must be a full Git object ID")
         if not isinstance(self.merge_gate, EvidenceMergeGate):
             raise ValueError("merge_gate must be an EvidenceMergeGate")
+        if self.merge_gate is EvidenceMergeGate.ELIGIBLE and (
+            not checks or any(status != "success" for status in checks.values())
+        ):
+            raise ValueError(
+                "eligible merge gate requires successful required checks"
+            )
 
 
 @dataclass(frozen=True)
@@ -571,10 +577,12 @@ def _repository_path(value: str) -> str:
     path = PurePosixPath(normalized)
     if (
         not normalized
+        or "`" in normalized
+        or any(ord(character) < 32 for character in normalized)
         or path.is_absolute()
         or any(part in {"", ".", ".."} for part in path.parts)
     ):
-        raise ValueError("changed path must be repository-relative")
+        raise ValueError("changed repository path is invalid")
     return path.as_posix()
 
 

@@ -229,6 +229,37 @@ def test_probe_reports_post_setup_direct_operation_eligibility(
     assert result.exit_code == 0
 
 
+def test_probe_requires_actions_oidc_variables_for_direct_eligibility(
+    tmp_path: Path,
+) -> None:
+    _write_config(tmp_path)
+    environment = _post_setup_environment()
+    environment.values.pop("ACTIONS_ID_TOKEN_REQUEST_URL")
+    environment.values.pop("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+
+    result = OidcProbe(
+        environment=environment,
+        command_runner=FakeCommands(
+            {
+                "tenant": "tenant",
+                "subscription": "subscription",
+                "client": "client",
+                "userType": "servicePrincipal",
+            }
+        ),
+        credential_provider=FakeCredentialProvider(FakeCredential()),
+        foundry_gateway=FakeFoundryGateway(),
+    ).run(
+        AuthProbeRequest(
+            repository_root=tmp_path,
+            scope="copilot-optimizer",
+        )
+    )
+
+    assert result.oidc_request_variables.present is False
+    assert result.direct_operations_eligible is False
+
+
 def test_probe_distinguishes_setup_time_actions_and_fails_closed(
     tmp_path: Path,
 ) -> None:
