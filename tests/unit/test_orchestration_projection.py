@@ -4,11 +4,14 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 
+import pytest
+
 from foundry_opt.orchestration import OutboxRecord
 from foundry_opt.orchestration.projection import (
     DashboardComment,
     DashboardProjection,
     GhDashboardGateway,
+    ProjectionError,
 )
 from foundry_opt.preflight.interfaces import CommandResult
 
@@ -251,6 +254,7 @@ def test_deployment_dashboard_preserves_pre_merge_candidate_evidence() -> None:
             }
         ],
         next_action="merge_exactly_one_candidate_pr",
+        source_sha256="9" * 64,
     )
     final = _record(
         "final-dashboard-2",
@@ -293,6 +297,49 @@ def test_deployment_dashboard_preserves_pre_merge_candidate_evidence() -> None:
     assert "Merge exactly one eligible candidate PR" not in body
     assert "<!-- foundry-opt:projection:slate-dashboard-2 -->" in body
     assert "<!-- foundry-opt:projection:final-dashboard-2 -->" in body
+
+
+def test_latest_dashboard_record_still_requires_current_schema() -> None:
+    gateway = FakeDashboardGateway()
+    source = FakeOutbox(
+        (
+            _record(
+                "slate-dashboard-2",
+                "candidate_slate_dashboard",
+                9,
+                phase="awaiting_selection",
+                status="waiting",
+                disposition="wait",
+                spec_sha256="d" * 64,
+                baseline_metrics={"quality": 0.5},
+                candidate_slate=[
+                    {
+                        "candidate_id": "candidate-1",
+                        "rank": 1,
+                        "draft_id": "draft-candidate-1",
+                        "metrics": {"quality": 0.9},
+                        "deltas": {"quality": 0.4},
+                        "guardrails": {"safety": "pass"},
+                        "evidence_sha256": "e" * 64,
+                        "evidence_url": (
+                            "https://github.com/octo-org/optimizer/blob/"
+                            "foundry-opt/state/issue-31/objects/evidence/"
+                            + "e" * 64
+                            + ".json"
+                        ),
+                    }
+                ],
+                next_action="merge_exactly_one_candidate_pr",
+                source_sha256="9" * 64,
+            ),
+        )
+    )
+
+    with pytest.raises(
+        ProjectionError,
+        match="dashboard projection payload is invalid",
+    ):
+        DashboardProjection(source, gateway).project(31)
 
 
 def test_dashboard_explains_specification_digest_and_classification() -> None:

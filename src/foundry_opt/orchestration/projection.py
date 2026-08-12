@@ -136,7 +136,8 @@ class DashboardProjection:
     ) -> None:
         for candidate in records:
             _require_issue(candidate, issue_number)
-            _validate_dashboard_payload(candidate)
+        # Historical milestones can use an earlier durable payload schema.
+        _validate_dashboard_payload(record)
         marker = _projection_marker(record.record_id)
         existing = self._gateway.find_dashboard(issue_number)
         if existing is not None and marker in existing.body:

@@ -227,3 +227,39 @@ def test_blocked_report_cannot_claim_a_mergeable_check() -> None:
     assert "Do not merge this PR" in projection.body
     assert check.status == "completed"
     assert check.conclusion == "failure"
+
+
+def test_omitted_merge_gate_fails_closed() -> None:
+    report = OptimizationReport(
+        issue_number=31,
+        candidate_id="candidate-1",
+        recommendation="Use the candidate.",
+        alternatives=(),
+        baseline_metrics={"quality": 0.5},
+        candidate_metrics={"quality": 0.9},
+        guardrails={"safety": "pass"},
+        thresholds={"quality": 0.8},
+        materiality={"quality": 0.05},
+        sample_count=5,
+        split="development",
+        foundry_operations=(),
+        changed_paths=("agent/main.py",),
+        validation=("tests: passed",),
+        spec_sha256="1" * 64,
+        base_commit="2" * 40,
+        patch_sha256="3" * 64,
+        evidence_sha256="4" * 64,
+        bundle_sha256="5" * 64,
+        expected_tree="6" * 40,
+        required_checks={"Foundry exact candidate check": "success"},
+    )
+
+    renderer = PublicEvidenceRenderer()
+    projection = renderer.render_pr(report)
+    check = renderer.render_check(report)
+
+    assert report.merge_gate is EvidenceMergeGate.PENDING
+    assert projection.draft is True
+    assert "Do not merge this PR" in projection.body
+    assert check.status == "in_progress"
+    assert check.conclusion is None

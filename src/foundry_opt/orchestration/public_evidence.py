@@ -107,7 +107,7 @@ class OptimizationReport:
     expected_tree: str
     materiality: Mapping[str, float] = field(default_factory=dict)
     required_checks: Mapping[str, str] = field(default_factory=dict)
-    merge_gate: EvidenceMergeGate = EvidenceMergeGate.ELIGIBLE
+    merge_gate: EvidenceMergeGate = EvidenceMergeGate.PENDING
 
     def __post_init__(self) -> None:
         if type(self.issue_number) is not int or self.issue_number < 1:
