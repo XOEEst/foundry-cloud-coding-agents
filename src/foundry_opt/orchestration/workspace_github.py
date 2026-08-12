@@ -22,6 +22,14 @@ _COMMIT = re.compile(r"^[0-9a-fA-F]{40}$")
 _PULL_REQUEST_FIELDS = (
     "number,headRefName,baseRefName,title,body,isDraft,state"
 )
+_COMMIT_ENVIRONMENT = {
+    "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+    "GIT_AUTHOR_EMAIL": "foundry-opt@example.invalid",
+    "GIT_AUTHOR_NAME": "Foundry Optimizer Workspace",
+    "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+    "GIT_COMMITTER_EMAIL": "foundry-opt@example.invalid",
+    "GIT_COMMITTER_NAME": "Foundry Optimizer Workspace",
+}
 
 
 class GitHubWorkspacePullRequestError(RuntimeError):
@@ -37,6 +45,27 @@ def workspace_pull_request_marker(issue_number: int) -> str:
     )
 
 
+def workspace_pull_request_base_marker(base_commit: str) -> str:
+    if (
+        not isinstance(base_commit, str)
+        or _COMMIT.fullmatch(base_commit) is None
+    ):
+        raise ValueError("workspace base commit is invalid")
+    return f"<!-- foundry-opt:workspace-base:{base_commit.lower()} -->"
+
+
+def workspace_pull_request_base_commit(body: str) -> str:
+    if not isinstance(body, str):
+        raise ValueError("workspace pull request body is invalid")
+    matches = re.findall(
+        r"<!-- foundry-opt:workspace-base:([0-9a-fA-F]{40}) -->",
+        body,
+    )
+    if len(matches) != 1:
+        raise ValueError("workspace pull request base marker is invalid")
+    return matches[0].lower()
+
+
 def _workspace_pull_request_search(issue_number: int) -> str:
     workspace_pull_request_marker(issue_number)
     return (
@@ -45,9 +74,13 @@ def _workspace_pull_request_search(issue_number: int) -> str:
     )
 
 
-def _workspace_pull_request_body(issue_number: int) -> str:
+def _workspace_pull_request_body(
+    issue_number: int,
+    base_commit: str,
+) -> str:
     return (
         f"{workspace_pull_request_marker(issue_number)}\n\n"
+        f"{workspace_pull_request_base_marker(base_commit)}\n\n"
         f"Persistent optimization workspace for issue #{issue_number}.\n"
     )
 
@@ -227,23 +260,75 @@ class GhWorkspacePullRequests:
             if (
                 len(fields) != 2
                 or fields[1] != branch_ref
-                or fields[0].casefold()
-                != pull_request.base_commit.casefold()
+            ):
+                raise GitHubWorkspacePullRequestError(
+                    "workspace branch does not match base commit"
+                )
+            remote_commit = fields[0].casefold()
+            if remote_commit == pull_request.base_commit.casefold():
+                return
+            if remote_commit != self._workspace_commit(
+                repository_root,
+                pull_request,
             ):
                 raise GitHubWorkspacePullRequestError(
                     "workspace branch does not match base commit"
                 )
             return
+        workspace_commit = self._workspace_commit(
+            repository_root,
+            pull_request,
+        )
         self._commands.run(
             (
                 "git",
                 "push",
                 f"--force-with-lease={branch_ref}:",
                 remote_name,
-                f"{pull_request.base_commit}:{branch_ref}",
+                f"{workspace_commit}:{branch_ref}",
             ),
             cwd=repository_root,
         )
+
+    def _workspace_commit(
+        self,
+        repository_root: Path,
+        pull_request: WorkspacePullRequest,
+    ) -> str:
+        try:
+            tree = self._commands.run(
+                (
+                    "git",
+                    "rev-parse",
+                    f"{pull_request.base_commit}^{{tree}}",
+                ),
+                cwd=repository_root,
+            ).stdout.strip()
+            commit = self._commands.run(
+                (
+                    "git",
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    pull_request.base_commit,
+                    "-m",
+                    (
+                        "Create persistent optimization workspace "
+                        f"for issue-{pull_request.issue_number}"
+                    ),
+                ),
+                cwd=repository_root,
+                environment=_COMMIT_ENVIRONMENT,
+            ).stdout.strip()
+        except CommandError as error:
+            raise GitHubWorkspacePullRequestError(
+                "workspace branch commit could not be created"
+            ) from error
+        if _COMMIT.fullmatch(tree) is None or _COMMIT.fullmatch(commit) is None:
+            raise GitHubWorkspacePullRequestError(
+                "workspace branch commit is invalid"
+            )
+        return commit.lower()
 
     def _verified_push_remote(
         self,
@@ -313,7 +398,8 @@ class GhWorkspacePullRequests:
             ),
             cwd=repository_root,
             input_text=_workspace_pull_request_body(
-                pull_request.issue_number
+                pull_request.issue_number,
+                pull_request.base_commit,
             ),
         )
         return self._pull_request_number(result.stdout)
@@ -350,7 +436,7 @@ class GhWorkspacePullRequests:
         )
         if (
             parsed.scheme != "https"
-            or not parsed.netloc
+            or parsed.netloc.casefold() != "github.com"
             or not parsed.path.startswith(expected_prefix)
         ):
             raise GitHubWorkspacePullRequestError(
@@ -370,6 +456,15 @@ class GhWorkspacePullRequests:
     ) -> int:
         number = value.get("number")
         body = value.get("body")
+        base_markers = (
+            re.findall(
+                r"<!-- foundry-opt:workspace-base:"
+                r"([0-9a-fA-F]{40}) -->",
+                body,
+            )
+            if isinstance(body, str)
+            else []
+        )
         if (
             type(number) is not int
             or number < 1
@@ -381,6 +476,12 @@ class GhWorkspacePullRequests:
                 pull_request.issue_number
             )
             not in body
+            or len(base_markers) > 1
+            or (
+                base_markers
+                and base_markers[0].casefold()
+                != pull_request.base_commit.casefold()
+            )
             or value.get("isDraft") is not True
             or value.get("state") != "OPEN"
             or (

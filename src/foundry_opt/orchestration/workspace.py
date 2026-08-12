@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from foundry_opt.orchestration.workspace_runtime import (
@@ -66,6 +66,70 @@ class WorkspaceResult:
     phase: WorkspacePhase
     workspace_pull_request: WorkspacePullRequest | None
     planned_effect_kinds: tuple[str, ...]
+    recorded: bool = False
+    issue_status_projection_intent: (
+        WorkspaceIssueStatusProjectionIntent | None
+    ) = None
+
+    def to_dict(self) -> dict[str, Any]:
+        pull_request = self.workspace_pull_request
+        return {
+            "issue_number": (
+                pull_request.issue_number
+                if pull_request is not None
+                else None
+            ),
+            "issue_status_projection_intent": (
+                self.issue_status_projection_intent.to_dict()
+                if self.issue_status_projection_intent is not None
+                else None
+            ),
+            "phase": self.phase.value,
+            "planned_effect_kinds": list(self.planned_effect_kinds),
+            "recorded": self.recorded,
+            "workspace_pull_request": (
+                {
+                    "base_commit": pull_request.base_commit,
+                    "branch": pull_request.branch,
+                    "draft": pull_request.draft,
+                    "issue_number": pull_request.issue_number,
+                    "number": pull_request.number,
+                    "reuse_existing": pull_request.reuse_existing,
+                    "title": pull_request.title,
+                }
+                if pull_request is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceIssueStatusProjectionIntent:
+    issue_number: int
+    phase: WorkspacePhase
+    workspace_pull_request_number: int
+
+    def __post_init__(self) -> None:
+        if type(self.issue_number) is not int or self.issue_number < 1:
+            raise ValueError("workspace projection issue is invalid")
+        if (
+            type(self.workspace_pull_request_number) is not int
+            or self.workspace_pull_request_number < 1
+        ):
+            raise ValueError(
+                "workspace projection pull request is invalid"
+            )
+
+    def to_dict(self) -> dict[str, int | str]:
+        return {
+            "issue_number": self.issue_number,
+            "kind": "workspace_issue_status",
+            "phase": self.phase.value,
+            "status": "workspace_ready",
+            "workspace_pull_request_number": (
+                self.workspace_pull_request_number
+            ),
+        }
 
 
 class OptimizationWorkspace:
@@ -155,11 +219,12 @@ class OptimizationWorkspace:
             if snapshot is not None
             else WorkspacePhase.SPECIFICATION
         )
-        if (
+        recorded = (
             snapshot is None
             or snapshot.workspace_pull_request_number
             != pull_request.number
-        ):
+        )
+        if recorded:
             self._store.commit(
                 expected_revision=(
                     snapshot.revision if snapshot is not None else None
@@ -175,6 +240,16 @@ class OptimizationWorkspace:
             phase=phase,
             workspace_pull_request=pull_request,
             planned_effect_kinds=("workspace_pr_sync",),
+            recorded=recorded,
+            issue_status_projection_intent=(
+                WorkspaceIssueStatusProjectionIntent(
+                    issue_number=issue.number,
+                    phase=phase,
+                    workspace_pull_request_number=pull_request.number,
+                )
+                if pull_request.number is not None
+                else None
+            ),
         )
 
     @staticmethod

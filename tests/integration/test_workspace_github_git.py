@@ -148,7 +148,18 @@ def test_workspace_creation_publishes_only_the_reserved_branch(
     ).stdout.splitlines()
     assert result.workspace_pull_request is not None
     assert result.workspace_pull_request.number == 104
-    assert remote_commit == base_commit
+    assert remote_commit != base_commit
+    assert commands.run(
+        ("git", "rev-parse", f"{remote_commit}^"),
+        cwd=repository,
+    ).stdout.strip() == base_commit
+    assert commands.run(
+        ("git", "rev-parse", f"{remote_commit}^{{tree}}"),
+        cwd=repository,
+    ).stdout.strip() == commands.run(
+        ("git", "rev-parse", f"{base_commit}^{{tree}}"),
+        cwd=repository,
+    ).stdout.strip()
     assert remote_refs == [
         "refs/heads/foundry-opt/workspace/issue-31"
     ]

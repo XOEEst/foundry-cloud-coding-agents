@@ -19,6 +19,7 @@ from foundry_opt.orchestration import (
 from foundry_opt.orchestration.workspace_github import (
     GhWorkspacePullRequests,
     GitHubWorkspacePullRequestError,
+    workspace_pull_request_base_marker,
     workspace_pull_request_marker,
 )
 from foundry_opt.preflight.interfaces import CommandResult
@@ -141,10 +142,24 @@ def test_issue_creation_creates_one_draft_workspace_pull_request(
             ): "",
             (
                 "git",
+                "rev-parse",
+                f"{_BASE_COMMIT}^{{tree}}",
+            ): f"{'c' * 40}\n",
+            (
+                "git",
+                "commit-tree",
+                "c" * 40,
+                "-p",
+                _BASE_COMMIT,
+                "-m",
+                "Create persistent optimization workspace for issue-31",
+            ): f"{'b' * 40}\n",
+            (
+                "git",
                 "push",
                 f"--force-with-lease={branch_ref}:",
                 "origin",
-                f"{_BASE_COMMIT}:{branch_ref}",
+                f"{'b' * 40}:{branch_ref}",
             ): "",
             (
                 "gh",
@@ -194,6 +209,7 @@ def test_issue_creation_creates_one_draft_workspace_pull_request(
     assert snapshot.workspace_pull_request_number == 104
     assert commands.calls[-1]["input_text"] == (
         f"{marker}\n\n"
+        f"{workspace_pull_request_base_marker(_BASE_COMMIT)}\n\n"
         "Persistent optimization workspace for issue #31.\n"
     )
     assert sum(
@@ -1042,6 +1058,20 @@ def test_issue_creation_rejects_a_mismatched_remote_branch_commit(
                 "origin",
                 branch_ref,
             ): f"{'b' * 40}\t{branch_ref}\n",
+            (
+                "git",
+                "rev-parse",
+                f"{_BASE_COMMIT}^{{tree}}",
+            ): f"{'c' * 40}\n",
+            (
+                "git",
+                "commit-tree",
+                "c" * 40,
+                "-p",
+                _BASE_COMMIT,
+                "-m",
+                "Create persistent optimization workspace for issue-31",
+            ): f"{'d' * 40}\n",
         }
     )
     workspace = OptimizationWorkspace(

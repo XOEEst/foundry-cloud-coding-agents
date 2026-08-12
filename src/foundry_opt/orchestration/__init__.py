@@ -31,11 +31,26 @@ from foundry_opt.orchestration.public_evidence import (
 from foundry_opt.orchestration.workspace import (
     OptimizationWorkspace,
     WorkspaceIssue,
+    WorkspaceIssueStatusProjectionIntent,
     WorkspacePhase,
     WorkspacePullRequest,
     WorkspaceRequest,
     WorkspaceResult,
     WorkspaceTrigger,
+)
+from foundry_opt.orchestration.workspace_intake import (
+    NormalizedWorkspaceEvent,
+    TrustedWorkspaceEventContext,
+    WorkspaceEventKind,
+    normalize_workspace_event,
+)
+from foundry_opt.orchestration.workspace_production import (
+    ProductionWorkspaceError,
+    ProductionWorkspaceService,
+    WorkspaceAdvanceRequest,
+    WorkspaceIntakeResult,
+    build_production_workspace,
+    build_production_workspace_service,
 )
 from foundry_opt.orchestration.workspace_store import (
     AuditBundle,
@@ -431,6 +446,7 @@ __all__ = [
     "TrustedDeploymentWorkflowContext",
     "UnresolvedSpecification",
     "WorkspaceIssue",
+    "WorkspaceIssueStatusProjectionIntent",
     "WorkspaceCompletedError",
     "WorkspaceConflictError",
     "WorkspaceCorruptionError",
@@ -448,6 +464,16 @@ __all__ = [
     "WorkspaceStore",
     "WorkspaceStoreError",
     "WorkspaceUpdate",
+    "NormalizedWorkspaceEvent",
+    "ProductionWorkspaceError",
+    "ProductionWorkspaceService",
+    "TrustedWorkspaceEventContext",
+    "WorkspaceAdvanceRequest",
+    "WorkspaceEventKind",
+    "WorkspaceIntakeResult",
+    "build_production_workspace",
+    "build_production_workspace_service",
+    "normalize_workspace_event",
     "candidate_pr_body",
     "candidate_pr_marker",
     "candidate_pull_request_event_from_payload",

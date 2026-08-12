@@ -59,6 +59,11 @@ auth_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(auth_app, name="auth")
+workspace_app = typer.Typer(
+    help="Advance the single durable optimization workspace.",
+    no_args_is_help=True,
+)
+app.add_typer(workspace_app, name="workspace")
 
 
 def _version_callback(value: bool) -> None:
@@ -133,6 +138,147 @@ def build_auth_probe():
     from foundry_opt.auth import build_production_auth_probe
 
     return build_production_auth_probe()
+
+
+def build_workspace_service():
+    """Return the production single-workspace service."""
+    from foundry_opt.orchestration.workspace_production import (
+        build_production_workspace_service,
+    )
+
+    return build_production_workspace_service()
+
+
+def _workspace_failure(error: Exception) -> None:
+    typer.echo(
+        f"Workspace error: {redact(str(error))}",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+@workspace_app.command("advance")
+def workspace_advance(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Load and advance the issue's single production workspace."""
+    from foundry_opt.orchestration.workspace_production import (
+        WorkspaceAdvanceRequest,
+    )
+
+    try:
+        result = build_workspace_service().advance(
+            WorkspaceAdvanceRequest(
+                repository_root=Path.cwd(),
+                issue_number=issue_number,
+            )
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        pull_request = result.workspace_pull_request
+        typer.echo(
+            f"Workspace {result.phase.value}: "
+            f"draft PR #{pull_request.number if pull_request else 'unknown'}"
+        )
+
+
+@workspace_app.command("intake")
+def workspace_intake(
+    event_path: Annotated[
+        Path,
+        typer.Option(
+            "--event-path",
+            exists=True,
+            dir_okay=False,
+            help="Trusted GitHub event JSON path.",
+        ),
+    ],
+    event_name: Annotated[
+        str,
+        typer.Option("--event-name", help="Trusted GitHub event name."),
+    ],
+    delivery_id: Annotated[
+        str,
+        typer.Option("--delivery-id", help="Trusted delivery identifier."),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    base_commit: Annotated[
+        str | None,
+        typer.Option(
+            "--base-commit",
+            help="Trusted default-branch commit for an issue event.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Normalize one trusted issue or workspace PR event and advance."""
+    from foundry_opt.orchestration.workspace_intake import (
+        TrustedWorkspaceEventContext,
+    )
+
+    try:
+        if event_path.stat().st_size > 2_000_000:
+            raise ValueError("workspace event payload is too large")
+        payload = json.loads(event_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("workspace event payload must be an object")
+        result = build_workspace_service().ingest(
+            payload,
+            TrustedWorkspaceEventContext(
+                event_name=event_name,
+                delivery_id=delivery_id,
+                repository=repository,
+                repository_id=repository_id,
+            ),
+            base_commit=base_commit,
+            repository_root=Path.cwd(),
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace event {result.event.delivery_id}: "
+            f"{result.workspace.phase.value}"
+        )
 
 
 def _render_auth_probe(result: AuthProbeResult) -> str:

@@ -241,6 +241,12 @@ def test_repeated_issue_and_continuation_events_are_idempotent(
         for result in results
         if result.workspace_pull_request is not None
     } == {104}
+    assert [result.recorded for result in results] == [
+        True,
+        False,
+        False,
+        False,
+    ]
 
 
 def test_continuation_rejects_a_workspace_pr_for_another_issue(
