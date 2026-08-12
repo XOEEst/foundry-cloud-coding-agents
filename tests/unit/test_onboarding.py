@@ -336,7 +336,7 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         "subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}" in generated
     )
     assert "repository-ID" in generated
-    assert "foundry-opt steward advance --help" in workflow
+    assert "foundry-opt workspace advance --help" in workflow
     assert "AZURE_DEPLOYMENT_CLIENT_ID" not in workflow
     deployment_workflow = next(
         change.content

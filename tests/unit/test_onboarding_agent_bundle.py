@@ -6,13 +6,16 @@ import json
 from pathlib import Path
 import re
 
+from typer.testing import CliRunner
 import yaml
 
+from foundry_opt.cli import app
 from foundry_opt.onboarding.bundle import (
     generate_repository_agent_bundle,
     legacy_repository_agent_bundle,
     legacy_repository_agent_hashes,
 )
+from foundry_opt.onboarding.generation import _render_setup_workflow
 from foundry_opt.onboarding.models import OnboardingRequest
 from foundry_opt.optimization.issues import (
     REQUIRED_HEADINGS,
@@ -87,15 +90,118 @@ def test_bundle_generates_single_workspace_customer_surfaces() -> None:
     steward = files[
         Path(".github/agents/foundry-optimization-steward.agent.md")
     ]
-    assert "one persistent draft workspace pull request" in steward
-    assert "compare bounded candidates internally" in steward
-    assert "update the same pull request" in steward
-    assert "Never create a worker issue" in steward
-    assert "Never create an internal handoff pull request" in steward
-    assert "planner, designer, or applier" in steward
+    normalized_steward = " ".join(steward.split())
+    assert "one persistent draft workspace pull request" in normalized_steward
+    assert "compare bounded candidates internally" in normalized_steward
+    assert "Update the same pull request" in normalized_steward
+    assert (
+        "returned durable workspace state and `next_actions`"
+        in normalized_steward
+    )
+    assert "Do not stop merely because" in normalized_steward
+    assert "waiting for an external operation" in normalized_steward
+    assert "waiting for the human merge" in normalized_steward
     assert steward.count(
-        "foundry-opt steward advance --issue <number> --json"
+        "foundry-opt workspace advance --issue <number> --json"
     ) == 1
+    assert "foundry-opt steward advance" not in steward
+
+
+def test_generated_customer_instructions_have_no_legacy_transport() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    instruction_paths = (
+        Path(".github/agents/foundry-optimization-steward.agent.md"),
+        Path(
+            ".github/skills/foundry-agent-optimizer/"
+            "ADAPTER_MAPPING.md"
+        ),
+        Path(".github/skills/foundry-agent-optimizer/SKILL.md"),
+        Path(
+            ".github/skills/foundry-agent-optimizer/"
+            "REPOSITORY_CONTEXT.md"
+        ),
+    )
+    text = "\n".join(files[path] for path in instruction_paths).casefold()
+
+    for forbidden in (
+        "worker issue",
+        "specialist agent",
+        "internal handoff",
+        "candidate pull request",
+        "candidate pr",
+        "foundry-optimization-capability.yml",
+        "foundry-optimization-deployment-bridge.yml",
+        "foundry-optimization-handoff.yml",
+        "foundry-optimization-issue-intake.yml",
+        "foundry-optimization-reconcile.yml",
+        "foundry-opt steward advance",
+    ):
+        assert forbidden not in text
+    assert "foundry-opt workspace advance" in text
+    assert "next_actions" in text
+
+
+def test_every_emitted_foundry_opt_command_resolves_against_cli() -> None:
+    request = _request()
+    files = generate_repository_agent_bundle(
+        request,
+        oidc_subject="repository_id:123",
+        deployment_workflow_name="Deploy support agent",
+    )
+    files[Path(".github/workflows/copilot-setup-steps.yml")] = (
+        _render_setup_workflow(
+            request,
+            warm_token_cache=True,
+            export_proxy_marker=True,
+        )
+    )
+    emitted = " ".join("\n".join(files.values()).split())
+    occurrences = re.findall(
+        r"\bfoundry-opt\s+(--version|[a-z][a-z0-9-]*)"
+        r"(?:\s+([a-z][a-z0-9-]*))?",
+        emitted,
+    )
+    assert occurrences
+
+    runner = CliRunner()
+    resolved: set[str] = set()
+    for first, second in occurrences:
+        if first == "--version":
+            result = runner.invoke(app, ["--version"])
+            command = "--version"
+        else:
+            candidates = (
+                ([first, second, "--help"], f"{first} {second}")
+                if second
+                else None,
+                ([first, "--help"], first),
+            )
+            result = None
+            command = ""
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                arguments, name = candidate
+                completed = runner.invoke(app, arguments)
+                if completed.exit_code == 0:
+                    result = completed
+                    command = name
+                    break
+            assert result is not None, (first, second)
+        assert result.exit_code == 0, (command, result.stdout)
+        resolved.add(command)
+
+    assert {
+        "init",
+        "optimize apply",
+        "optimize reconcile",
+        "steward deployment-bridge",
+        "steward publication-result-auto",
+        "workspace advance",
+    } <= resolved
 
 
 def test_orchestration_onboarding_bundle_matches_golden_hashes() -> None:
@@ -181,7 +287,8 @@ def test_bundle_copies_skill_snapshot_and_workspace_context() -> None:
     assert "client-id" not in context
     assert "one persistent draft workspace pull request" in context
     assert "same workspace pull request" in context
-    assert "specialist pull requests" in context
+    assert "secondary optimization" in context
+    assert "specialist pull requests" not in context
 
 
 def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:

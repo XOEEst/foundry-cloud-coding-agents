@@ -1,76 +1,70 @@
 # Foundry adapter mapping for the Tenzing improvement loop
 
-The vendored protocol in `references/tenzing/` (see `references/tenzing/UPSTREAM.md` for exact
-provenance) describes a domain-agnostic, human-supervised loop: define an objective, an editable
-area, and an evaluation recipe once via `INIT.md`; then run `climb.md` forever, branching one git
-branch per experiment, scoring it, and logging the outcome to a scoreboard until a termination
-condition is met.
+The vendored protocol in `references/tenzing/` describes a
+domain-independent loop: fix an objective and edit boundary, try bounded
+experiments, evaluate them, retain evidence, and stop at a declared condition.
+The snapshot remains unmodified.
 
-This repository does not run that loop as upstream wrote it. `foundry-opt` already enforces a
-stricter, machine-checked version of the same shape — issue-approved specs instead of an interview,
-ephemeral worktrees instead of long-lived branches, Foundry agent drafts instead of ad hoc "produce a
-run", and redacted, hashed evidence instead of a free-form scoreboard. This document is the
-**normative mapping** between the two: read it alongside the unmodified snapshot to understand how
-each vendored concept is realized by this codebase. It is deliberately kept **outside**
-`references/tenzing/` so it can be revised as the adapter evolves without ever touching the vendored
-upstream files.
+`foundry-opt` realizes that loop inside one issue and one persistent workspace
+pull request. The assigned steward follows durable workspace `next_actions`;
+internal candidate alternatives are implementation details, not separate
+GitHub review surfaces.
 
-## The steward and three specialists
+## Single-workspace realization
 
-`../SKILL.md` directs one campaign steward and three specialists, each with a narrow,
-non-overlapping responsibility. The steward owns the state machine and private Git-state ref;
-GitHub Actions only transport trusted events and apply persisted effects. This mapping document is
-written from the specialists' point of view:
+The issue fixes the target-specific objective and requested inputs within
+`.github/foundry-optimizer.yaml`. The workspace command creates or reuses the
+one draft pull request and advances its durable state:
 
-- **Specification planner** — turns an approved GitHub issue into an **immutable spec PR**:
-  `OptimizationIssueRequest` is filed, then hashed and recorded as `OptimizationSpec` /
-  `OptimizationSpecApproval` (`foundry_opt/optimization/models.py`, `approve_optimization_spec`,
-  `OptimizationSpec.sha256`). It does **not** brainstorm candidate ideas — it only fixes the
-  objective, metrics, datasets/evaluators, and allowed mutations before any candidate work exists.
-- **Candidate designer** — receives only a canonical `CandidateDesignIntent` from the steward and
-  edits the reserved worktree within its pinned paths and remaining budget. It is the only
-  specialist that brainstorms or writes candidate code. The steward, not the designer, fixes exact
-  draft/evaluation intents, computes eligibility, and records the durable scoreboard. Trusted
-  Actions supply only the optimizer-OIDC Foundry network capability for those persisted intents.
-- **Exact-patch applier** — invokes `PatchApplier.apply_exact` (`ExactPatchRequest` →
-  `AppliedPatch`, via `verify_and_apply_candidate` in `foundry_opt/github_workflow/candidate.py`)
-  against an already-selected, already-evidenced candidate. It performs **no selection** (the
-  Pareto-eligible candidate was already chosen upstream by the optimization runner's evaluation
-  pipeline) and **no repair**: if applying the exact patch would require anything beyond a clean,
-  tree-verified apply, `verify_and_apply_candidate` rejects it as `substantive_repair` rather than
-  attempting to fix it up.
+`foundry-opt workspace advance --issue <number> --json`
+
+The steward performs only returned internal actions, updates the same branch,
+and invokes the command again. It pauses only for an external operation, the
+human merge, a blocked state, or completion.
+
+Foundry network work stays outside Copilot:
+
+- `foundry-optimization-operations.yml` uses the optimizer OIDC identity for
+  persisted asset, draft, development-evaluation, and retained-evaluation
+  operations.
+- `deploy-foundry-agent.yml` uses the separate deployment OIDC identity for
+  exact publication only.
+- `foundry-exact-candidate-check.yml` validates the selected patch and tree
+  without redesign or repair.
 
 ## Mapping table
 
-| Tenzing concept (`references/tenzing/...`) | Foundry adapter realization |
+| Tenzing concept | Foundry single-workspace realization |
 | --- | --- |
-| `climb_config/objective.md` — primary metric, direction, soft constraints | Produced by the **specification planner** as an **issue-approved optimization spec**: `OptimizationIssueRequest` is filed against a GitHub issue, then hashed and recorded as `OptimizationSpec` / `OptimizationSpecApproval` (`foundry_opt/optimization/models.py`). The objective, metric policies (`MetricPolicy`), and hard guardrails are fixed and content-hashed (`OptimizationSpec.sha256`) as an immutable spec PR before any candidate work starts — there is no informal "agent interviews you" step, and no candidate brainstorming happens at this stage. |
-| `climb_config/dos-and-donts.md` — editable area, read-only files, dependency rule | Also fixed by the **specification planner** in the same **issue-approved optimization spec**: the editable surface is the `allowed_mutations` set (`MutationClass`) and `RestrictedOptIns` on the approved spec / target config, checked by preflight before a campaign runs. The read-only / no-secrets rule is enforced in code (`foundry_opt/security.py: reject_secret_content`), not left to an agent's discipline. |
-| `climb_config/data.md` — data inputs, held-out set, leakage rule | **Pinned dataset/evaluator identities, not staged files.** The approved spec records dataset and evaluator identity and content hash as `AssetProvenance` entries (`name`, `version`, `content_sha256`; `foundry_opt/optimization/models.py`) — the candidate designer never receives raw held-out rows to place anywhere. Development-split aggregate feedback *may* inform its next idea generation step, but held-out validation rows are never written into a candidate's source bundle; they stay outside the packaged `BundleArtifact`/`DraftRequest` entirely and are consumed only by the evaluation adapter (`foundry_opt/adapters/evaluation.py: EvaluationGateway`), which fetches them from Foundry-side dataset resources by name/version to score a submitted draft. |
-| Branches — one long-lived git branch per experiment | **Temporary worktrees isolate code experiments only.** Each candidate's code is materialized only inside its own disposable, optimizer-owned `CampaignWorktree` (`branch` prefixed `foundry-opt/`; `foundry_opt/campaign/protocols.py`, `foundry_opt/campaign/worktrees.py: contained_worktree_root`, `require_managed_worktree`) — never on a long-lived branch a human has to clean up, and never holding dataset content (see the row above). A candidate escapes its worktree only as a `PatchArtifact` (`export_patch`) plus its `BundleArtifact`/draft — exact, reviewable code artifacts, not a persistent branch. |
-| `climb_config/evaluation.md` — produce a run, score it, read the metric | **Foundry source-ZIP drafts/evals**, authorized deterministically by the **steward** after the candidate designer returns code. The steward persists the exact bundle hash, draft idempotency binding, datasets/evaluators, split, and metric policy. Trusted Actions then supplies only the optimizer-OIDC network capability to create/reconcile that exact `DraftRequest` and development evaluation, CAS-recording a privacy-safe `EvaluationResult`. Held-out evaluation remains in the deployment bridge. "Read the metric" is still `EvaluationResult.metrics`, normalized against the immutable `MetricPolicy`; Actions cannot choose a candidate or reinterpret it. |
-| `experiment_tracking/results.tsv` + `experiment_metadata/` — scoreboard + per-branch evidence | **Redacted evidence / Pareto results**, computed by the **steward's deterministic pipeline**, not by the designer or applier. Instead of a flat `keep`/`discard`/`crash` row per branch, `select_eligible_candidates` (`foundry_opt/evaluation/selection.py`) computes a `ParetoResult` — the non-dominated frontier of candidates that clear every hard guardrail and materially improve the baseline. `EvidenceRequest` / `EvidenceManifest` (`foundry_opt/evidence/`) then write a hashed, **redacted** evidence manifest (`sensitive_values` are scrubbed before anything is written) covering the baseline, every candidate, and the Pareto frontier — the durable, reviewable record a human reads instead of `results.tsv`. The **exact-patch applier** never re-runs or second-guesses this selection; it only applies a `PatchArtifact` this pipeline already marked eligible. |
-| Termination condition — `forever` / `n-iterations` / `until-target` / `report-each` | **Bounded Copilot sessions**, enforced around the candidate-designer loop. Each candidate's implementation session is time-boxed by `CampaignLimits` (`deadline_minutes`, `candidate_cutoff_minutes`; `foundry_opt/campaign/models.py`, enforced in `foundry_opt/campaign/engine.py`). Rather than an open-ended loop a human must remember to stop, every candidate-design session is cut off automatically at `candidate_cutoff_minutes`, and the whole campaign is bounded by `deadline_minutes` — a hard wall-clock backstop instead of a self-reported termination condition. |
-| Experiment budget / stopping point | **Repository policy plus issue-bounded execution.** `.github/foundry-optimizer.yaml` supplies maximum changed candidates, launch cutoff, campaign deadline, retry limits, and allowed issue overrides. The issue supplies the optimization-specific goal and assets but cannot widen those limits. The steward records the remaining budget in durable state so replacement sessions resume rather than restart the loop. |
+| Objective and success criteria | The `[Optimize]` issue selects one configured target and supplies a measurable goal, metric policies, guardrails, assets, and requested mutations. Repository policy validates and content-hashes the resulting boundary before experiments advance. |
+| Editable area and prohibitions | Allowed paths, mutation classes, restricted opt-ins, dependency rules, validation commands, and secret rejection come from repository policy plus the immutable issue boundary. The workspace may narrow but never widen them. |
+| Data inputs and leakage rule | Dataset and evaluator identities are pinned by name, version, and content hash. Development aggregates may guide the next internal experiment. Held-out rows, raw traces, prompts, and responses never enter a worktree or pull request. |
+| One branch per experiment | Candidate alternatives use disposable optimizer-managed code isolation. Only the selected exact patch is materialized on the persistent workspace branch. Rejected alternatives remain privacy-safe lineage and aggregates. |
+| Produce and score a run | The workspace records exact operation intent. The optimizer-OIDC workflow creates or reconciles the bound Foundry draft and evaluation, then records normalized metrics and remote identities without raw evidence. |
+| Scoreboard and experiment metadata | Durable workspace state and redacted evidence retain baseline metrics, candidate aggregates, deltas, guardrails, hashes, costs, and selection lineage. The root issue and workspace pull request project that state for review. |
+| Keep/discard decision | Deterministic eligibility and selection compare bounded candidates against hard guardrails and materiality. The steward cannot override the returned decision in prose or by editing metadata. |
+| Termination condition | Repository limits bound candidate count, cutoff, deadline, retries, and cost. Workspace `next_actions` determine whether the steward continues internally or pauses for an external operation, human merge, blocked state, or completion. |
+| Final publication | After the same workspace pull request is eligible and merged, the deployment-identity workflow publishes the exact selected version. The optimizer-identity workflow then evaluates retained behavior. |
 
 ## Reading order
 
-1. Skim `references/tenzing/README.md` and `references/tenzing/climb.md` to understand the loop shape
-   upstream intends — ideas, one branch per experiment, evaluate, log, repeat.
-2. Read this table to translate each of those steps into what actually executes in this repository:
-   an immutable, issue-approved spec; pinned dataset/evaluator identities consumed only by the
-   evaluation adapter; a disposable, code-only worktree; a Foundry source-ZIP draft and eval; a
-   redacted evidence manifest with a Pareto frontier; and a bounded Copilot session per candidate.
-3. See `../SKILL.md` for how the specification planner, optimization runner, and exact-patch applier
-   in a generated customer repository are directed to use this mapping in practice.
+1. Read `references/tenzing/README.md` and
+   `references/tenzing/climb.md` for the upstream loop shape.
+2. Use the table above to translate that shape into issue policy, internal
+   workspace experiments, Foundry operations, redacted evidence, and durable
+   `next_actions`.
+3. Read `../SKILL.md` for the generated steward and workflow contract.
 
-## What this document is not
+## Guardrails
 
-This is an **adapter mapping**, not a modification of the upstream protocol. The files under
-`references/tenzing/` are never edited to reflect this mapping — see
-`references/tenzing/UPSTREAM.md` for why the snapshot stays byte-for-byte unchanged and how it is
-deliberately upgraded offline. If this mapping and the vendored files ever appear to disagree, this
-document is what changes.
+- Never edit files under `references/tenzing/`.
+- Never put dataset rows, traces, credentials, evaluator prompts, or held-out
+  evidence in repository state.
+- Never execute pull-request-controlled scripts in a privileged workflow.
+- Never let optimizer and deployment identities assume each other's role.
+- Never create a second optimization branch or pull request.
+- Never infer lifecycle authority from comments, labels, or chat history.
 
-The snapshot is never fetched at runtime, during a build, or by CI. It is a reviewed read-only input,
-not a live dependency or an instruction channel controlled by upstream after onboarding.
+This mapping is repository integration guidance, not an upstream Tenzing
+artifact. If the adaptation changes, this file changes while the vendored
+snapshot remains byte-for-byte reviewed.

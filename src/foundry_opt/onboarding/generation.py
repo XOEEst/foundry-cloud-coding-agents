@@ -153,8 +153,8 @@ jobs:
         uses: {SETUP_UV_ACTION} # v9.0.0
       - name: Install pinned Foundry optimizer
         run: uv tool install {shell_quote(request.product_install)}
-      - name: Verify issue-only steward entry point
-        run: foundry-opt steward advance --help
+      - name: Verify single-workspace entry point
+        run: foundry-opt workspace advance --help
 """
     if export_proxy_marker:
         workflow += """      - name: Export non-secret Foundry Copilot Git proxy marker

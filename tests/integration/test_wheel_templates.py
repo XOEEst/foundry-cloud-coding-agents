@@ -46,13 +46,13 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
         skill = archive.read(skill_path).decode("utf-8")
 
     assert "Create one `[Optimize]` issue" in skill
-    assert "foundry-opt steward advance --issue <number>" in skill
+    assert "foundry-opt workspace advance --issue <number>" in skill
+    assert "next_actions" in skill
     assert "FOUNDRY_OPT_COPILOT_GIT_PROXY=1" in generation
     assert "https://ai.azure.com/.default" in generation
     assert "https://cognitiveservices.azure.com/.default" in generation
     assert "--output none" in generation
     assert "https://management.azure.com" not in generation
-    assert "FOUNDRY_OPT_COPILOT_GIT_PROXY=1" in skill
     assert "pull_request_target" in bundle
     assert "foundry-optimization-workspace.yml" in bundle
     assert "foundry-optimization-operations.yml" in bundle
@@ -62,3 +62,5 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
         1,
     )[0]
     assert "python -m foundry_opt.orchestration.capability_bridge" in bundle
+    assert "foundry-opt steward advance" not in skill
+    assert "foundry-optimization-handoff.yml" not in skill

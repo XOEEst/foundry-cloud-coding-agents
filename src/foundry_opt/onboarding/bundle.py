@@ -95,8 +95,11 @@ def _repository_context(
         "- `.github/foundry-optimizer.yaml` is durable repository policy; "
         "each issue supplies its own goal and assets within that boundary.\n"
         "- The steward compares bounded candidates internally, updates the "
-        "same workspace pull request, and never creates worker issues, "
-        "specialist pull requests, or internal handoff pull requests.\n"
+        "same workspace pull request, and creates no secondary optimization "
+        "branches or review surfaces.\n"
+        "- The steward follows durable workspace `next_actions`, continuing "
+        "internal work and pausing only for an external operation, the human "
+        "merge, a blocked state, or completion.\n"
         "- Normal user action: watch the issue and its one workspace pull "
         "request, then merge that pull request when it becomes eligible.\n"
     )
@@ -233,12 +236,10 @@ def _issue_form(request: OnboardingRequest) -> str:
                 "type": "markdown",
                 "attributes": {
                     "value": (
-                        "Creating this one issue starts the campaign. Normally "
-                        "you take no action until eligible candidate PRs are "
-                        "ready, then merge exactly one. An immutable spec PR "
-                        "needs review only when the dashboard identifies new, "
-                        "changed, custom, synthetic, trace-derived, human-gated, "
-                        "or unpinned assets. Track bounded experiments, "
+                        "Creating this one issue starts one persistent draft "
+                        "workspace pull request. Normally you take no action "
+                        "until that pull request is eligible, then merge it. "
+                        "Track bounded internal experiments, "
                         "held-out evidence, deployment, and retained improvement "
                         "in the root issue dashboard. Do not include credentials, "
                         "raw traces, or private dataset rows."
@@ -475,21 +476,22 @@ disable-model-invocation: false
 
 Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
 `REPOSITORY_CONTEXT.md`, the assigned optimization issue, and the existing
-workspace pull request for that issue. These single-workspace rules supersede
-legacy specialist and internal-handoff descriptions in the copied skill.
+workspace pull request for that issue.
 
-Own exactly one persistent draft workspace pull request. Use
-`foundry-opt steward advance --issue <number> --json` exactly once per
-assignment and resume only from durable workspace state. You must
-compare bounded candidates internally.
-Then update the same pull request with the exact selected patch and
-privacy-safe evidence. Never create a second optimization pull request.
+Own exactly one persistent draft workspace pull request. Advance it only with:
 
-Never create a worker issue. Never create an internal handoff pull request.
-Never delegate to planner, designer, or applier agents. Do not reproduce
-workspace transitions in prose, shell, comments, labels, or ad hoc files.
-The canonical command owns candidate bounds, evaluation, eligibility,
-selection, deployment intent, and retained-improvement state.
+`foundry-opt workspace advance --issue <number> --json`
+
+Read the returned durable workspace state and `next_actions`. Perform only
+listed internal actions and compare bounded candidates internally. Update the
+same pull request and invoke the command again. Do not stop merely because
+one invocation returned successfully. Stop only when the result is waiting
+for an external operation, waiting for the human merge, blocked, or complete.
+
+Do not create a second optimization branch or review surface. Do not reproduce
+workspace transitions in prose, shell, comments, labels, or ad hoc files. The
+workspace command owns candidate bounds, evaluation, eligibility, selection,
+deployment intent, and retained-improvement state.
 
 Edit only the paths allowed by the immutable issue and repository policy.
 Never expose credentials, private dataset rows, held-out cases, raw traces,
@@ -498,9 +500,8 @@ adapters; the optimizer-OIDC operations workflow performs persisted Foundry
 operations and post-deployment evaluation. Deployment remains isolated under
 the separate deployment identity.
 
-After the single command returns, stop immediately. A blocked, wait, or retry
-result means stop for the workspace workflow or operations workflow to resume
-the same pull request. Do not continue investigating or attempt a workaround.
+Never invent an action absent from `next_actions` or continue after an
+external/human wait. Do not attempt a workaround for a blocked result.
 """
 
 

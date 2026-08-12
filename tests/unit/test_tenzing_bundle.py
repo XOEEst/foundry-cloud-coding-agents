@@ -195,13 +195,13 @@ def test_adapter_mapping_document_lives_outside_the_vendored_snapshot() -> None:
 @pytest.mark.parametrize(
     ("tenzing_concept", "foundry_concept"),
     (
-        ("objective", "issue-approved optimization spec"),
-        ("data", "pinned dataset"),
-        ("branches", "temporary worktrees isolate code experiments"),
-        ("evaluation", "Foundry source-ZIP draft"),
-        ("results", "Pareto"),
-        ("results", "redacted"),
-        ("termination", "bounded Copilot session"),
+        ("objective", "`[Optimize]` issue"),
+        ("data", "pinned"),
+        ("branch", "disposable optimizer-managed code isolation"),
+        ("evaluation", "optimizer OIDC identity"),
+        ("scoreboard", "redacted evidence"),
+        ("termination", "next_actions"),
+        ("publication", "deployment OIDC identity"),
     ),
 )
 def test_adapter_mapping_document_maps_expected_concepts(
@@ -215,70 +215,25 @@ def test_adapter_mapping_document_maps_expected_concepts(
     assert foundry_concept.lower() in text
 
 
-def test_adapter_mapping_document_cites_real_foundry_symbols() -> None:
-    text = (SKILL_ROOT / "ADAPTER_MAPPING.md").read_text(encoding="utf-8")
-    for symbol in (
-        "OptimizationSpec",
-        "AssetProvenance",
-        "contained_worktree_root",
-        "CampaignWorktree",
-        "DraftRequest",
-        "EvaluationGateway",
-        "select_eligible_candidates",
-        "ParetoResult",
-        "EvidenceManifest",
-        "deadline_minutes",
-        "candidate_cutoff_minutes",
-        "apply_exact",
-        "ExactPatchRequest",
-        "substantive_repair",
-    ):
-        assert symbol in text
-
-
-def test_adapter_mapping_document_names_the_three_agents() -> None:
+def test_adapter_mapping_document_uses_single_workspace_contract() -> None:
     text = _normalized(
         (SKILL_ROOT / "ADAPTER_MAPPING.md").read_text(encoding="utf-8")
     ).lower()
-    for role in ("specification planner", "optimization runner", "exact-patch applier"):
-        assert role in text
+    assert "foundry-opt workspace advance --issue <number> --json" in text
+    assert "one persistent workspace" in text
+    assert "same branch" in text
+    assert "next_actions" in text
+    assert "external operation" in text
+    assert "human merge" in text
 
 
 def test_adapter_mapping_document_does_not_claim_datasets_are_staged_in_worktrees() -> None:
-    """Datasets/evaluators are identity- and hash-pinned in the spec, not files in a worktree.
-
-    Regression guard for the earlier (incorrect) design, which claimed development/validation
-    datasets were staged inside a candidate's worktree and that deleting the worktree was what
-    enforced held-out opacity. Neither claim should appear anymore.
-    """
     text = _normalized(
         (SKILL_ROOT / "ADAPTER_MAPPING.md").read_text(encoding="utf-8")
     ).lower()
-    assert "staged only inside a campaign's contained" not in text
-    assert "held-out set stays opaque" not in text
-    assert "deleted after the campaign, so no dataset content" not in text
-
-
-def test_adapter_mapping_document_describes_pinned_dataset_identity_and_evaluation_adapter() -> (
-    None
-):
-    raw_text = (SKILL_ROOT / "ADAPTER_MAPPING.md").read_text(encoding="utf-8")
-    lowered = _normalized(raw_text).lower()
-    assert "content_sha256" in raw_text
-    assert "development" in lowered and "idea generation" in lowered
-    assert "held-out validation rows" in lowered or "held-out rows" in lowered
-    assert "outside" in lowered and "source bundle" in lowered
-    assert "evaluation adapter" in lowered
-    assert "worktrees isolate code experiments" in lowered
-
-
-def test_adapter_mapping_document_keeps_applier_out_of_selection_and_repair() -> None:
-    text = _normalized(
-        (SKILL_ROOT / "ADAPTER_MAPPING.md").read_text(encoding="utf-8")
-    ).lower()
-    assert "no selection" in text
-    assert "no repair" in text
-    assert "never re-runs or second-guesses this selection" in text
+    assert "dataset and evaluator identities are pinned" in text
+    assert "held-out rows" in text
+    assert "never enter a worktree or pull request" in text
 
 
 def test_skill_template_is_top_level_and_not_inside_the_snapshot() -> None:
@@ -288,57 +243,53 @@ def test_skill_template_is_top_level_and_not_inside_the_snapshot() -> None:
     assert SNAPSHOT_ROOT not in skill_doc.parents
 
 
-def test_skill_template_directs_the_three_named_agents() -> None:
+def test_skill_template_directs_one_workspace_steward() -> None:
     text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")).lower()
-    for role in (
-        "specification planner",
-        "candidate designer",
-        "exact-patch applier",
-    ):
-        assert role in text
-    assert "foundry-opt steward advance --issue <number>" in text
-    assert "candidatedesignintent" in text
-
-
-def test_skill_template_specification_planner_does_not_brainstorm_candidates() -> None:
-    text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")).lower()
-    assert "immutable specification" in text
-    assert "does not brainstorm or evaluate candidate ideas" in text
-
-
-def test_skill_template_candidate_designer_owns_bounded_idea_generation() -> None:
-    text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")).lower()
-    assert "only specialist that generates ideas or writes candidate code" in text
-    assert "bounded" in text
-
-
-def test_skill_template_exact_patch_applier_has_no_selection_or_repair() -> None:
-    text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")).lower()
-    assert "performs no selection" in text
-    assert "no repair" in text
+    assert "foundry-optimization-steward" in text
+    assert "foundry-opt workspace advance --issue <number> --json" in text
+    assert "one persistent draft workspace pull request" in text
+    assert "same pull request" in text
+    assert "next_actions" in text
+    assert "do not stop merely because" in text
+    assert "waiting for an external foundry operation" in text
+    assert "waiting for the human merge" in text
 
 
 def test_skill_template_does_not_claim_datasets_are_staged_in_worktrees() -> None:
     text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")).lower()
-    assert "no dataset content is staged there" in text
-    assert "held-out set stays opaque" not in text
+    assert "dataset content never enters them" in text
+    assert "held-out rows" in text
+    assert "never enter" in text
 
 
-def test_skill_template_documents_explicit_copilot_proxy_authority() -> None:
-    text = _normalized(
-        (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-    )
-    lowered = text.lower()
+def test_skill_template_keeps_operations_and_deployment_separate() -> None:
+    text = _normalized((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"))
+    assert "`foundry-optimization-operations.yml`" in text
+    assert "optimizer OIDC identity" in text
+    assert "`deploy-foundry-agent.yml`" in text
+    assert "separate deployment OIDC identity" in text
+    assert "optimizer identity never publishes" in text
 
-    assert "`FOUNDRY_OPT_COPILOT_GIT_PROXY=1`" in text
-    assert "non-secret" in lowered
-    assert "exact loopback" in lowered
-    assert "native `copilot/` branch" in text
-    assert "handoff validator" in lowered
-    assert "compare-and-swap" in lowered
-    assert "isolated git configuration" in lowered
-    assert "`pushurl`" in text
-    assert "pack-helper" in lowered
+
+def test_skill_and_mapping_remove_legacy_customer_transport() -> None:
+    text = "\n".join(
+        (SKILL_ROOT / name).read_text(encoding="utf-8")
+        for name in ("SKILL.md", "ADAPTER_MAPPING.md")
+    ).casefold()
+    for forbidden in (
+        "worker issue",
+        "specialist agent",
+        "internal handoff",
+        "candidate pull request",
+        "candidate pr",
+        "foundry-opt steward advance",
+        "foundry-optimization-capability.yml",
+        "foundry-optimization-deployment-bridge.yml",
+        "foundry-optimization-handoff.yml",
+        "foundry-optimization-issue-intake.yml",
+        "foundry-optimization-reconcile.yml",
+    ):
+        assert forbidden not in text
 
 
 def test_skill_template_references_the_vendored_snapshot() -> None:
