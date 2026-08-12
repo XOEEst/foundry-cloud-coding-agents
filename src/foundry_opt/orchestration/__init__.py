@@ -35,6 +35,7 @@ from foundry_opt.orchestration.workspace_store import (
     WorkspaceSnapshot,
     WorkspaceUpdate,
 )
+from foundry_opt.orchestration.workspace_runtime import WorkspaceStore
 from foundry_opt.orchestration.workspace_git_store import (
     GitWorkspaceStore,
     WorkspaceCompletedError,
@@ -422,6 +423,7 @@ __all__ = [
     "WorkspaceTrigger",
     "WorkspaceSnapshot",
     "WorkspaceStateMigrationPlan",
+    "WorkspaceStore",
     "WorkspaceStoreError",
     "WorkspaceUpdate",
     "candidate_pr_body",
