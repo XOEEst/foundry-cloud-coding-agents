@@ -222,6 +222,79 @@ def test_final_deployment_dashboard_renders_only_aggregate_comparison() -> None:
     assert "raw_response" not in body
 
 
+def test_deployment_dashboard_preserves_pre_merge_candidate_evidence() -> None:
+    gateway = FakeDashboardGateway()
+    slate = _record(
+        "slate-dashboard-2",
+        "candidate_slate_dashboard",
+        9,
+        phase="awaiting_selection",
+        status="waiting",
+        disposition="wait",
+        spec_sha256="d" * 64,
+        baseline_metrics={"quality": 0.5},
+        candidate_slate=[
+            {
+                "candidate_id": "candidate-1",
+                "rank": 1,
+                "draft_id": "draft-candidate-1",
+                "metrics": {"quality": 0.9},
+                "deltas": {"quality": 0.4},
+                "guardrails": {"safety": "pass"},
+                "evidence_sha256": "e" * 64,
+                "evidence_url": (
+                    "https://github.com/octo-org/optimizer/blob/"
+                    "foundry-opt/state/issue-31/objects/evidence/"
+                    + "e" * 64
+                    + ".json"
+                ),
+            }
+        ],
+        next_action="merge_exactly_one_candidate_pr",
+    )
+    final = _record(
+        "final-dashboard-2",
+        "deployment_final_dashboard",
+        14,
+        phase="completed",
+        status="completed",
+        disposition="complete",
+        candidate_id="candidate-1",
+        deployment_version=13,
+        lineage_sha256="a" * 64,
+        merge_actor="maintainer",
+        required_checks=["exact-candidate", "tests"],
+        spec_sha256="b" * 64,
+        merge_commit="c" * 40,
+        tree_sha="d" * 40,
+        patch_sha256="e" * 64,
+        bundle_sha256="f" * 64,
+        evidence_sha256="1" * 64,
+        metadata_sha256="2" * 64,
+        source_sha256="f" * 64,
+        run_id=991,
+        run_url=(
+            "https://github.com/octo-org/agents/actions/runs/991"
+        ),
+        portal_url="https://ai.azure.com/example",
+        baseline_metrics={"quality": 0.5},
+        draft_metrics={"quality": 0.9},
+        deployed_metrics={"quality": 0.88},
+    )
+    source = FakeOutbox((slate, final))
+
+    DashboardProjection(source, gateway).project(31)
+
+    body = gateway.created[0]
+    assert "### Candidate comparison" in body
+    assert "[redacted evidence](https://github.com/" in body
+    assert "### Verified deployment result" in body
+    assert "### Historical selection evidence" in body
+    assert "Merge exactly one eligible candidate PR" not in body
+    assert "<!-- foundry-opt:projection:slate-dashboard-2 -->" in body
+    assert "<!-- foundry-opt:projection:final-dashboard-2 -->" in body
+
+
 def test_dashboard_explains_specification_digest_and_classification() -> None:
     gateway = FakeDashboardGateway()
     source = FakeOutbox(
