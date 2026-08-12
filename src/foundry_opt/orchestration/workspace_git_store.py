@@ -20,7 +20,9 @@ from foundry_opt.orchestration.git_transport import (
 )
 from foundry_opt.orchestration.workspace import WorkspacePhase
 from foundry_opt.orchestration.workspace_state_migration import (
+    WorkspaceStateConversionPayload,
     WorkspaceStateMigrationPlan,
+    validate_workspace_state_conversion_payload,
     workspace_state_v3_migration_plan,
 )
 from foundry_opt.orchestration.workspace_store import (
@@ -309,6 +311,80 @@ class GitWorkspaceStore:
             retained_paths=tuple(retained_paths),
         )
 
+    def write_conversion(
+        self,
+        payload: WorkspaceStateConversionPayload,
+        *,
+        target_ref: str,
+        expected_revision: str | None,
+    ) -> WorkspaceSnapshot:
+        validate_workspace_state_conversion_payload(payload)
+        _conversion_target_ref(self._root, target_ref)
+        if target_ref == payload.source_ref:
+            raise ValueError("conversion target must not be the v3 source ref")
+        if expected_revision is not None and (
+            _COMMIT.fullmatch(expected_revision) is None
+        ):
+            raise ValueError("expected_revision must be a commit SHA")
+
+        source_revision = self._remote_revision(payload.source_ref)
+        if source_revision != payload.source_revision:
+            raise WorkspaceConflictError(
+                "workspace state v3 changed before conversion write"
+            )
+        self._fetch(payload.source_ref, payload.source_revision)
+        files, final_update = _conversion_files(payload.transitions)
+        current_revision = self._remote_revision(target_ref)
+        if current_revision is not None:
+            self._fetch(target_ref, current_revision)
+            if self._revision_matches_files(current_revision, files):
+                return self._load_active(
+                    payload.issue_number,
+                    current_revision,
+                    self._paths(current_revision),
+                )[0]
+            raise WorkspaceConflictError(
+                "workspace conversion target already exists"
+            )
+        if current_revision != expected_revision:
+            raise WorkspaceConflictError(
+                "workspace conversion target revision changed"
+            )
+
+        revision = self._write_commit(
+            parent=payload.source_revision,
+            files=files,
+            message=(
+                f"Convert workspace state v3 to v4 for "
+                f"issue-{payload.issue_number}"
+            ),
+        )
+        try:
+            self._push(
+                ref=target_ref,
+                source_revision=revision,
+                expected_revision=None,
+            )
+        except WorkspaceConflictError:
+            acknowledged = self._remote_revision(target_ref)
+            if acknowledged != revision:
+                raise
+        if self._remote_revision(payload.source_ref) != payload.source_revision:
+            raise WorkspaceConflictError(
+                "workspace state v3 changed during conversion write"
+            )
+        return WorkspaceSnapshot(
+            issue_number=payload.issue_number,
+            revision=revision,
+            phase=final_update.phase,
+            workspace_pull_request_number=(
+                final_update.workspace_pull_request_number
+            ),
+            candidates=final_update.candidates,
+            selected_patch=final_update.selected_patch,
+            external_operation_ids=final_update.external_operation_ids,
+        )
+
     def _load_active(
         self,
         issue_number: int,
@@ -524,6 +600,18 @@ class GitWorkspaceStore:
                 f"workspace state is missing {path}"
             ) from error
 
+    def _revision_matches_files(
+        self,
+        revision: str,
+        files: Mapping[str, bytes],
+    ) -> bool:
+        if set(self._paths(revision)) != set(files):
+            return False
+        return all(
+            self._show(revision, path) == content
+            for path, content in files.items()
+        )
+
     def _remote_revision(self, ref: str) -> str | None:
         safe_remote = resolve_safe_fetch_remote(
             self._root,
@@ -693,6 +781,74 @@ def _state_document(
             update.workspace_pull_request_number
         ),
     }
+
+
+def _conversion_files(
+    transitions: tuple[WorkspaceUpdate, ...],
+) -> tuple[dict[str, bytes], WorkspaceUpdate]:
+    if not transitions:
+        raise ValueError("workspace conversion requires transitions")
+    journal: list[dict[str, Any]] = []
+    final_candidates: bytes | None = None
+    final_patch: bytes | None = None
+    final_state: dict[str, Any] | None = None
+    for update in transitions:
+        _validate_update(update)
+        candidates_content = (
+            _canonical_json(_candidates_to_document(update.candidates))
+            if update.candidates
+            else None
+        )
+        candidates_sha256 = (
+            hashlib.sha256(candidates_content).hexdigest()
+            if candidates_content is not None
+            else None
+        )
+        patch_sha256 = (
+            hashlib.sha256(update.selected_patch).hexdigest()
+            if update.selected_patch is not None
+            else None
+        )
+        state_document = _state_document(
+            update,
+            candidates_sha256=candidates_sha256,
+            selected_patch_sha256=patch_sha256,
+        )
+        entry_without_hash = {
+            **state_document,
+            "index": len(journal) + 1,
+            "previous_sha256": (
+                journal[-1]["entry_sha256"] if journal else None
+            ),
+            "schema_version": _SCHEMA_VERSION,
+            "semantic_event": update.semantic_event,
+        }
+        journal.append(
+            {
+                **entry_without_hash,
+                "entry_sha256": _document_sha256(entry_without_hash),
+            }
+        )
+        final_candidates = candidates_content
+        final_patch = update.selected_patch
+        final_state = state_document
+    assert final_state is not None
+    snapshot_document = {
+        "journal_head": journal[-1]["entry_sha256"],
+        "schema_version": _SCHEMA_VERSION,
+        "state": final_state,
+    }
+    files = {
+        "journal.jsonl": b"".join(
+            _canonical_json(item) for item in journal
+        ),
+        "snapshot.json": _canonical_json(snapshot_document),
+    }
+    if final_candidates is not None:
+        files["evidence/candidates.json"] = final_candidates
+    if final_patch is not None:
+        files["patches/selected.patch"] = final_patch
+    return files, transitions[-1]
 
 
 def _validate_update(update: WorkspaceUpdate) -> None:
@@ -1061,6 +1217,28 @@ def _state_ref(issue_number: int) -> str:
 
 def _audit_ref(issue_number: int) -> str:
     return f"refs/heads/foundry-opt/audit/issue-{issue_number}"
+
+
+def _conversion_target_ref(root: Path, value: str) -> None:
+    if (
+        type(value) is not str
+        or not value.startswith("refs/heads/foundry-opt/")
+        or value.startswith(
+            (
+                "refs/heads/foundry-opt/state/",
+                "refs/heads/foundry-opt/audit/",
+            )
+        )
+    ):
+        raise ValueError("conversion target ref is invalid")
+    checked = subprocess.run(
+        ("git", "check-ref-format", value),
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    if checked.returncode != 0:
+        raise ValueError("conversion target ref is invalid")
 
 
 def _run(

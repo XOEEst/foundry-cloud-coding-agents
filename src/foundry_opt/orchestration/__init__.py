@@ -46,8 +46,12 @@ from foundry_opt.orchestration.workspace_git_store import (
     WorkspaceStoreError,
 )
 from foundry_opt.orchestration.workspace_state_migration import (
+    convert_workspace_state_v3,
     detect_workspace_state_v3,
+    WorkspaceStateConversionError,
+    WorkspaceStateConversionPayload,
     WorkspaceStateMigrationPlan,
+    validate_workspace_state_conversion_payload,
     workspace_state_v3_migration_plan,
 )
 from foundry_opt.orchestration.git_state import (
@@ -422,6 +426,8 @@ __all__ = [
     "WorkspaceResult",
     "WorkspaceTrigger",
     "WorkspaceSnapshot",
+    "WorkspaceStateConversionError",
+    "WorkspaceStateConversionPayload",
     "WorkspaceStateMigrationPlan",
     "WorkspaceStore",
     "WorkspaceStoreError",
@@ -430,6 +436,7 @@ __all__ = [
     "candidate_pr_marker",
     "candidate_pull_request_event_from_payload",
     "candidate_worker_bindings",
+    "convert_workspace_state_v3",
     "deployment_cleanup_effect",
     "detect_workspace_state_v3",
     "deployment_workflow_event_from_payload",
@@ -443,5 +450,6 @@ __all__ = [
     "public_evidence_marker",
     "applier_worker_result_record",
     "verify_candidate_pull_request",
+    "validate_workspace_state_conversion_payload",
     "workspace_state_v3_migration_plan",
 ]
