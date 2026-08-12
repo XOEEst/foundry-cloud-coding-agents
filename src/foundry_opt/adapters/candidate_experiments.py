@@ -26,6 +26,7 @@ from foundry_opt.orchestration.candidate_experiments import (
     CandidateExperimentResult,
     CandidateExperimentRunner,
     DirectExperimentUnavailable,
+    PersistedCandidateExperimentOperation,
 )
 from foundry_opt.preflight.redaction import redact
 
@@ -83,7 +84,12 @@ class DirectCandidateExperimentAdapter:
 
 
 class ActionsCandidateExperimentAdapter:
-    """Dispatch one persisted operation and reconcile its redacted summary."""
+    """Dispatch one persisted operation and reconcile its redacted summary.
+
+    The gateway's dispatch is idempotent for the persisted operation SHA and
+    idempotency key. This adapter therefore safely retries dispatch only after
+    reconciliation confirms that the durable result is still absent.
+    """
 
     def __init__(self, gateway: CandidateExperimentActionsGateway) -> None:
         self._gateway = gateway
@@ -101,6 +107,7 @@ class ActionsCandidateExperimentAdapter:
             result = self._gateway.reconcile(persisted)
         if result is None:
             raise CandidateExperimentPending(request.idempotency_key)
+        _validate_result_lineage(persisted, result)
         return _bound_result(request, result, executor="actions_oidc")
 
 
@@ -165,6 +172,10 @@ class FoundryCandidateExperimentOperation:
             draft_id=draft.version_id,
             evaluation_id=result.run.evaluation_id,
             run_id=result.run.run_id,
+            operation_sha256=(
+                CandidateExperimentOperation.from_request(request).sha256
+            ),
+            idempotency_key=request.idempotency_key,
         )
 
 
@@ -210,6 +221,21 @@ def _validate_persisted(
         raise ValueError("persisted candidate experiment operation changed")
     if actual.idempotency_key != expected.idempotency_key:
         raise ValueError("persisted candidate experiment idempotency changed")
+
+
+def _validate_result_lineage(
+    persisted: PersistedCandidateExperimentOperation,
+    result: CandidateExperimentResult,
+) -> None:
+    if (
+        result.operation_sha256 != persisted.sha256
+        or result.idempotency_key
+        != persisted.operation.idempotency_key
+    ):
+        raise ValueError(
+            "candidate experiment result lineage does not match the "
+            "persisted operation"
+        )
 
 
 def _validate_plan(
@@ -278,6 +304,8 @@ def _bound_result(
         draft_id=_redacted(result.draft_id),
         evaluation_id=_redacted(result.evaluation_id),
         run_id=_redacted(result.run_id),
+        operation_sha256=result.operation_sha256,
+        idempotency_key=result.idempotency_key,
     )
 
 

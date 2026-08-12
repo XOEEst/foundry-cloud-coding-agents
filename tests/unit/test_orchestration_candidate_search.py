@@ -1,10 +1,11 @@
 import pytest
 
-from foundry_opt.orchestration.candidate_experiments import (
+from foundry_opt.orchestration import (
+    BoundedCandidateSearch,
     CandidateExperimentRequest,
     CandidateExperimentResult,
+    CandidateSearchSummary,
 )
-from foundry_opt.orchestration.candidate_search import BoundedCandidateSearch
 
 
 def _request(index: int) -> CandidateExperimentRequest:
@@ -44,6 +45,7 @@ def test_bounded_candidate_search_is_sequential_and_returns_safe_summaries() -> 
 
     assert runner.calls == ["candidate-1", "candidate-2", "candidate-3"]
     assert [summary.candidate_id for summary in summaries] == runner.calls
+    assert isinstance(summaries[0], CandidateSearchSummary)
     assert summaries[0].patch_sha256 == "1" * 64
     assert summaries[0].idempotency_key == "9" * 64
     assert summaries[0].metrics == {"quality": 1.0}
@@ -59,5 +61,15 @@ def test_bounded_candidate_search_rejects_oversized_slate_before_evaluation() ->
 
     with pytest.raises(ValueError, match="candidate search exceeds"):
         search.evaluate((_request(1), _request(2), _request(3)))
+
+    assert runner.calls == []
+
+
+def test_bounded_candidate_search_rejects_empty_configuration() -> None:
+    runner = RecordingRunner()
+    search = BoundedCandidateSearch(runner=runner, max_candidates=2)
+
+    with pytest.raises(ValueError, match="at least one configured candidate"):
+        search.evaluate(())
 
     assert runner.calls == []

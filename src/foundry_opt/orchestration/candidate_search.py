@@ -56,6 +56,10 @@ class BoundedCandidateSearch:
         requests: Sequence[CandidateExperimentRequest],
     ) -> tuple[CandidateSearchSummary, ...]:
         configured = tuple(requests)
+        if not configured:
+            raise ValueError(
+                "candidate search requires at least one configured candidate"
+            )
         if len(configured) > self._max_candidates:
             raise ValueError("candidate search exceeds its configured bound")
         candidate_ids = tuple(item.candidate_id for item in configured)

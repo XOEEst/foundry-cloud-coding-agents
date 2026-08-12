@@ -13,6 +13,10 @@ from foundry_opt.orchestration.candidate_experiments import (
     DirectExperimentUnavailable,
     PersistedCandidateExperimentOperation,
 )
+from foundry_opt.orchestration.candidate_search import (
+    BoundedCandidateSearch,
+    CandidateSearchSummary,
+)
 from foundry_opt.orchestration.public_evidence import (
     AlternativeResult,
     CheckProjection,
@@ -261,6 +265,7 @@ __all__ = [
     "CampaignInbox",
     "CampaignPhase",
     "CampaignState",
+    "BoundedCandidateSearch",
     "CheckProjection",
     "CandidateExperimentRequest",
     "CandidateExperimentResult",
@@ -302,6 +307,7 @@ __all__ = [
     "CandidateSelectionResult",
     "CandidateSelectionService",
     "CandidateSelectionStatus",
+    "CandidateSearchSummary",
     "CandidateSupersessionBridge",
     "CandidateSupersessionBridgeResult",
     "CandidateSupersessionBridgeStatus",

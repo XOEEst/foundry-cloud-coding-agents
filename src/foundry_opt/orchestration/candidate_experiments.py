@@ -108,6 +108,8 @@ class CandidateExperimentResult:
     draft_id: str
     evaluation_id: str
     run_id: str
+    operation_sha256: str | None = None
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.candidate_id, "candidate_id")
@@ -124,6 +126,15 @@ class CandidateExperimentResult:
             (self.run_id, "run_id"),
         ):
             _safe_text(value, name)
+        if (self.operation_sha256 is None) != (
+            self.idempotency_key is None
+        ):
+            raise ValueError(
+                "candidate experiment result lineage is incomplete"
+            )
+        if self.operation_sha256 is not None:
+            _sha256(self.operation_sha256, "operation_sha256")
+            _sha256(self.idempotency_key, "result idempotency_key")
 
 
 @dataclass(frozen=True)
@@ -227,6 +238,14 @@ class CandidateExperimentAdapter(Protocol):
 
 
 class CandidateExperimentActionsGateway(Protocol):
+    """Durable transport for one consolidated candidate experiment.
+
+    ``persist`` must return the canonical operation envelope. ``dispatch``
+    must be idempotent for the envelope's SHA-256 and idempotency key, so
+    retries cannot create a second Foundry operation. ``reconcile`` returns
+    only a result bound to that same persisted lineage.
+    """
+
     def persist(
         self,
         operation: CandidateExperimentOperation,
