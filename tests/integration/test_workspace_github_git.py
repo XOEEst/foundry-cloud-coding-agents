@@ -33,6 +33,27 @@ class GitWithFakeGitHub:
         input_bytes: bytes | None = None,
     ) -> CommandResult:
         command = tuple(arguments)
+        if command in {
+            (
+                "git",
+                "config",
+                "--get-all",
+                "remote.origin.url",
+            ),
+            (
+                "git",
+                "remote",
+                "get-url",
+                "--push",
+                "--all",
+                "origin",
+            ),
+        }:
+            return CommandResult(
+                0,
+                "https://github.com/octo-org/optimizer.git\n",
+                "",
+            )
         if command[0] == "git":
             return self._commands.run(
                 command,

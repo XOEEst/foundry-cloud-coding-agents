@@ -7,6 +7,8 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from foundry_opt.adapters.commands import CommandError
+from foundry_opt.adapters.github import github_repository_from_remote_url
 from foundry_opt.orchestration.workspace import WorkspacePullRequest
 from foundry_opt.preflight.interfaces import CommandRunner
 
@@ -51,6 +53,12 @@ def _workspace_pull_request_body(issue_number: int) -> str:
 
 
 class GhWorkspacePullRequests:
+    """Synchronize the single draft PR for an optimization workspace.
+
+    Matching closed or merged pull requests fail closed and are not
+    recreated while lifecycle policy for those states remains undefined.
+    """
+
     def __init__(
         self,
         commands: CommandRunner,
@@ -82,34 +90,56 @@ class GhWorkspacePullRequests:
             pull_request,
         )
         if matches:
-            number = self._validate_existing(
-                matches[0],
+            return self._reuse_existing(
+                repository_root,
                 pull_request,
+                matches[0],
             )
-            if matches[0]["title"] != pull_request.title:
-                self._commands.run(
-                    (
-                        "gh",
-                        "pr",
-                        "edit",
-                        str(number),
-                        "--repo",
-                        self._repository,
-                        "--title",
-                        pull_request.title,
-                    ),
-                    cwd=repository_root,
-                )
-            return replace(pull_request, number=number)
         if pull_request.number is not None:
             raise GitHubWorkspacePullRequestError(
                 "workspace pull request was not found"
             )
         self._ensure_branch(repository_root, pull_request)
+        matches = self._find_pull_requests(
+            repository_root,
+            pull_request,
+        )
+        if matches:
+            return self._reuse_existing(
+                repository_root,
+                pull_request,
+                matches[0],
+            )
         number = self._create_pull_request(
             repository_root,
             pull_request,
         )
+        return replace(pull_request, number=number)
+
+    def _reuse_existing(
+        self,
+        repository_root: Path,
+        pull_request: WorkspacePullRequest,
+        existing: dict[str, Any],
+    ) -> WorkspacePullRequest:
+        number = self._validate_existing(
+            existing,
+            pull_request,
+        )
+        if existing["title"] != pull_request.title:
+            self._commands.run(
+                (
+                    "gh",
+                    "pr",
+                    "edit",
+                    str(number),
+                    "--repo",
+                    self._repository,
+                    "--title",
+                    pull_request.title,
+                ),
+                cwd=repository_root,
+            )
         return replace(pull_request, number=number)
 
     def _find_pull_requests(
@@ -180,13 +210,14 @@ class GhWorkspacePullRequests:
         repository_root: Path,
         pull_request: WorkspacePullRequest,
     ) -> None:
+        remote_name = self._verified_push_remote(repository_root)
         branch_ref = f"refs/heads/{pull_request.branch}"
         remote = self._commands.run(
             (
                 "git",
                 "ls-remote",
                 "--heads",
-                "origin",
+                remote_name,
                 branch_ref,
             ),
             cwd=repository_root,
@@ -208,11 +239,55 @@ class GhWorkspacePullRequests:
                 "git",
                 "push",
                 f"--force-with-lease={branch_ref}:",
-                "origin",
+                remote_name,
                 f"{pull_request.base_commit}:{branch_ref}",
             ),
             cwd=repository_root,
         )
+
+    def _verified_push_remote(
+        self,
+        repository_root: Path,
+    ) -> str:
+        remote_name = "origin"
+        try:
+            configured = self._commands.run(
+                (
+                    "git",
+                    "config",
+                    "--get-all",
+                    f"remote.{remote_name}.url",
+                ),
+                cwd=repository_root,
+            ).stdout.splitlines()
+            push_urls = self._commands.run(
+                (
+                    "git",
+                    "remote",
+                    "get-url",
+                    "--push",
+                    "--all",
+                    remote_name,
+                ),
+                cwd=repository_root,
+            ).stdout.splitlines()
+        except CommandError as error:
+            raise GitHubWorkspacePullRequestError(
+                "workspace push remote is unavailable"
+            ) from error
+        if (
+            len(configured) != 1
+            or push_urls != configured
+            or (
+                github_repository_from_remote_url(configured[0])
+                or ""
+            ).casefold()
+            != self._repository.casefold()
+        ):
+            raise GitHubWorkspacePullRequestError(
+                "workspace push remote does not match repository"
+            )
+        return remote_name
 
     def _create_pull_request(
         self,

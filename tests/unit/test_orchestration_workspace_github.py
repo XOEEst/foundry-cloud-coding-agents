@@ -34,7 +34,10 @@ _BRANCH = "foundry-opt/workspace/issue-31"
 class FakeCommands:
     def __init__(
         self,
-        responses: dict[tuple[str, ...], str | Exception],
+        responses: dict[
+            tuple[str, ...],
+            str | Exception | list[str | Exception],
+        ],
     ) -> None:
         self.responses = responses
         self.calls: list[dict[str, Any]] = []
@@ -61,6 +64,12 @@ class FakeCommands:
         response = self.responses.get(command)
         if response is None:
             raise AssertionError(f"unexpected command: {command}")
+        if isinstance(response, list):
+            if not response:
+                raise AssertionError(
+                    f"exhausted command responses: {command}"
+                )
+            response = response.pop(0)
         if isinstance(response, Exception):
             raise response
         return CommandResult(0, response, "")
@@ -109,6 +118,20 @@ def test_issue_creation_creates_one_draft_workspace_pull_request(
         {
             list_by_branch: "[]",
             list_by_marker: "[]",
+            (
+                "git",
+                "config",
+                "--get-all",
+                "remote.origin.url",
+            ): f"https://github.com/{_REPOSITORY}.git\n",
+            (
+                "git",
+                "remote",
+                "get-url",
+                "--push",
+                "--all",
+                "origin",
+            ): f"https://github.com/{_REPOSITORY}.git\n",
             (
                 "git",
                 "ls-remote",
@@ -385,6 +408,7 @@ def test_multiple_workspace_pull_requests_fail_closed(
         ("body", "<!-- foundry-opt:workspace-pr:issue-32:v1 -->"),
         ("isDraft", False),
         ("state", "CLOSED"),
+        ("state", "MERGED"),
     ),
 )
 def test_mismatched_workspace_pull_requests_fail_closed(
@@ -650,3 +674,406 @@ def test_continuation_does_not_replace_a_missing_committed_pr(
         )
 
     assert len(commands.invocations) == 2
+
+
+def test_issue_creation_rejects_a_mismatched_push_remote(
+    tmp_path: Path,
+) -> None:
+    commands = FakeCommands(
+        {
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                _REPOSITORY,
+                "--state",
+                "all",
+                "--head",
+                _BRANCH,
+                "--json",
+                "number,headRefName,baseRefName,title,body,isDraft,state",
+                "--limit",
+                "2",
+            ): "[]",
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                _REPOSITORY,
+                "--state",
+                "all",
+                "--search",
+                '"foundry-opt:workspace-pr:issue-31:v1" in:body',
+                "--json",
+                "number,headRefName,baseRefName,title,body,isDraft,state",
+                "--limit",
+                "2",
+            ): "[]",
+            (
+                "git",
+                "config",
+                "--get-all",
+                "remote.origin.url",
+            ): f"https://github.com/{_REPOSITORY}.git\n",
+            (
+                "git",
+                "remote",
+                "get-url",
+                "--push",
+                "--all",
+                "origin",
+            ): "https://github.com/other-org/other-repo.git\n",
+        }
+    )
+    workspace = OptimizationWorkspace(
+        store=InMemoryWorkspaceStore(),
+        pull_requests=GhWorkspacePullRequests(
+            commands,
+            repository=_REPOSITORY,
+            base_branch=_BASE_BRANCH,
+        ),
+    )
+
+    with pytest.raises(
+        GitHubWorkspacePullRequestError,
+        match="push remote",
+    ):
+        workspace.advance(
+            WorkspaceRequest(
+                repository_root=tmp_path,
+                issue=WorkspaceIssue(
+                    number=_ISSUE_NUMBER,
+                    title="[Optimize] Improve policy coverage",
+                    body=(
+                        "Improve policy coverage without weakening safety."
+                    ),
+                    base_commit=_BASE_COMMIT,
+                ),
+                trigger=WorkspaceTrigger.ISSUE_CREATED,
+            )
+        )
+
+    assert commands.invocations[-1][:4] == (
+        "git",
+        "remote",
+        "get-url",
+        "--push",
+    )
+
+
+def test_issue_creation_reuses_a_concurrently_created_workspace_pr(
+    tmp_path: Path,
+) -> None:
+    existing = json.dumps(
+        [
+            {
+                "number": 104,
+                "headRefName": _BRANCH,
+                "baseRefName": _BASE_BRANCH,
+                "title": (
+                    "[Optimize] #31 workspace - "
+                    "draft, not yet selectable"
+                ),
+                "body": workspace_pull_request_marker(_ISSUE_NUMBER),
+                "isDraft": True,
+                "state": "OPEN",
+            }
+        ]
+    )
+    list_by_branch = (
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        _REPOSITORY,
+        "--state",
+        "all",
+        "--head",
+        _BRANCH,
+        "--json",
+        "number,headRefName,baseRefName,title,body,isDraft,state",
+        "--limit",
+        "2",
+    )
+    list_by_marker = (
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        _REPOSITORY,
+        "--state",
+        "all",
+        "--search",
+        '"foundry-opt:workspace-pr:issue-31:v1" in:body',
+        "--json",
+        "number,headRefName,baseRefName,title,body,isDraft,state",
+        "--limit",
+        "2",
+    )
+    remote_url = f"https://github.com/{_REPOSITORY}.git\n"
+    commands = FakeCommands(
+        {
+            list_by_branch: ["[]", existing],
+            list_by_marker: ["[]", existing],
+            (
+                "git",
+                "config",
+                "--get-all",
+                "remote.origin.url",
+            ): remote_url,
+            (
+                "git",
+                "remote",
+                "get-url",
+                "--push",
+                "--all",
+                "origin",
+            ): remote_url,
+            (
+                "git",
+                "ls-remote",
+                "--heads",
+                "origin",
+                f"refs/heads/{_BRANCH}",
+            ): (
+                f"{_BASE_COMMIT}\t"
+                f"refs/heads/{_BRANCH}\n"
+            ),
+        }
+    )
+    workspace = OptimizationWorkspace(
+        store=InMemoryWorkspaceStore(),
+        pull_requests=GhWorkspacePullRequests(
+            commands,
+            repository=_REPOSITORY,
+            base_branch=_BASE_BRANCH,
+        ),
+    )
+
+    result = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=WorkspaceIssue(
+                number=_ISSUE_NUMBER,
+                title="[Optimize] Improve policy coverage",
+                body="Improve policy coverage without weakening safety.",
+                base_commit=_BASE_COMMIT,
+            ),
+            trigger=WorkspaceTrigger.ISSUE_CREATED,
+        )
+    )
+
+    assert result.workspace_pull_request is not None
+    assert result.workspace_pull_request.number == 104
+    assert commands.invocations.count(list_by_branch) == 2
+    assert commands.invocations.count(list_by_marker) == 2
+    assert not any(
+        invocation[:3] == ("gh", "pr", "create")
+        for invocation in commands.invocations
+    )
+
+
+def test_issue_creation_reuses_a_matching_remote_branch_commit(
+    tmp_path: Path,
+) -> None:
+    list_by_branch = (
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        _REPOSITORY,
+        "--state",
+        "all",
+        "--head",
+        _BRANCH,
+        "--json",
+        "number,headRefName,baseRefName,title,body,isDraft,state",
+        "--limit",
+        "2",
+    )
+    list_by_marker = (
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        _REPOSITORY,
+        "--state",
+        "all",
+        "--search",
+        '"foundry-opt:workspace-pr:issue-31:v1" in:body',
+        "--json",
+        "number,headRefName,baseRefName,title,body,isDraft,state",
+        "--limit",
+        "2",
+    )
+    branch_ref = f"refs/heads/{_BRANCH}"
+    remote_url = f"https://github.com/{_REPOSITORY}.git\n"
+    commands = FakeCommands(
+        {
+            list_by_branch: "[]",
+            list_by_marker: "[]",
+            (
+                "git",
+                "config",
+                "--get-all",
+                "remote.origin.url",
+            ): remote_url,
+            (
+                "git",
+                "remote",
+                "get-url",
+                "--push",
+                "--all",
+                "origin",
+            ): remote_url,
+            (
+                "git",
+                "ls-remote",
+                "--heads",
+                "origin",
+                branch_ref,
+            ): f"{_BASE_COMMIT}\t{branch_ref}\n",
+            (
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                _REPOSITORY,
+                "--draft",
+                "--base",
+                _BASE_BRANCH,
+                "--head",
+                _BRANCH,
+                "--title",
+                "[Optimize] #31 workspace - draft, not yet selectable",
+                "--body-file",
+                "-",
+            ): f"https://github.com/{_REPOSITORY}/pull/104\n",
+        }
+    )
+    workspace = OptimizationWorkspace(
+        store=InMemoryWorkspaceStore(),
+        pull_requests=GhWorkspacePullRequests(
+            commands,
+            repository=_REPOSITORY,
+            base_branch=_BASE_BRANCH,
+        ),
+    )
+
+    result = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=WorkspaceIssue(
+                number=_ISSUE_NUMBER,
+                title="[Optimize] Improve policy coverage",
+                body="Improve policy coverage without weakening safety.",
+                base_commit=_BASE_COMMIT,
+            ),
+            trigger=WorkspaceTrigger.ISSUE_CREATED,
+        )
+    )
+
+    assert result.workspace_pull_request is not None
+    assert result.workspace_pull_request.number == 104
+    assert commands.invocations.count(list_by_branch) == 2
+    assert not any(
+        invocation[:2] == ("git", "push")
+        for invocation in commands.invocations
+    )
+
+
+def test_issue_creation_rejects_a_mismatched_remote_branch_commit(
+    tmp_path: Path,
+) -> None:
+    branch_ref = f"refs/heads/{_BRANCH}"
+    remote_url = f"https://github.com/{_REPOSITORY}.git\n"
+    commands = FakeCommands(
+        {
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                _REPOSITORY,
+                "--state",
+                "all",
+                "--head",
+                _BRANCH,
+                "--json",
+                "number,headRefName,baseRefName,title,body,isDraft,state",
+                "--limit",
+                "2",
+            ): "[]",
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                _REPOSITORY,
+                "--state",
+                "all",
+                "--search",
+                '"foundry-opt:workspace-pr:issue-31:v1" in:body',
+                "--json",
+                "number,headRefName,baseRefName,title,body,isDraft,state",
+                "--limit",
+                "2",
+            ): "[]",
+            (
+                "git",
+                "config",
+                "--get-all",
+                "remote.origin.url",
+            ): remote_url,
+            (
+                "git",
+                "remote",
+                "get-url",
+                "--push",
+                "--all",
+                "origin",
+            ): remote_url,
+            (
+                "git",
+                "ls-remote",
+                "--heads",
+                "origin",
+                branch_ref,
+            ): f"{'b' * 40}\t{branch_ref}\n",
+        }
+    )
+    workspace = OptimizationWorkspace(
+        store=InMemoryWorkspaceStore(),
+        pull_requests=GhWorkspacePullRequests(
+            commands,
+            repository=_REPOSITORY,
+            base_branch=_BASE_BRANCH,
+        ),
+    )
+
+    with pytest.raises(
+        GitHubWorkspacePullRequestError,
+        match="branch does not match base commit",
+    ):
+        workspace.advance(
+            WorkspaceRequest(
+                repository_root=tmp_path,
+                issue=WorkspaceIssue(
+                    number=_ISSUE_NUMBER,
+                    title="[Optimize] Improve policy coverage",
+                    body=(
+                        "Improve policy coverage without weakening safety."
+                    ),
+                    base_commit=_BASE_COMMIT,
+                ),
+                trigger=WorkspaceTrigger.ISSUE_CREATED,
+            )
+        )
+
+    assert not any(
+        invocation[:2] == ("git", "push")
+        or invocation[:3] == ("gh", "pr", "create")
+        for invocation in commands.invocations
+    )
