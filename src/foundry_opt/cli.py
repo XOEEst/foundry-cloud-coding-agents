@@ -64,6 +64,11 @@ workspace_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(workspace_app, name="workspace")
+workspace_migration_app = typer.Typer(
+    help="Inventory, convert, and safely archive legacy workspace refs.",
+    no_args_is_help=True,
+)
+workspace_app.add_typer(workspace_migration_app, name="migration")
 
 
 def _version_callback(value: bool) -> None:
@@ -149,12 +154,182 @@ def build_workspace_service():
     return build_production_workspace_service()
 
 
+def build_workspace_migration_service():
+    """Return the production legacy workspace migration service."""
+    from foundry_opt.orchestration.workspace_migration import (
+        build_production_workspace_migration_service,
+    )
+
+    return build_production_workspace_migration_service(Path.cwd())
+
+
 def _workspace_failure(error: Exception) -> None:
     typer.echo(
         f"Workspace error: {redact(str(error))}",
         err=True,
     )
     raise typer.Exit(1)
+
+
+def _workspace_migration_output(result) -> None:
+    typer.echo(
+        json.dumps(
+            result.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _workspace_migration_failure(error: Exception) -> None:
+    typer.echo(
+        json.dumps(
+            {
+                "error": redact(str(error)),
+                "status": "refused",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    raise typer.Exit(1)
+
+
+@workspace_migration_app.command("inventory")
+def workspace_migration_inventory() -> None:
+    """Inventory legacy v3 state and inbox refs without exposing contents."""
+    try:
+        result = build_workspace_migration_service().inventory()
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_migration_failure(error)
+    _workspace_migration_output(result)
+
+
+@workspace_migration_app.command("convert")
+def workspace_migration_convert(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    expected_source_revision: Annotated[
+        str,
+        typer.Option(
+            "--expected-source-revision",
+            help="Exact v3 state revision returned by inventory.",
+        ),
+    ],
+) -> None:
+    """Convert one verified closed v3 state ref to its compact v4 audit ref."""
+    try:
+        result = build_workspace_migration_service().convert(
+            issue_number,
+            expected_source_revision=expected_source_revision,
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_migration_failure(error)
+    _workspace_migration_output(result)
+
+
+@workspace_migration_app.command("archive")
+def workspace_migration_archive(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Delete only refs matching all exact planned revisions.",
+        ),
+    ] = False,
+    expected_state_revision: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-state-revision",
+            help="Planned state SHA, or 'absent'. Required with --apply.",
+        ),
+    ] = None,
+    expected_inbox_revision: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-inbox-revision",
+            help="Planned inbox SHA, or 'absent'. Required with --apply.",
+        ),
+    ] = None,
+    expected_audit_revision: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-audit-revision",
+            help="Planned audit SHA, or 'absent'. Required with --apply.",
+        ),
+    ] = None,
+) -> None:
+    """Produce a dry-run archive plan, or apply its exact revisions."""
+    try:
+        if not apply:
+            if any(
+                value is not None
+                for value in (
+                    expected_state_revision,
+                    expected_inbox_revision,
+                    expected_audit_revision,
+                )
+            ):
+                raise ValueError(
+                    "expected revisions require --apply"
+                )
+            result = build_workspace_migration_service().plan_archive(
+                issue_number
+            )
+        else:
+            missing = [
+                option
+                for option, value in (
+                    (
+                        "--expected-state-revision",
+                        expected_state_revision,
+                    ),
+                    (
+                        "--expected-inbox-revision",
+                        expected_inbox_revision,
+                    ),
+                    (
+                        "--expected-audit-revision",
+                        expected_audit_revision,
+                    ),
+                )
+                if value is None
+            ]
+            if missing:
+                raise typer.BadParameter(
+                    f"{', '.join(missing)} required with --apply"
+                )
+            result = build_workspace_migration_service().apply_archive(
+                issue_number,
+                expected_revisions={
+                    "audit": _migration_revision(
+                        expected_audit_revision
+                    ),
+                    "inbox": _migration_revision(
+                        expected_inbox_revision
+                    ),
+                    "state": _migration_revision(
+                        expected_state_revision
+                    ),
+                },
+            )
+    except typer.BadParameter:
+        raise
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_migration_failure(error)
+    _workspace_migration_output(result)
+
+
+def _migration_revision(value: str | None) -> str | None:
+    if value == "absent":
+        return None
+    return value
 
 
 @workspace_app.command("advance")
