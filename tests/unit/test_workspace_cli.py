@@ -13,6 +13,7 @@ from foundry_opt.orchestration import (
     WorkspacePhase,
     WorkspacePullRequest,
     WorkspaceResult,
+    WorkspaceTrigger,
 )
 
 
@@ -75,6 +76,35 @@ def test_workspace_advance_emits_stable_json(
         "status": "workspace_ready",
         "workspace_pull_request_number": 104,
     }
+
+
+def test_workspace_advance_accepts_explicit_lifecycle_trigger(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    class Service:
+        def advance(self, request: WorkspaceAdvanceRequest):
+            assert request.trigger is WorkspaceTrigger.DEPLOYMENT_COMPLETED
+            return _result()
+
+    monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "advance",
+            "--issue",
+            "31",
+            "--trigger",
+            "deployment_completed",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
 
 
 def test_workspace_help_exposes_advance_and_intake() -> None:

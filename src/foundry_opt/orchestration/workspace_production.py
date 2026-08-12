@@ -179,6 +179,11 @@ class ProductionWorkspaceService:
             base_commit = pull_request.base_commit
         elif existing is not None:
             number, base_commit = existing
+            selected = request.trigger in {
+                WorkspaceTrigger.PULL_REQUEST_MERGED,
+                WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+                WorkspaceTrigger.RETENTION_COMPLETED,
+            }
             pull_request = WorkspacePullRequest(
                 number=number,
                 issue_number=request.issue_number,
@@ -187,10 +192,14 @@ class ProductionWorkspaceService:
                     f"issue-{request.issue_number}"
                 ),
                 title=(
-                    f"[Optimize] #{request.issue_number} workspace - "
-                    "draft, not yet selectable"
+                    f"[Optimize] #{request.issue_number} selected candidate"
+                    if selected
+                    else (
+                        f"[Optimize] #{request.issue_number} workspace - "
+                        "draft, not yet selectable"
+                    )
                 ),
-                draft=True,
+                draft=not selected,
                 reuse_existing=True,
                 base_commit=base_commit,
             )

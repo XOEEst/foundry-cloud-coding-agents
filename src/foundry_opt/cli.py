@@ -163,6 +163,13 @@ def workspace_advance(
         int,
         typer.Option("--issue", min=1, help="Optimization issue number."),
     ],
+    trigger: Annotated[
+        str,
+        typer.Option(
+            "--trigger",
+            help="Trusted lifecycle trigger to apply.",
+        ),
+    ] = "continue",
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Emit a stable JSON result."),
@@ -172,12 +179,15 @@ def workspace_advance(
     from foundry_opt.orchestration.workspace_production import (
         WorkspaceAdvanceRequest,
     )
+    from foundry_opt.orchestration.workspace import WorkspaceTrigger
 
     try:
+        lifecycle_trigger = WorkspaceTrigger(trigger)
         result = build_workspace_service().advance(
             WorkspaceAdvanceRequest(
                 repository_root=Path.cwd(),
                 issue_number=issue_number,
+                trigger=lifecycle_trigger,
             )
         )
     except (RuntimeError, ValueError, OSError) as error:
@@ -192,9 +202,15 @@ def workspace_advance(
         )
     else:
         pull_request = result.workspace_pull_request
+        next_action = (
+            result.next_action.kind.value
+            if result.next_action is not None
+            else "none"
+        )
         typer.echo(
             f"Workspace {result.phase.value}: "
-            f"draft PR #{pull_request.number if pull_request else 'unknown'}"
+            f"PR #{pull_request.number if pull_request else 'unknown'}; "
+            f"next action {next_action}"
         )
 
 

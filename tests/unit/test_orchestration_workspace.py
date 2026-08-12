@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from foundry_opt.orchestration import (
+    CandidateSummary,
     InMemoryWorkspaceStore,
     OptimizationWorkspace,
     WorkspaceIssue,
@@ -11,6 +12,7 @@ from foundry_opt.orchestration import (
     WorkspacePullRequest,
     WorkspaceRequest,
     WorkspaceTrigger,
+    WorkspaceUpdate,
 )
 
 
@@ -69,6 +71,11 @@ def test_issue_creation_plans_one_persistent_draft_workspace_pr(
     assert result.workspace_pull_request.reuse_existing is True
     assert result.workspace_pull_request.base_commit == "a" * 40
     assert result.planned_effect_kinds == ("workspace_pr_sync",)
+    assert result.next_action is not None
+    assert result.next_action.kind.value == "run_candidate_experiments"
+    assert result.next_action.trigger is (
+        WorkspaceTrigger.EXPERIMENTS_COMPLETED
+    )
 
 
 def test_issue_creation_commits_the_synchronized_workspace_pr_number(
@@ -353,12 +360,97 @@ def test_issue_creation_rejects_a_mismatched_synchronized_pr(
     assert store.load(31) is None
 
 
-def test_first_slice_rejects_unimplemented_triggers(
+def test_lifecycle_triggers_advance_same_workspace_and_preserve_selection(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryWorkspaceStore()
+    pull_requests = AssigningWorkspacePullRequests()
+    workspace = OptimizationWorkspace(
+        store=store,
+        pull_requests=pull_requests,
+    )
+    issue = WorkspaceIssue(
+        number=31,
+        title="[Optimize] Improve policy coverage",
+        body="Improve policy coverage without weakening safety.",
+        base_commit="a" * 40,
+    )
+    draft = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=issue,
+            trigger=WorkspaceTrigger.ISSUE_CREATED,
+        )
+    ).workspace_pull_request
+    assert draft is not None
+    store.commit(
+        expected_revision=store.load(31).revision,
+        update=WorkspaceUpdate(
+            issue_number=31,
+            phase=WorkspacePhase.AWAITING_SELECTION,
+            workspace_pull_request_number=104,
+            semantic_event="experiments_completed",
+            candidates=(
+                CandidateSummary(
+                    candidate_id="candidate-2",
+                    metrics={"quality": 2.0},
+                    eligible=True,
+                    selected=True,
+                ),
+            ),
+            selected_patch=b"selected patch",
+            external_operation_ids=("evaluation-2",),
+        ),
+    )
+    selected = replace(
+        draft,
+        title="[Optimize] #31 selected candidate",
+        draft=False,
+    )
+
+    deployment = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=issue,
+            trigger=WorkspaceTrigger.PULL_REQUEST_MERGED,
+            workspace_pull_request=selected,
+        )
+    )
+    retention = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=issue,
+            trigger=WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+            workspace_pull_request=selected,
+        )
+    )
+    completed = workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=issue,
+            trigger=WorkspaceTrigger.RETENTION_COMPLETED,
+            workspace_pull_request=selected,
+        )
+    )
+
+    assert deployment.phase is WorkspacePhase.DEPLOYMENT
+    assert deployment.next_action.kind.value == "deploy_selected_candidate"
+    assert retention.phase is WorkspacePhase.RETENTION
+    assert retention.next_action.kind.value == "complete_retention"
+    assert completed.phase is WorkspacePhase.COMPLETED
+    assert completed.next_action.kind.value == "none"
+    final = store.load(31)
+    assert final.candidates[0].selected is True
+    assert final.selected_patch == b"selected patch"
+    assert final.external_operation_ids == ("evaluation-2",)
+
+
+def test_lifecycle_rejects_out_of_order_trigger(
     tmp_path: Path,
 ) -> None:
     workspace = OptimizationWorkspace()
 
-    with pytest.raises(ValueError, match="workspace trigger"):
+    with pytest.raises(ValueError, match="workspace transition"):
         workspace.advance(
             WorkspaceRequest(
                 repository_root=tmp_path,
