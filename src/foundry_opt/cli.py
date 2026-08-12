@@ -6,6 +6,11 @@ from typing import Annotated
 import typer
 
 from foundry_opt import __version__
+from foundry_opt.auth import (
+    AUTH_PROBE_SCOPE,
+    AuthProbeRequest,
+    AuthProbeResult,
+)
 from foundry_opt.config import OptimizerConfig, load_config
 from foundry_opt.config.loader import ConfigLoadError
 from foundry_opt.onboarding import (
@@ -49,6 +54,11 @@ steward_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(steward_app, name="steward")
+auth_app = typer.Typer(
+    help="Inspect product-side Azure OIDC readiness without exposing credentials.",
+    no_args_is_help=True,
+)
+app.add_typer(auth_app, name="auth")
 
 
 def _version_callback(value: bool) -> None:
@@ -116,6 +126,89 @@ def build_candidate_design_submission_service():
     )
 
     return build_production_candidate_design_submission_service()
+
+
+def build_auth_probe():
+    """Return the deterministic product-side OIDC probe."""
+    from foundry_opt.auth import build_production_auth_probe
+
+    return build_production_auth_probe()
+
+
+def _render_auth_probe(result: AuthProbeResult) -> str:
+    tokens = ", ".join(
+        f"{item.resource}={'pass' if item.success else 'fail'}"
+        for item in result.token_acquisition
+    )
+    foundry = result.foundry_connectivity
+    return "\n".join(
+        (
+            f"Environment: {result.environment_kind.value}",
+            (
+                "OIDC request variables present: "
+                f"{str(result.oidc_request_variables.present).lower()}"
+            ),
+            (
+                "Azure principal: "
+                f"{result.azure_principal.principal_type}; "
+                "configured client match="
+                f"{str(result.azure_principal.client_match).lower()}"
+            ),
+            f"Token acquisition: {tokens}",
+            (
+                "Foundry read-only connectivity: "
+                f"{str(foundry.read_only_access_success).lower()}"
+            ),
+            "Refresh/reacquisition: unknown",
+            (
+                "Direct operations eligible: "
+                f"{str(result.direct_operations_eligible).lower()}"
+            ),
+        )
+    )
+
+
+@auth_app.command("probe")
+def auth_probe(
+    scope: Annotated[
+        str,
+        typer.Option(
+            "--scope",
+            help="Product auth scope to inspect.",
+        ),
+    ] = ...,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit a stable JSON result.",
+        ),
+    ] = False,
+) -> None:
+    """Probe current product-side Azure OIDC readiness without printing tokens."""
+    if scope != AUTH_PROBE_SCOPE:
+        typer.echo(
+            "Authentication probe input error: unsupported scope.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    result = build_auth_probe().run(
+        AuthProbeRequest(
+            repository_root=Path.cwd(),
+            scope=scope,
+        )
+    )
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(_render_auth_probe(result))
+    raise typer.Exit(result.exit_code)
 
 
 def _render_onboarding(result: OnboardingResult) -> str:
