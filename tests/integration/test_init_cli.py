@@ -184,9 +184,13 @@ def test_init_cli_returns_zero_and_describes_draft_pr(
     assert "Draft PR: Configure Foundry optimizer onboarding" in result.stdout
     assert "https://github.com/octo-org/agents/pull/42" in result.stdout
     assert ".github/foundry-optimizer.yaml" in result.stdout
-    assert ".github/workflows/foundry-optimization-capability.yml" in (
+    assert ".github/workflows/foundry-optimization-operations.yml" in (
         result.stdout
     )
+    assert ".github/workflows/foundry-optimization-workspace.yml" in (
+        result.stdout
+    )
+    assert ".github/workflows/deploy-foundry-agent.yml" in result.stdout
     assert "COPILOT_ASSIGNMENT_TOKEN" in result.stdout
     assert "foundry-opt init cannot create Actions secrets" in result.stdout
     assert "installation token" in result.stdout

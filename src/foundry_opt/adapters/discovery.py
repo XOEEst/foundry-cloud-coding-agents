@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -346,16 +347,12 @@ def _discover_deployment_workflows(
     workflow_root = root / ".github/workflows"
     if not workflow_root.is_dir():
         return ()
+    generated_workflows = _owned_generated_workflows(root)
     discoveries: list[DeploymentWorkflowDiscovery] = []
     paths = sorted((*workflow_root.glob("*.yml"), *workflow_root.glob("*.yaml")))
     for path in paths:
-        if path.name in {
-            "copilot-setup-steps.yml",
-            "foundry-exact-candidate-check.yml",
-            "foundry-optimization-deployment-bridge.yml",
-            "foundry-optimization-issue-intake.yml",
-            "foundry-optimization-reconcile.yml",
-        }:
+        relative_path = path.relative_to(root).as_posix()
+        if relative_path in generated_workflows:
             continue
         try:
             content = path.read_text(encoding="utf-8")
@@ -401,6 +398,37 @@ def _discover_deployment_workflows(
             )
         )
     return tuple(discoveries)
+
+
+def _owned_generated_workflows(root: Path) -> frozenset[str]:
+    manifest_path = root / ".github/foundry-optimizer.generated.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return frozenset()
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        return frozenset()
+    owned: set[str] = set()
+    for relative_path, expected_digest in files.items():
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path.startswith(".github/workflows/")
+            or not isinstance(expected_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+        ):
+            continue
+        path = root / Path(relative_path)
+        try:
+            content = path.read_text(encoding="utf-8")
+            actual_digest = hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest()
+        except (OSError, UnicodeError):
+            continue
+        if actual_digest == expected_digest:
+            owned.add(relative_path)
+    return frozenset(owned)
 
 
 def _deployment_trigger(

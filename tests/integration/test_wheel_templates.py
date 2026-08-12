@@ -54,5 +54,11 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
     assert "https://management.azure.com" not in generation
     assert "FOUNDRY_OPT_COPILOT_GIT_PROXY=1" in skill
     assert "pull_request_target" in bundle
-    assert "foundry-optimization-capability.yml" in bundle
+    assert "foundry-optimization-workspace.yml" in bundle
+    assert "foundry-optimization-operations.yml" in bundle
+    assert "deploy-foundry-agent.yml" in bundle
+    assert "foundry-candidate-designer.agent.md" not in bundle.split(
+        "def _previous_repository_agent_bundle",
+        1,
+    )[0]
     assert "python -m foundry_opt.orchestration.capability_bridge" in bundle

@@ -230,24 +230,46 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         change.path.as_posix() for change in result.changes
     }
     assert {
+        path
+        for path in generated_paths
+        if path.startswith(".github/agents/")
+    } == {
+        ".github/agents/foundry-optimization-steward.agent.md",
+    }
+    assert {
+        path
+        for path in generated_paths
+        if path.startswith(".github/workflows/")
+    } == {
+        ".github/workflows/copilot-setup-steps.yml",
+        ".github/workflows/deploy-foundry-agent.yml",
+        ".github/workflows/foundry-exact-candidate-check.yml",
+        ".github/workflows/foundry-optimization-operations.yml",
+        ".github/workflows/foundry-optimization-workspace.yml",
+    }
+    assert {
         ".github/foundry-optimizer.yaml",
         ".github/workflows/copilot-setup-steps.yml",
         ".github/skills/foundry-agent-optimizer/SKILL.md",
         ".github/ISSUE_TEMPLATE/foundry-optimization.yml",
+        ".github/agents/foundry-optimization-steward.agent.md",
+        ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md",
+        ".github/workflows/deploy-foundry-agent.yml",
+        ".github/workflows/foundry-exact-candidate-check.yml",
+        ".github/workflows/foundry-optimization-operations.yml",
+        ".github/workflows/foundry-optimization-workspace.yml",
+        ".github/foundry-optimizer.generated.json",
+    } <= generated_paths
+    assert not {
         ".github/agents/foundry-optimization-planner.agent.md",
         ".github/agents/foundry-candidate-designer.agent.md",
         ".github/agents/foundry-candidate-applier.agent.md",
-        ".github/agents/foundry-optimization-steward.agent.md",
-        ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md",
-        ".github/skills/foundry-agent-optimizer/SKILL.md",
-        ".github/workflows/copilot-setup-steps.yml",
-        ".github/workflows/foundry-exact-candidate-check.yml",
         ".github/workflows/foundry-optimization-issue-intake.yml",
         ".github/workflows/foundry-optimization-reconcile.yml",
+        ".github/workflows/foundry-optimization-handoff.yml",
+        ".github/workflows/foundry-optimization-capability.yml",
         ".github/workflows/foundry-optimization-deployment-bridge.yml",
-        ".github/workflows/foundry-exact-candidate-check.yml",
-        ".github/foundry-optimizer.generated.json",
-    } <= generated_paths
+    } & generated_paths
     assert probe.deleted == [
         ("support-agent", "draft-onboarding-probe")
     ]
@@ -320,10 +342,7 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         change.content
         for change in result.changes
         if change.path.as_posix()
-        == (
-            ".github/workflows/"
-            "foundry-optimization-deployment-bridge.yml"
-        )
+        == ".github/workflows/deploy-foundry-agent.yml"
     )
     assert yaml.safe_load(deployment_workflow)[True]["workflow_run"][
         "workflows"
@@ -445,15 +464,25 @@ def test_generated_change_set_has_content_addressed_ownership_manifest(
         if path != manifest_path
     }
     assert set(manifest["obsolete"]) == {
+        ".github/agents/foundry-candidate-applier.agent.md",
+        ".github/agents/foundry-candidate-designer.agent.md",
+        ".github/agents/foundry-optimization-planner.agent.md",
         ".github/agents/foundry-optimization-runner.agent.md",
+        ".github/workflows/campaign-drafts.yml",
+        ".github/workflows/campaign-evaluate.yml",
+        ".github/workflows/foundry-optimization-capability.yml",
         ".github/workflows/foundry-optimization-control.yml",
+        ".github/workflows/foundry-optimization-deployment-bridge.yml",
+        ".github/workflows/foundry-optimization-handoff.yml",
+        ".github/workflows/foundry-optimization-issue-intake.yml",
+        ".github/workflows/foundry-optimization-reconcile.yml",
         ".github/workflows/foundry-post-deployment-check.yml",
     }
     assert {
-        ".github/agents/foundry-optimization-planner.agent.md",
-        ".github/agents/foundry-candidate-applier.agent.md",
         ".github/agents/foundry-optimization-steward.agent.md",
-        ".github/workflows/foundry-optimization-issue-intake.yml",
+        ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md",
+        ".github/skills/foundry-agent-optimizer/SKILL.md",
+        ".github/workflows/copilot-setup-steps.yml",
     } <= set(manifest["accepted_previous_sha256"])
     assert manifest["accepted_previous_sha256"][
         ".github/skills/foundry-agent-optimizer/SKILL.md"
@@ -463,7 +492,6 @@ def test_generated_change_set_has_content_addressed_ownership_manifest(
     assert {
         ".github/workflows/copilot-setup-steps.yml",
         ".github/workflows/foundry-exact-candidate-check.yml",
-        ".github/workflows/foundry-optimization-issue-intake.yml",
     } <= set(manifest["accepted_previous_normalized_sha256"])
     workflow_path = Path(".github/workflows/copilot-setup-steps.yml")
     marker_block = (
@@ -510,6 +538,7 @@ def test_generated_change_set_has_content_addressed_ownership_manifest(
     ]
     assert {
         ".github/workflows/foundry-optimization-control.yml",
+        ".github/workflows/foundry-optimization-issue-intake.yml",
         ".github/workflows/foundry-post-deployment-check.yml",
     } <= set(manifest["obsolete_normalized_sha256"])
 

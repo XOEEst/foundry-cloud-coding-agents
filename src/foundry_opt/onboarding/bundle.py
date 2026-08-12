@@ -31,7 +31,83 @@ def generate_repository_agent_bundle(
 ) -> dict[Path, str]:
     contents = _copy_skill_template()
     skill_root = Path(".github/skills/foundry-agent-optimizer")
-    contents[skill_root / "REPOSITORY_CONTEXT.md"] = (
+    contents[skill_root / "REPOSITORY_CONTEXT.md"] = _repository_context(
+        request,
+        oidc_subject=oidc_subject,
+    )
+    contents.update(
+        {
+            Path(".foundry-optimizer/.gitignore"): (
+                "campaigns/\nworktrees/\ncapability-worktrees/\n"
+            ),
+            Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml"): (
+                _issue_form(request)
+            ),
+            Path(
+                ".github/agents/foundry-optimization-steward.agent.md"
+            ): _steward_agent(),
+            Path(
+                ".github/workflows/foundry-optimization-workspace.yml"
+            ): _workspace_workflow(request),
+            Path(
+                ".github/workflows/foundry-optimization-operations.yml"
+            ): _operations_workflow(request),
+            Path(
+                ".github/workflows/foundry-exact-candidate-check.yml"
+            ): _candidate_check_workflow(request),
+            Path(
+                ".github/workflows/deploy-foundry-agent.yml"
+            ): _deployment_bridge_workflow(
+                request,
+                deployment_workflow_name=deployment_workflow_name,
+            ),
+        }
+    )
+    return contents
+
+
+def _repository_context(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str,
+) -> str:
+    return (
+        "# Repository optimization context\n\n"
+        f"- Configured target: `{request.target_name}`\n"
+        f"- Configured environment: `{request.environment_name}`\n"
+        f"- Verified immutable OIDC subject: `{oidc_subject}`\n"
+        "- Configuration: `.github/foundry-optimizer.yaml`\n"
+        "- Azure authentication is OIDC-only; never request credentials.\n"
+        "- GitHub Copilot receives non-secret Azure identifiers through "
+        "repository-level Agents variables.\n"
+        "- Deployment uses only the separate "
+        "`AZURE_DEPLOYMENT_CLIENT_ID` Actions-environment variable.\n"
+        "- Foundry operations and post-deployment evaluation run only in "
+        "`foundry-optimization-operations.yml` under the optimizer "
+        "`AZURE_CLIENT_ID`; Copilot performs no Foundry network operations.\n"
+        "- Copilot session assignment uses the repository Actions secret "
+        "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
+        "user-to-server token; an installation token is not supported.\n"
+        "- foundry-opt init cannot create Actions secrets; configure the "
+        "assignment secret manually and never commit its value.\n"
+        "- Create the generated `[Optimize]` issue to start one persistent "
+        "draft workspace pull request; workflow dispatch is retry-only.\n"
+        "- `.github/foundry-optimizer.yaml` is durable repository policy; "
+        "each issue supplies its own goal and assets within that boundary.\n"
+        "- The steward compares bounded candidates internally, updates the "
+        "same workspace pull request, and never creates worker issues, "
+        "specialist pull requests, or internal handoff pull requests.\n"
+        "- Normal user action: watch the issue and its one workspace pull "
+        "request, then merge that pull request when it becomes eligible.\n"
+    )
+
+
+def _previous_repository_context(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str,
+) -> str:
+    return (
         "# Repository optimization context\n\n"
         f"- Configured target: `{request.target_name}`\n"
         f"- Configured environment: `{request.environment_name}`\n"
@@ -64,6 +140,18 @@ def generate_repository_agent_bundle(
         "`refs/heads/foundry-opt/state/issue-<N>`; issue comments and labels "
         "are projections.\n"
     )
+
+
+def _previous_repository_agent_bundle(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str,
+    deployment_workflow_name: str = "Foundry deployment",
+) -> dict[Path, str]:
+    contents = _copy_skill_template()
+    contents[
+        Path(".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md")
+    ] = _previous_repository_context(request, oidc_subject=oidc_subject)
     contents.update(
         {
             Path(".foundry-optimizer/.gitignore"): (
@@ -83,7 +171,7 @@ def generate_repository_agent_bundle(
             ): _applier_agent(),
             Path(
                 ".github/agents/foundry-optimization-steward.agent.md"
-            ): _steward_agent(),
+            ): _previous_steward_agent(),
             Path(
                 ".github/workflows/foundry-optimization-issue-intake.yml"
             ): _issue_intake_workflow(request),
@@ -102,6 +190,7 @@ def generate_repository_agent_bundle(
             ): _deployment_bridge_workflow(
                 request,
                 deployment_workflow_name=deployment_workflow_name,
+                consolidated=False,
             ),
             Path(
                 ".github/workflows/foundry-exact-candidate-check.yml"
@@ -378,6 +467,46 @@ rejects the candidate.
 def _steward_agent() -> str:
     return """---
 name: foundry-optimization-steward
+description: Own one issue's persistent Foundry optimization workspace.
+target: github-copilot
+tools: ["read", "search", "edit", "execute"]
+disable-model-invocation: false
+---
+
+Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
+`REPOSITORY_CONTEXT.md`, the assigned optimization issue, and the existing
+workspace pull request for that issue. These single-workspace rules supersede
+legacy specialist and internal-handoff descriptions in the copied skill.
+
+Own exactly one persistent draft workspace pull request. Use
+`foundry-opt steward advance --issue <number> --json` exactly once per
+assignment and resume only from durable workspace state. You must
+compare bounded candidates internally.
+Then update the same pull request with the exact selected patch and
+privacy-safe evidence. Never create a second optimization pull request.
+
+Never create a worker issue. Never create an internal handoff pull request.
+Never delegate to planner, designer, or applier agents. Do not reproduce
+workspace transitions in prose, shell, comments, labels, or ad hoc files.
+The canonical command owns candidate bounds, evaluation, eligibility,
+selection, deployment intent, and retained-improvement state.
+
+Edit only the paths allowed by the immutable issue and repository policy.
+Never expose credentials, private dataset rows, held-out cases, raw traces,
+evaluator prompts, or unredacted evidence. Copilot never calls Foundry network
+adapters; the optimizer-OIDC operations workflow performs persisted Foundry
+operations and post-deployment evaluation. Deployment remains isolated under
+the separate deployment identity.
+
+After the single command returns, stop immediately. A blocked, wait, or retry
+result means stop for the workspace workflow or operations workflow to resume
+the same pull request. Do not continue investigating or attempt a workaround.
+"""
+
+
+def _previous_steward_agent() -> str:
+    return """---
+name: foundry-optimization-steward
 description: Advance one issue-driven optimization campaign from trusted events.
 target: github-copilot
 tools: ["read", "search", "execute"]
@@ -432,6 +561,234 @@ workflows apply only effects already persisted in the outbox.
 After the single command returns, stop immediately. A `blocked`, `delegate`, or `wait`
 disposition, or a `waiting` status, means stop and await transport
 or a new assignment. Do not continue investigating or attempt a workaround.
+"""
+
+
+def _workspace_workflow(request: OnboardingRequest) -> str:
+    install = json.dumps(request.product_install)
+    return f"""name: Foundry optimization workspace
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed]
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review, closed]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Optimization issue number to retry
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: foundry-optimization-workspace
+  cancel-in-progress: false
+
+jobs:
+  advance:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' &&
+      (github.event.action != 'opened' ||
+      startsWith(github.event.issue.title, '[Optimize] '))) ||
+      (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.base.ref ==
+      github.event.repository.default_branch &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(
+      github.event.pull_request.head.ref,
+      'foundry-opt/workspace/issue-'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - name: Require Copilot assignment token
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+        shell: bash
+        run: |
+          if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then
+            echo "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN" >&2
+            exit 1
+          fi
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Resolve trusted workspace issue
+        id: workspace
+        env:
+          DISPATCH_ISSUE: ${{{{ inputs.issue }}}}
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+
+          with open(
+              os.environ["TRUSTED_EVENT_PATH"],
+              encoding="utf-8",
+          ) as stream:
+              event = json.load(stream)
+          event_name = os.environ["TRUSTED_EVENT_NAME"]
+          if event_name == "issues":
+              issue = event.get("issue", {{}}).get("number")
+              pull_request = ""
+          elif event_name == "pull_request_target":
+              pull_request_data = event.get("pull_request", {{}})
+              body = pull_request_data.get("body") or ""
+              matches = re.findall(
+                  r"foundry-opt:workspace-pr:issue-([1-9][0-9]*):v1",
+                  body,
+              )
+              if len(matches) != 1:
+                  raise SystemExit(
+                      "workspace pull request marker is missing or ambiguous"
+                  )
+              issue = int(matches[0])
+              pull_request = str(pull_request_data.get("number") or "")
+          elif event_name == "workflow_dispatch":
+              raw_issue = os.environ.get("DISPATCH_ISSUE", "")
+              issue = int(raw_issue) if re.fullmatch(
+                  r"[1-9][0-9]*",
+                  raw_issue,
+              ) else None
+              pull_request = ""
+          else:
+              raise SystemExit("unsupported workspace event")
+          if type(issue) is not int or issue < 1:
+              raise SystemExit("workspace issue number is invalid")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"issue={{issue}}\\n")
+              output.write(f"pull_request={{pull_request}}\\n")
+      - name: Advance workspace and continue the same Copilot pull request
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_PULL_REQUEST_NUMBER: >-
+            ${{{{ steps.workspace.outputs.pull_request }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
+        run: >-
+          uv run --no-project --no-config --no-env-file
+          --with "$OPTIMIZER_PACKAGE"
+          foundry-opt workspace advance --issue "$ISSUE" --json
+"""
+
+
+def _operations_workflow(request: OnboardingRequest) -> str:
+    install = json.dumps(request.product_install)
+    actions_environment = (
+        request.mirror_actions_environment or request.environment_name
+    )
+    return f"""name: Foundry optimization operations
+
+on:
+  push:
+    branches:
+      - foundry-opt/state/issue-*
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Optional optimization issue number to retry
+        required: false
+        type: number
+
+permissions:
+  contents: write
+  id-token: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: foundry-optimization-operations
+  cancel-in-progress: false
+
+jobs:
+  operate:
+    runs-on: ubuntu-latest
+    environment: {json.dumps(actions_environment)}
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      AZURE_CLIENT_ID: ${{{{ vars.AZURE_CLIENT_ID }}}}
+      AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
+      AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - name: Require Copilot assignment token
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+        shell: bash
+        run: |
+          if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then
+            echo "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN" >&2
+            exit 1
+          fi
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
+        with:
+          client-id: ${{{{ vars.AZURE_CLIENT_ID }}}}
+          tenant-id: ${{{{ vars.AZURE_TENANT_ID }}}}
+          subscription-id: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      - uses: {_SETUP_PYTHON_ACTION} # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Execute persisted optimizer operations
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
+        run: >-
+          uv run --no-project --no-config --no-env-file
+          --with "$OPTIMIZER_PACKAGE"
+          python -m foundry_opt.orchestration.capability_bridge
+      - name: Evaluate retained post-deployment behavior
+        env:
+          REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
+        shell: bash
+        run: |
+          if [ -n "$REQUESTED_ISSUE" ]; then
+            if [[ ! "$REQUESTED_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Invalid issue number" >&2
+              exit 1
+            fi
+            issues=("$REQUESTED_ISSUE")
+          else
+            mapfile -t issues < <(
+              git ls-remote --heads origin \
+                'refs/heads/foundry-opt/state/issue-*' |
+              sed -n \
+                's#.*refs/heads/foundry-opt/state/issue-\\([1-9][0-9]*\\)$#\\1#p' |
+              sort -n -u |
+              head -25
+            )
+          fi
+          for issue in "${{issues[@]}}"; do
+            uv run --no-project --no-config --no-env-file \
+              --with "$OPTIMIZER_PACKAGE" \
+              foundry-opt optimize reconcile --issue "$issue" --json
+          done
 """
 
 
@@ -724,13 +1081,39 @@ def _deployment_bridge_workflow(
     request: OnboardingRequest,
     *,
     deployment_workflow_name: str,
+    consolidated: bool = True,
 ) -> str:
     install = json.dumps(request.product_install)
     workflow_name = json.dumps(deployment_workflow_name)
+    display_name = (
+        "Deploy Foundry agent"
+        if consolidated
+        else "Foundry optimization deployment bridge"
+    )
+    default_branch_env = (
+        ""
+        if consolidated
+        else (
+            "      DEFAULT_BRANCH: "
+            "${{ github.event.repository.default_branch }}\n"
+        )
+    )
+    reconcile = (
+        '            printf \'Recorded deployment publication for issue '
+        '%s\\n\' "$issue"\n'
+        if consolidated
+        else (
+            "            gh workflow run "
+            "foundry-optimization-reconcile.yml               "
+            '--repo "$GITHUB_REPOSITORY"               '
+            '--ref "$DEFAULT_BRANCH"               '
+            '-f "issue=$issue"\n'
+        )
+    )
     actions_environment = (
         request.mirror_actions_environment or request.environment_name
     )
-    return f"""name: Foundry optimization deployment bridge
+    return f"""name: {display_name}
 
 on:
   push:
@@ -775,7 +1158,7 @@ jobs:
       AZURE_CLIENT_ID: ${{{{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}}}
       AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
       AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
-      DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+{default_branch_env}\
       OPTIMIZER_PACKAGE: {install}
     steps:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
@@ -829,10 +1212,7 @@ jobs:
               PUBLICATION_JSON="$publication_json" python -c \
                 'import json, os; value = json.loads(os.environ["PUBLICATION_JSON"]); issue = value.get("issue_number"); assert type(issue) is int and issue > 0; print(issue)'
             )"
-            gh workflow run foundry-optimization-reconcile.yml \
-              --repo "$GITHUB_REPOSITORY" \
-              --ref "$DEFAULT_BRANCH" \
-              -f "issue=$issue"
+{reconcile}\
           elif [ -n "$REQUESTED_ISSUE" ]; then
             if [[ ! "$REQUESTED_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
               echo "Invalid issue number" >&2
@@ -925,7 +1305,7 @@ jobs:
 """
 
 
-def legacy_repository_agent_bundle(
+def _historical_repository_agent_bundle(
     request: OnboardingRequest,
     *,
     oidc_subject: str = "repository_id:legacy-placeholder",
@@ -974,6 +1354,28 @@ def legacy_repository_agent_bundle(
             ".github/workflows/foundry-exact-candidate-check.yml"
         ): _legacy_candidate_check_workflow(request),
     }
+
+
+def legacy_repository_agent_bundle(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str = "repository_id:legacy-placeholder",
+    deployment_workflow_name: str = "Foundry deployment",
+) -> dict[Path, str]:
+    """Return prior generated files and exact content for safe migration."""
+
+    contents = _historical_repository_agent_bundle(
+        request,
+        oidc_subject=oidc_subject,
+    )
+    contents.update(
+        _previous_repository_agent_bundle(
+            request,
+            oidc_subject=oidc_subject,
+            deployment_workflow_name=deployment_workflow_name,
+        )
+    )
+    return contents
 
 
 def _legacy_planner_agent() -> str:
@@ -1295,10 +1697,12 @@ def legacy_repository_agent_hashes(
     request: OnboardingRequest,
     *,
     oidc_subject: str,
+    deployment_workflow_name: str = "Foundry deployment",
 ) -> dict[Path, str]:
     contents = legacy_repository_agent_bundle(
         request,
         oidc_subject=oidc_subject,
+        deployment_workflow_name=deployment_workflow_name,
     )
     hashes = {
         path: hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -1307,6 +1711,12 @@ def legacy_repository_agent_hashes(
     hashes[
         Path(".github/skills/foundry-agent-optimizer/SKILL.md")
     ] = "ff0c3f9a072d5381bfd5d056efc9a0fbb27d82be319297666502a8142143e9e9"
+    hashes[Path(".github/workflows/campaign-drafts.yml")] = (
+        "5823847aa2c124c5865742b5ae1e041af3bec882b2b6a9cf13269e3468adcd23"
+    )
+    hashes[Path(".github/workflows/campaign-evaluate.yml")] = (
+        "c41bf79ee88c750b686d72c90e5fd892c5dbd69f18a95465e1464dd94d4879c6"
+    )
     return hashes
 
 

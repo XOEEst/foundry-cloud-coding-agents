@@ -300,18 +300,18 @@ def generate_change_contents(
         Path(".github/foundry-optimizer.yaml"): config_text,
         Path(".github/workflows/copilot-setup-steps.yml"): workflow_text,
     }
+    deployment_workflow_name = workflow.name or workflow.path.as_posix()
     contents.update(
         generate_repository_agent_bundle(
             request,
             oidc_subject=oidc_subject,
-            deployment_workflow_name=(
-                workflow.name or workflow.path.as_posix()
-            ),
+            deployment_workflow_name=deployment_workflow_name,
         )
     )
     legacy_hashes = legacy_repository_agent_hashes(
         request,
         oidc_subject=oidc_subject,
+        deployment_workflow_name=deployment_workflow_name,
     )
     legacy_hashes[
         Path(".github/workflows/copilot-setup-steps.yml")
@@ -321,6 +321,7 @@ def generate_change_contents(
     legacy_contents = legacy_repository_agent_bundle(
         request,
         oidc_subject=oidc_subject,
+        deployment_workflow_name=deployment_workflow_name,
     )
     legacy_contents[
         Path(".github/workflows/copilot-setup-steps.yml")
