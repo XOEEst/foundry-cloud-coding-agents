@@ -3,10 +3,15 @@ from foundry_opt.orchestration.campaign import (
     OptimizationCampaign,
 )
 from foundry_opt.orchestration.candidate_experiments import (
+    CandidateExperimentActionsGateway,
+    CandidateExperimentOperation,
+    CandidateExperimentPending,
+    CandidateExperimentPlan,
     CandidateExperimentRequest,
     CandidateExperimentResult,
     CandidateExperimentRunner,
     DirectExperimentUnavailable,
+    PersistedCandidateExperimentOperation,
 )
 from foundry_opt.orchestration.public_evidence import (
     AlternativeResult,
@@ -260,6 +265,10 @@ __all__ = [
     "CandidateExperimentRequest",
     "CandidateExperimentResult",
     "CandidateExperimentRunner",
+    "CandidateExperimentActionsGateway",
+    "CandidateExperimentOperation",
+    "CandidateExperimentPending",
+    "CandidateExperimentPlan",
     "CandidateSummary",
     "CandidateAssetsRegistrationPending",
     "CandidateAssetsRegistrationPlan",
@@ -373,6 +382,7 @@ __all__ = [
     "IssueProjection",
     "OptimizationCampaign",
     "OptimizationReport",
+    "PersistedCandidateExperimentOperation",
     "OptimizationWorkspace",
     "OptimizationSpecPolicy",
     "OptimizationSpecServiceResolver",

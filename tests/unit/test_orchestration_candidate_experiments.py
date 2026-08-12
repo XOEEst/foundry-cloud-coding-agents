@@ -1,3 +1,5 @@
+import pytest
+
 from foundry_opt.orchestration import (
     CandidateExperimentRequest,
     CandidateExperimentResult,
@@ -80,3 +82,23 @@ def test_unavailable_direct_evaluation_uses_actions_with_same_request() -> None:
     assert result.executor == "actions_oidc"
     assert direct.calls == 1
     assert actions.calls == 1
+
+
+def test_real_direct_failure_does_not_fall_back_after_side_effects() -> None:
+    class FailingDirect:
+        def evaluate(
+            self,
+            request: CandidateExperimentRequest,
+        ) -> CandidateExperimentResult:
+            raise RuntimeError("Foundry draft creation failed")
+
+    actions = ActionsRunner(_result("actions_oidc"))
+    runner = CandidateExperimentRunner(
+        direct=FailingDirect(),
+        fallback=actions,
+    )
+
+    with pytest.raises(RuntimeError, match="draft creation failed"):
+        runner.evaluate(_request())
+
+    assert actions.calls == 0
