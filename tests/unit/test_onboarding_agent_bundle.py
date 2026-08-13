@@ -401,7 +401,7 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
     assert "head -25" in text
     assert text.count(
         "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
-    ) == 1
+    ) == 2
     assert (
         'if [ "$TRUSTED_EVENT_NAME" = "push" ] &&'
         in text

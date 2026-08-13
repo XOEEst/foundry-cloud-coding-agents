@@ -1132,6 +1132,7 @@ jobs:
           github.event_name == 'workflow_run' ||
           inputs.deployment_run_id != ''
         env:
+          GH_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_WORKFLOW_RUN_ID: >-
