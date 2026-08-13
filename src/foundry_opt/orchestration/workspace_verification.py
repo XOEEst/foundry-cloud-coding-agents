@@ -12,7 +12,11 @@ from typing import Any, Protocol
 
 from foundry_opt.adapters.commands import CommandError, SubprocessCommandRunner
 from foundry_opt.adapters.github import github_repository_from_remote_url
-from foundry_opt.evaluation import MetricPolicy
+from foundry_opt.evaluation import (
+    MetricDirection,
+    MetricPolicy,
+    UndefinedBehavior,
+)
 from foundry_opt.optimization.issues import (
     IssueSpecificationError,
     parse_optimization_issue_request,
@@ -348,7 +352,19 @@ class ProductionWorkspaceVerifyIssueLoader:
         return WorkspaceVerifiedIssue(
             repository=parsed.repository,
             target=parsed.target,
-            metrics=parsed.metrics,
+            metrics={
+                name: MetricPolicy(
+                    name=name,
+                    direction=MetricDirection(policy.direction.value),
+                    threshold=policy.threshold,
+                    materiality=policy.materiality,
+                    hard_guardrail=policy.hard_guardrail,
+                    undefined_behavior=UndefinedBehavior(
+                        policy.undefined_behavior.value
+                    ),
+                )
+                for name, policy in parsed.metrics.items()
+            },
         )
 
 
