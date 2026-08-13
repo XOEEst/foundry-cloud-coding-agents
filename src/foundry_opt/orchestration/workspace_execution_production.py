@@ -600,7 +600,7 @@ def _trusted_execution_inputs(
         _asset_reference(registry.prepare(asset, context).provenance)
         for asset in (*issue_request.datasets, *issue_request.evaluators)
     )
-    if any(asset.remote_id in {None, ""} for asset in assets):
+    if any(not _asset_reference_is_complete(asset) for asset in assets):
         raise RuntimeError("trusted workspace assets are incomplete")
     return _TrustedExecutionInputs(
         config=config,
@@ -610,6 +610,15 @@ def _trusted_execution_inputs(
         request=issue_request,
         spec=spec_result.spec,
         assets=assets,
+    )
+
+
+def _asset_reference_is_complete(
+    asset: EvaluationAssetReference,
+) -> bool:
+    return (
+        asset.remote_id not in {None, ""}
+        or asset.content_sha256 not in {None, ""}
     )
 
 
