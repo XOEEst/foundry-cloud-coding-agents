@@ -18,6 +18,7 @@ from foundry_opt.orchestration import (
 from foundry_opt.orchestration.workspace_operations_executor import (
     WorkspaceOperationsResult,
     WorkspaceOperationsStatus,
+    WorkspaceResumeRequest,
     WorkspaceVerificationRequest,
 )
 from foundry_opt.orchestration.workspace_verification import (
@@ -415,6 +416,69 @@ def test_workspace_operations_execute_emits_stable_json(
         "status": "candidate_recorded",
         "verification": None,
         "workspace_pull_request_number": None,
+    }
+
+
+def test_workspace_operations_execute_emits_baseline_resume_payload(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    class Service:
+        def execute(self, request):
+            return WorkspaceOperationsResult(
+                issue_number=31,
+                status=WorkspaceOperationsStatus.BASELINE_RECORDED,
+                recorded=True,
+                phase=WorkspacePhase.EVALUATING,
+                operation_id="2" * 64,
+                workspace_pull_request_number=104,
+                resume=WorkspaceResumeRequest(
+                    workspace_pull_request_number=104,
+                    comment_marker="<!-- foundry-opt:workspace-resume -->",
+                    comment_body=(
+                        "<!-- foundry-opt:workspace-resume -->\n"
+                        "@copilot continue this same workspace pull request."
+                    ),
+                ),
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_workspace_operations_service",
+        lambda: Service(),
+    )
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "operations",
+            "execute",
+            "--issue",
+            "31",
+            "--event-name",
+            "workflow_dispatch",
+            "--repository",
+            "octo-org/optimizer",
+            "--repository-id",
+            "123",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "baseline_recorded"
+    assert payload["workspace_pull_request_number"] == 104
+    assert payload["resume"] == {
+        "comment_body": (
+            "<!-- foundry-opt:workspace-resume -->\n"
+            "@copilot continue this same workspace pull request."
+        ),
+        "comment_marker": "<!-- foundry-opt:workspace-resume -->",
+        "workspace_pull_request_number": 104,
     }
 
 

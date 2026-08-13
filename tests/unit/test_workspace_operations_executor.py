@@ -27,9 +27,17 @@ from foundry_opt.orchestration.workspace import (
     WorkspaceTrigger,
 )
 from foundry_opt.orchestration.workspace_operations_executor import (
+    PendingWorkspaceBaselineExecution,
+    PersistedWorkspaceBaselineOperation,
     StoredCandidateExperimentResult,
+    StoredWorkspaceBaselineResult,
     WorkspaceCandidateSelectionRequest,
+    WorkspaceBaselineCompletionRequest,
+    WorkspaceBaselineOperation,
+    WorkspaceBaselineRequest,
+    WorkspaceBaselineResult,
     PendingCandidateExperimentExecution,
+    TrustedWorkspaceBaselinePlan,
     TrustedWorkspaceArtifactContext,
     TrustedCandidateExecutionPlan,
     TrustedCandidatePackagingContract,
@@ -71,6 +79,118 @@ def _persisted_candidate_operation() -> (
         ),
         sha256=operation.sha256,
     )
+
+
+def _persisted_baseline_operation() -> PersistedWorkspaceBaselineOperation:
+    request = WorkspaceBaselineRequest(
+        issue_number=31,
+        target_name="support-agent",
+        published_base_version="published-base-7",
+        development_suite="support-dev-suite",
+        idempotency_key="5" * 64,
+    )
+    operation = WorkspaceBaselineOperation.from_request(request)
+    return PersistedWorkspaceBaselineOperation(
+        operation=operation,
+        reference=(
+            "workspace-operations/"
+            f"baseline-{operation.idempotency_key}.json"
+        ),
+        sha256=operation.sha256,
+    )
+
+
+def _baseline_result(
+    operation: PersistedWorkspaceBaselineOperation,
+    **overrides,
+) -> WorkspaceBaselineResult:
+    values = {
+        "target_name": operation.operation.target_name,
+        "executor": "actions_oidc",
+        "metrics": {"quality": 0.74},
+        "evaluation_id": "baseline-eval-31",
+        "run_id": "baseline-run-31",
+        "base_commit": "a" * 40,
+        "published_base_version": (
+            operation.operation.published_base_version
+        ),
+        "development_suite": operation.operation.development_suite,
+        "operation_sha256": operation.sha256,
+        "idempotency_key": operation.operation.idempotency_key,
+    }
+    values.update(overrides)
+    return WorkspaceBaselineResult(**values)
+
+
+def _pending_baseline_execution(
+    operation: PersistedWorkspaceBaselineOperation,
+    *,
+    request_payload: dict[str, object] | None = None,
+) -> PendingWorkspaceBaselineExecution:
+    return PendingWorkspaceBaselineExecution(
+        operation=operation,
+        request_payload=request_payload or {},
+    )
+
+
+def _baseline_plan(
+    pending: PendingWorkspaceBaselineExecution,
+    **overrides,
+) -> TrustedWorkspaceBaselinePlan:
+    operation = pending.operation
+    values = {
+        "operation": operation,
+        "request": WorkspaceBaselineRequest(
+            issue_number=operation.operation.issue_number,
+            target_name=operation.operation.target_name,
+            published_base_version=(
+                operation.operation.published_base_version
+            ),
+            development_suite=operation.operation.development_suite,
+            idempotency_key=operation.operation.idempotency_key,
+        ),
+        "base_commit": "a" * 40,
+        "target_name": operation.operation.target_name,
+        "base_agent_version": 7,
+        "published_base_version": (
+            operation.operation.published_base_version
+        ),
+        "development_suite": operation.operation.development_suite,
+        "assets": (
+            EvaluationAssetReference(
+                asset_id="dataset-development",
+                kind="dataset",
+                source="foundry",
+                role="development",
+                name="support-dev",
+                version="1",
+                remote_id="foundry:dataset:support-dev:1",
+            ),
+            EvaluationAssetReference(
+                asset_id="evaluator-quality",
+                kind="evaluator",
+                source="builtin",
+                name="quality-evaluator",
+                version="1",
+                remote_id="builtin:quality-evaluator:1",
+                metrics=("quality",),
+            ),
+        ),
+        "evaluation_policy": EvaluationPolicy(
+            metrics=(
+                MetricPolicy(
+                    name="quality",
+                    direction=MetricDirection.MAXIMIZE,
+                    threshold=0.7,
+                    materiality=0.1,
+                    hard_guardrail=False,
+                    undefined_behavior=UndefinedBehavior.FAIL,
+                ),
+            )
+        ),
+    }
+    values.update(overrides)
+    return TrustedWorkspaceBaselinePlan(**values)
 
 
 def _candidate_result(
@@ -385,6 +505,113 @@ class RecordingCandidateSelectionService:
         return self._results.pop(0)
 
 
+class RecordingBaselineStore:
+    def __init__(
+        self,
+        pending: PendingWorkspaceBaselineExecution | None,
+    ) -> None:
+        self.pending = pending
+        self.result: StoredWorkspaceBaselineResult | None = None
+        self.workspace: WorkspaceResult | None = None
+        self.persist_calls = 0
+        self.failures: list[Exception] = []
+
+    def load_pending(
+        self,
+        issue_number: int,
+    ) -> PendingWorkspaceBaselineExecution | None:
+        return self.pending if issue_number == 31 else None
+
+    def load_result(
+        self,
+        operation: PersistedWorkspaceBaselineOperation,
+    ) -> StoredWorkspaceBaselineResult | None:
+        return self.result
+
+    def persist_result(
+        self,
+        operation: PersistedWorkspaceBaselineOperation,
+        result: WorkspaceBaselineResult,
+    ) -> StoredWorkspaceBaselineResult:
+        self.persist_calls += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        self.result = StoredWorkspaceBaselineResult(
+            result=result,
+            workspace=self.workspace,
+        )
+        return self.result
+
+
+class RecordingBaselineExecutor:
+    def __init__(
+        self,
+        *,
+        reconciled: list[WorkspaceBaselineResult | None],
+        executed: list[WorkspaceBaselineResult | None],
+    ) -> None:
+        self._reconciled = reconciled
+        self._executed = executed
+        self.reconcile_calls = 0
+        self.execute_calls = 0
+        self.plans: list[TrustedWorkspaceBaselinePlan] = []
+
+    def reconcile(
+        self,
+        plan: TrustedWorkspaceBaselinePlan,
+    ) -> WorkspaceBaselineResult | None:
+        self.reconcile_calls += 1
+        self.plans.append(plan)
+        return self._reconciled.pop(0)
+
+    def execute(
+        self,
+        plan: TrustedWorkspaceBaselinePlan,
+    ) -> WorkspaceBaselineResult | None:
+        self.execute_calls += 1
+        self.plans.append(plan)
+        return self._executed.pop(0)
+
+
+class RecordingBaselinePlanner:
+    def __init__(
+        self,
+        plan: TrustedWorkspaceBaselinePlan | None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.plan = plan
+        self.error = error
+        self.calls: list[tuple[Path, PendingWorkspaceBaselineExecution]] = []
+
+    def resolve(
+        self,
+        repository_root: Path,
+        pending: PendingWorkspaceBaselineExecution,
+    ) -> TrustedWorkspaceBaselinePlan:
+        self.calls.append((repository_root, pending))
+        if self.error is not None:
+            raise self.error
+        assert self.plan is not None
+        return self.plan
+
+
+class RecordingBaselineCompletionService:
+    def __init__(
+        self,
+        results: list[WorkspaceResult | None],
+    ) -> None:
+        self._results = results
+        self.requests: list[WorkspaceBaselineCompletionRequest] = []
+
+    def complete(
+        self,
+        request: WorkspaceBaselineCompletionRequest,
+    ) -> WorkspaceResult | None:
+        self.requests.append(request)
+        return self._results.pop(0)
+
+
 class StaticDeploymentLoader:
     def __init__(self, target: WorkspaceDeploymentTarget | None) -> None:
         self.target = target
@@ -491,6 +718,170 @@ def _workspace_result(
         ),
         report=report,
     )
+
+
+def test_baseline_executes_before_candidate_fallback_and_resumes_same_pr(
+    tmp_path: Path,
+) -> None:
+    baseline = _persisted_baseline_operation()
+    pending_baseline = _pending_baseline_execution(baseline)
+    candidate = _persisted_candidate_operation()
+    pending_candidate = _pending_candidate_execution(candidate)
+    baseline_store = RecordingBaselineStore(pending_baseline)
+    baseline_planner = RecordingBaselinePlanner(
+        _baseline_plan(pending_baseline)
+    )
+    baseline_executor = RecordingBaselineExecutor(
+        reconciled=[None],
+        executed=[_baseline_result(baseline)],
+    )
+    baseline_completion = RecordingBaselineCompletionService(
+        [
+            _workspace_result(
+                WorkspacePhase.EVALUATING,
+                recorded=True,
+                next_action=(
+                    WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS
+                ),
+                workspace_pull_request_number=104,
+            )
+        ]
+    )
+    candidate_store = RecordingCandidateStore(pending_candidate)
+    candidate_planner = RecordingCandidatePlanner(
+        _candidate_plan(pending_candidate)
+    )
+    candidate_executor = RecordingCandidateExecutor(
+        reconciled=[None],
+        executed=[_candidate_result(candidate)],
+    )
+    service = WorkspaceOperationsService(
+        baseline_store=baseline_store,
+        baseline_planner=baseline_planner,
+        baseline_executor=baseline_executor,
+        baseline_completion=baseline_completion,
+        candidate_store=candidate_store,
+        candidate_planner=candidate_planner,
+        candidate_executor=candidate_executor,
+    )
+
+    result = service.execute(_execute_request(tmp_path))
+
+    assert result.status is WorkspaceOperationsStatus.BASELINE_RECORDED
+    assert result.recorded is True
+    assert result.operation_id == baseline.sha256
+    assert result.phase is WorkspacePhase.EVALUATING
+    assert result.workspace_pull_request_number == 104
+    assert result.verification is None
+    assert result.resume is not None
+    assert (
+        result.resume.workspace_pull_request_number == 104
+    )
+    assert "@copilot continue this same workspace pull request" in (
+        result.resume.comment_body
+    )
+    assert baseline_store.persist_calls == 1
+    assert candidate_store.persist_calls == 0
+    assert baseline_executor.reconcile_calls == 1
+    assert baseline_executor.execute_calls == 1
+    assert candidate_executor.reconcile_calls == 0
+    assert candidate_executor.execute_calls == 0
+    assert len(baseline_completion.requests) == 1
+    request = baseline_completion.requests[0]
+    assert request.plan.base_commit == "a" * 40
+    assert request.plan.published_base_version == "published-base-7"
+    assert request.plan.development_suite == "support-dev-suite"
+
+
+def test_baseline_completion_recovers_lost_ack_without_reexecution(
+    tmp_path: Path,
+) -> None:
+    baseline = _persisted_baseline_operation()
+    pending = _pending_baseline_execution(baseline)
+    store = RecordingBaselineStore(pending)
+    store.result = StoredWorkspaceBaselineResult(
+        result=_baseline_result(baseline)
+    )
+    completion = RecordingBaselineCompletionService(
+        [
+            _workspace_result(
+                WorkspacePhase.EVALUATING,
+                recorded=True,
+                next_action=(
+                    WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS
+                ),
+                workspace_pull_request_number=104,
+            )
+        ]
+    )
+    executor = RecordingBaselineExecutor(reconciled=[None], executed=[None])
+    service = WorkspaceOperationsService(
+        baseline_store=store,
+        baseline_planner=RecordingBaselinePlanner(_baseline_plan(pending)),
+        baseline_executor=executor,
+        baseline_completion=completion,
+    )
+
+    result = service.execute(_execute_request(tmp_path))
+
+    assert result.status is WorkspaceOperationsStatus.BASELINE_RECORDED
+    assert result.recorded is True
+    assert result.resume is not None
+    assert store.persist_calls == 0
+    assert executor.reconcile_calls == 0
+    assert executor.execute_calls == 0
+    assert len(completion.requests) == 1
+
+
+def test_baseline_rejects_untrusted_payload_that_requests_candidate_patch(
+    tmp_path: Path,
+) -> None:
+    baseline = _persisted_baseline_operation()
+    pending = _pending_baseline_execution(
+        baseline,
+        request_payload={
+            "patch_sha256": "1" * 64,
+            "validation_commands": [["powershell", "-File", "forged.ps1"]],
+            "asset_ids": ["dataset-development", "forged-asset"],
+        },
+    )
+    store = RecordingBaselineStore(pending)
+
+    class RejectingPlanner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(
+            self,
+            repository_root: Path,
+            pending_execution: PendingWorkspaceBaselineExecution,
+        ) -> TrustedWorkspaceBaselinePlan:
+            self.calls += 1
+            payload = pending_execution.request_payload
+            assert payload["patch_sha256"] == "1" * 64
+            raise ValueError(
+                "workspace baseline must ignore candidate patch requests"
+            )
+
+    planner = RejectingPlanner()
+    executor = RecordingBaselineExecutor(reconciled=[None], executed=[None])
+    service = WorkspaceOperationsService(
+        baseline_store=store,
+        baseline_planner=planner,
+        baseline_executor=executor,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="ignore candidate patch requests",
+    ):
+        service.execute(_execute_request(tmp_path))
+
+    assert planner.calls == 1
+    assert executor.reconcile_calls == 0
+    assert executor.execute_calls == 0
+    assert store.persist_calls == 0
+    assert store.result is None
 
 
 def test_candidate_fallback_is_idempotent_across_retries(

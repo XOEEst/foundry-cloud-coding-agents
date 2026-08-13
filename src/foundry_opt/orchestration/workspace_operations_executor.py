@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import hashlib
 import json
@@ -287,6 +287,8 @@ def _workspace_verification_request(
 
 class WorkspaceOperationsStatus(StrEnum):
     NOOP = "noop"
+    BASELINE_PENDING = "baseline_pending"
+    BASELINE_RECORDED = "baseline_recorded"
     CANDIDATE_PENDING = "candidate_pending"
     CANDIDATE_RECORDED = "candidate_recorded"
     DEPLOYMENT_DISPATCHED = "deployment_dispatched"
@@ -1110,6 +1112,240 @@ def normalize_workspace_deployment_artifact(
 
 
 @dataclass(frozen=True)
+class WorkspaceBaselineRequest:
+    issue_number: int
+    target_name: str
+    published_base_version: str
+    development_suite: str
+    idempotency_key: str
+
+    def __post_init__(self) -> None:
+        _positive_integer(self.issue_number, "workspace issue number")
+        _identifier(self.target_name, "workspace baseline target")
+        _identifier(
+            self.published_base_version,
+            "workspace baseline published base version",
+        )
+        _identifier(
+            self.development_suite,
+            "workspace baseline development suite",
+        )
+        _sha256(
+            self.idempotency_key,
+            "workspace baseline idempotency key",
+        )
+
+
+@dataclass(frozen=True)
+class WorkspaceBaselineOperation:
+    issue_number: int
+    target_name: str
+    published_base_version: str
+    development_suite: str
+    idempotency_key: str
+    schema_version: int = field(default=1, init=False)
+    kind: str = field(default="workspace_baseline", init=False)
+
+    def __post_init__(self) -> None:
+        WorkspaceBaselineRequest(
+            issue_number=self.issue_number,
+            target_name=self.target_name,
+            published_base_version=self.published_base_version,
+            development_suite=self.development_suite,
+            idempotency_key=self.idempotency_key,
+        )
+
+    @classmethod
+    def from_request(
+        cls,
+        request: WorkspaceBaselineRequest,
+    ) -> WorkspaceBaselineOperation:
+        if not isinstance(request, WorkspaceBaselineRequest):
+            raise ValueError("workspace baseline request is invalid")
+        return cls(
+            issue_number=request.issue_number,
+            target_name=request.target_name,
+            published_base_version=request.published_base_version,
+            development_suite=request.development_suite,
+            idempotency_key=request.idempotency_key,
+        )
+
+    @property
+    def sha256(self) -> str:
+        payload = json.dumps(
+            {
+                "development_suite": self.development_suite,
+                "idempotency_key": self.idempotency_key,
+                "issue_number": self.issue_number,
+                "kind": self.kind,
+                "published_base_version": self.published_base_version,
+                "schema_version": self.schema_version,
+                "target_name": self.target_name,
+            },
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True)
+class PersistedWorkspaceBaselineOperation:
+    operation: WorkspaceBaselineOperation
+    reference: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation, WorkspaceBaselineOperation):
+            raise ValueError("persisted workspace baseline is invalid")
+        if (
+            not isinstance(self.reference, str)
+            or _REFERENCE.fullmatch(self.reference) is None
+            or "://" in self.reference
+        ):
+            raise ValueError("persisted workspace baseline reference is invalid")
+        _sha256(self.sha256, "persisted workspace baseline sha256")
+        if self.sha256 != self.operation.sha256:
+            raise ValueError("persisted workspace baseline changed")
+
+
+@dataclass(frozen=True)
+class WorkspaceBaselineResult:
+    target_name: str
+    executor: str
+    metrics: Mapping[str, float]
+    evaluation_id: str
+    run_id: str
+    base_commit: str
+    published_base_version: str
+    development_suite: str
+    operation_sha256: str | None = None
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        _identifier(self.target_name, "workspace baseline target")
+        _identifier(self.executor, "workspace baseline executor")
+        object.__setattr__(self, "metrics", _frozen_metrics(self.metrics))
+        _safe_text(self.evaluation_id, "workspace baseline evaluation ID")
+        _safe_text(self.run_id, "workspace baseline run ID")
+        _commit(self.base_commit, "workspace baseline base commit")
+        _identifier(
+            self.published_base_version,
+            "workspace baseline published base version",
+        )
+        _identifier(
+            self.development_suite,
+            "workspace baseline development suite",
+        )
+        if (self.operation_sha256 is None) != (
+            self.idempotency_key is None
+        ):
+            raise ValueError("workspace baseline lineage is incomplete")
+        if self.operation_sha256 is not None:
+            _sha256(
+                self.operation_sha256,
+                "workspace baseline operation sha256",
+            )
+            _sha256(
+                self.idempotency_key,
+                "workspace baseline idempotency key",
+            )
+
+
+@dataclass(frozen=True)
+class StoredWorkspaceBaselineResult:
+    result: WorkspaceBaselineResult
+    workspace: WorkspaceResult | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, WorkspaceBaselineResult):
+            raise ValueError("workspace baseline result is invalid")
+        if self.workspace is not None and not isinstance(
+            self.workspace,
+            WorkspaceResult,
+        ):
+            raise ValueError("workspace baseline workspace result is invalid")
+
+
+@dataclass(frozen=True)
+class PendingWorkspaceBaselineExecution:
+    operation: PersistedWorkspaceBaselineOperation
+    request_payload: Mapping[str, Any] = MappingProxyType({})
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.operation,
+            PersistedWorkspaceBaselineOperation,
+        ):
+            raise ValueError("pending workspace baseline is invalid")
+        if not isinstance(self.request_payload, Mapping):
+            raise ValueError("pending workspace baseline payload is invalid")
+        object.__setattr__(
+            self,
+            "request_payload",
+            MappingProxyType(dict(self.request_payload)),
+        )
+
+
+@dataclass(frozen=True)
+class TrustedWorkspaceBaselinePlan:
+    operation: PersistedWorkspaceBaselineOperation
+    request: WorkspaceBaselineRequest
+    base_commit: str
+    target_name: str
+    base_agent_version: int
+    published_base_version: str
+    development_suite: str
+    assets: tuple[EvaluationAssetReference, ...]
+    evaluation_policy: EvaluationPolicy
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.operation,
+            PersistedWorkspaceBaselineOperation,
+        ):
+            raise ValueError("workspace baseline operation is invalid")
+        if not isinstance(self.request, WorkspaceBaselineRequest):
+            raise ValueError("workspace baseline request is invalid")
+        expected = WorkspaceBaselineOperation.from_request(self.request)
+        if self.operation.operation != expected or self.operation.sha256 != (
+            expected.sha256
+        ):
+            raise ValueError("workspace baseline lineage is invalid")
+        _commit(self.base_commit, "workspace baseline base commit")
+        _identifier(self.target_name, "workspace baseline target")
+        _positive_integer(
+            self.base_agent_version,
+            "workspace baseline base agent version",
+        )
+        _identifier(
+            self.published_base_version,
+            "workspace baseline published base version",
+        )
+        _identifier(
+            self.development_suite,
+            "workspace baseline development suite",
+        )
+        if (
+            self.request.target_name != self.target_name
+            or self.request.published_base_version
+            != self.published_base_version
+            or self.request.development_suite != self.development_suite
+        ):
+            raise ValueError("workspace baseline lineage is invalid")
+        assets = tuple(self.assets)
+        if not assets or any(
+            not isinstance(asset, EvaluationAssetReference)
+            for asset in assets
+        ):
+            raise ValueError("workspace baseline assets are invalid")
+        object.__setattr__(self, "assets", assets)
+        if not isinstance(self.evaluation_policy, EvaluationPolicy):
+            raise ValueError("workspace baseline evaluation policy is invalid")
+
+
+@dataclass(frozen=True)
 class StoredCandidateExperimentResult:
     result: CandidateExperimentResult
     workspace: WorkspaceResult | None = None
@@ -1275,6 +1511,73 @@ class TrustedCandidateExecutionPlan:
             raise ValueError("candidate execution candidate limit is invalid")
 
 
+class PendingWorkspaceBaselineStore(Protocol):
+    def load_pending(
+        self,
+        issue_number: int,
+    ) -> PendingWorkspaceBaselineExecution | None: ...
+
+    def load_result(
+        self,
+        operation: PersistedWorkspaceBaselineOperation,
+    ) -> StoredWorkspaceBaselineResult | None: ...
+
+    def persist_result(
+        self,
+        operation: PersistedWorkspaceBaselineOperation,
+        result: WorkspaceBaselineResult,
+    ) -> StoredWorkspaceBaselineResult: ...
+
+
+class WorkspaceBaselineExecutionPlanner(Protocol):
+    def resolve(
+        self,
+        repository_root: Path,
+        pending: PendingWorkspaceBaselineExecution,
+    ) -> TrustedWorkspaceBaselinePlan: ...
+
+
+class WorkspaceBaselineOperationExecutor(Protocol):
+    def reconcile(
+        self,
+        plan: TrustedWorkspaceBaselinePlan,
+    ) -> WorkspaceBaselineResult | None: ...
+
+    def execute(
+        self,
+        plan: TrustedWorkspaceBaselinePlan,
+    ) -> WorkspaceBaselineResult | None: ...
+
+
+@dataclass(frozen=True)
+class WorkspaceBaselineCompletionRequest:
+    repository_root: Path
+    issue_number: int
+    plan: TrustedWorkspaceBaselinePlan
+    result: WorkspaceBaselineResult
+
+    def __post_init__(self) -> None:
+        _positive_integer(self.issue_number, "workspace issue number")
+        if not isinstance(self.plan, TrustedWorkspaceBaselinePlan):
+            raise ValueError("workspace baseline plan is invalid")
+        if not isinstance(self.result, WorkspaceBaselineResult):
+            raise ValueError("workspace baseline result is invalid")
+        if self.plan.request.issue_number != self.issue_number:
+            raise ValueError("workspace baseline issue changed")
+        _validate_baseline_result(
+            self.plan.operation,
+            self.plan,
+            self.result,
+        )
+
+
+class WorkspaceBaselineCompletionService(Protocol):
+    def complete(
+        self,
+        request: WorkspaceBaselineCompletionRequest,
+    ) -> WorkspaceResult | None: ...
+
+
 class PendingCandidateExperimentStore(Protocol):
     def load_pending(
         self,
@@ -1395,6 +1698,58 @@ class WorkspaceCompletionFinalizer(Protocol):
         self,
         request: WorkspaceReadyForHumanRequest,
     ) -> WorkspaceFinalizationEffect: ...
+
+
+class EmptyPendingWorkspaceBaselineStore:
+    def load_pending(
+        self,
+        issue_number: int,
+    ) -> PendingWorkspaceBaselineExecution | None:
+        return None
+
+    def load_result(
+        self,
+        operation: PersistedWorkspaceBaselineOperation,
+    ) -> StoredWorkspaceBaselineResult | None:
+        return None
+
+    def persist_result(
+        self,
+        operation: PersistedWorkspaceBaselineOperation,
+        result: WorkspaceBaselineResult,
+    ) -> StoredWorkspaceBaselineResult:
+        return StoredWorkspaceBaselineResult(result=result)
+
+
+class UnavailableWorkspaceBaselineExecutionPlanner:
+    def resolve(
+        self,
+        repository_root: Path,
+        pending: PendingWorkspaceBaselineExecution,
+    ) -> TrustedWorkspaceBaselinePlan:
+        raise RuntimeError("trusted workspace baseline planner is not configured")
+
+
+class NoopWorkspaceBaselineOperationExecutor:
+    def reconcile(
+        self,
+        plan: TrustedWorkspaceBaselinePlan,
+    ) -> WorkspaceBaselineResult | None:
+        return None
+
+    def execute(
+        self,
+        plan: TrustedWorkspaceBaselinePlan,
+    ) -> WorkspaceBaselineResult | None:
+        return None
+
+
+class NoopWorkspaceBaselineCompletionService:
+    def complete(
+        self,
+        request: WorkspaceBaselineCompletionRequest,
+    ) -> WorkspaceResult | None:
+        return None
 
 
 class EmptyPendingCandidateExperimentStore:
@@ -1521,6 +1876,14 @@ class WorkspaceOperationsService:
     def __init__(
         self,
         *,
+        baseline_store: PendingWorkspaceBaselineStore | None = None,
+        baseline_planner: WorkspaceBaselineExecutionPlanner | None = None,
+        baseline_executor: (
+            WorkspaceBaselineOperationExecutor | None
+        ) = None,
+        baseline_completion: (
+            WorkspaceBaselineCompletionService | None
+        ) = None,
         candidate_store: PendingCandidateExperimentStore | None = None,
         candidate_planner: (
             CandidateExperimentExecutionPlanner | None
@@ -1538,6 +1901,26 @@ class WorkspaceOperationsService:
         retention_evaluator: WorkspaceRetentionEvaluator | None = None,
         finalizer: WorkspaceCompletionFinalizer | None = None,
     ) -> None:
+        self._baseline_store = (
+            baseline_store
+            if baseline_store is not None
+            else EmptyPendingWorkspaceBaselineStore()
+        )
+        self._baseline_planner = (
+            baseline_planner
+            if baseline_planner is not None
+            else UnavailableWorkspaceBaselineExecutionPlanner()
+        )
+        self._baseline_executor = (
+            baseline_executor
+            if baseline_executor is not None
+            else NoopWorkspaceBaselineOperationExecutor()
+        )
+        self._baseline_completion = (
+            baseline_completion
+            if baseline_completion is not None
+            else NoopWorkspaceBaselineCompletionService()
+        )
         self._candidate_store = (
             candidate_store
             if candidate_store is not None
@@ -1589,6 +1972,15 @@ class WorkspaceOperationsService:
         self,
         request: WorkspaceOperationsExecuteRequest,
     ) -> WorkspaceOperationsResult:
+        pending_baseline = self._baseline_store.load_pending(
+            request.issue_number
+        )
+        if pending_baseline is not None:
+            plan = self._baseline_planner.resolve(
+                request.repository_root,
+                pending_baseline,
+            )
+            return self._execute_baseline(request, plan)
         pending = self._candidate_store.load_pending(request.issue_number)
         if pending is not None:
             plan = self._candidate_planner.resolve(
@@ -1838,6 +2230,74 @@ class WorkspaceOperationsService:
             ),
         )
 
+    def _execute_baseline(
+        self,
+        request: WorkspaceOperationsExecuteRequest,
+        plan: TrustedWorkspaceBaselinePlan,
+    ) -> WorkspaceOperationsResult:
+        operation = plan.operation
+        if plan.request.issue_number != request.issue_number:
+            raise ValueError("workspace baseline issue changed")
+        stored = self._baseline_store.load_result(operation)
+        if stored is None:
+            result = self._baseline_executor.reconcile(plan)
+        else:
+            result = stored.result
+        if result is None:
+            result = self._baseline_executor.execute(plan)
+            if result is None:
+                return WorkspaceOperationsResult(
+                    issue_number=request.issue_number,
+                    status=WorkspaceOperationsStatus.BASELINE_PENDING,
+                    recorded=False,
+                    operation_id=operation.sha256,
+                )
+        _validate_baseline_result(operation, plan, result)
+        existing = self._baseline_store.load_result(operation)
+        if existing is not None:
+            _validate_baseline_result(operation, plan, existing.result)
+            workspace, workspace_recorded = self._complete_baseline(
+                request=request,
+                plan=plan,
+                stored=existing,
+            )
+            return WorkspaceOperationsResult(
+                issue_number=request.issue_number,
+                status=WorkspaceOperationsStatus.BASELINE_RECORDED,
+                recorded=workspace_recorded,
+                operation_id=operation.sha256,
+                phase=workspace.phase if workspace is not None else None,
+                workspace_pull_request_number=(
+                    _workspace_pull_request_number(workspace)
+                ),
+                resume=_workspace_resume_request(
+                    issue_number=request.issue_number,
+                    operation_key=operation.sha256,
+                    workspace=workspace,
+                ),
+            )
+        persisted = self._baseline_store.persist_result(operation, result)
+        workspace, _workspace_recorded = self._complete_baseline(
+            request=request,
+            plan=plan,
+            stored=persisted,
+        )
+        return WorkspaceOperationsResult(
+            issue_number=request.issue_number,
+            status=WorkspaceOperationsStatus.BASELINE_RECORDED,
+            recorded=True,
+            operation_id=operation.sha256,
+            phase=workspace.phase if workspace is not None else None,
+            workspace_pull_request_number=(
+                _workspace_pull_request_number(workspace)
+            ),
+            resume=_workspace_resume_request(
+                issue_number=request.issue_number,
+                operation_key=operation.sha256,
+                workspace=workspace,
+            ),
+        )
+
     def _complete_candidate_selection(
         self,
         *,
@@ -1848,6 +2308,26 @@ class WorkspaceOperationsService:
         workspace = stored.workspace
         completed = self._candidate_selection.complete(
             WorkspaceCandidateSelectionRequest(
+                repository_root=request.repository_root,
+                issue_number=request.issue_number,
+                plan=plan,
+                result=stored.result,
+            )
+        )
+        if completed is None:
+            return workspace, False
+        return completed, completed.recorded
+
+    def _complete_baseline(
+        self,
+        *,
+        request: WorkspaceOperationsExecuteRequest,
+        plan: TrustedWorkspaceBaselinePlan,
+        stored: StoredWorkspaceBaselineResult,
+    ) -> tuple[WorkspaceResult | None, bool]:
+        workspace = stored.workspace
+        completed = self._baseline_completion.complete(
+            WorkspaceBaselineCompletionRequest(
                 repository_root=request.repository_root,
                 issue_number=request.issue_number,
                 plan=plan,
@@ -1873,6 +2353,26 @@ def _validate_candidate_result(
         raise ValueError("candidate experiment result lineage changed")
 
 
+def _validate_baseline_result(
+    operation: PersistedWorkspaceBaselineOperation,
+    plan: TrustedWorkspaceBaselinePlan,
+    result: WorkspaceBaselineResult,
+) -> None:
+    if (
+        result.target_name != operation.operation.target_name
+        or result.target_name != plan.target_name
+        or result.base_commit != plan.base_commit
+        or result.published_base_version
+        != operation.operation.published_base_version
+        or result.published_base_version != plan.published_base_version
+        or result.development_suite != operation.operation.development_suite
+        or result.development_suite != plan.development_suite
+        or result.operation_sha256 != operation.sha256
+        or result.idempotency_key != operation.operation.idempotency_key
+    ):
+        raise ValueError("workspace baseline result lineage changed")
+
+
 def build_production_workspace_operations_service() -> (
     WorkspaceOperationsService
 ):
@@ -1888,20 +2388,35 @@ def build_production_workspace_operations_service() -> (
 __all__ = [
     "CandidateExperimentExecutionPlanner",
     "CandidateExperimentOperationExecutor",
+    "EmptyPendingWorkspaceBaselineStore",
     "EmptyPendingCandidateExperimentStore",
     "EmptyWorkspaceDeploymentStateLoader",
+    "NoopWorkspaceBaselineOperationExecutor",
     "NoopWorkspaceDeploymentRunVerifier",
+    "PendingWorkspaceBaselineExecution",
     "PendingCandidateExperimentExecution",
     "PlanningWorkspaceCompletionFinalizer",
     "PlanningWorkspaceDeploymentWorkflowExecutor",
+    "PendingWorkspaceBaselineStore",
     "PendingCandidateExperimentStore",
+    "PersistedWorkspaceBaselineOperation",
     "StoredCandidateExperimentResult",
+    "StoredWorkspaceBaselineResult",
+    "TrustedWorkspaceBaselinePlan",
     "TrustedCandidateExecutionPlan",
     "TrustedCandidatePackagingContract",
+    "WorkspaceBaselineCompletionRequest",
+    "WorkspaceBaselineCompletionService",
+    "WorkspaceBaselineExecutionPlanner",
+    "WorkspaceBaselineOperation",
+    "WorkspaceBaselineOperationExecutor",
+    "WorkspaceBaselineRequest",
+    "WorkspaceBaselineResult",
     "WorkspaceCandidateSelectionRequest",
     "WorkspaceCandidateSelectionService",
     "TrustedWorkspaceArtifactContext",
     "TrustedWorkspaceExecutionContext",
+    "UnavailableWorkspaceBaselineExecutionPlanner",
     "UnavailableCandidateExperimentExecutionPlanner",
     "UnavailableWorkspaceRetentionEvaluator",
     "WorkspaceCompletionFinalizer",
