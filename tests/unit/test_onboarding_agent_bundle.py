@@ -71,7 +71,6 @@ def test_bundle_generates_single_workspace_customer_surfaces() -> None:
         Path(".github/workflows/foundry-optimization-workspace.yml"),
         Path(".github/workflows/foundry-optimization-operations.yml"),
         Path(".github/workflows/foundry-exact-candidate-check.yml"),
-        Path(".github/workflows/deploy-foundry-agent.yml"),
     }
     assert not any(
         fragment in path.name
@@ -105,6 +104,7 @@ def test_bundle_generates_single_workspace_customer_surfaces() -> None:
         "foundry-opt workspace advance --issue <number> --json"
     ) == 1
     assert "foundry-opt steward advance" not in steward
+    assert Path(".github/workflows/deploy-foundry-agent.yml") not in files
 
 
 def test_generated_customer_instructions_have_no_legacy_transport() -> None:
@@ -161,6 +161,7 @@ def test_every_emitted_foundry_opt_command_resolves_against_cli() -> None:
     emitted = " ".join("\n".join(files.values()).split())
     occurrences = re.findall(
         r"\bfoundry-opt\s+(--version|[a-z][a-z0-9-]*)"
+        r"(?:\s+([a-z][a-z0-9-]*))?"
         r"(?:\s+([a-z][a-z0-9-]*))?",
         emitted,
     )
@@ -168,12 +169,15 @@ def test_every_emitted_foundry_opt_command_resolves_against_cli() -> None:
 
     runner = CliRunner()
     resolved: set[str] = set()
-    for first, second in occurrences:
+    for first, second, third in occurrences:
         if first == "--version":
             result = runner.invoke(app, ["--version"])
             command = "--version"
         else:
             candidates = (
+                ([first, second, third, "--help"], f"{first} {second} {third}")
+                if second and third
+                else None,
                 ([first, second, "--help"], f"{first} {second}")
                 if second
                 else None,
@@ -190,17 +194,16 @@ def test_every_emitted_foundry_opt_command_resolves_against_cli() -> None:
                     result = completed
                     command = name
                     break
-            assert result is not None, (first, second)
+            assert result is not None, (first, second, third)
         assert result.exit_code == 0, (command, result.stdout)
         resolved.add(command)
 
     assert {
         "init",
-        "optimize apply",
-        "optimize reconcile",
-        "steward deployment-bridge",
-        "steward publication-result-auto",
         "workspace advance",
+        "workspace operations execute",
+        "workspace operations reconcile",
+        "optimize apply",
     } <= resolved
 
 
@@ -341,52 +344,57 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
     workflow = yaml.safe_load(text)
 
     assert workflow["permissions"] == {
+        "actions": "write",
         "contents": "write",
         "id-token": "write",
         "issues": "write",
         "pull-requests": "write",
     }
     assert workflow["jobs"]["operate"]["environment"] == "production"
+    assert workflow[True]["workflow_run"] == {
+        "workflows": ["Foundry deployment"],
+        "types": ["completed"],
+    }
     assert "AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}" in text
     assert "AZURE_DEPLOYMENT_CLIENT_ID" not in text
-    assert "python -m foundry_opt.orchestration.capability_bridge" in (
+    assert "foundry-opt workspace operations execute" in (
         " ".join(text.split())
     )
-    assert "Evaluate retained post-deployment behavior" in text
-    assert "foundry-opt optimize reconcile --issue \"$issue\" --json" in (
+    assert "foundry-opt workspace operations reconcile" in (
         " ".join(text.split())
     )
+    assert "gh run download" in text
     assert "head -25" in text
     assert "ref: ${{ github.event.repository.default_branch }}" in text
+    for forbidden in (
+        "optimize reconcile",
+        "capability_bridge",
+        "deployment_bridge",
+        "worker issue",
+        "internal handoff",
+        "campaign-drafts",
+        "campaign-evaluate",
+    ):
+        assert forbidden not in text
 
 
-def test_deployment_workflow_keeps_deployment_identity_isolated() -> None:
+def test_bundle_preserves_customer_deployment_workflow() -> None:
     files = generate_repository_agent_bundle(
         _request(),
         oidc_subject="repository_id:123",
         deployment_workflow_name="Deploy support agent",
     )
-    text = files[Path(".github/workflows/deploy-foundry-agent.yml")]
-    workflow = yaml.safe_load(text)
+    operations = yaml.safe_load(
+        files[
+            Path(".github/workflows/foundry-optimization-operations.yml")
+        ]
+    )
 
-    assert workflow[True]["workflow_run"] == {
+    assert Path(".github/workflows/deploy-foundry-agent.yml") not in files
+    assert operations[True]["workflow_run"] == {
         "workflows": ["Deploy support agent"],
         "types": ["completed"],
     }
-    assert workflow["permissions"] == {
-        "actions": "write",
-        "contents": "write",
-        "id-token": "write",
-    }
-    assert "AZURE_CLIENT_ID: ${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}" in text
-    assert "AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}" not in text
-    assert "foundry-opt steward deployment-bridge" in (
-        " ".join(text.split())
-    )
-    assert "publication-result-auto" in text
-    assert "foundry-opt optimize reconcile" not in text
-    assert "foundry-optimization-reconcile.yml" not in text
-    assert "COPILOT_ASSIGNMENT_TOKEN" not in text
 
 
 def test_exact_check_never_executes_untrusted_pull_request_code() -> None:
@@ -437,15 +445,10 @@ def test_generated_workflows_are_yaml_safe_and_action_pinned() -> None:
             Path(".github/workflows/foundry-optimization-operations.yml")
         ]
     )
-    deployment = yaml.safe_load(
-        files[Path(".github/workflows/deploy-foundry-agent.yml")]
-    )
     assert operations["jobs"]["operate"]["environment"] == (
         'prod"\\nrun: echo owned'
     )
-    assert deployment["jobs"]["deployment-bridge"]["environment"] == (
-        'prod"\\nrun: echo owned'
-    )
+    assert Path(".github/workflows/deploy-foundry-agent.yml") not in files
 
 
 def test_privileged_workflows_use_pinned_isolated_installs() -> None:
@@ -457,7 +460,6 @@ def test_privileged_workflows_use_pinned_isolated_installs() -> None:
     for path in (
         Path(".github/workflows/foundry-optimization-workspace.yml"),
         Path(".github/workflows/foundry-optimization-operations.yml"),
-        Path(".github/workflows/deploy-foundry-agent.yml"),
     ):
         text = files[path]
         assert "fetch-depth: 0" in text

@@ -15,6 +15,10 @@ from foundry_opt.orchestration import (
     WorkspaceResult,
     WorkspaceTrigger,
 )
+from foundry_opt.orchestration.workspace_operations_executor import (
+    WorkspaceOperationsResult,
+    WorkspaceOperationsStatus,
+)
 
 
 runner = CliRunner()
@@ -114,6 +118,13 @@ def test_workspace_help_exposes_production_lifecycle_commands() -> None:
     assert "intake" in completed.stdout
     assert "experiments-complete" in completed.stdout
     assert "operation-complete" in completed.stdout
+    assert "operations" in completed.stdout
+
+    operations = runner.invoke(app, ["workspace", "operations", "--help"])
+
+    assert operations.exit_code == 0
+    assert "execute" in operations.stdout
+    assert "reconcile" in operations.stdout
 
 
 def test_workspace_experiments_complete_ingests_manifest(
@@ -208,6 +219,153 @@ def test_workspace_operation_complete_uses_trusted_context(
 
     assert completed.exit_code == 0
     assert json.loads(completed.stdout)["event"]["operation_id"] == "deploy-1"
+
+
+def test_workspace_operations_execute_emits_stable_json(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    class Service:
+        def execute(self, request):
+            assert request.repository_root == tmp_path
+            assert request.issue_number == 31
+            assert request.context.event_name == "workflow_dispatch"
+            assert request.context.repository == "octo-org/optimizer"
+            assert request.context.repository_id == 123
+            return WorkspaceOperationsResult(
+                issue_number=31,
+                status=WorkspaceOperationsStatus.CANDIDATE_RECORDED,
+                recorded=True,
+                phase=WorkspacePhase.EVALUATING,
+                operation_id="2" * 64,
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_workspace_operations_service",
+        lambda: Service(),
+    )
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "operations",
+            "execute",
+            "--issue",
+            "31",
+            "--event-name",
+            "workflow_dispatch",
+            "--repository",
+            "octo-org/optimizer",
+            "--repository-id",
+            "123",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout) == {
+        "deployment_run_id": None,
+        "deployment_run_url": None,
+        "finalization": None,
+        "issue_number": 31,
+        "operation_id": "2" * 64,
+        "phase": "evaluating",
+        "recorded": True,
+        "status": "candidate_recorded",
+        "workspace_pull_request_number": None,
+    }
+
+
+def test_workspace_operations_reconcile_uses_trusted_artifact_context(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    operation = tmp_path / "deployment-result.json"
+    operation.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "kind": "deployment_result",
+                "status": "completed",
+                "issue_number": 31,
+                "workspace_pull_request_number": 104,
+                "operation_id": "deployment-123",
+                "candidate_id": "candidate-2",
+                "patch_sha256": "1" * 64,
+                "bundle_sha256": "2" * 64,
+                "evidence_sha256": "3" * 64,
+                "spec_sha256": "4" * 64,
+                "merge_commit": "a" * 40,
+                "tree_sha": "b" * 40,
+                "artifact_name": "foundry-optimization-deployment-result",
+                "run_id": 991,
+                "run_url": "https://github.com/octo-org/optimizer/actions/runs/991",
+                "deployment_version": 13,
+                "portal_url": "https://ai.azure.com/projects/demo/agents/demo/versions/13",
+                "lineage_sha256": "5" * 64,
+                "repository": {
+                    "full_name": "octo-org/optimizer",
+                    "id": 123,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Service:
+        def reconcile(self, request):
+            assert request.repository_root == tmp_path
+            assert request.issue_number == 31
+            assert request.payload["operation_id"] == "deployment-123"
+            assert request.context.repository == "octo-org/optimizer"
+            assert request.context.repository_id == 123
+            assert request.context.run_id == 991
+            assert (
+                request.context.artifact_name
+                == "foundry-optimization-deployment-result"
+            )
+            return WorkspaceOperationsResult(
+                issue_number=31,
+                status=WorkspaceOperationsStatus.COMPLETED,
+                recorded=True,
+                phase=WorkspacePhase.COMPLETED,
+                operation_id="retention-123",
+                workspace_pull_request_number=104,
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_workspace_operations_service",
+        lambda: Service(),
+    )
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "operations",
+            "reconcile",
+            "--issue",
+            "31",
+            "--result",
+            str(operation),
+            "--repository",
+            "octo-org/optimizer",
+            "--repository-id",
+            "123",
+            "--run-id",
+            "991",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["status"] == "completed"
 
 
 def test_workspace_intake_normalizes_trusted_event_through_service(

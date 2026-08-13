@@ -190,12 +190,11 @@ def test_init_cli_returns_zero_and_describes_draft_pr(
     assert ".github/workflows/foundry-optimization-workspace.yml" in (
         result.stdout
     )
-    assert ".github/workflows/deploy-foundry-agent.yml" in result.stdout
     assert "COPILOT_ASSIGNMENT_TOKEN" in result.stdout
     assert "foundry-opt init cannot create Actions secrets" in result.stdout
     assert "installation token" in result.stdout
     assert "optimizer AZURE_CLIENT_ID" in result.stdout
-    assert "Foundry capability workflow" in result.stdout
+    assert "Foundry operations workflow" in result.stdout
 
 
 def test_init_cli_can_create_agents_variables(

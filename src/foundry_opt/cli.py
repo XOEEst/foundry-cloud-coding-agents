@@ -67,6 +67,11 @@ workspace_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(workspace_app, name="workspace")
+workspace_operations_app = typer.Typer(
+    help="Execute trusted v4 workspace operations.",
+    no_args_is_help=True,
+)
+workspace_app.add_typer(workspace_operations_app, name="operations")
 workspace_migration_app = typer.Typer(
     help="Inventory, convert, clean up, and safely archive legacy workspace refs.",
     no_args_is_help=True,
@@ -155,6 +160,15 @@ def build_workspace_service():
     )
 
     return build_production_workspace_service()
+
+
+def build_workspace_operations_service():
+    """Return the trusted v4 workspace operations service."""
+    from foundry_opt.orchestration.workspace_operations_executor import (
+        build_production_workspace_operations_service,
+    )
+
+    return build_production_workspace_operations_service()
 
 
 def build_workspace_migration_service():
@@ -651,6 +665,170 @@ def workspace_operation_complete(
         typer.echo(
             f"Workspace operation {result.event.operation.operation_id}: "
             f"{result.workspace.phase.value}"
+        )
+
+
+@workspace_operations_app.command("execute")
+def workspace_operations_execute(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    event_name: Annotated[
+        str,
+        typer.Option(
+            "--event-name",
+            help="Trusted GitHub event name.",
+        ),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    state_ref: Annotated[
+        str | None,
+        typer.Option(
+            "--state-ref",
+            help="Trusted foundry-opt/state branch ref name when present.",
+        ),
+    ] = None,
+    workflow_run_id: Annotated[
+        int | None,
+        typer.Option(
+            "--workflow-run-id",
+            min=1,
+            help="Trusted workflow_run ID when present.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Execute trusted candidate or deployment v4 workspace operations."""
+    from foundry_opt.orchestration.workspace_operations_executor import (
+        TrustedWorkspaceExecutionContext,
+        WorkspaceOperationsExecuteRequest,
+    )
+
+    try:
+        result = build_workspace_operations_service().execute(
+            WorkspaceOperationsExecuteRequest(
+                repository_root=Path.cwd(),
+                issue_number=issue_number,
+                context=TrustedWorkspaceExecutionContext(
+                    event_name=event_name,
+                    repository=repository,
+                    repository_id=repository_id,
+                    state_ref=state_ref,
+                    workflow_run_id=workflow_run_id,
+                ),
+            )
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace operations {result.status.value}: "
+            f"issue #{result.issue_number}"
+        )
+
+
+@workspace_operations_app.command("reconcile")
+def workspace_operations_reconcile(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    result_path: Annotated[
+        Path,
+        typer.Option(
+            "--result",
+            exists=True,
+            dir_okay=False,
+            help="Trusted deployment result JSON.",
+        ),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    run_id: Annotated[
+        int,
+        typer.Option("--run-id", min=1, help="Trusted workflow run ID."),
+    ],
+    artifact_name: Annotated[
+        str,
+        typer.Option(
+            "--artifact-name",
+            help="Trusted artifact name.",
+        ),
+    ] = "foundry-optimization-deployment-result",
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Reconcile a trusted deployment artifact into v4 workspace state."""
+    from foundry_opt.orchestration.workspace_operations_executor import (
+        TrustedWorkspaceArtifactContext,
+        WorkspaceOperationsReconcileRequest,
+    )
+
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "workspace deployment result must be a JSON object"
+            )
+        result = build_workspace_operations_service().reconcile(
+            WorkspaceOperationsReconcileRequest(
+                repository_root=Path.cwd(),
+                issue_number=issue_number,
+                payload=payload,
+                context=TrustedWorkspaceArtifactContext(
+                    repository=repository,
+                    repository_id=repository_id,
+                    run_id=run_id,
+                    artifact_name=artifact_name,
+                ),
+            )
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace operations {result.status.value}: "
+            f"issue #{result.issue_number}"
         )
 
 

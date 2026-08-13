@@ -242,7 +242,6 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         if path.startswith(".github/workflows/")
     } == {
         ".github/workflows/copilot-setup-steps.yml",
-        ".github/workflows/deploy-foundry-agent.yml",
         ".github/workflows/foundry-exact-candidate-check.yml",
         ".github/workflows/foundry-optimization-operations.yml",
         ".github/workflows/foundry-optimization-workspace.yml",
@@ -254,7 +253,6 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         ".github/ISSUE_TEMPLATE/foundry-optimization.yml",
         ".github/agents/foundry-optimization-steward.agent.md",
         ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md",
-        ".github/workflows/deploy-foundry-agent.yml",
         ".github/workflows/foundry-exact-candidate-check.yml",
         ".github/workflows/foundry-optimization-operations.yml",
         ".github/workflows/foundry-optimization-workspace.yml",
@@ -338,15 +336,7 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
     assert "repository-ID" in generated
     assert "foundry-opt workspace advance --help" in workflow
     assert "AZURE_DEPLOYMENT_CLIENT_ID" not in workflow
-    deployment_workflow = next(
-        change.content
-        for change in result.changes
-        if change.path.as_posix()
-        == ".github/workflows/deploy-foundry-agent.yml"
-    )
-    assert yaml.safe_load(deployment_workflow)[True]["workflow_run"][
-        "workflows"
-    ] == [".github/workflows/deploy.yml"]
+    assert ".github/workflows/deploy-foundry-agent.yml" not in generated_paths
     assert (
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
         in generated

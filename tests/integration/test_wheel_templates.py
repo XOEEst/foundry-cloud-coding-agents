@@ -11,10 +11,13 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
     repository = Path(__file__).resolve().parents[2]
     subprocess.run(
         (
-            "uv",
+            "python",
+            "-m",
+            "hatchling",
             "build",
-            "--wheel",
-            "--out-dir",
+            "--target",
+            "wheel",
+            "--directory",
             str(tmp_path),
         ),
         cwd=repository,
@@ -44,6 +47,10 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
             "foundry_opt/onboarding/generation.py"
         ).decode("utf-8")
         skill = archive.read(skill_path).decode("utf-8")
+    current_bundle_source = bundle.split(
+        "def _issue_intake_workflow",
+        1,
+    )[0]
 
     assert "Create one `[Optimize]` issue" in skill
     assert "foundry-opt workspace advance --issue <number>" in skill
@@ -56,11 +63,19 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
     assert "pull_request_target" in bundle
     assert "foundry-optimization-workspace.yml" in bundle
     assert "foundry-optimization-operations.yml" in bundle
-    assert "deploy-foundry-agent.yml" in bundle
+    assert "foundry-opt workspace operations execute" in (
+        current_bundle_source
+    )
+    assert "foundry-opt workspace operations reconcile" in (
+        current_bundle_source
+    )
     assert "foundry-candidate-designer.agent.md" not in bundle.split(
         "def _previous_repository_agent_bundle",
         1,
     )[0]
-    assert "python -m foundry_opt.orchestration.capability_bridge" in bundle
+    assert (
+        "python -m foundry_opt.orchestration.capability_bridge"
+        not in current_bundle_source
+    )
     assert "foundry-opt steward advance" not in skill
     assert "foundry-optimization-handoff.yml" not in skill

@@ -189,7 +189,7 @@ def run_onboarding(
                 "Generated onboarding files are already current.",
                 "Keep AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and the "
                 "optimizer AZURE_CLIENT_ID in the generated Actions "
-                "environment for the Foundry capability workflow.",
+                "environment for the Foundry operations workflow.",
                 _COPILOT_ASSIGNMENT_GUIDANCE,
             ),
         )
@@ -395,9 +395,10 @@ def run_onboarding(
                     f"{request.environment_name}.",
                 )
             ),
-            "The generated Foundry capability workflow uses only the "
-            "optimizer identity for asset, draft, and development "
-            "evaluation effects.",
+            "The generated Foundry operations workflow uses only the "
+            "optimizer identity for persisted candidate operations and "
+            "post-deployment evaluation; deployment remains isolated in "
+            "the preserved customer workflow.",
             "Azure OIDC itself uses no stored credential; Copilot "
             "assignment separately requires the Actions secret below.",
             _COPILOT_ASSIGNMENT_GUIDANCE,

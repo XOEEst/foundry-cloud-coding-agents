@@ -51,16 +51,13 @@ def generate_repository_agent_bundle(
             ): _workspace_workflow(request),
             Path(
                 ".github/workflows/foundry-optimization-operations.yml"
-            ): _operations_workflow(request),
-            Path(
-                ".github/workflows/foundry-exact-candidate-check.yml"
-            ): _candidate_check_workflow(request),
-            Path(
-                ".github/workflows/deploy-foundry-agent.yml"
-            ): _deployment_bridge_workflow(
+            ): _operations_workflow(
                 request,
                 deployment_workflow_name=deployment_workflow_name,
             ),
+            Path(
+                ".github/workflows/foundry-exact-candidate-check.yml"
+            ): _candidate_check_workflow(request),
         }
     )
     return contents
@@ -82,6 +79,10 @@ def _repository_context(
         "repository-level Agents variables.\n"
         "- Deployment uses only the separate "
         "`AZURE_DEPLOYMENT_CLIENT_ID` Actions-environment variable.\n"
+        "- Preserve the customer deployment workflow; do not overwrite "
+        "`.github/workflows/deploy-foundry-agent.yml`. The optimizer "
+        "operations workflow observes or dispatches it and consumes its "
+        "`foundry-optimization-deployment-result` artifact.\n"
         "- Foundry operations and post-deployment evaluation run only in "
         "`foundry-optimization-operations.yml` under the optimizer "
         "`AZURE_CLIENT_ID`; Copilot performs no Foundry network operations.\n"
@@ -690,8 +691,13 @@ jobs:
 """
 
 
-def _operations_workflow(request: OnboardingRequest) -> str:
+def _operations_workflow(
+    request: OnboardingRequest,
+    *,
+    deployment_workflow_name: str,
+) -> str:
     install = json.dumps(request.product_install)
+    workflow_name = json.dumps(deployment_workflow_name)
     actions_environment = (
         request.mirror_actions_environment or request.environment_name
     )
@@ -703,6 +709,9 @@ on:
       - foundry-opt/state/issue-*
   schedule:
     - cron: "*/5 * * * *"
+  workflow_run:
+    workflows: [{workflow_name}]
+    types: [completed]
   workflow_dispatch:
     inputs:
       issue:
@@ -711,17 +720,27 @@ on:
         type: number
 
 permissions:
+  actions: write
   contents: write
   id-token: write
   issues: write
   pull-requests: write
 
 concurrency:
-  group: foundry-optimization-operations
+  group: >-
+    foundry-optimization-operations-${{{{
+      github.event.workflow_run.id ||
+      inputs.issue ||
+      github.ref_name ||
+      github.run_id
+    }}}}
   cancel-in-progress: false
 
 jobs:
   operate:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: {json.dumps(actions_environment)}
     env:
@@ -753,29 +772,27 @@ jobs:
         with:
           python-version: "3.12"
       - uses: {_SETUP_UV_ACTION} # v9.0.0
-      - name: Execute persisted optimizer operations
+      - name: Execute trusted workspace operations
         env:
-          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
           REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
-        run: >-
-          uv run --no-project --no-config --no-env-file
-          --with "$OPTIMIZER_PACKAGE"
-          python -m foundry_opt.orchestration.capability_bridge
-      - name: Evaluate retained post-deployment behavior
-        env:
-          REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
+          TRUSTED_WORKFLOW_RUN_ID: ${{{{ github.event.workflow_run.id }}}}
         shell: bash
         run: |
+          issues=()
           if [ -n "$REQUESTED_ISSUE" ]; then
             if [[ ! "$REQUESTED_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
               echo "Invalid issue number" >&2
               exit 1
             fi
             issues=("$REQUESTED_ISSUE")
-          else
+          elif [ "$TRUSTED_EVENT_NAME" = "push" ] && \
+            [[ "$TRUSTED_STATE_REF" =~ ^foundry-opt/state/issue-([1-9][0-9]*)$ ]]; then
+            issues=("${{BASH_REMATCH[1]}}")
+          elif [ "$TRUSTED_EVENT_NAME" != "workflow_run" ]; then
             mapfile -t issues < <(
               git ls-remote --heads origin \
                 'refs/heads/foundry-opt/state/issue-*' |
@@ -786,10 +803,63 @@ jobs:
             )
           fi
           for issue in "${{issues[@]}}"; do
+            args=(
+              foundry-opt workspace operations execute
+              --issue "$issue"
+              --event-name "$TRUSTED_EVENT_NAME"
+              --repository "$TRUSTED_REPOSITORY"
+              --repository-id "$TRUSTED_REPOSITORY_ID"
+              --json
+            )
+            if [ -n "$TRUSTED_STATE_REF" ]; then
+              args+=(--state-ref "$TRUSTED_STATE_REF")
+            fi
+            if [[ "$TRUSTED_WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              args+=(--workflow-run-id "$TRUSTED_WORKFLOW_RUN_ID")
+            fi
             uv run --no-project --no-config --no-env-file \
               --with "$OPTIMIZER_PACKAGE" \
-              foundry-opt optimize reconcile --issue "$issue" --json
+              "${{args[@]}}"
           done
+      - name: Reconcile authenticated deployment result
+        if: github.event_name == 'workflow_run'
+        env:
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_WORKFLOW_RUN_ID: ${{{{ github.event.workflow_run.id }}}}
+        shell: bash
+        run: |
+          if [[ ! "$TRUSTED_WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid workflow run ID" >&2
+            exit 1
+          fi
+          result_dir="$GITHUB_WORKSPACE/.foundry-optimizer/deployment-result"
+          mkdir -p "$result_dir"
+          gh run download "$TRUSTED_WORKFLOW_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name foundry-optimization-deployment-result \
+            --dir "$result_dir"
+          mapfile -d '' result_files < <(
+            find "$result_dir" -type f -name deployment-result.json -print0
+          )
+          if [ "${{#result_files[@]}}" -ne 1 ]; then
+            echo "Expected exactly one deployment-result.json" >&2
+            exit 1
+          fi
+          issue="$(
+            RESULT_FILE="${{result_files[0]}}" python -c \
+              "import json, os; value = json.load(open(os.environ['RESULT_FILE'], encoding='utf-8')); issue = value.get('issue_number'); assert type(issue) is int and issue > 0; print(issue)"
+          )"
+          uv run --no-project --no-config --no-env-file \
+            --with "$OPTIMIZER_PACKAGE" \
+            foundry-opt workspace operations reconcile \
+            --issue "$issue" \
+            --result "${{result_files[0]}}" \
+            --repository "$TRUSTED_REPOSITORY" \
+            --repository-id "$TRUSTED_REPOSITORY_ID" \
+            --run-id "$TRUSTED_WORKFLOW_RUN_ID" \
+            --artifact-name foundry-optimization-deployment-result \
+            --json
 """
 
 
