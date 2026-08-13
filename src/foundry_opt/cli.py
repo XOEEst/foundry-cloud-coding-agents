@@ -264,6 +264,13 @@ def workspace_migration_archive(
             help="Planned audit SHA, or 'absent'. Required with --apply.",
         ),
     ] = None,
+    expected_migration_revision: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-migration-revision",
+            help="Planned migration SHA, or 'absent'. Required with --apply.",
+        ),
+    ] = None,
 ) -> None:
     """Produce a dry-run archive plan, or apply its exact revisions."""
     try:
@@ -274,6 +281,7 @@ def workspace_migration_archive(
                     expected_state_revision,
                     expected_inbox_revision,
                     expected_audit_revision,
+                    expected_migration_revision,
                 )
             ):
                 raise ValueError(
@@ -298,6 +306,10 @@ def workspace_migration_archive(
                         "--expected-audit-revision",
                         expected_audit_revision,
                     ),
+                    (
+                        "--expected-migration-revision",
+                        expected_migration_revision,
+                    ),
                 )
                 if value is None
             ]
@@ -313,6 +325,9 @@ def workspace_migration_archive(
                     ),
                     "inbox": _migration_revision(
                         expected_inbox_revision
+                    ),
+                    "migration": _migration_revision(
+                        expected_migration_revision
                     ),
                     "state": _migration_revision(
                         expected_state_revision

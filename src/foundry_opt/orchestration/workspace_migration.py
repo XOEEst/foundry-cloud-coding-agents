@@ -12,10 +12,12 @@ from typing import Mapping, Protocol
 from foundry_opt.adapters.commands import CommandError, SubprocessCommandRunner
 from foundry_opt.adapters.github import github_repository_from_remote_url
 from foundry_opt.orchestration.git_transport import (
+    atomic_compare_and_swap_delete,
     compare_and_swap_push,
     configured_remote_url,
     fetch_revision,
     GitTransportError,
+    list_remote_heads,
     remote_revision,
     resolve_safe_fetch_remote,
     resolve_safe_push_remote,
@@ -328,7 +330,15 @@ class WorkspaceMigrationService:
                 expected_revisions=revisions,
                 reason="audit_ref_missing",
             )
-        if revisions["state"] is None and revisions["inbox"] is None:
+        if revisions["migration"] not in {None, revisions["audit"]}:
+            raise WorkspaceMigrationError(
+                "workspace migration ref does not match audit"
+            )
+        if (
+            revisions["state"] is None
+            and revisions["inbox"] is None
+            and revisions["migration"] is None
+        ):
             self._verify_audit(
                 issue_number,
                 audit_revision=revisions["audit"],
@@ -340,7 +350,7 @@ class WorkspaceMigrationService:
                 status="already_completed",
                 expected_revisions=revisions,
             )
-        if revisions["state"] is None:
+        if revisions["state"] is None and revisions["inbox"] is not None:
             return WorkspaceArchiveResult(
                 issue_number=issue_number,
                 issue_lifecycle=lifecycle,
@@ -348,15 +358,16 @@ class WorkspaceMigrationService:
                 expected_revisions=revisions,
                 reason="legacy_state_missing",
             )
-        plan = detect_workspace_state_v3(
-            self._root,
-            issue_number,
-            remote=self._remote,
-        )
-        if plan is None or plan.source_revision != revisions["state"]:
-            raise WorkspaceMigrationError(
-                "workspace state is not validated legacy v3"
+        if revisions["state"] is not None:
+            plan = detect_workspace_state_v3(
+                self._root,
+                issue_number,
+                remote=self._remote,
             )
+            if plan is None or plan.source_revision != revisions["state"]:
+                raise WorkspaceMigrationError(
+                    "workspace state is not validated legacy v3"
+                )
         self._verify_audit(
             issue_number,
             audit_revision=revisions["audit"],
@@ -387,7 +398,7 @@ class WorkspaceMigrationService:
             raise WorkspaceMigrationError(
                 "workspace audit ref was not planned"
             )
-        for kind in ("state", "inbox"):
+        for kind in ("state", "inbox", "migration"):
             if current[kind] not in {expected[kind], None}:
                 raise WorkspaceMigrationError(
                     f"workspace {kind} ref changed after planning"
@@ -407,6 +418,7 @@ class WorkspaceMigrationService:
         )
         targets = {
             _inbox_ref(issue_number): current["inbox"],
+            _conversion_ref(issue_number): current["migration"],
             _state_ref(issue_number): current["state"],
         }
         present = {
@@ -414,7 +426,10 @@ class WorkspaceMigrationService:
             for ref, revision in targets.items()
             if revision is not None
         }
-        if present and expected["state"] is None:
+        if (
+            (current["state"] is not None or current["inbox"] is not None)
+            and expected["state"] is None
+        ):
             raise WorkspaceMigrationError(
                 "workspace legacy state revision was not planned"
             )
@@ -428,13 +443,21 @@ class WorkspaceMigrationService:
             )
         self._require_closed(issue_number)
         self._delete_refs(
-            present,
+            targets,
             audit_ref=_audit_ref(issue_number),
             audit_revision=expected["audit"],
         )
-        if self._remote_revision(_audit_ref(issue_number)) != expected["audit"]:
+        after = self._issue_revisions(issue_number)
+        if after["audit"] != expected["audit"]:
             raise WorkspaceMigrationError(
                 "workspace audit ref changed during archival"
+            )
+        if any(
+            after[kind] is not None
+            for kind in ("inbox", "migration", "state")
+        ):
+            raise WorkspaceMigrationError(
+                "workspace archival deletion was not verified"
             )
         return WorkspaceArchiveResult(
             issue_number=issue_number,
@@ -454,32 +477,26 @@ class WorkspaceMigrationService:
             raise WorkspaceMigrationError(
                 "workspace migration fetch destination is not trusted"
             )
-        completed = subprocess.run(
-            (
-                "git",
-                "ls-remote",
-                "--heads",
-                safe_remote.url,
-                "refs/heads/foundry-opt/state/issue-*",
-                "refs/heads/foundry-opt/inbox/issue-*",
-            ),
-            cwd=self._root,
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-        if completed.returncode != 0:
+        try:
+            entries = list_remote_heads(
+                self._root,
+                safe_remote,
+                (
+                    "refs/heads/foundry-opt/state/issue-*",
+                    "refs/heads/foundry-opt/inbox/issue-*",
+                ),
+            )
+        except GitTransportError as error:
             raise WorkspaceMigrationError(
                 "workspace legacy ref inventory failed"
-            )
+            ) from error
         refs: dict[int, dict[str, str]] = {}
-        for line in completed.stdout.splitlines():
-            fields = line.split()
-            if len(fields) != 2 or _COMMIT.fullmatch(fields[0]) is None:
+        for revision, ref in entries:
+            if _COMMIT.fullmatch(revision) is None:
                 raise WorkspaceMigrationError(
                     "workspace legacy ref metadata is invalid"
                 )
-            match = _LEGACY_REF.fullmatch(fields[1])
+            match = _LEGACY_REF.fullmatch(ref)
             if match is None:
                 raise WorkspaceMigrationError(
                     "workspace legacy ref metadata is invalid"
@@ -491,7 +508,7 @@ class WorkspaceMigrationService:
                 raise WorkspaceMigrationError(
                     "workspace legacy ref metadata is ambiguous"
                 )
-            issue_refs[kind] = fields[0]
+            issue_refs[kind] = revision
         return refs
 
     def _issue_revisions(
@@ -501,6 +518,9 @@ class WorkspaceMigrationService:
         return {
             "audit": self._remote_revision(_audit_ref(issue_number)),
             "inbox": self._remote_revision(_inbox_ref(issue_number)),
+            "migration": self._remote_revision(
+                _conversion_ref(issue_number)
+            ),
             "state": self._remote_revision(_state_ref(issue_number)),
         }
 
@@ -590,7 +610,7 @@ class WorkspaceMigrationService:
 
     def _delete_refs(
         self,
-        refs: Mapping[str, str],
+        refs: Mapping[str, str | None],
         *,
         audit_ref: str,
         audit_revision: str,
@@ -603,28 +623,22 @@ class WorkspaceMigrationService:
             raise WorkspaceMigrationError(
                 "workspace migration push destination is not trusted"
             )
-        arguments = [
-            "git",
-            "push",
-            "--atomic",
-            f"--force-with-lease={audit_ref}:{audit_revision}",
-        ]
-        for ref, revision in sorted(refs.items()):
-            arguments.append(f"--force-with-lease={ref}:{revision}")
-        arguments.append(safe_remote.url)
-        arguments.append(f"{audit_revision}:{audit_ref}")
-        arguments.extend(f":{ref}" for ref in sorted(refs))
-        completed = subprocess.run(
-            tuple(arguments),
-            cwd=self._root,
-            capture_output=True,
-            check=False,
-            text=True,
-        )
+        try:
+            returncode = atomic_compare_and_swap_delete(
+                self._root,
+                safe_remote,
+                refs=refs,
+                guard_ref=audit_ref,
+                guard_revision=audit_revision,
+            )
+        except GitTransportError as error:
+            raise WorkspaceMigrationError(
+                "workspace archival compare-and-swap failed"
+            ) from error
         remaining = {
             ref: self._remote_revision(ref) for ref in sorted(refs)
         }
-        if completed.returncode != 0 and any(remaining.values()):
+        if returncode != 0 and any(remaining.values()):
             raise WorkspaceMigrationError(
                 "workspace archival compare-and-swap failed"
             )
@@ -716,7 +730,7 @@ def build_production_workspace_migration_service(
 def _expected_revisions(
     value: Mapping[str, str | None],
 ) -> dict[str, str | None]:
-    if set(value) != {"audit", "inbox", "state"}:
+    if set(value) != {"audit", "inbox", "migration", "state"}:
         raise ValueError("expected revisions are incomplete")
     result = dict(value)
     for kind, revision in result.items():

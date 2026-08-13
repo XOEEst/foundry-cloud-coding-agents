@@ -58,6 +58,7 @@ def test_workspace_migration_commands_emit_stable_json(
                     "expected_revisions": {
                         "audit": "b" * 40,
                         "inbox": None,
+                        "migration": "b" * 40,
                         "state": "a" * 40,
                     },
                     "issue_number": issue_number,
@@ -116,6 +117,8 @@ def test_workspace_migration_commands_emit_stable_json(
             "absent",
             "--expected-audit-revision",
             "b" * 40,
+            "--expected-migration-revision",
+            "b" * 40,
         ],
     )
 
@@ -140,6 +143,7 @@ def test_workspace_migration_commands_emit_stable_json(
             {
                 "audit": "b" * 40,
                 "inbox": None,
+                "migration": "b" * 40,
                 "state": "a" * 40,
             },
         ),

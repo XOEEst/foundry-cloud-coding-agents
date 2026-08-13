@@ -101,6 +101,35 @@ def _revision(repository: Path, ref: str) -> str | None:
     return output.split()[0] if output else None
 
 
+def _bare_revision(repository: Path, ref: str) -> str | None:
+    completed = subprocess.run(
+        ("git", f"--git-dir={repository}", "rev-parse", "--verify", ref),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else None
+
+
+def _install_ambient_redirect(
+    monkeypatch,
+    *,
+    origin_url: str,
+    redirect_url: str,
+) -> None:
+    entries = (
+        (f"url.{redirect_url}.insteadOf", origin_url),
+        ("http.proxy", "http://127.0.0.1:1"),
+        ("credential.helper", "!false"),
+    )
+    monkeypatch.setenv("GIT_CONFIG_COUNT", str(len(entries)))
+    for index, (key, value) in enumerate(entries):
+        monkeypatch.setenv(f"GIT_CONFIG_KEY_{index}", key)
+        monkeypatch.setenv(f"GIT_CONFIG_VALUE_{index}", value)
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+
+
 class _Lifecycle:
     def __init__(self, states: dict[int, IssueLifecycle]) -> None:
         self._states = states
@@ -143,6 +172,44 @@ def test_inventory_reports_all_closed_legacy_refs_without_private_state(
     }
     assert "snapshot" not in str(payload)
     assert "journal" not in str(payload)
+
+
+def test_inventory_ignores_ambient_git_transport_redirection(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state_revision = _v3_state(repository, 31)
+    origin = Path(
+        _run(("git", "config", "--get", "remote.origin.url"), repository)
+    )
+    redirect = tmp_path / "inventory-redirect.git"
+    _run(("git", "init", "--bare", str(redirect)), tmp_path)
+    _run(
+        (
+            "git",
+            "push",
+            str(redirect),
+            f"HEAD:refs/heads/foundry-opt/state/issue-99",
+        ),
+        repository,
+    )
+    origin_url = origin.resolve().as_uri()
+    _run(("git", "remote", "set-url", "origin", origin_url), repository)
+    _install_ambient_redirect(
+        monkeypatch,
+        origin_url=origin_url,
+        redirect_url=redirect.resolve().as_uri(),
+    )
+    service = WorkspaceMigrationService(
+        repository,
+        _Lifecycle({31: IssueLifecycle.CLOSED}),
+    )
+
+    payload = service.inventory().to_dict()
+
+    assert [item["issue_number"] for item in payload["items"]] == [31]
+    assert payload["items"][0]["state_revision"] == state_revision
 
 
 @pytest.mark.parametrize(
@@ -230,6 +297,7 @@ def test_archive_dry_run_does_not_mutate_refs(
     assert plan["expected_revisions"] == {
         "audit": conversion.audit_revision,
         "inbox": inbox_revision,
+        "migration": conversion.audit_revision,
         "state": state_revision,
     }
     assert _revision(
@@ -279,6 +347,38 @@ def test_archive_refuses_refs_changed_after_planning(
     ) == changed_inbox
 
 
+def test_archive_refuses_migration_ref_changed_after_planning(
+    repository: Path,
+) -> None:
+    state_revision = _v3_state(repository, 31)
+    service = WorkspaceMigrationService(
+        repository,
+        _Lifecycle({31: IssueLifecycle.CLOSED}),
+    )
+    service.convert(31, expected_source_revision=state_revision)
+    plan = service.plan_archive(31)
+    changed_migration = _install_ref(
+        repository,
+        "refs/heads/foundry-opt/migration/issue-31",
+        "changed migration",
+    )
+
+    with pytest.raises(WorkspaceMigrationError, match="migration.*changed"):
+        service.apply_archive(
+            31,
+            expected_revisions=plan.expected_revisions,
+        )
+
+    assert _revision(
+        repository,
+        "refs/heads/foundry-opt/migration/issue-31",
+    ) == changed_migration
+    assert _revision(
+        repository,
+        "refs/heads/foundry-opt/state/issue-31",
+    ) == state_revision
+
+
 def test_archive_deletes_only_explicit_issue_refs_and_retries_safely(
     repository: Path,
 ) -> None:
@@ -310,6 +410,7 @@ def test_archive_deletes_only_explicit_issue_refs_and_retries_safely(
     expectations = {
         "audit": conversion.audit_revision,
         "inbox": inbox_revision,
+        "migration": conversion.audit_revision,
         "state": state_revision,
     }
 
@@ -325,6 +426,7 @@ def test_archive_deletes_only_explicit_issue_refs_and_retries_safely(
     assert first["status"] == "completed"
     assert first["deleted_refs"] == [
         "refs/heads/foundry-opt/inbox/issue-31",
+        "refs/heads/foundry-opt/migration/issue-31",
         "refs/heads/foundry-opt/state/issue-31",
     ]
     assert second["status"] == "already_completed"
@@ -340,4 +442,122 @@ def test_archive_deletes_only_explicit_issue_refs_and_retries_safely(
     assert _revision(
         repository,
         "refs/heads/foundry-opt/audit/issue-31",
+    ) == conversion.audit_revision
+    assert _revision(
+        repository,
+        "refs/heads/foundry-opt/migration/issue-31",
+    ) is None
+
+
+def test_archive_cleans_up_stranded_migration_ref(
+    repository: Path,
+) -> None:
+    state_revision = _v3_state(repository, 31)
+    service = WorkspaceMigrationService(
+        repository,
+        _Lifecycle({31: IssueLifecycle.CLOSED}),
+    )
+    conversion = service.convert(
+        31,
+        expected_source_revision=state_revision,
+    )
+    _run(
+        (
+            "git",
+            "push",
+            "origin",
+            ":refs/heads/foundry-opt/state/issue-31",
+        ),
+        repository,
+    )
+
+    plan = service.plan_archive(31)
+    result = service.apply_archive(
+        31,
+        expected_revisions=plan.expected_revisions,
+    )
+
+    assert plan.status == "planned"
+    assert plan.expected_revisions["state"] is None
+    assert (
+        plan.expected_revisions["migration"]
+        == conversion.audit_revision
+    )
+    assert result.deleted_refs == (
+        "refs/heads/foundry-opt/migration/issue-31",
+    )
+    assert _revision(
+        repository,
+        "refs/heads/foundry-opt/migration/issue-31",
+    ) is None
+    assert _revision(
+        repository,
+        "refs/heads/foundry-opt/audit/issue-31",
+    ) == conversion.audit_revision
+
+
+def test_archive_deletion_ignores_ambient_git_transport_redirection(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state_revision = _v3_state(repository, 31)
+    service = WorkspaceMigrationService(
+        repository,
+        _Lifecycle({31: IssueLifecycle.CLOSED}),
+    )
+    conversion = service.convert(
+        31,
+        expected_source_revision=state_revision,
+    )
+    plan = service.plan_archive(31)
+    origin = Path(
+        _run(("git", "config", "--get", "remote.origin.url"), repository)
+    )
+    redirect = tmp_path / "deletion-redirect.git"
+    _run(("git", "init", "--bare", str(redirect)), tmp_path)
+    for ref, revision in (
+        (
+            "refs/heads/foundry-opt/audit/issue-31",
+            conversion.audit_revision,
+        ),
+        (
+            "refs/heads/foundry-opt/migration/issue-31",
+            conversion.audit_revision,
+        ),
+        (
+            "refs/heads/foundry-opt/state/issue-31",
+            state_revision,
+        ),
+    ):
+        _run(("git", "push", str(redirect), f"{revision}:{ref}"), repository)
+    origin_url = origin.resolve().as_uri()
+    _run(("git", "remote", "set-url", "origin", origin_url), repository)
+    _install_ambient_redirect(
+        monkeypatch,
+        origin_url=origin_url,
+        redirect_url=redirect.resolve().as_uri(),
+    )
+
+    result = service.apply_archive(
+        31,
+        expected_revisions=plan.expected_revisions,
+    )
+
+    assert result.status == "completed"
+    assert _bare_revision(
+        origin,
+        "refs/heads/foundry-opt/state/issue-31",
+    ) is None
+    assert _bare_revision(
+        origin,
+        "refs/heads/foundry-opt/migration/issue-31",
+    ) is None
+    assert _bare_revision(
+        redirect,
+        "refs/heads/foundry-opt/state/issue-31",
+    ) == state_revision
+    assert _bare_revision(
+        redirect,
+        "refs/heads/foundry-opt/migration/issue-31",
     ) == conversion.audit_revision
