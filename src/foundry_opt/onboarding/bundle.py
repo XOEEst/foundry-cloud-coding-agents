@@ -732,6 +732,7 @@ on:
 
 permissions:
   actions: write
+  checks: write
   contents: write
   id-token: write
   issues: write
@@ -886,6 +887,260 @@ jobs:
           )"
           printf '%s\\n' "$result_json"
           printf '%s\\n' "$result_json" >> "$WORKSPACE_RESUME_FILE"
+      - name: Publish trusted exact verification check and ready finalized workspace pull request
+        env:
+          OPTIMIZER_PACKAGE: {install}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          WORKSPACE_RESUME_FILE: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
+        shell: python
+        run: |
+          from datetime import datetime, timezone
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          results_path = Path(os.environ["WORKSPACE_RESUME_FILE"])
+          if not results_path.is_file():
+              raise SystemExit(0)
+
+          entries: dict[tuple[int, str], dict[str, object]] = {{}}
+          for line in results_path.read_text(encoding="utf-8").splitlines():
+              if not line.strip():
+                  continue
+              document = json.loads(line)
+              verification = document.get("verification")
+              if verification is None:
+                  continue
+              if not isinstance(verification, dict):
+                  raise SystemExit("workspace verification payload is invalid")
+              issue = verification.get("issue_number")
+              pull_request = verification.get(
+                  "workspace_pull_request_number"
+              )
+              candidate = verification.get("candidate_id")
+              check_name = verification.get("check_name")
+              if (
+                  type(issue) is not int
+                  or issue < 1
+                  or type(pull_request) is not int
+                  or pull_request < 1
+                  or not isinstance(candidate, str)
+                  or not re.fullmatch(
+                      r"[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}",
+                      candidate,
+                  )
+                  or not isinstance(check_name, str)
+                  or not check_name
+              ):
+                  raise SystemExit("workspace verification payload is invalid")
+              entries[(pull_request, check_name)] = {{
+                  "candidate_id": candidate,
+                  "issue_number": issue,
+              }}
+
+          repository = os.environ["TRUSTED_REPOSITORY"]
+          package = os.environ["OPTIMIZER_PACKAGE"]
+          failure = False
+          for (pull_request, check_name), entry in sorted(entries.items()):
+              pull_request_view = json.loads(
+                  subprocess.run(
+                      [
+                          "gh",
+                          "pr",
+                          "view",
+                          str(pull_request),
+                          "--repo",
+                          repository,
+                          "--json",
+                          "number,headRefOid,isDraft,state",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+              )
+              head_sha = pull_request_view.get("headRefOid")
+              if (
+                  not isinstance(pull_request_view, dict)
+                  or pull_request_view.get("number") != pull_request
+                  or pull_request_view.get("state") != "OPEN"
+                  or not isinstance(pull_request_view.get("isDraft"), bool)
+                  or not isinstance(head_sha, str)
+                  or re.fullmatch(r"[0-9a-f]{{40}}", head_sha) is None
+              ):
+                  raise SystemExit(
+                      "workspace pull request verification target is invalid"
+                  )
+
+              verify = subprocess.run(
+                  [
+                      "uv",
+                      "run",
+                      "--no-project",
+                      "--no-config",
+                      "--no-env-file",
+                      "--with",
+                      package,
+                      "foundry-opt",
+                      "workspace",
+                      "verify",
+                      "--issue",
+                      str(entry["issue_number"]),
+                      "--candidate",
+                      str(entry["candidate_id"]),
+                      "--pull-request",
+                      str(pull_request),
+                      "--head-sha",
+                      head_sha,
+                      "--json",
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if verify.stdout:
+                  print(verify.stdout, end="")
+              if verify.stderr:
+                  print(verify.stderr, end="", file=sys.stderr)
+
+              summary = (
+                  "## Trusted workspace verification\\n\\n"
+                  "Trusted verification failed before a summary could be "
+                  "produced.\\n"
+              )
+              if verify.stdout.strip():
+                  try:
+                      verify_document = json.loads(verify.stdout)
+                  except json.JSONDecodeError:
+                      verify_document = None
+                  if isinstance(verify_document, dict):
+                      value = verify_document.get("summary_markdown")
+                      if isinstance(value, str) and value.strip():
+                          summary = value
+              if verify.returncode != 0:
+                  details = verify.stderr.strip() or verify.stdout.strip()
+                  if details:
+                      summary = (
+                          f"{{summary}}\\n"
+                          "```text\\n"
+                          f"{{details[:4000]}}\\n"
+                          "```\\n"
+                      )
+
+              external_id = (
+                  "foundry-opt:workspace-verify:"
+                  f"issue-{{entry['issue_number']}}:"
+                  f"pr-{{pull_request}}:"
+                  f"{{check_name}}"
+              )
+              existing_runs = json.loads(
+                  subprocess.run(
+                      [
+                          "gh",
+                          "api",
+                          f"repos/{{repository}}/commits/{{head_sha}}/check-runs",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+              )
+              check_run_id = None
+              if not isinstance(existing_runs, dict) or not isinstance(
+                  existing_runs.get("check_runs"),
+                  list,
+              ):
+                  raise SystemExit(
+                      "workspace verification check-runs response is invalid"
+                  )
+              for check_run in existing_runs["check_runs"]:
+                  if (
+                      isinstance(check_run, dict)
+                      and check_run.get("name") == check_name
+                      and check_run.get("external_id") == external_id
+                      and type(check_run.get("id")) is int
+                      and check_run["id"] > 0
+                  ):
+                      check_run_id = check_run["id"]
+                      break
+
+              timestamp = (
+                  datetime.now(timezone.utc)
+                  .replace(microsecond=0)
+                  .isoformat()
+                  .replace("+00:00", "Z")
+              )
+              payload = {{
+                  "completed_at": timestamp,
+                  "conclusion": (
+                      "success" if verify.returncode == 0 else "failure"
+                  ),
+                  "external_id": external_id,
+                  "name": check_name,
+                  "output": {{
+                      "summary": summary,
+                      "title": "Foundry exact candidate check",
+                  }},
+                  "status": "completed",
+              }}
+              if check_run_id is None:
+                  payload["head_sha"] = head_sha
+                  subprocess.run(
+                      [
+                          "gh",
+                          "api",
+                          f"repos/{{repository}}/check-runs",
+                          "--method",
+                          "POST",
+                          "--input",
+                          "-",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      input=json.dumps(payload),
+                  )
+              else:
+                  subprocess.run(
+                      [
+                          "gh",
+                          "api",
+                          f"repos/{{repository}}/check-runs/{{check_run_id}}",
+                          "--method",
+                          "PATCH",
+                          "--input",
+                          "-",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      input=json.dumps(payload),
+                  )
+
+              if verify.returncode == 0:
+                  if pull_request_view["isDraft"]:
+                      subprocess.run(
+                          [
+                              "gh",
+                              "pr",
+                              "ready",
+                              str(pull_request),
+                              "--repo",
+                              repository,
+                          ],
+                          check=True,
+                          capture_output=True,
+                          text=True,
+                      )
+              else:
+                  failure = True
+
+          if failure:
+              raise SystemExit(1)
       - name: Resume same workspace pull request when trusted state needs Copilot
         env:
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}

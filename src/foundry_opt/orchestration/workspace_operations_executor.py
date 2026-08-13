@@ -262,6 +262,29 @@ def _workspace_resume_request(
     )
 
 
+def _workspace_verification_request(
+    *,
+    issue_number: int,
+    workspace: WorkspaceResult | None,
+) -> WorkspaceVerificationRequest | None:
+    if (
+        workspace is None
+        or workspace.report is None
+        or workspace.next_action is None
+        or workspace.next_action.kind
+        is not WorkspaceNextActionKind.MERGE_WORKSPACE_PULL_REQUEST
+    ):
+        return None
+    pull_request_number = _workspace_pull_request_number(workspace)
+    if pull_request_number is None:
+        return None
+    return WorkspaceVerificationRequest(
+        issue_number=issue_number,
+        candidate_id=workspace.report.candidate_id,
+        workspace_pull_request_number=pull_request_number,
+    )
+
+
 class WorkspaceOperationsStatus(StrEnum):
     NOOP = "noop"
     CANDIDATE_PENDING = "candidate_pending"
@@ -668,6 +691,33 @@ class WorkspaceResumeRequest:
 
 
 @dataclass(frozen=True)
+class WorkspaceVerificationRequest:
+    issue_number: int
+    candidate_id: str
+    workspace_pull_request_number: int
+    check_name: str = "exact-candidate"
+
+    def __post_init__(self) -> None:
+        _positive_integer(self.issue_number, "workspace issue number")
+        _identifier(self.candidate_id, "workspace candidate")
+        _positive_integer(
+            self.workspace_pull_request_number,
+            "workspace pull request number",
+        )
+        _safe_text(self.check_name, "workspace verification check name")
+
+    def to_dict(self) -> dict[str, int | str]:
+        return {
+            "candidate_id": self.candidate_id,
+            "check_name": self.check_name,
+            "issue_number": self.issue_number,
+            "workspace_pull_request_number": (
+                self.workspace_pull_request_number
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class WorkspaceCompletionRequest:
     repository_root: Path
     target: WorkspaceDeploymentTarget
@@ -740,6 +790,7 @@ class WorkspaceOperationsResult:
     deployment_run_url: str | None = None
     finalization: WorkspaceFinalizationEffect | None = None
     resume: WorkspaceResumeRequest | None = None
+    verification: WorkspaceVerificationRequest | None = None
 
     def __post_init__(self) -> None:
         _positive_integer(self.issue_number, "workspace issue number")
@@ -773,6 +824,11 @@ class WorkspaceOperationsResult:
             WorkspaceResumeRequest,
         ):
             raise ValueError("workspace resume request is invalid")
+        if self.verification is not None and not isinstance(
+            self.verification,
+            WorkspaceVerificationRequest,
+        ):
+            raise ValueError("workspace verification request is invalid")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -793,6 +849,11 @@ class WorkspaceOperationsResult:
                 else None
             ),
             "status": self.status.value,
+            "verification": (
+                self.verification.to_dict()
+                if self.verification is not None
+                else None
+            ),
             "workspace_pull_request_number": (
                 self.workspace_pull_request_number
             ),
@@ -1746,6 +1807,10 @@ class WorkspaceOperationsService:
                     operation_key=operation.sha256,
                     workspace=workspace,
                 ),
+                verification=_workspace_verification_request(
+                    issue_number=request.issue_number,
+                    workspace=workspace,
+                ),
             )
         persisted = self._candidate_store.persist_result(operation, result)
         workspace, _workspace_recorded = self._complete_candidate_selection(
@@ -1765,6 +1830,10 @@ class WorkspaceOperationsService:
             resume=_workspace_resume_request(
                 issue_number=request.issue_number,
                 operation_key=operation.sha256,
+                workspace=workspace,
+            ),
+            verification=_workspace_verification_request(
+                issue_number=request.issue_number,
                 workspace=workspace,
             ),
         )
@@ -1854,6 +1923,7 @@ __all__ = [
     "WorkspaceOperationsStatus",
     "WorkspaceReadyForHumanRequest",
     "WorkspaceResumeRequest",
+    "WorkspaceVerificationRequest",
     "WorkspaceRetentionEvaluator",
     "WorkspaceRetentionOutcome",
     "WorkspaceRetentionStatus",

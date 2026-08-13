@@ -349,6 +349,7 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
 
     assert workflow["permissions"] == {
         "actions": "write",
+        "checks": "write",
         "contents": "write",
         "id-token": "write",
         "issues": "write",
@@ -369,6 +370,13 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
     )
     assert "gh run download" in text
     assert "workspace-resume.ndjson" in text
+    assert "Publish trusted exact verification check and ready finalized workspace pull request" in text
+    assert 'repos/{repository}/commits/{head_sha}/check-runs' in text
+    assert 'repos/{repository}/check-runs/{check_run_id}' in text
+    assert '"foundry-opt",' in text
+    assert '"workspace",' in text
+    assert '"verify",' in text
+    assert '"ready",' in text
     assert "gh pr comment" in text
     assert 'repos/{repository}/issues/{pull_request}/comments' in text
     assert "@copilot" in text
@@ -396,6 +404,11 @@ def test_operations_workflow_resumes_same_workspace_pull_request_without_creatin
     ]
 
     assert "Resume same workspace pull request when trusted state needs Copilot" in text
+    assert text.index(
+        "Publish trusted exact verification check and ready finalized workspace pull request"
+    ) < text.index(
+        "Resume same workspace pull request when trusted state needs Copilot"
+    )
     assert "workspace resume payload is invalid" in text
     assert "gh pr comment" in text
     assert "gh pr create" not in text

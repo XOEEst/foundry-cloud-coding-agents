@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -469,6 +470,7 @@ def _workspace_result(
     recorded: bool,
     next_action: WorkspaceNextActionKind | None = None,
     workspace_pull_request_number: int | None = None,
+    report: object | None = None,
 ) -> WorkspaceResult:
     return WorkspaceResult(
         phase=phase,
@@ -487,6 +489,7 @@ def _workspace_result(
             if next_action is not None
             else None
         ),
+        report=report,
     )
 
 
@@ -547,6 +550,7 @@ def test_candidate_fallback_resumes_same_workspace_pull_request(
     assert result.status is WorkspaceOperationsStatus.CANDIDATE_RECORDED
     assert result.workspace_pull_request_number == 104
     assert result.resume is not None
+    assert result.verification is None
     assert result.resume.workspace_pull_request_number == 104
     assert "@copilot" in result.resume.comment_body
     assert "same workspace pull request" in result.resume.comment_body
@@ -574,6 +578,7 @@ def test_candidate_fallback_final_result_promotes_ready_workspace_pr_in_actions(
                     WorkspaceNextActionKind.MERGE_WORKSPACE_PULL_REQUEST
                 ),
                 workspace_pull_request_number=104,
+                report=SimpleNamespace(candidate_id="candidate-2"),
             )
         ]
     )
@@ -594,6 +599,11 @@ def test_candidate_fallback_final_result_promotes_ready_workspace_pr_in_actions(
     assert result.phase is WorkspacePhase.AWAITING_SELECTION
     assert result.workspace_pull_request_number == 104
     assert result.resume is None
+    assert result.verification is not None
+    assert result.verification.issue_number == 31
+    assert result.verification.candidate_id == "candidate-2"
+    assert result.verification.workspace_pull_request_number == 104
+    assert result.verification.check_name == "exact-candidate"
     assert len(selection.requests) == 1
     assert selection.requests[0].issue_number == 31
     assert (

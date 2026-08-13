@@ -498,7 +498,7 @@ def test_candidate_completion_resumes_partial_and_duplicates_without_rerun(
     assert store.load(31).revision == completed_revision
 
 
-def test_github_finalizer_preserves_workspace_identity_and_marks_pr_ready(
+def test_github_finalizer_preserves_workspace_identity_without_marking_pr_ready(
     tmp_path: Path,
 ) -> None:
     class Commands:
@@ -541,7 +541,7 @@ def test_github_finalizer_preserves_workspace_identity_and_marks_pr_ready(
     )
 
     assert finalized.number == 104
-    assert finalized.draft is False
+    assert finalized.draft is True
     assert commands.calls[0][0][:3] == ("gh", "pr", "view")
     assert commands.calls[1][0][:3] == ("gh", "pr", "edit")
     assert "<!-- foundry-opt:workspace-pr:issue-31:v1 -->" in (
@@ -550,7 +550,7 @@ def test_github_finalizer_preserves_workspace_identity_and_marks_pr_ready(
     assert f"<!-- foundry-opt:workspace-base:{'b' * 40} -->" in (
         commands.calls[1][1]["input_text"]
     )
-    assert commands.calls[2][0][:3] == ("gh", "pr", "ready")
+    assert len(commands.calls) == 2
 
 
 def test_github_finalizer_reconciles_already_ready_pr_without_edits(

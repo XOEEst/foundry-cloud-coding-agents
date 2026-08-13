@@ -66,6 +66,10 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
     assert "gh workflow run foundry-optimization-operations.yml" in (
         current_bundle_source
     )
+    assert "repos/{{repository}}/commits/{{head_sha}}/check-runs" in (
+        current_bundle_source
+    )
+    assert '"ready",' in current_bundle_source
     assert "foundry-opt workspace operations execute" in (
         current_bundle_source
     )

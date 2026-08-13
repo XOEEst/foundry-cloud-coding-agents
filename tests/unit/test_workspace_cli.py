@@ -18,6 +18,7 @@ from foundry_opt.orchestration import (
 from foundry_opt.orchestration.workspace_operations_executor import (
     WorkspaceOperationsResult,
     WorkspaceOperationsStatus,
+    WorkspaceVerificationRequest,
 )
 from foundry_opt.orchestration.workspace_verification import (
     WorkspaceEvidenceLink,
@@ -412,6 +413,7 @@ def test_workspace_operations_execute_emits_stable_json(
         "recorded": True,
         "resume": None,
         "status": "candidate_recorded",
+        "verification": None,
         "workspace_pull_request_number": None,
     }
 
@@ -502,6 +504,61 @@ def test_workspace_operations_reconcile_uses_trusted_artifact_context(
 
     assert completed.exit_code == 0
     assert json.loads(completed.stdout)["status"] == "completed"
+
+
+def test_workspace_operations_execute_emits_verification_payload(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    class Service:
+        def execute(self, request):
+            return WorkspaceOperationsResult(
+                issue_number=31,
+                status=WorkspaceOperationsStatus.CANDIDATE_RECORDED,
+                recorded=False,
+                phase=WorkspacePhase.AWAITING_SELECTION,
+                operation_id="2" * 64,
+                workspace_pull_request_number=104,
+                verification=WorkspaceVerificationRequest(
+                    issue_number=31,
+                    candidate_id="candidate-2",
+                    workspace_pull_request_number=104,
+                ),
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_workspace_operations_service",
+        lambda: Service(),
+    )
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "operations",
+            "execute",
+            "--issue",
+            "31",
+            "--event-name",
+            "workflow_dispatch",
+            "--repository",
+            "octo-org/optimizer",
+            "--repository-id",
+            "123",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["verification"] == {
+        "candidate_id": "candidate-2",
+        "check_name": "exact-candidate",
+        "issue_number": 31,
+        "workspace_pull_request_number": 104,
+    }
 
 
 def test_workspace_intake_normalizes_trusted_event_through_service(

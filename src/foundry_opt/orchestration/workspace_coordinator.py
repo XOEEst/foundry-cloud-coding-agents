@@ -447,18 +447,6 @@ class GhWorkspacePullRequestFinalizer:
                     cwd=repository_root,
                     input_text=body,
                 )
-            if current["isDraft"]:
-                self._commands.run(
-                    (
-                        "gh",
-                        "pr",
-                        "ready",
-                        str(pull_request.number),
-                        "--repo",
-                        self._repository,
-                    ),
-                    cwd=repository_root,
-                )
         except (CommandError, json.JSONDecodeError) as error:
             raise RuntimeError(
                 "workspace pull request finalization failed"
@@ -468,7 +456,7 @@ class GhWorkspacePullRequestFinalizer:
             issue_number=pull_request.issue_number,
             branch=pull_request.branch,
             title=projection.title,
-            draft=False,
+            draft=bool(current["isDraft"]),
             reuse_existing=True,
             base_commit=pull_request.base_commit,
         )
@@ -670,7 +658,6 @@ class WorkspaceCandidateCoordinator:
             or finalized.issue_number != pull_request.issue_number
             or finalized.branch != pull_request.branch
             or finalized.base_commit != pull_request.base_commit
-            or finalized.draft
             or finalized.title != projection.title
         ):
             raise ValueError("workspace finalizer changed pull request identity")
