@@ -32,6 +32,9 @@ from foundry_opt.orchestration.steward import (
     StewardAdvanceRequest,
     StewardAdvanceService,
 )
+from foundry_opt.orchestration.workspace_migration import (
+    WorkspaceLegacyCleanupPlan,
+)
 
 
 app = typer.Typer(
@@ -65,7 +68,7 @@ workspace_app = typer.Typer(
 )
 app.add_typer(workspace_app, name="workspace")
 workspace_migration_app = typer.Typer(
-    help="Inventory, convert, and safely archive legacy workspace refs.",
+    help="Inventory, convert, clean up, and safely archive legacy workspace refs.",
     no_args_is_help=True,
 )
 workspace_app.add_typer(workspace_migration_app, name="migration")
@@ -339,6 +342,56 @@ def workspace_migration_archive(
     except (RuntimeError, ValueError, OSError) as error:
         _workspace_migration_failure(error)
     _workspace_migration_output(result)
+
+
+@workspace_migration_app.command("cleanup-legacy")
+def workspace_migration_cleanup_legacy(
+    plan_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--plan-file",
+            dir_okay=False,
+            help="Write a dry-run plan or load an exact plan with --apply.",
+        ),
+    ] = None,
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Apply the exact cleanup plan loaded from --plan-file.",
+        ),
+    ] = False,
+) -> None:
+    """Plan or apply exact legacy ref cleanup without freeform arguments."""
+    try:
+        service = build_workspace_migration_service()
+        if apply:
+            if plan_file is None:
+                raise typer.BadParameter("--plan-file is required with --apply")
+            payload = json.loads(plan_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("workspace cleanup plan must be a JSON object")
+            result = service.apply_cleanup_legacy(
+                WorkspaceLegacyCleanupPlan.from_dict(payload)
+            )
+            _workspace_migration_output(result)
+            return
+        result = service.plan_cleanup_legacy()
+        if plan_file is not None:
+            plan_file.parent.mkdir(parents=True, exist_ok=True)
+            plan_file.write_text(
+                json.dumps(
+                    result.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+        _workspace_migration_output(result)
+    except typer.BadParameter:
+        raise
+    except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
+        _workspace_migration_failure(error)
 
 
 def _migration_revision(value: str | None) -> str | None:

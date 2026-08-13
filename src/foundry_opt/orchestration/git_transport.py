@@ -193,11 +193,15 @@ def atomic_compare_and_swap_delete(
     remote: SafePushRemote,
     *,
     refs: Mapping[str, str | None],
-    guard_ref: str,
-    guard_revision: str,
+    guard_ref: str | None = None,
+    guard_revision: str | None = None,
 ) -> int:
     if not refs:
         raise ValueError("at least one ref is required")
+    if (guard_ref is None) != (guard_revision is None):
+        raise ValueError(
+            "guard_ref and guard_revision must either both be set or both be absent"
+        )
     with _isolated_git_transport(root, remote.url) as (
         transport_git_dir,
         environment,
@@ -207,14 +211,18 @@ def atomic_compare_and_swap_delete(
             transport_git_dir,
             "push",
             "--atomic",
-            f"--force-with-lease={guard_ref}:{guard_revision}",
         ]
+        if guard_ref is not None and guard_revision is not None:
+            arguments.append(
+                f"--force-with-lease={guard_ref}:{guard_revision}"
+            )
         for ref, revision in sorted(refs.items()):
             arguments.append(
                 f"--force-with-lease={ref}:{revision or ''}"
             )
         arguments.append(remote.url)
-        arguments.append(f"{guard_revision}:{guard_ref}")
+        if guard_ref is not None and guard_revision is not None:
+            arguments.append(f"{guard_revision}:{guard_ref}")
         arguments.extend(f":{ref}" for ref in sorted(refs))
         completed = _run(
             root,

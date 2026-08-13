@@ -101,6 +101,12 @@ from foundry_opt.orchestration.workspace_git_store import (
     WorkspacePrivacyError,
     WorkspaceStoreError,
 )
+from foundry_opt.orchestration.workspace_migration import (
+    WorkspaceLegacyCleanupPlan,
+    WorkspaceLegacyCleanupResult,
+    WorkspaceLegacyRefKind,
+    WorkspaceLegacyRefRecord,
+)
 from foundry_opt.orchestration.workspace_state_migration import (
     convert_workspace_state_v3,
     detect_workspace_state_v3,
@@ -507,6 +513,10 @@ __all__ = [
     "WorkspaceStateConversionError",
     "WorkspaceStateConversionPayload",
     "WorkspaceStateMigrationPlan",
+    "WorkspaceLegacyCleanupPlan",
+    "WorkspaceLegacyCleanupResult",
+    "WorkspaceLegacyRefKind",
+    "WorkspaceLegacyRefRecord",
     "WorkspaceStore",
     "WorkspaceStoreError",
     "WorkspaceUpdate",

@@ -26,6 +26,18 @@ class _Result:
         return self._payload
 
 
+class _CleanupPlan:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def to_dict(self) -> dict[str, object]:
+        return self._payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "_CleanupPlan":
+        return cls(payload)
+
+
 def test_workspace_migration_commands_emit_stable_json(
     monkeypatch,
     tmp_path: Path,
@@ -165,6 +177,155 @@ def test_workspace_migration_apply_requires_exact_expectations() -> None:
 
     assert completed.exit_code != 0
     assert "--expected-state-revision" in completed.output
+
+
+def test_workspace_cleanup_legacy_commands_emit_stable_json(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    plan_file = tmp_path / "cleanup-plan.json"
+    calls: list[tuple[object, ...]] = []
+
+    class Service:
+        def plan_cleanup_legacy(self):
+            calls.append(("plan-cleanup",))
+            return _CleanupPlan(
+                {
+                    "apply": False,
+                    "content_hash": "c" * 64,
+                    "deletions": [
+                        {
+                            "action": "delete",
+                            "issue_lifecycle": "closed",
+                            "issue_number": 31,
+                            "reason": "closed_orphan_legacy_ref",
+                            "ref": "refs/heads/foundry-opt/spec/issue-31/abc",
+                            "ref_kind": "spec",
+                            "revision": "a" * 40,
+                        }
+                    ],
+                    "items": [
+                        {
+                            "action": "delete",
+                            "issue_lifecycle": "closed",
+                            "issue_number": 31,
+                            "reason": "closed_orphan_legacy_ref",
+                            "ref": "refs/heads/foundry-opt/spec/issue-31/abc",
+                            "ref_kind": "spec",
+                            "revision": "a" * 40,
+                        }
+                    ],
+                    "remote": "origin",
+                    "status": "planned",
+                }
+            )
+
+        def apply_cleanup_legacy(self, plan):
+            calls.append(("apply-cleanup", plan.to_dict()))
+            return _Result(
+                {
+                    "apply": True,
+                    "audit_manifest": [
+                        {
+                            "action": "delete",
+                            "issue_lifecycle": "closed",
+                            "issue_number": 31,
+                            "reason": "closed_orphan_legacy_ref",
+                            "ref": "refs/heads/foundry-opt/spec/issue-31/abc",
+                            "ref_kind": "spec",
+                            "revision": "a" * 40,
+                        }
+                    ],
+                    "content_hash": "c" * 64,
+                    "deleted_refs": [
+                        "refs/heads/foundry-opt/spec/issue-31/abc"
+                    ],
+                    "remote": "origin",
+                    "status": "completed",
+                }
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_workspace_migration_service",
+        lambda: Service(),
+    )
+    monkeypatch.setattr(cli, "WorkspaceLegacyCleanupPlan", _CleanupPlan)
+
+    dry_run = runner.invoke(
+        app,
+        [
+            "workspace",
+            "migration",
+            "cleanup-legacy",
+            "--plan-file",
+            str(plan_file),
+        ],
+    )
+    apply = runner.invoke(
+        app,
+        [
+            "workspace",
+            "migration",
+            "cleanup-legacy",
+            "--apply",
+            "--plan-file",
+            str(plan_file),
+        ],
+    )
+
+    assert dry_run.exit_code == 0
+    assert json.loads(dry_run.stdout)["status"] == "planned"
+    assert json.loads(plan_file.read_text(encoding="utf-8")) == {
+        "apply": False,
+        "content_hash": "c" * 64,
+        "deletions": [
+            {
+                "action": "delete",
+                "issue_lifecycle": "closed",
+                "issue_number": 31,
+                "reason": "closed_orphan_legacy_ref",
+                "ref": "refs/heads/foundry-opt/spec/issue-31/abc",
+                "ref_kind": "spec",
+                "revision": "a" * 40,
+            }
+        ],
+        "items": [
+            {
+                "action": "delete",
+                "issue_lifecycle": "closed",
+                "issue_number": 31,
+                "reason": "closed_orphan_legacy_ref",
+                "ref": "refs/heads/foundry-opt/spec/issue-31/abc",
+                "ref_kind": "spec",
+                "revision": "a" * 40,
+            }
+        ],
+        "remote": "origin",
+        "status": "planned",
+    }
+    assert apply.exit_code == 0
+    assert json.loads(apply.stdout)["status"] == "completed"
+    assert calls == [
+        ("plan-cleanup",),
+        ("apply-cleanup", json.loads(plan_file.read_text(encoding="utf-8"))),
+    ]
+
+
+def test_workspace_cleanup_legacy_apply_requires_plan_file() -> None:
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "migration",
+            "cleanup-legacy",
+            "--apply",
+        ],
+    )
+
+    assert completed.exit_code != 0
+    assert "--plan-file" in completed.output
 
 
 def test_github_lifecycle_reader_requests_only_public_issue_state(
