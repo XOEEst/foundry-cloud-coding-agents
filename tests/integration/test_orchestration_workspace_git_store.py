@@ -143,12 +143,16 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
             experiments=(
                 WorkspaceExperimentRecord(
                     candidate_id="candidate-1",
+                    mutation_class="system_instructions",
                     patch_sha256=hashlib.sha256(patch).hexdigest(),
                     bundle_sha256="d" * 64,
                     evidence_sha256="c" * 64,
                     idempotency_key="1" * 64,
                     operation_sha256="2" * 64,
                     status="completed",
+                    changed_paths=("agent.py",),
+                    validation=("pytest: passed",),
+                    expected_tree=lineage.expected_tree,
                     executor="direct_oidc",
                     draft_id="draft-1",
                     evaluation_id="evaluation-1",

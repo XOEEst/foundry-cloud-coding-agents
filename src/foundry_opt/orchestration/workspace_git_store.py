@@ -1333,6 +1333,7 @@ def _experiment_to_document(
     return {
         "bundle_sha256": record.bundle_sha256,
         "candidate_id": record.candidate_id,
+        "changed_paths": list(record.changed_paths),
         "draft_id": record.draft_id,
         "evaluation_id": record.evaluation_id,
         "evidence_sha256": record.evidence_sha256,
@@ -1340,10 +1341,13 @@ def _experiment_to_document(
         "guardrails": dict(record.guardrails),
         "idempotency_key": record.idempotency_key,
         "metrics": dict(record.metrics),
+        "mutation_class": record.mutation_class,
         "operation_sha256": record.operation_sha256,
         "patch_sha256": record.patch_sha256,
         "run_id": record.run_id,
         "status": record.status,
+        "validation": list(record.validation),
+        "expected_tree": record.expected_tree,
     }
 
 
@@ -1358,12 +1362,16 @@ def _experiments_from_document(
         records = tuple(
             WorkspaceExperimentRecord(
                 candidate_id=item["candidate_id"],
+                mutation_class=item["mutation_class"],
                 patch_sha256=item["patch_sha256"],
                 bundle_sha256=item["bundle_sha256"],
                 evidence_sha256=item["evidence_sha256"],
                 idempotency_key=item["idempotency_key"],
                 operation_sha256=item["operation_sha256"],
                 status=item["status"],
+                changed_paths=tuple(item["changed_paths"]),
+                validation=tuple(item["validation"]),
+                expected_tree=item["expected_tree"],
                 executor=item["executor"],
                 draft_id=item["draft_id"],
                 evaluation_id=item["evaluation_id"],
@@ -1388,6 +1396,7 @@ def _experiment_document(value: Any) -> bool:
         {
             "bundle_sha256",
             "candidate_id",
+            "changed_paths",
             "draft_id",
             "evaluation_id",
             "evidence_sha256",
@@ -1395,10 +1404,13 @@ def _experiment_document(value: Any) -> bool:
             "guardrails",
             "idempotency_key",
             "metrics",
+            "mutation_class",
             "operation_sha256",
             "patch_sha256",
             "run_id",
             "status",
+            "validation",
+            "expected_tree",
         },
         "workspace experiment",
     )
@@ -1433,11 +1445,15 @@ def _validate_experiment_transition(
         if prior.status == "completed" and item != prior:
             raise error_type("completed workspace experiment changed")
         if prior.status == "pending" and (
-            item.patch_sha256 != prior.patch_sha256
+            item.mutation_class != prior.mutation_class
+            or item.patch_sha256 != prior.patch_sha256
             or item.bundle_sha256 != prior.bundle_sha256
             or item.evidence_sha256 != prior.evidence_sha256
             or item.idempotency_key != prior.idempotency_key
             or item.operation_sha256 != prior.operation_sha256
+            or item.changed_paths != prior.changed_paths
+            or item.validation != prior.validation
+            or item.expected_tree != prior.expected_tree
         ):
             raise error_type("workspace experiment lineage changed")
 

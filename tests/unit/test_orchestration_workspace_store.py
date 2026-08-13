@@ -36,6 +36,7 @@ def test_finalize_retains_only_the_minimal_audit_bundle() -> None:
             experiments=(
                 WorkspaceExperimentRecord(
                     candidate_id="candidate-1",
+                    mutation_class="system_instructions",
                     patch_sha256=hashlib.sha256(
                         b"diff --git a/agent.py b/agent.py\n"
                     ).hexdigest(),
@@ -44,6 +45,9 @@ def test_finalize_retains_only_the_minimal_audit_bundle() -> None:
                     idempotency_key="1" * 64,
                     operation_sha256="2" * 64,
                     status="completed",
+                    changed_paths=("agent.py",),
+                    validation=("pytest: passed",),
+                    expected_tree="b" * 40,
                     executor="direct_oidc",
                     draft_id="draft-1",
                     evaluation_id="evaluation-1",

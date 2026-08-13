@@ -388,12 +388,16 @@ def test_production_assignment_skips_pending_actions_experiment(
         experiments=(
             WorkspaceExperimentRecord(
                 candidate_id="candidate-1",
+                mutation_class="system_instructions",
                 patch_sha256="1" * 64,
                 bundle_sha256="2" * 64,
                 evidence_sha256="3" * 64,
                 idempotency_key="4" * 64,
                 operation_sha256="5" * 64,
                 status="pending",
+                changed_paths=("agent.py",),
+                validation=("pytest: passed",),
+                expected_tree="6" * 40,
             ),
         ),
         lineage=None,

@@ -13,19 +13,15 @@ def _candidate() -> dict:
     patch = b"diff --git a/agent.py b/agent.py\n"
     return {
         "candidate_id": "candidate-1",
-        "idempotency_key": "e" * 64,
-        "experiment_reference": "target:support-agent",
+        "mutation_class": "instructions",
         "patch_base64": base64.b64encode(patch).decode("ascii"),
         "summary": "Improve policy coverage.",
-        "changed_paths": ["agent.py"],
-        "validation": ["pytest: passed"],
-        "expected_tree": "f" * 40,
     }
 
 
 def _payload() -> dict:
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "issue_number": 31,
         "target": "support-agent",
         "base_commit": "a" * 40,
@@ -40,7 +36,7 @@ def test_manifest_contains_only_untrusted_candidate_proposal() -> None:
     assert proposal.patch_sha256 == hashlib.sha256(
         proposal.exact_patch
     ).hexdigest()
-    assert proposal.experiment_reference == "target:support-agent"
+    assert proposal.mutation_class == "instructions"
     assert not hasattr(proposal, "experiment_result")
 
 
@@ -57,6 +53,13 @@ def test_manifest_contains_only_untrusted_candidate_proposal() -> None:
         "run_id",
         "executor",
         "required_checks",
+        "patch_sha256",
+        "changed_paths",
+        "validation",
+        "expected_tree",
+        "idempotency_key",
+        "experiment_reference",
+        "foundry_operations",
     ),
 )
 def test_manifest_rejects_model_supplied_result_fields(
@@ -92,7 +95,7 @@ def test_manifest_rejects_model_supplied_trust_context(
 
 def test_single_candidate_manifest_uses_same_proposal_contract() -> None:
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "issue_number": 31,
         "target": "support-agent",
         "base_commit": "a" * 40,

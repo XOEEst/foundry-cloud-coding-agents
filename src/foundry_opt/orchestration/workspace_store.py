@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 from math import isfinite
+from pathlib import Path
 import re
 from types import MappingProxyType
 from typing import Mapping
@@ -271,12 +272,16 @@ class WorkspaceLineage:
 @dataclass(frozen=True)
 class WorkspaceExperimentRecord:
     candidate_id: str
+    mutation_class: str
     patch_sha256: str
     bundle_sha256: str
     evidence_sha256: str
     idempotency_key: str
     operation_sha256: str
     status: str
+    changed_paths: tuple[str, ...]
+    validation: tuple[str, ...]
+    expected_tree: str
     executor: str | None = None
     draft_id: str | None = None
     evaluation_id: str | None = None
@@ -290,6 +295,13 @@ class WorkspaceExperimentRecord:
             self.candidate_id,
         ) is None:
             raise ValueError("workspace experiment candidate is invalid")
+        if re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            self.mutation_class,
+        ) is None:
+            raise ValueError(
+                "workspace experiment mutation class is invalid"
+            )
         for value, name in (
             (self.patch_sha256, "patch"),
             (self.bundle_sha256, "bundle"),
@@ -303,6 +315,25 @@ class WorkspaceExperimentRecord:
                 )
         if self.status not in {"pending", "completed"}:
             raise ValueError("workspace experiment status is invalid")
+        if (
+            re.fullmatch(r"[0-9a-f]{40}", self.expected_tree) is None
+            or not self.changed_paths
+            or any(
+                not isinstance(path, str)
+                or not path
+                or path.startswith(("/", "\\"))
+                or ".." in Path(path).parts
+                for path in self.changed_paths
+            )
+            or not self.validation
+            or any(
+                not isinstance(item, str) or not item.strip()
+                for item in self.validation
+            )
+        ):
+            raise ValueError(
+                "workspace experiment preparation is invalid"
+            )
         metrics = dict(self.metrics)
         guardrails = dict(self.guardrails)
         if any(
@@ -349,6 +380,8 @@ class WorkspaceExperimentRecord:
                 "completed workspace experiment result is incomplete"
             )
         object.__setattr__(self, "metrics", MappingProxyType(metrics))
+        object.__setattr__(self, "changed_paths", tuple(self.changed_paths))
+        object.__setattr__(self, "validation", tuple(self.validation))
         object.__setattr__(
             self,
             "guardrails",
@@ -526,11 +559,15 @@ def _validate_experiment_records(
         if prior.status == "completed" and current != prior:
             raise ValueError("completed workspace experiment changed")
         if prior.status == "pending" and (
-            current.patch_sha256 != prior.patch_sha256
+            current.mutation_class != prior.mutation_class
+            or current.patch_sha256 != prior.patch_sha256
             or current.bundle_sha256 != prior.bundle_sha256
             or current.evidence_sha256 != prior.evidence_sha256
             or current.idempotency_key != prior.idempotency_key
             or current.operation_sha256 != prior.operation_sha256
+            or current.changed_paths != prior.changed_paths
+            or current.validation != prior.validation
+            or current.expected_tree != prior.expected_tree
         ):
             raise ValueError("workspace experiment lineage changed")
 

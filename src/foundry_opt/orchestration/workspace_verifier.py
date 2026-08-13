@@ -304,6 +304,9 @@ class WorkspaceVerifier:
                 == lineage.evidence_sha256
                 and selected_experiment.bundle_sha256
                 == lineage.bundle_sha256
+                and selected_experiment.expected_tree
+                == lineage.expected_tree
+                and selected_experiment.changed_paths == head_paths
             )
             checks.append(
                 _check(

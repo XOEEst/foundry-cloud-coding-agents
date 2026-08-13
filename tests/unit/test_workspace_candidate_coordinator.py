@@ -102,6 +102,7 @@ def _record(
     result = candidate.experiment_result
     return WorkspaceExperimentRecord(
         candidate_id=candidate.experiment.candidate_id,
+        mutation_class="system_instructions",
         patch_sha256=candidate.experiment.patch_sha256,
         bundle_sha256=candidate.experiment.bundle_sha256,
         evidence_sha256=candidate.experiment.evidence_sha256,
@@ -112,6 +113,9 @@ def _record(
             ).sha256
         ),
         status=status,
+        changed_paths=candidate.changed_paths,
+        validation=candidate.validation,
+        expected_tree=candidate.expected_tree,
         executor=result.executor if status == "completed" else None,
         draft_id=result.draft_id if status == "completed" else None,
         evaluation_id=(
@@ -389,6 +393,14 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     )
     assert result.report.bundle_sha256 == "5" * 64
     assert result.report.evidence_sha256 == "7" * 64
+    assert tuple(
+        (operation.kind, operation.identifier)
+        for operation in result.report.foundry_operations
+    ) == (
+        ("draft", "draft-2"),
+        ("evaluation", "evaluation-2"),
+        ("run", "run-2"),
+    )
     assert snapshot.lineage is not None
     assert snapshot.lineage.patch_sha256 == result.report.patch_sha256
     assert snapshot.lineage.evidence_sha256 == (
@@ -452,6 +464,53 @@ def test_candidate_completion_requires_configured_count_before_evaluation(
         )
 
     assert store.load(31) == before
+
+
+def test_candidate_completion_rejects_untrusted_preparation_metadata(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryWorkspaceStore()
+    workspace = OptimizationWorkspace(
+        store=store,
+        candidate_coordinator=WorkspaceCandidateCoordinator(
+            store=store,
+            selector=SelectSecondCandidate(),
+            exact_publisher=RecordingExactPublisher(),
+            finalizer=RecordingFinalizer(),
+            candidate_count=2,
+        ),
+    )
+    workspace.advance(
+        WorkspaceRequest(
+            repository_root=tmp_path,
+            issue=_issue(),
+            trigger=WorkspaceTrigger.ISSUE_CREATED,
+            workspace_pull_request=_pull_request(),
+        )
+    )
+    candidates = (_candidate(1), _candidate(2))
+    _seed_records(store, candidates)
+    forged = replace(
+        candidates[1],
+        changed_paths=("agent.py", "model-supplied.txt"),
+        validation=("model says tests passed",),
+        expected_tree="f" * 40,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="changed trusted experiment lineage",
+    ):
+        workspace.advance(
+            WorkspaceRequest(
+                repository_root=tmp_path,
+                issue=_issue(),
+                trigger=WorkspaceTrigger.EXPERIMENTS_COMPLETED,
+                workspace_pull_request=_pull_request(),
+                candidates=(candidates[0], forged),
+                report_context=_report_context(),
+            )
+        )
 
 
 def test_candidate_completion_fails_closed_before_selection_without_checks(

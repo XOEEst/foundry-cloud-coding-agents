@@ -92,6 +92,7 @@ from foundry_opt.orchestration.workspace_verifier import (
     WorkspaceVerifier,
 )
 from foundry_opt.orchestration.workspace_experiments import (
+    GitWorkspaceCandidatePreparer,
     TrustedWorkspaceExperimentResultContext,
     WorkspaceExperimentExecutionResult,
     WorkspaceExperimentExecutor,
@@ -740,15 +741,21 @@ class ProductionWorkspaceService:
             )
         if (
             self._experiment_runner is None
-            or self._experiment_request_builder is None
         ):
             raise ProductionWorkspaceError(
                 "workspace experiment executor is not configured"
             )
+        request_builder = (
+            self._experiment_request_builder
+            or GitWorkspaceCandidatePreparer(
+                commands=self._commands,
+                config=config,
+            )
+        )
         return WorkspaceExperimentExecutor(
             store=GitWorkspaceStore(root),
             runner=self._experiment_runner,
-            request_builder=self._experiment_request_builder,
+            request_builder=request_builder,
         ).execute(
             repository_root=root,
             issue_number=manifest.issue_number,
@@ -1232,7 +1239,7 @@ def _trusted_candidates(
         if (
             record.status != "completed"
             or record.patch_sha256 != proposal.patch_sha256
-            or record.idempotency_key != proposal.idempotency_key
+            or record.mutation_class != proposal.mutation_class
         ):
             raise ProductionWorkspaceError(
                 "workspace proposal does not match trusted experiment"
@@ -1264,9 +1271,9 @@ def _trusted_candidates(
                 experiment_result=result,
                 exact_patch=proposal.exact_patch,
                 summary=proposal.summary,
-                changed_paths=proposal.changed_paths,
-                validation=proposal.validation,
-                expected_tree=proposal.expected_tree,
+                changed_paths=record.changed_paths,
+                validation=record.validation,
+                expected_tree=record.expected_tree,
             )
         )
     return tuple(candidates)

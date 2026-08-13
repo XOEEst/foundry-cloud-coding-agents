@@ -51,7 +51,7 @@ def parse_workspace_experiment_manifest(
         "workspace manifest",
     )
     issue_number, target, base_commit = _header(
-        payload, schema_version=3
+        payload, schema_version=4
     )
     raw_candidates = payload["candidates"]
     if (
@@ -62,11 +62,7 @@ def parse_workspace_experiment_manifest(
         raise ValueError("workspace manifest candidates are invalid")
     candidates = tuple(_candidate(item) for item in raw_candidates)
     ids = tuple(item.candidate_id for item in candidates)
-    keys = tuple(item.idempotency_key for item in candidates)
-    if (
-        len(ids) != len(set(ids))
-        or len(keys) != len(set(keys))
-    ):
+    if len(ids) != len(set(ids)):
         raise ValueError("workspace proposal identities must be unique")
     return WorkspaceExperimentManifest(
         issue_number=issue_number,
@@ -92,7 +88,7 @@ def parse_workspace_candidate_manifest(
         "workspace candidate manifest",
     )
     issue_number, target, base_commit = _header(
-        payload, schema_version=2
+        payload, schema_version=3
     )
     return WorkspaceCandidateManifest(
         issue_number=issue_number,
@@ -131,13 +127,9 @@ def _candidate(value: Any) -> WorkspaceCandidateProposal:
         value,
         {
             "candidate_id",
-            "changed_paths",
-            "expected_tree",
-            "experiment_reference",
-            "idempotency_key",
+            "mutation_class",
             "patch_base64",
             "summary",
-            "validation",
         },
         "workspace manifest candidate",
     )
@@ -157,12 +149,8 @@ def _candidate(value: Any) -> WorkspaceCandidateProposal:
     return WorkspaceCandidateProposal(
         candidate_id=value["candidate_id"],
         exact_patch=patch,
-        idempotency_key=value["idempotency_key"],
-        experiment_reference=value["experiment_reference"],
         summary=value["summary"],
-        changed_paths=_strings(value["changed_paths"], "changed paths"),
-        validation=_strings(value["validation"], "validation"),
-        expected_tree=value["expected_tree"],
+        mutation_class=value["mutation_class"],
     )
 
 
@@ -173,15 +161,6 @@ def _exact_keys(
 ) -> None:
     if set(value) != expected:
         raise ValueError(f"{name} fields are invalid")
-
-
-def _strings(value: Any, name: str) -> tuple[str, ...]:
-    if (
-        not isinstance(value, list)
-        or any(not isinstance(item, str) for item in value)
-    ):
-        raise ValueError(f"workspace {name} are invalid")
-    return tuple(value)
 
 
 __all__ = [

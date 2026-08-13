@@ -101,8 +101,10 @@ from foundry_opt.orchestration.workspace_verifier import (
     WorkspaceVerifier,
 )
 from foundry_opt.orchestration.workspace_experiments import (
+    GitWorkspaceCandidatePreparer,
     NormalizedWorkspaceExperimentResult,
     TrustedWorkspaceExperimentResultContext,
+    WorkspaceCandidatePreparation,
     WorkspaceExperimentExecutionResult,
     WorkspaceExperimentExecutor,
     WorkspaceExperimentRequestBuilder,
@@ -571,6 +573,8 @@ __all__ = [
     "WorkspaceExperimentExecutionResult",
     "WorkspaceExperimentExecutor",
     "WorkspaceExperimentRequestBuilder",
+    "WorkspaceCandidatePreparation",
+    "GitWorkspaceCandidatePreparer",
     "NormalizedWorkspaceEvent",
     "ProductionWorkspaceError",
     "ProductionWorkspaceService",

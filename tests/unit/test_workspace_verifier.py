@@ -125,12 +125,16 @@ def _workspace(tmp_path: Path):
             experiments=(
                 WorkspaceExperimentRecord(
                     candidate_id="candidate-1",
+                    mutation_class="system_instructions",
                     patch_sha256=lineage.patch_sha256,
                     bundle_sha256=lineage.bundle_sha256,
                     evidence_sha256=lineage.evidence_sha256,
                     idempotency_key="d" * 64,
                     operation_sha256="e" * 64,
                     status="completed",
+                    changed_paths=("agent.py",),
+                    validation=("pytest: passed",),
+                    expected_tree=lineage.expected_tree,
                     executor="direct_oidc",
                     draft_id="draft-1",
                     evaluation_id="evaluation-1",

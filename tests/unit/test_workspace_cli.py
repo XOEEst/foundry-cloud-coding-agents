@@ -237,11 +237,16 @@ def test_workspace_experiment_executes_untrusted_candidate_manifest(
     manifest.write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "issue_number": 31,
                 "target": "support-agent",
                 "base_commit": "a" * 40,
-                "candidate": {"candidate_id": "candidate-1"},
+                "candidate": {
+                    "candidate_id": "candidate-1",
+                    "mutation_class": "system_instructions",
+                    "patch_base64": "cGF0Y2g=",
+                    "summary": "Improve quality.",
+                },
             }
         ),
         encoding="utf-8",
@@ -261,9 +266,11 @@ def test_workspace_experiment_executes_untrusted_candidate_manifest(
 
     class Service:
         def execute_experiment(self, payload, *, repository_root):
-            assert payload["candidate"] == {
-                "candidate_id": "candidate-1"
-            }
+            assert payload["candidate"]["candidate_id"] == "candidate-1"
+            assert (
+                payload["candidate"]["mutation_class"]
+                == "system_instructions"
+            )
             assert repository_root == tmp_path
             return Result()
 

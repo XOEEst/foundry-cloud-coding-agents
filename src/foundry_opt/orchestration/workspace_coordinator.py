@@ -800,6 +800,9 @@ class WorkspaceCandidateCoordinator:
                 != record.evidence_sha256
                 or candidate.experiment.idempotency_key
                 != record.idempotency_key
+                or candidate.changed_paths != record.changed_paths
+                or candidate.validation != record.validation
+                or candidate.expected_tree != record.expected_tree
                 or prepared != trusted
             ):
                 raise ValueError(

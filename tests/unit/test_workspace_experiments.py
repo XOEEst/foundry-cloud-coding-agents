@@ -1,8 +1,11 @@
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from foundry_opt.adapters.commands import SubprocessCommandRunner
+from foundry_opt.config.models import MutationClass
 from foundry_opt.orchestration import (
     CandidateExperimentOperation,
     CandidateExperimentPending,
@@ -10,6 +13,8 @@ from foundry_opt.orchestration import (
     CandidateExperimentResult,
     InMemoryWorkspaceStore,
     WorkspaceCandidateProposal,
+    WorkspaceCandidatePreparation,
+    GitWorkspaceCandidatePreparer,
     WorkspaceExperimentExecutor,
     WorkspaceBaselineRecord,
     WorkspacePhase,
@@ -24,25 +29,115 @@ def _proposal() -> WorkspaceCandidateProposal:
     return WorkspaceCandidateProposal(
         candidate_id="candidate-1",
         exact_patch=b"trusted proposal patch",
-        idempotency_key="a" * 64,
-        experiment_reference="target:support-agent",
         summary="Improve quality.",
-        changed_paths=("agent.py",),
-        validation=("tests passed",),
-        expected_tree="b" * 40,
+        mutation_class="instructions",
     )
 
 
+def test_git_preparer_derives_exact_candidate_artifacts(
+    tmp_path: Path,
+) -> None:
+    commands = SubprocessCommandRunner()
+    commands.run(("git", "init", "-b", "main"), cwd=tmp_path)
+    commands.run(
+        ("git", "config", "user.email", "tests@example.invalid"),
+        cwd=tmp_path,
+    )
+    commands.run(
+        ("git", "config", "user.name", "Tests"),
+        cwd=tmp_path,
+    )
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    source = agent / "app.py"
+    source.write_text("VALUE = 'baseline'\n", encoding="utf-8")
+    commands.run(("git", "add", "agent/app.py"), cwd=tmp_path)
+    commands.run(("git", "commit", "-m", "baseline"), cwd=tmp_path)
+    base_commit = commands.run(
+        ("git", "rev-parse", "HEAD"), cwd=tmp_path
+    ).stdout.strip()
+    source.write_text("VALUE = 'improved'\n", encoding="utf-8")
+    patch = commands.run(
+        ("git", "diff", "--binary", "--", "agent/app.py"),
+        cwd=tmp_path,
+    ).stdout.encode("utf-8")
+    commands.run(("git", "add", "agent/app.py"), cwd=tmp_path)
+    expected_tree = commands.run(
+        ("git", "write-tree"), cwd=tmp_path
+    ).stdout.strip()
+    commands.run(("git", "reset", "--hard", base_commit), cwd=tmp_path)
+    config = SimpleNamespace(
+        targets={
+            "support-agent": SimpleNamespace(
+                edit_paths=(Path("agent"),),
+                validation_commands=(
+                    "python -c \"from pathlib import Path; "
+                    "assert 'improved' in "
+                    "Path('agent/app.py').read_text()\"",
+                ),
+                package=SimpleNamespace(
+                    include=("agent/**",),
+                    exclude=(),
+                ),
+                runtime=SimpleNamespace(
+                    dependency_resolution="remote_build"
+                ),
+                allowed_mutations={MutationClass.SYSTEM_INSTRUCTIONS},
+            )
+        },
+        campaign=SimpleNamespace(
+            evidence_path=Path(".foundry-optimizer/campaigns")
+        ),
+    )
+    proposal = WorkspaceCandidateProposal(
+        candidate_id="candidate-1",
+        exact_patch=patch,
+        summary="Improve quality.",
+        mutation_class="system_instructions",
+    )
+
+    prepared = GitWorkspaceCandidatePreparer(
+        commands=commands,
+        config=config,
+    ).build(
+        repository_root=tmp_path,
+        issue_number=31,
+        target="support-agent",
+        base_commit=base_commit,
+        proposal=proposal,
+    )
+
+    assert prepared.request.patch_sha256 == hashlib.sha256(patch).hexdigest()
+    assert prepared.changed_paths == ("agent/app.py",)
+    assert prepared.validation == (
+        "python -c: passed",
+    )
+    assert prepared.expected_tree == expected_tree
+    assert len(prepared.request.bundle_sha256) == 64
+    assert len(prepared.request.evidence_sha256) == 64
+    assert len(prepared.request.idempotency_key) == 64
+
+
 class Builder:
-    def build(self, **kwargs) -> CandidateExperimentRequest:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def build(self, **kwargs) -> WorkspaceCandidatePreparation:
+        self.calls += 1
         proposal = kwargs["proposal"]
-        return CandidateExperimentRequest(
-            issue_number=kwargs["issue_number"],
-            candidate_id=proposal.candidate_id,
-            patch_sha256=proposal.patch_sha256,
-            bundle_sha256="c" * 64,
-            evidence_sha256="d" * 64,
-            idempotency_key=proposal.idempotency_key,
+        return WorkspaceCandidatePreparation(
+            request=CandidateExperimentRequest(
+                issue_number=kwargs["issue_number"],
+                candidate_id=proposal.candidate_id,
+                patch_sha256=proposal.patch_sha256,
+                bundle_sha256="c" * 64,
+                evidence_sha256="d" * 64,
+                idempotency_key="a" * 64,
+            ),
+            mutation_class=proposal.mutation_class,
+            changed_paths=("agent.py",),
+            validation=("pytest: passed",),
+            expected_tree="b" * 40,
         )
 
 
@@ -125,10 +220,11 @@ def test_trusted_execution_persists_result_and_retry_does_not_rerun(
 ) -> None:
     store = _store()
     runner = Runner()
+    builder = Builder()
     executor = WorkspaceExperimentExecutor(
         store=store,
         runner=runner,
-        request_builder=Builder(),
+        request_builder=builder,
     )
 
     first = executor.execute(
@@ -150,6 +246,7 @@ def test_trusted_execution_persists_result_and_retry_does_not_rerun(
     assert first.status == "completed"
     assert retry.recorded is False
     assert runner.calls == 1
+    assert builder.calls == 1
     assert record.metrics == {"quality": 0.9}
     assert record.guardrails == {"safety": "pass"}
     assert record.bundle_sha256 == "c" * 64
@@ -157,6 +254,10 @@ def test_trusted_execution_persists_result_and_retry_does_not_rerun(
     assert record.patch_sha256 == hashlib.sha256(
         _proposal().exact_patch
     ).hexdigest()
+    assert record.changed_paths == ("agent.py",)
+    assert record.validation == ("pytest: passed",)
+    assert record.expected_tree == "b" * 40
+    assert record.mutation_class == "instructions"
 
 
 def test_actions_pending_persists_operation_without_result_fields(
@@ -182,6 +283,33 @@ def test_actions_pending_persists_operation_without_result_fields(
     assert record.status == "pending"
     assert record.metrics == {}
     assert record.draft_id is None
+
+
+def test_failed_trusted_preparation_creates_no_experiment_operation(
+    tmp_path: Path,
+) -> None:
+    class RejectingBuilder:
+        def build(self, **kwargs):
+            raise RuntimeError("workspace candidate validation failed")
+
+    store = _store()
+    runner = Runner()
+
+    with pytest.raises(RuntimeError, match="validation failed"):
+        WorkspaceExperimentExecutor(
+            store=store,
+            runner=runner,
+            request_builder=RejectingBuilder(),
+        ).execute(
+            repository_root=tmp_path,
+            issue_number=31,
+            target="support-agent",
+            base_commit="e" * 40,
+            proposal=_proposal(),
+        )
+
+    assert store.load(31).experiments == ()
+    assert runner.calls == 0
 
 
 def test_candidate_execution_requires_completed_trusted_baseline(
