@@ -76,6 +76,11 @@ from foundry_opt.orchestration.workspace_production import (
 from foundry_opt.orchestration.workspace_assignment import (
     GhWorkspaceCopilotAssigner,
 )
+from foundry_opt.orchestration.workspace_projection import (
+    GhWorkspaceIssueProjector,
+    WorkspaceIssueProjectionResult,
+    WorkspaceIssueProjector,
+)
 from foundry_opt.orchestration.workspace_manifest import (
     WorkspaceCandidateManifest,
     WorkspaceExperimentManifest,
@@ -564,6 +569,9 @@ __all__ = [
     "WorkspaceExperimentManifest",
     "WorkspaceCandidateManifest",
     "GhWorkspaceCopilotAssigner",
+    "GhWorkspaceIssueProjector",
+    "WorkspaceIssueProjectionResult",
+    "WorkspaceIssueProjector",
     "ConfiguredWorkspaceSelector",
     "NormalizedWorkspaceOperation",
     "TrustedWorkspaceOperationContext",

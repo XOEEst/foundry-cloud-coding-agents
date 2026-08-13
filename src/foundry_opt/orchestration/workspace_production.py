@@ -72,6 +72,10 @@ from foundry_opt.orchestration.workspace_manifest import (
 from foundry_opt.orchestration.workspace_policy import (
     ConfiguredWorkspaceSelector,
 )
+from foundry_opt.orchestration.workspace_projection import (
+    GhWorkspaceIssueProjector,
+    WorkspaceIssueProjector,
+)
 from foundry_opt.orchestration.workspace_verifier import (
     WorkspaceVerificationResult,
     WorkspaceVerifier,
@@ -217,6 +221,7 @@ class _RepositoryContext:
 
 WorkspaceFactory = Callable[..., OptimizationWorkspace]
 CopilotAssignerFactory = Callable[..., GhWorkspaceCopilotAssigner]
+IssueProjectorFactory = Callable[..., WorkspaceIssueProjector]
 
 
 def build_production_workspace(
@@ -280,12 +285,16 @@ class ProductionWorkspaceService:
         copilot_assigner_factory: CopilotAssignerFactory = (
             GhWorkspaceCopilotAssigner
         ),
+        issue_projector_factory: IssueProjectorFactory = (
+            GhWorkspaceIssueProjector
+        ),
     ) -> None:
         self._commands = commands or SubprocessCommandRunner()
         self._workspace_factory = workspace_factory
         self._experiment_runner = experiment_runner
         self._experiment_request_builder = experiment_request_builder
         self._copilot_assigner_factory = copilot_assigner_factory
+        self._issue_projector_factory = issue_projector_factory
 
     def assign_copilot(
         self,
@@ -456,7 +465,7 @@ class ProductionWorkspaceService:
             candidate_count=request.candidate_count,
             selector=request.selector,
         )
-        return workspace.advance(
+        result = workspace.advance(
             WorkspaceRequest(
                 repository_root=root,
                 issue=WorkspaceIssue(
@@ -471,6 +480,42 @@ class ProductionWorkspaceService:
                 report_context=request.report_context,
                 operation=request.operation,
             )
+        )
+        self._project_workspace_result(
+            root,
+            repository=context.repository,
+            result=result,
+        )
+        return result
+
+    def _project_workspace_result(
+        self,
+        root: Path,
+        *,
+        repository: str,
+        result: WorkspaceResult,
+    ) -> None:
+        intent = result.issue_status_projection_intent
+        if intent is None:
+            return
+        pull_request = result.workspace_pull_request
+        if (
+            pull_request is None
+            or pull_request.number
+            != intent.workspace_pull_request_number
+            or pull_request.issue_number != intent.issue_number
+        ):
+            raise ProductionWorkspaceError(
+                "workspace issue projection identity changed"
+            )
+        self._issue_projector_factory(
+            commands=self._commands,
+            repository_root=root,
+            repository=repository,
+        ).project(
+            intent,
+            base_commit=pull_request.base_commit,
+            report=result.report,
         )
 
     def complete_experiments(

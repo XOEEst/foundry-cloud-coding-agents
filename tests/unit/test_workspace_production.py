@@ -15,7 +15,10 @@ from foundry_opt.orchestration import (
     TrustedWorkspaceEventContext,
     WorkspaceAdvanceRequest,
     WorkspaceExperimentRecord,
+    WorkspaceIssueStatusProjectionIntent,
     WorkspacePhase,
+    WorkspacePullRequest,
+    WorkspaceResult,
     WorkspaceSnapshot,
     WorkspaceTrigger,
     build_production_workspace,
@@ -94,6 +97,92 @@ def test_production_builder_wires_candidate_coordinator(
     )
 
     assert workspace._candidate_coordinator is not None
+
+
+def test_production_advance_publishes_state_derived_issue_projection(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    projected: dict[str, Any] = {}
+    pull_request = WorkspacePullRequest(
+        number=104,
+        issue_number=31,
+        branch="foundry-opt/workspace/issue-31",
+        title="[Optimize] #31 workspace - draft, not yet selectable",
+        draft=True,
+        reuse_existing=True,
+        base_commit="a" * 40,
+    )
+    workspace_result = WorkspaceResult(
+        phase=WorkspacePhase.SPECIFICATION,
+        workspace_pull_request=pull_request,
+        planned_effect_kinds=("workspace_pr_sync",),
+        issue_status_projection_intent=(
+            WorkspaceIssueStatusProjectionIntent(
+                issue_number=31,
+                phase=WorkspacePhase.SPECIFICATION,
+                workspace_pull_request_number=104,
+            )
+        ),
+    )
+
+    class Workspace:
+        def advance(self, request):
+            return workspace_result
+
+    class Projector:
+        def project(self, intent, *, base_commit, report=None):
+            projected["intent"] = intent
+            projected["base_commit"] = base_commit
+            projected["report"] = report
+
+    service = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+        workspace_factory=lambda **_: Workspace(),
+        issue_projector_factory=lambda **kwargs: (
+            projected.update(kwargs) or Projector()
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_repository_context",
+        lambda root: type(
+            "Context",
+            (),
+            {
+                "repository": "octo-org/optimizer",
+                "default_branch": "main",
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_issue",
+        lambda root, repository, issue: {
+            "title": "[Optimize] Improve policy coverage",
+            "body": "Improve policy coverage.",
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_existing_workspace_pull_request",
+        lambda root, repository, issue: (104, "a" * 40),
+    )
+
+    result = service.advance(
+        WorkspaceAdvanceRequest(
+            repository_root=tmp_path,
+            issue_number=31,
+        )
+    )
+
+    assert result is workspace_result
+    assert projected["repository"] == "octo-org/optimizer"
+    assert projected["intent"] == (
+        workspace_result.issue_status_projection_intent
+    )
+    assert projected["base_commit"] == "a" * 40
+    assert projected["report"] is None
 
 
 def test_production_assignment_uses_state_workspace_pr_for_candidate_work(
