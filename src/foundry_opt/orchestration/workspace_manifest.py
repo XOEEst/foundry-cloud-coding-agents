@@ -6,10 +6,8 @@ from dataclasses import dataclass
 import re
 from typing import Any
 
-from foundry_opt.evaluation import EvaluationPolicy
 from foundry_opt.orchestration.workspace import (
     WorkspaceCandidateProposal,
-    WorkspaceReportContext,
 )
 from foundry_opt.security import reject_secret_content
 
@@ -25,7 +23,6 @@ class WorkspaceExperimentManifest:
     target: str
     base_commit: str
     candidates: tuple[WorkspaceCandidateProposal, ...]
-    report_context: WorkspaceReportContext
 
 
 @dataclass(frozen=True)
@@ -39,7 +36,7 @@ class WorkspaceCandidateManifest:
 def parse_workspace_experiment_manifest(
     payload: Mapping[str, Any],
     *,
-    policy: EvaluationPolicy,
+    policy: object | None = None,
 ) -> WorkspaceExperimentManifest:
     reject_secret_content(payload)
     _exact_keys(
@@ -48,13 +45,14 @@ def parse_workspace_experiment_manifest(
             "base_commit",
             "candidates",
             "issue_number",
-            "report_context",
             "schema_version",
             "target",
         },
         "workspace manifest",
     )
-    issue_number, target, base_commit = _header(payload)
+    issue_number, target, base_commit = _header(
+        payload, schema_version=3
+    )
     raw_candidates = payload["candidates"]
     if (
         not isinstance(raw_candidates, list)
@@ -75,7 +73,6 @@ def parse_workspace_experiment_manifest(
         target=target,
         base_commit=base_commit,
         candidates=candidates,
-        report_context=_report_context(payload["report_context"], policy),
     )
 
 
@@ -94,7 +91,9 @@ def parse_workspace_candidate_manifest(
         },
         "workspace candidate manifest",
     )
-    issue_number, target, base_commit = _header(payload)
+    issue_number, target, base_commit = _header(
+        payload, schema_version=2
+    )
     return WorkspaceCandidateManifest(
         issue_number=issue_number,
         target=target,
@@ -103,8 +102,12 @@ def parse_workspace_candidate_manifest(
     )
 
 
-def _header(payload: Mapping[str, Any]) -> tuple[int, str, str]:
-    if payload["schema_version"] != 2:
+def _header(
+    payload: Mapping[str, Any],
+    *,
+    schema_version: int,
+) -> tuple[int, str, str]:
+    if payload["schema_version"] != schema_version:
         raise ValueError("workspace manifest schema version is invalid")
     issue_number = payload["issue_number"]
     target = payload["target"]
@@ -160,34 +163,6 @@ def _candidate(value: Any) -> WorkspaceCandidateProposal:
         changed_paths=_strings(value["changed_paths"], "changed paths"),
         validation=_strings(value["validation"], "validation"),
         expected_tree=value["expected_tree"],
-    )
-
-
-def _report_context(
-    value: Any,
-    policy: EvaluationPolicy,
-) -> WorkspaceReportContext:
-    if not isinstance(value, Mapping):
-        raise ValueError("workspace report context is invalid")
-    _exact_keys(
-        value,
-        {
-            "baseline_metrics",
-            "sample_count",
-            "spec_sha256",
-            "split",
-        },
-        "workspace report context",
-    )
-    baseline = value["baseline_metrics"]
-    if not isinstance(baseline, Mapping):
-        raise ValueError("workspace baseline metrics are invalid")
-    return WorkspaceReportContext(
-        baseline_metrics=baseline,
-        policy=policy,
-        sample_count=value["sample_count"],
-        split=value["split"],
-        spec_sha256=value["spec_sha256"],
     )
 
 

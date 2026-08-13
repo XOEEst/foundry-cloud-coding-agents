@@ -775,6 +775,112 @@ def workspace_experiment_result(
         )
 
 
+@workspace_app.command("baseline")
+def workspace_baseline(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Execute or reconcile the trusted baseline experiment."""
+    try:
+        result = build_workspace_service().execute_baseline(
+            repository_root=Path.cwd(),
+            issue_number=issue_number,
+        )
+    except (
+        ConfigLoadError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace baseline {result.status}; "
+            f"next action {result.next_action}"
+        )
+
+
+@workspace_app.command("baseline-result")
+def workspace_baseline_result(
+    result_path: Annotated[
+        Path,
+        typer.Option(
+            "--result",
+            exists=True,
+            dir_okay=False,
+            help="Trusted Actions baseline result JSON.",
+        ),
+    ],
+    delivery_id: Annotated[
+        str,
+        typer.Option("--delivery-id", help="Trusted delivery identifier."),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Ingest a trusted Actions baseline experiment result."""
+    from foundry_opt.orchestration.workspace_experiments import (
+        TrustedWorkspaceExperimentResultContext,
+    )
+
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "workspace baseline result must be a JSON object"
+            )
+        result = build_workspace_service().ingest_baseline_result(
+            payload,
+            TrustedWorkspaceExperimentResultContext(
+                delivery_id=delivery_id,
+                repository=repository,
+                repository_id=repository_id,
+            ),
+            repository_root=Path.cwd(),
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(f"Workspace baseline {result.status}")
+
+
 @workspace_app.command("operation-complete")
 def workspace_operation_complete(
     result_path: Annotated[

@@ -33,6 +33,10 @@ from foundry_opt.optimization.specification import (
     spec_file_path,
     spec_issue_marker,
 )
+from foundry_opt.orchestration.workspace import WorkspaceIssue
+from foundry_opt.orchestration.workspace_specification import (
+    TrustedWorkspaceSpecificationResolver,
+)
 
 
 _REPOSITORY = "octo-org/optimizer"
@@ -101,6 +105,34 @@ def _metrics_section() -> str:
           undefined_behavior: fail
         """
     ).strip()
+
+
+def _policy_assets_issue_body() -> str:
+    datasets = dedent(
+        """
+        - asset_id: development-data
+          source: foundry
+          name: development-data
+          version: v1
+          role: development
+        - asset_id: validation-data
+          source: foundry
+          name: validation-data
+          version: v1
+          role: validation
+        """
+    ).strip()
+    evaluators = dedent(
+        """
+        - asset_id: quality-evaluator
+          source: foundry
+          name: quality-evaluator
+          version: v1
+          metrics:
+            - quality
+        """
+    ).strip()
+    return _issue_body(datasets=datasets, evaluators=evaluators)
 
 
 def _issue_body(
@@ -1129,3 +1161,53 @@ def test_partial_status_when_the_label_update_fails(tmp_path: Path) -> None:
     assert any(failure.operation == "update_labels" for failure in result.failures)
     # The ready comment still succeeded even though the label move failed.
     assert gateway.comments
+
+
+def test_workspace_resolver_approves_existing_policy_assets_without_spec_pr(
+    tmp_path: Path,
+) -> None:
+    config = _config(
+        allowed_dataset_sources=["foundry"],
+        allowed_evaluator_sources=["foundry"],
+        allow_spec_auto_approval=True,
+    )
+    record = TrustedWorkspaceSpecificationResolver().resolve(
+        repository_root=tmp_path,
+        repository="octo-org/optimizer",
+        base_branch="main",
+        issue=WorkspaceIssue(
+            number=31,
+            title="[Optimize] Improve support quality",
+            body=_policy_assets_issue_body(),
+            base_commit="b" * 40,
+        ),
+        config=config,
+    )
+
+    assert record.status == "policy_approved"
+    assert record.spec_sha256 is not None
+    assert record.asset_ids == (
+        "development-data",
+        "validation-data",
+        "quality-evaluator",
+    )
+
+
+def test_workspace_resolver_fails_closed_for_human_gated_assets(
+    tmp_path: Path,
+) -> None:
+    record = TrustedWorkspaceSpecificationResolver().resolve(
+        repository_root=tmp_path,
+        repository="octo-org/optimizer",
+        base_branch="main",
+        issue=WorkspaceIssue(
+            number=31,
+            title="[Optimize] Improve support quality",
+            body=_issue_body(),
+            base_commit="b" * 40,
+        ),
+        config=_config(),
+    )
+
+    assert record.status == "human_review_required"
+    assert record.spec_sha256 is None

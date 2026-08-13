@@ -519,6 +519,23 @@ class WorkspaceCandidateCoordinator:
         snapshot = self._store.load(request.issue.number)
         if snapshot is None:
             raise ValueError("workspace state is required")
+        baseline = snapshot.baseline
+        specification = snapshot.specification
+        if (
+            specification is None
+            or specification.status != "policy_approved"
+            or baseline is None
+            or baseline.status != "completed"
+            or request.report_context.spec_sha256
+            != specification.spec_sha256
+            or dict(request.report_context.baseline_metrics)
+            != dict(baseline.metrics)
+            or request.report_context.sample_count != baseline.sample_count
+            or request.report_context.split != baseline.split
+        ):
+            raise ValueError(
+                "workspace report context is not trusted state"
+            )
         if snapshot.phase is WorkspacePhase.SPECIFICATION:
             snapshot = self._store.commit(
                 expected_revision=snapshot.revision,
@@ -534,6 +551,8 @@ class WorkspaceCandidateCoordinator:
                     ),
                     experiments=snapshot.experiments,
                     lineage=snapshot.lineage,
+                    specification=snapshot.specification,
+                    baseline=snapshot.baseline,
                 ),
             )
         experiments, snapshot = self._evaluate_candidates(
@@ -684,6 +703,8 @@ class WorkspaceCandidateCoordinator:
                     external_operation_ids=external_ids,
                     experiments=snapshot.experiments,
                     lineage=lineage,
+                    specification=snapshot.specification,
+                    baseline=snapshot.baseline,
                 ),
             )
             if recorded

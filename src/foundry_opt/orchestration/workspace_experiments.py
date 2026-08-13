@@ -183,6 +183,15 @@ class WorkspaceExperimentExecutor:
             WorkspacePhase.EVALUATING,
         }:
             raise ValueError("workspace experiment state is unavailable")
+        if (
+            snapshot.specification is None
+            or snapshot.specification.status != "policy_approved"
+            or snapshot.baseline is None
+            or snapshot.baseline.status != "completed"
+        ):
+            raise ValueError(
+                "trusted workspace specification and baseline are required"
+            )
         existing = {
             item.candidate_id: item for item in snapshot.experiments
         }.get(proposal.candidate_id)
@@ -237,6 +246,8 @@ class WorkspaceExperimentExecutor:
                     ),
                     experiments=(*snapshot.experiments, pending),
                     lineage=snapshot.lineage,
+                    specification=snapshot.specification,
+                    baseline=snapshot.baseline,
                 ),
             )
             existing = pending
@@ -288,6 +299,8 @@ class WorkspaceExperimentExecutor:
                 ),
                 experiments=records,
                 lineage=snapshot.lineage,
+                specification=snapshot.specification,
+                baseline=snapshot.baseline,
             ),
         )
         return _execution_result(
@@ -363,6 +376,8 @@ class WorkspaceExperimentExecutor:
                 ),
                 experiments=records,
                 lineage=snapshot.lineage,
+                specification=snapshot.specification,
+                baseline=snapshot.baseline,
             ),
         )
         return _execution_result(

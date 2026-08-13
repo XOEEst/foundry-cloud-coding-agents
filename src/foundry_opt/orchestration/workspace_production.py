@@ -34,11 +34,14 @@ from foundry_opt.orchestration.workspace import (
     WorkspaceCandidateProposal,
     WorkspaceIssue,
     WorkspaceOperation,
+    WorkspaceNextAction,
+    WorkspaceNextActionKind,
     WorkspacePhase,
     WorkspacePullRequest,
     WorkspaceReportContext,
     WorkspaceRequest,
     WorkspaceResult,
+    WorkspaceIssueStatusProjectionIntent,
     WorkspaceTrigger,
 )
 from foundry_opt.orchestration.workspace_assignment import (
@@ -58,6 +61,15 @@ from foundry_opt.orchestration.workspace_git_store import GitWorkspaceStore
 from foundry_opt.orchestration.workspace_store import (
     WorkspaceExperimentRecord,
     WorkspaceSnapshot,
+    WorkspaceUpdate,
+)
+from foundry_opt.orchestration.workspace_baseline import (
+    WorkspaceBaselineExecutionResult,
+    WorkspaceBaselineExecutor,
+    WorkspaceBaselineRequestBuilder,
+)
+from foundry_opt.orchestration.workspace_specification import (
+    TrustedWorkspaceSpecificationResolver,
 )
 from foundry_opt.orchestration.workspace_intake import (
     NormalizedWorkspaceEvent,
@@ -65,7 +77,6 @@ from foundry_opt.orchestration.workspace_intake import (
     normalize_workspace_event,
 )
 from foundry_opt.orchestration.workspace_manifest import (
-    WorkspaceCandidateManifest,
     parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
 )
@@ -282,6 +293,12 @@ class ProductionWorkspaceService:
         experiment_request_builder: (
             WorkspaceExperimentRequestBuilder | None
         ) = None,
+        baseline_request_builder: (
+            WorkspaceBaselineRequestBuilder | None
+        ) = None,
+        specification_resolver: (
+            TrustedWorkspaceSpecificationResolver | None
+        ) = None,
         copilot_assigner_factory: CopilotAssignerFactory = (
             GhWorkspaceCopilotAssigner
         ),
@@ -293,6 +310,11 @@ class ProductionWorkspaceService:
         self._workspace_factory = workspace_factory
         self._experiment_runner = experiment_runner
         self._experiment_request_builder = experiment_request_builder
+        self._baseline_request_builder = baseline_request_builder
+        self._specification_resolver = (
+            specification_resolver
+            or TrustedWorkspaceSpecificationResolver()
+        )
         self._copilot_assigner_factory = copilot_assigner_factory
         self._issue_projector_factory = issue_projector_factory
 
@@ -457,6 +479,30 @@ class ProductionWorkspaceService:
                 root,
                 context.default_branch,
             )
+        workspace_issue = WorkspaceIssue(
+            number=request.issue_number,
+            title=issue["title"],
+            body=issue["body"],
+            base_commit=base_commit.lower(),
+        )
+        if request.trigger is WorkspaceTrigger.CONTINUE:
+            snapshot = _load_workspace_snapshot(root, request.issue_number)
+            if snapshot is not None:
+                snapshot = self._ensure_trusted_specification(
+                    root,
+                    repository=context.repository,
+                    base_branch=context.default_branch,
+                    issue=workspace_issue,
+                    snapshot=snapshot,
+                )
+                gated = _trusted_intake_gate(snapshot, pull_request)
+                if gated is not None:
+                    self._project_workspace_result(
+                        root,
+                        repository=context.repository,
+                        result=gated,
+                    )
+                    return gated
         workspace = self._workspace_factory(
             repository_root=root,
             repository=context.repository,
@@ -468,12 +514,7 @@ class ProductionWorkspaceService:
         result = workspace.advance(
             WorkspaceRequest(
                 repository_root=root,
-                issue=WorkspaceIssue(
-                    number=request.issue_number,
-                    title=issue["title"],
-                    body=issue["body"],
-                    base_commit=base_commit.lower(),
-                ),
+                issue=workspace_issue,
                 trigger=request.trigger,
                 workspace_pull_request=pull_request,
                 candidates=request.candidates,
@@ -481,12 +522,75 @@ class ProductionWorkspaceService:
                 operation=request.operation,
             )
         )
+        if request.trigger in {
+            WorkspaceTrigger.ISSUE_CREATED,
+            WorkspaceTrigger.CONTINUE,
+        }:
+            snapshot = _load_workspace_snapshot(root, request.issue_number)
+            if snapshot is not None:
+                snapshot = self._ensure_trusted_specification(
+                    root,
+                    repository=context.repository,
+                    base_branch=context.default_branch,
+                    issue=workspace_issue,
+                    snapshot=snapshot,
+                )
+                result = (
+                    _trusted_intake_gate(
+                        snapshot, result.workspace_pull_request
+                    )
+                    or result
+                )
         self._project_workspace_result(
             root,
             repository=context.repository,
             result=result,
         )
         return result
+
+    def _ensure_trusted_specification(
+        self,
+        root: Path,
+        *,
+        repository: str,
+        base_branch: str,
+        issue: WorkspaceIssue,
+        snapshot: WorkspaceSnapshot,
+    ) -> WorkspaceSnapshot:
+        if snapshot.specification is not None:
+            if snapshot.specification.base_commit != issue.base_commit:
+                raise ProductionWorkspaceError(
+                    "trusted workspace specification base changed"
+                )
+            return snapshot
+        config = load_config(
+            root / ".github" / "foundry-optimizer.yaml"
+        )
+        specification = self._specification_resolver.resolve(
+            repository_root=root,
+            repository=repository,
+            base_branch=base_branch,
+            issue=issue,
+            config=config,
+        )
+        return GitWorkspaceStore(root).commit(
+            expected_revision=snapshot.revision,
+            update=WorkspaceUpdate(
+                issue_number=snapshot.issue_number,
+                phase=snapshot.phase,
+                workspace_pull_request_number=(
+                    snapshot.workspace_pull_request_number
+                ),
+                semantic_event="trusted_specification_resolved",
+                candidates=snapshot.candidates,
+                selected_patch=snapshot.selected_patch,
+                external_operation_ids=snapshot.external_operation_ids,
+                experiments=snapshot.experiments,
+                lineage=snapshot.lineage,
+                specification=specification,
+                baseline=snapshot.baseline,
+            ),
+        )
 
     def _project_workspace_result(
         self,
@@ -539,10 +643,7 @@ class ProductionWorkspaceService:
                 "workspace manifest target is not configured"
             )
         policy = _evaluation_policy(target.metrics)
-        manifest = parse_workspace_experiment_manifest(
-            payload,
-            policy=policy,
-        )
+        manifest = parse_workspace_experiment_manifest(payload)
         candidate_count = (
             target.campaign_overrides.max_changed_candidates
             if (
@@ -574,6 +675,25 @@ class ProductionWorkspaceService:
             raise ProductionWorkspaceError(
                 "workspace state is unavailable"
             )
+        if (
+            snapshot.specification is None
+            or snapshot.specification.status != "policy_approved"
+            or snapshot.specification.spec_sha256 is None
+            or snapshot.specification.target != manifest.target
+            or snapshot.specification.base_commit != manifest.base_commit
+            or snapshot.baseline is None
+            or snapshot.baseline.status != "completed"
+        ):
+            raise ProductionWorkspaceError(
+                "trusted specification and baseline are incomplete"
+            )
+        report_context = WorkspaceReportContext(
+            baseline_metrics=snapshot.baseline.metrics,
+            policy=policy,
+            sample_count=snapshot.baseline.sample_count,
+            split=snapshot.baseline.split,
+            spec_sha256=snapshot.specification.spec_sha256,
+        )
         candidates = _trusted_candidates(
             manifest.issue_number,
             manifest.candidates,
@@ -587,7 +707,7 @@ class ProductionWorkspaceService:
                 base_commit=manifest.base_commit,
                 expected_repository=context.repository,
                 candidates=candidates,
-                report_context=manifest.report_context,
+                report_context=report_context,
                 candidate_count=candidate_count,
                 selector=selector,
             )
@@ -656,6 +776,72 @@ class ProductionWorkspaceService:
                 "trusted experiment repository ID does not match GitHub"
             )
         return WorkspaceExperimentExecutor(
+            store=GitWorkspaceStore(root),
+            runner=None,
+            request_builder=None,
+        ).ingest_result(
+            issue_number=event.issue_number,
+            result=event.result,
+        )
+
+    def execute_baseline(
+        self,
+        *,
+        repository_root: Path,
+        issue_number: int,
+    ) -> WorkspaceBaselineExecutionResult:
+        root = repository_root.expanduser().resolve()
+        snapshot = GitWorkspaceStore(root).load(issue_number)
+        if (
+            snapshot is None
+            or snapshot.specification is None
+            or snapshot.specification.status != "policy_approved"
+        ):
+            raise ProductionWorkspaceError(
+                "trusted workspace specification is incomplete"
+            )
+        specification = snapshot.specification
+        if (
+            self._experiment_runner is None
+            or self._baseline_request_builder is None
+        ):
+            raise ProductionWorkspaceError(
+                "workspace baseline executor is not configured"
+            )
+        return WorkspaceBaselineExecutor(
+            store=GitWorkspaceStore(root),
+            runner=self._experiment_runner,
+            request_builder=self._baseline_request_builder,
+        ).execute(
+            repository_root=root,
+            issue_number=issue_number,
+            target=specification.target,
+            base_commit=specification.base_commit,
+        )
+
+    def ingest_baseline_result(
+        self,
+        payload: Mapping[str, Any],
+        context: TrustedWorkspaceExperimentResultContext,
+        *,
+        repository_root: Path,
+    ) -> WorkspaceBaselineExecutionResult:
+        event = normalize_workspace_experiment_result(payload, context)
+        if event.result.candidate_id != "baseline":
+            raise ProductionWorkspaceError(
+                "trusted baseline result identity is invalid"
+            )
+        root = repository_root.expanduser().resolve()
+        repository = self._repository_context(root).repository
+        if (
+            repository.casefold() != event.repository.casefold()
+            or self._repository_id(root, repository)
+            != event.repository_id
+        ):
+            raise ProductionWorkspaceError(
+                "trusted baseline repository does not match origin"
+            )
+        return WorkspaceBaselineExecutor(
             store=GitWorkspaceStore(root),
             runner=None,
             request_builder=None,
@@ -1090,6 +1276,14 @@ def _copilot_assignment_action(
     snapshot: WorkspaceSnapshot,
 ) -> tuple[str, bool]:
     if snapshot.phase is WorkspacePhase.SPECIFICATION:
+        if snapshot.specification is None:
+            return "resolve_trusted_specification", False
+        if snapshot.specification.status == "human_review_required":
+            return "review_specification", False
+        if snapshot.baseline is None:
+            return "establish_baseline", False
+        if snapshot.baseline.status == "pending":
+            return "await_trusted_actions_result", False
         return "run_candidate_experiments", True
     if snapshot.phase is WorkspacePhase.EVALUATING:
         if any(
@@ -1110,3 +1304,67 @@ def _copilot_assignment_action(
         WorkspacePhase.RETENTION: ("complete_retention", False),
         WorkspacePhase.COMPLETED: ("none", False),
     }[snapshot.phase]
+
+
+def _load_workspace_snapshot(
+    root: Path,
+    issue_number: int,
+) -> WorkspaceSnapshot | None:
+    try:
+        return GitWorkspaceStore(root).load(issue_number)
+    except ValueError:
+        return None
+
+
+def _trusted_intake_gate(
+    snapshot: WorkspaceSnapshot,
+    pull_request: WorkspacePullRequest | None,
+) -> WorkspaceResult | None:
+    specification = snapshot.specification
+    if specification is None:
+        return None
+    if specification.status == "human_review_required":
+        kind = WorkspaceNextActionKind.REVIEW_SPECIFICATION
+    elif snapshot.baseline is None:
+        kind = WorkspaceNextActionKind.ESTABLISH_BASELINE
+    elif snapshot.baseline.status == "pending":
+        kind = WorkspaceNextActionKind.ESTABLISH_BASELINE
+    else:
+        return None
+    pull_request_number = snapshot.workspace_pull_request_number
+    if pull_request_number is None:
+        raise ProductionWorkspaceError(
+            "trusted workspace gate requires its pull request"
+        )
+    if pull_request is None:
+        pull_request = WorkspacePullRequest(
+            number=pull_request_number,
+            issue_number=snapshot.issue_number,
+            branch=(
+                f"foundry-opt/workspace/issue-{snapshot.issue_number}"
+            ),
+            title=(
+                f"[Optimize] #{snapshot.issue_number} workspace - "
+                "draft, not yet selectable"
+            ),
+            draft=True,
+            reuse_existing=True,
+            base_commit=specification.base_commit,
+        )
+    return WorkspaceResult(
+        phase=snapshot.phase,
+        workspace_pull_request=pull_request,
+        planned_effect_kinds=(),
+        recorded=True,
+        issue_status_projection_intent=WorkspaceIssueStatusProjectionIntent(
+            issue_number=snapshot.issue_number,
+            phase=snapshot.phase,
+            workspace_pull_request_number=pull_request_number,
+        ),
+        next_action=WorkspaceNextAction(
+            kind=kind,
+            issue_number=snapshot.issue_number,
+            workspace_pull_request_number=pull_request_number,
+            trigger=None,
+        ),
+    )

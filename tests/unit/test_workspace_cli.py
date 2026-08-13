@@ -13,7 +13,6 @@ from foundry_opt.orchestration import (
     WorkspacePhase,
     WorkspacePullRequest,
     WorkspaceResult,
-    WorkspaceTrigger,
 )
 from foundry_opt.orchestration.workspace_operations_executor import (
     WorkspaceOperationsResult,
@@ -128,6 +127,8 @@ def test_workspace_help_exposes_production_lifecycle_commands() -> None:
     assert "experiment" in completed.stdout
     assert "experiment-result" in completed.stdout
     assert "experiments-complete" in completed.stdout
+    assert "baseline" in completed.stdout
+    assert "baseline-result" in completed.stdout
     assert "operation-complete" in completed.stdout
     assert "verify" in completed.stdout
     assert "operations" in completed.stdout
@@ -342,6 +343,94 @@ def test_workspace_experiment_result_uses_trusted_context(
 
     assert completed.exit_code == 0
     assert json.loads(completed.stdout)["candidate_id"] == "candidate-1"
+
+
+def test_workspace_baseline_executes_from_trusted_state(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    class Result:
+        status = "completed"
+        next_action = "continue_workspace"
+
+        def to_dict(self):
+            return {
+                "status": self.status,
+                "next_action": self.next_action,
+            }
+
+    class Service:
+        def execute_baseline(self, *, repository_root, issue_number):
+            assert repository_root == tmp_path
+            assert issue_number == 31
+            return Result()
+
+    monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
+
+    completed = runner.invoke(
+        app,
+        ["workspace", "baseline", "--issue", "31", "--json"],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["status"] == "completed"
+
+
+def test_workspace_baseline_result_uses_trusted_context(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result_path = tmp_path / "baseline-result.json"
+    result_path.write_text(
+        json.dumps({"schema_version": 1, "issue_number": 31}),
+        encoding="utf-8",
+    )
+
+    class Result:
+        status = "completed"
+
+        def to_dict(self):
+            return {"status": self.status}
+
+    class Service:
+        def ingest_baseline_result(
+            self,
+            payload,
+            context,
+            *,
+            repository_root,
+        ):
+            assert payload["issue_number"] == 31
+            assert context.delivery_id == "delivery-123"
+            assert context.repository == "octo-org/optimizer"
+            assert context.repository_id == 123
+            assert repository_root == tmp_path
+            return Result()
+
+    monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "baseline-result",
+            "--result",
+            str(result_path),
+            "--delivery-id",
+            "delivery-123",
+            "--repository",
+            "octo-org/optimizer",
+            "--repository-id",
+            "123",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["status"] == "completed"
 
 
 def test_workspace_operation_complete_uses_trusted_context(

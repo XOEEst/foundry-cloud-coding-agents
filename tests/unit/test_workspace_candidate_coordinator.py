@@ -23,6 +23,7 @@ from foundry_opt.orchestration import (
     OptimizationWorkspace,
     WorkspaceCandidate,
     WorkspaceCandidateCoordinator,
+    WorkspaceBaselineRecord,
     WorkspaceExperimentRecord,
     WorkspaceExactPatchResult,
     WorkspaceIssue,
@@ -31,6 +32,7 @@ from foundry_opt.orchestration import (
     WorkspacePullRequest,
     WorkspaceReportContext,
     WorkspaceRequest,
+    WorkspaceSpecificationRecord,
     WorkspaceSelectionDecision,
     WorkspaceTrigger,
     WorkspaceUpdate,
@@ -171,6 +173,35 @@ def _seed_records(
             semantic_event="trusted_experiments_recorded",
             external_operation_ids=external_ids,
             experiments=records,
+            specification=WorkspaceSpecificationRecord(
+                status="policy_approved",
+                spec_sha256="a" * 64,
+                base_commit="b" * 40,
+                target="support-agent",
+                environment="development",
+                asset_ids=("development", "validation", "quality"),
+                metric_names=("quality",),
+                policy_reason=(
+                    "repository policy approved immutable assets"
+                ),
+            ),
+            baseline=WorkspaceBaselineRecord(
+                status="completed",
+                operation_sha256="1" * 64,
+                idempotency_key="2" * 64,
+                bundle_sha256="3" * 64,
+                evidence_sha256="4" * 64,
+                dataset_ids=("development", "validation"),
+                evaluator_ids=("quality",),
+                split="development",
+                sample_count=6,
+                executor="direct_oidc",
+                draft_id="baseline-draft",
+                evaluation_id="baseline-evaluation",
+                run_id="baseline-run",
+                metrics={"quality": 0.0},
+                guardrails={"safety": "pass"},
+            ),
         ),
     )
 
@@ -342,6 +373,14 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     )
     assert result.report is not None
     assert result.report.candidate_id == "candidate-2"
+    assert snapshot.baseline is not None
+    assert result.report.baseline_metrics == snapshot.baseline.metrics
+    assert result.report.sample_count == snapshot.baseline.sample_count
+    assert result.report.split == snapshot.baseline.split
+    assert snapshot.specification is not None
+    assert result.report.spec_sha256 == (
+        snapshot.specification.spec_sha256
+    )
     assert result.report.candidate_metrics == {"quality": 2.0}
     assert result.report.changed_paths == ("agent.py",)
     assert "scratch/exploration.txt" not in result.report.changed_paths
@@ -582,6 +621,8 @@ def test_candidate_completion_waits_for_all_trusted_results_and_reconciles(
                 partial.experiments[0],
                 completed_record,
             ),
+            specification=partial.specification,
+            baseline=partial.baseline,
         ),
     )
 

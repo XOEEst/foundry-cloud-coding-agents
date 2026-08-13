@@ -54,6 +54,8 @@ class WorkspaceTrigger(StrEnum):
 
 
 class WorkspaceNextActionKind(StrEnum):
+    REVIEW_SPECIFICATION = "review_specification"
+    ESTABLISH_BASELINE = "establish_baseline"
     RUN_CANDIDATE_EXPERIMENTS = "run_candidate_experiments"
     MERGE_WORKSPACE_PULL_REQUEST = "merge_workspace_pull_request"
     DEPLOY_SELECTED_CANDIDATE = "deploy_selected_candidate"
@@ -945,6 +947,10 @@ class OptimizationWorkspace:
             ),
             experiments=snapshot.experiments if snapshot is not None else (),
             lineage=snapshot.lineage if snapshot is not None else None,
+            specification=(
+                snapshot.specification if snapshot is not None else None
+            ),
+            baseline=snapshot.baseline if snapshot is not None else None,
         )
 
     @staticmethod

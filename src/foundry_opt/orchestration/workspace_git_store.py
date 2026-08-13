@@ -28,8 +28,10 @@ from foundry_opt.orchestration.workspace_state_migration import (
 from foundry_opt.orchestration.workspace_store import (
     AuditBundle,
     CandidateSummary,
+    WorkspaceBaselineRecord,
     WorkspaceExperimentRecord,
     WorkspaceLineage,
+    WorkspaceSpecificationRecord,
     WorkspaceSnapshot,
     WorkspaceUpdate,
 )
@@ -162,6 +164,19 @@ class GitWorkspaceStore:
                 update.experiments,
                 WorkspaceConflictError,
             )
+            if (
+                current_snapshot.specification is not None
+                and update.specification
+                != current_snapshot.specification
+            ):
+                raise WorkspaceConflictError(
+                    "workspace specification changed"
+                )
+            _validate_baseline_transition(
+                current_snapshot.baseline,
+                update.baseline,
+                WorkspaceConflictError,
+            )
         candidates_content = (
             _canonical_json(_candidates_to_document(update.candidates))
             if update.candidates
@@ -235,6 +250,8 @@ class GitWorkspaceStore:
             external_operation_ids=update.external_operation_ids,
             experiments=update.experiments,
             lineage=update.lineage,
+            specification=update.specification,
+            baseline=update.baseline,
         )
 
     def finalize(self, issue_number: int) -> AuditBundle:
@@ -326,6 +343,8 @@ class GitWorkspaceStore:
             external_operation_ids=snapshot.external_operation_ids,
             experiments=snapshot.experiments,
             lineage=snapshot.lineage,
+            specification=snapshot.specification,
+            baseline=snapshot.baseline,
             retained_paths=tuple(retained_paths),
         )
 
@@ -568,6 +587,12 @@ class GitWorkspaceStore:
                     state_document["experiments"]
                 ),
                 lineage=lineage,
+                specification=_specification_from_document(
+                    state_document["specification"]
+                ),
+                baseline=_baseline_from_document(
+                    state_document["baseline"]
+                ),
             ),
             journal,
         )
@@ -817,6 +842,7 @@ class GitWorkspaceStore:
 
 
 _STATE_KEYS = (
+    "baseline",
     "candidates_sha256",
     "external_operation_ids",
     "experiments",
@@ -824,6 +850,7 @@ _STATE_KEYS = (
     "lineage",
     "phase",
     "selected_patch_sha256",
+    "specification",
     "workspace_pull_request_number",
 )
 
@@ -835,6 +862,7 @@ def _state_document(
     selected_patch_sha256: str | None,
 ) -> dict[str, Any]:
     return {
+        "baseline": _baseline_to_document(update.baseline),
         "candidates_sha256": candidates_sha256,
         "external_operation_ids": list(update.external_operation_ids),
         "experiments": [
@@ -845,6 +873,9 @@ def _state_document(
         "lineage": _lineage_to_document(update.lineage),
         "phase": update.phase.value,
         "selected_patch_sha256": selected_patch_sha256,
+        "specification": _specification_to_document(
+            update.specification
+        ),
         "workspace_pull_request_number": (
             update.workspace_pull_request_number
         ),
@@ -940,6 +971,18 @@ def _validate_update(update: WorkspaceUpdate) -> None:
         update.experiments,
         WorkspacePrivacyError,
     )
+    if (
+        update.specification is not None
+        and type(update.specification) is not WorkspaceSpecificationRecord
+    ):
+        raise WorkspacePrivacyError(
+            "workspace specification record is invalid"
+        )
+    if (
+        update.baseline is not None
+        and type(update.baseline) is not WorkspaceBaselineRecord
+    ):
+        raise WorkspacePrivacyError("workspace baseline record is invalid")
     if update.selected_patch is not None:
         _validate_patch(update.selected_patch, WorkspacePrivacyError)
     if update.lineage is not None:
@@ -1152,7 +1195,136 @@ def _validate_state_document(document: Any, issue_number: int) -> None:
     )
     _experiments_from_document(document["experiments"])
     _lineage_from_document(document["lineage"])
+    _specification_from_document(document["specification"])
+    _baseline_from_document(document["baseline"])
     _validate_privacy(document)
+
+
+def _specification_to_document(
+    record: WorkspaceSpecificationRecord | None,
+) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    return {
+        "asset_ids": list(record.asset_ids),
+        "base_commit": record.base_commit,
+        "environment": record.environment,
+        "metric_names": list(record.metric_names),
+        "policy_reason": record.policy_reason,
+        "spec_sha256": record.spec_sha256,
+        "status": record.status,
+        "target": record.target,
+    }
+
+
+def _specification_from_document(
+    value: Any,
+) -> WorkspaceSpecificationRecord | None:
+    if value is None:
+        return None
+    _exact_keys(
+        value,
+        {
+            "asset_ids",
+            "base_commit",
+            "environment",
+            "metric_names",
+            "policy_reason",
+            "spec_sha256",
+            "status",
+            "target",
+        },
+        "workspace specification",
+    )
+    try:
+        return WorkspaceSpecificationRecord(
+            status=value["status"],
+            spec_sha256=value["spec_sha256"],
+            base_commit=value["base_commit"],
+            target=value["target"],
+            environment=value["environment"],
+            asset_ids=tuple(value["asset_ids"]),
+            metric_names=tuple(value["metric_names"]),
+            policy_reason=value["policy_reason"],
+        )
+    except (TypeError, ValueError) as error:
+        raise WorkspaceCorruptionError(
+            "workspace specification is invalid"
+        ) from error
+
+
+def _baseline_to_document(
+    record: WorkspaceBaselineRecord | None,
+) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    return {
+        "bundle_sha256": record.bundle_sha256,
+        "dataset_ids": list(record.dataset_ids),
+        "draft_id": record.draft_id,
+        "evaluation_id": record.evaluation_id,
+        "evaluator_ids": list(record.evaluator_ids),
+        "evidence_sha256": record.evidence_sha256,
+        "executor": record.executor,
+        "guardrails": dict(record.guardrails),
+        "idempotency_key": record.idempotency_key,
+        "metrics": dict(record.metrics),
+        "operation_sha256": record.operation_sha256,
+        "run_id": record.run_id,
+        "sample_count": record.sample_count,
+        "split": record.split,
+        "status": record.status,
+    }
+
+
+def _baseline_from_document(
+    value: Any,
+) -> WorkspaceBaselineRecord | None:
+    if value is None:
+        return None
+    _exact_keys(
+        value,
+        {
+            "bundle_sha256",
+            "dataset_ids",
+            "draft_id",
+            "evaluation_id",
+            "evaluator_ids",
+            "evidence_sha256",
+            "executor",
+            "guardrails",
+            "idempotency_key",
+            "metrics",
+            "operation_sha256",
+            "run_id",
+            "sample_count",
+            "split",
+            "status",
+        },
+        "workspace baseline",
+    )
+    try:
+        return WorkspaceBaselineRecord(
+            status=value["status"],
+            operation_sha256=value["operation_sha256"],
+            idempotency_key=value["idempotency_key"],
+            bundle_sha256=value["bundle_sha256"],
+            evidence_sha256=value["evidence_sha256"],
+            dataset_ids=tuple(value["dataset_ids"]),
+            evaluator_ids=tuple(value["evaluator_ids"]),
+            split=value["split"],
+            sample_count=value["sample_count"],
+            executor=value["executor"],
+            draft_id=value["draft_id"],
+            evaluation_id=value["evaluation_id"],
+            run_id=value["run_id"],
+            metrics=value["metrics"],
+            guardrails=value["guardrails"],
+        )
+    except (TypeError, ValueError) as error:
+        raise WorkspaceCorruptionError(
+            "workspace baseline is invalid"
+        ) from error
 
 
 def _experiment_to_document(
@@ -1268,6 +1440,30 @@ def _validate_experiment_transition(
             or item.operation_sha256 != prior.operation_sha256
         ):
             raise error_type("workspace experiment lineage changed")
+
+
+def _validate_baseline_transition(
+    previous: WorkspaceBaselineRecord | None,
+    current: WorkspaceBaselineRecord | None,
+    error_type: type[WorkspaceCorruptionError],
+) -> None:
+    if previous is None:
+        return
+    if current is None:
+        raise error_type("workspace baseline was removed")
+    if previous.status == "completed" and current != previous:
+        raise error_type("completed workspace baseline changed")
+    if previous.status == "pending" and (
+        current.operation_sha256 != previous.operation_sha256
+        or current.idempotency_key != previous.idempotency_key
+        or current.bundle_sha256 != previous.bundle_sha256
+        or current.evidence_sha256 != previous.evidence_sha256
+        or current.dataset_ids != previous.dataset_ids
+        or current.evaluator_ids != previous.evaluator_ids
+        or current.split != previous.split
+        or current.sample_count != previous.sample_count
+    ):
+        raise error_type("workspace baseline lineage changed")
 
 
 def _lineage_to_document(

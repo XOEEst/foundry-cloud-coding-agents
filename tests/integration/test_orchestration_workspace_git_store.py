@@ -14,6 +14,7 @@ from foundry_opt.orchestration import (
     detect_workspace_state_v3,
     GitWorkspaceStore,
     WorkspaceCompletedError,
+    WorkspaceBaselineRecord,
     WorkspaceConflictError,
     WorkspaceCorruptionError,
     WorkspaceExperimentRecord,
@@ -21,6 +22,7 @@ from foundry_opt.orchestration import (
     WorkspaceLineage,
     WorkspacePhase,
     WorkspacePrivacyError,
+    WorkspaceSpecificationRecord,
     WorkspaceUpdate,
 )
 
@@ -82,6 +84,33 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
             f"trusted-selector:head:{'f' * 40}"
         ),
     )
+    specification = WorkspaceSpecificationRecord(
+        status="policy_approved",
+        spec_sha256="a" * 64,
+        base_commit="b" * 40,
+        target="support-agent",
+        environment="development",
+        asset_ids=("development", "validation", "quality"),
+        metric_names=("policy_coverage",),
+        policy_reason="repository policy approved immutable assets",
+    )
+    baseline = WorkspaceBaselineRecord(
+        status="completed",
+        operation_sha256="3" * 64,
+        idempotency_key="4" * 64,
+        bundle_sha256="5" * 64,
+        evidence_sha256="6" * 64,
+        dataset_ids=("development", "validation"),
+        evaluator_ids=("quality",),
+        split="development",
+        sample_count=24,
+        executor="direct_oidc",
+        draft_id="baseline-draft",
+        evaluation_id="baseline-evaluation",
+        run_id="baseline-run",
+        metrics={"policy_coverage": 0.2},
+        guardrails={"safety": "pass"},
+    )
 
     first = store.commit(
         expected_revision=None,
@@ -90,6 +119,8 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
             phase=WorkspacePhase.SPECIFICATION,
             workspace_pull_request_number=104,
             semantic_event="issue_created",
+            specification=specification,
+            baseline=baseline,
         ),
     )
     second = store.commit(
@@ -127,6 +158,8 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
                 ),
             ),
             lineage=lineage,
+            specification=specification,
+            baseline=baseline,
         ),
     )
 
@@ -156,6 +189,8 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
         + "\n"
     ).encode()
     assert snapshot["state"]["lineage"]["spec_sha256"] == "a" * 64
+    assert snapshot["state"]["specification"]["spec_sha256"] == "a" * 64
+    assert snapshot["state"]["baseline"]["sample_count"] == 24
     assert snapshot["state"]["experiments"][0]["status"] == "completed"
     assert snapshot["state"]["experiments"][0]["metrics"] == {
         "policy_coverage": 0.5

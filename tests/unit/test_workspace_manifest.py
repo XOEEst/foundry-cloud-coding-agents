@@ -3,28 +3,10 @@ import hashlib
 
 import pytest
 
-from foundry_opt.evaluation import (
-    EvaluationPolicy,
-    MetricDirection,
-    MetricPolicy,
-)
 from foundry_opt.orchestration import (
     parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
 )
-
-
-def _policy() -> EvaluationPolicy:
-    return EvaluationPolicy(
-        (
-            MetricPolicy(
-                "quality",
-                MetricDirection.MAXIMIZE,
-                0.8,
-                0.05,
-            ),
-        )
-    )
 
 
 def _candidate() -> dict:
@@ -43,25 +25,16 @@ def _candidate() -> dict:
 
 def _payload() -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "issue_number": 31,
         "target": "support-agent",
         "base_commit": "a" * 40,
-        "report_context": {
-            "baseline_metrics": {"quality": 0.8},
-            "sample_count": 12,
-            "split": "development",
-            "spec_sha256": "d" * 64,
-        },
         "candidates": [_candidate()],
     }
 
 
 def test_manifest_contains_only_untrusted_candidate_proposal() -> None:
-    manifest = parse_workspace_experiment_manifest(
-        _payload(),
-        policy=_policy(),
-    )
+    manifest = parse_workspace_experiment_manifest(_payload())
     proposal = manifest.candidates[0]
 
     assert proposal.patch_sha256 == hashlib.sha256(
@@ -93,7 +66,28 @@ def test_manifest_rejects_model_supplied_result_fields(
     payload["candidates"][0][forged_field] = {"quality": 99.0}
 
     with pytest.raises(ValueError, match="candidate fields"):
-        parse_workspace_experiment_manifest(payload, policy=_policy())
+        parse_workspace_experiment_manifest(payload)
+
+
+@pytest.mark.parametrize(
+    "forged_field",
+    (
+        "report_context",
+        "spec_sha256",
+        "baseline_metrics",
+        "thresholds",
+        "asset_ids",
+        "policy",
+    ),
+)
+def test_manifest_rejects_model_supplied_trust_context(
+    forged_field: str,
+) -> None:
+    payload = _payload()
+    payload[forged_field] = {"quality": 99.0}
+
+    with pytest.raises(ValueError, match="manifest fields"):
+        parse_workspace_experiment_manifest(payload)
 
 
 def test_single_candidate_manifest_uses_same_proposal_contract() -> None:

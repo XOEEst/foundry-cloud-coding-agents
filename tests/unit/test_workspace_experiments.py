@@ -11,7 +11,9 @@ from foundry_opt.orchestration import (
     InMemoryWorkspaceStore,
     WorkspaceCandidateProposal,
     WorkspaceExperimentExecutor,
+    WorkspaceBaselineRecord,
     WorkspacePhase,
+    WorkspaceSpecificationRecord,
     WorkspaceUpdate,
     TrustedWorkspaceExperimentResultContext,
     normalize_workspace_experiment_result,
@@ -79,6 +81,40 @@ def _store() -> InMemoryWorkspaceStore:
             phase=WorkspacePhase.SPECIFICATION,
             workspace_pull_request_number=104,
             semantic_event="issue_created",
+            specification=WorkspaceSpecificationRecord(
+                status="policy_approved",
+                spec_sha256="f" * 64,
+                base_commit="e" * 40,
+                target="support-agent",
+                environment="development",
+                asset_ids=(
+                    "development-dataset",
+                    "validation-dataset",
+                    "quality-evaluator",
+                ),
+                metric_names=("quality",),
+                policy_reason="repository policy approved immutable assets",
+            ),
+            baseline=WorkspaceBaselineRecord(
+                status="completed",
+                operation_sha256="1" * 64,
+                idempotency_key="2" * 64,
+                bundle_sha256="3" * 64,
+                evidence_sha256="4" * 64,
+                dataset_ids=(
+                    "development-dataset",
+                    "validation-dataset",
+                ),
+                evaluator_ids=("quality-evaluator",),
+                split="development",
+                sample_count=20,
+                executor="direct_oidc",
+                draft_id="baseline-draft",
+                evaluation_id="baseline-evaluation",
+                run_id="baseline-run",
+                metrics={"quality": 0.5},
+                guardrails={"safety": "pass"},
+            ),
         ),
     )
     return store
@@ -146,6 +182,46 @@ def test_actions_pending_persists_operation_without_result_fields(
     assert record.status == "pending"
     assert record.metrics == {}
     assert record.draft_id is None
+
+
+def test_candidate_execution_requires_completed_trusted_baseline(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryWorkspaceStore()
+    store.commit(
+        expected_revision=None,
+        update=WorkspaceUpdate(
+            issue_number=31,
+            phase=WorkspacePhase.SPECIFICATION,
+            workspace_pull_request_number=104,
+            semantic_event="trusted_specification_resolved",
+            specification=WorkspaceSpecificationRecord(
+                status="policy_approved",
+                spec_sha256="f" * 64,
+                base_commit="e" * 40,
+                target="support-agent",
+                environment="development",
+                asset_ids=("development", "validation", "quality"),
+                metric_names=("quality",),
+                policy_reason=(
+                    "repository policy approved immutable assets"
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="baseline are required"):
+        WorkspaceExperimentExecutor(
+            store=store,
+            runner=Runner(),
+            request_builder=Builder(),
+        ).execute(
+            repository_root=tmp_path,
+            issue_number=31,
+            target="support-agent",
+            base_commit="e" * 40,
+            proposal=_proposal(),
+        )
 
 
 def test_trusted_actions_result_completes_pending_and_reconciles_retry(

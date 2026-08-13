@@ -12,9 +12,12 @@ from foundry_opt.adapters.commands import SubprocessCommandRunner
 from foundry_opt.orchestration import (
     CandidateSummary,
     InMemoryWorkspaceStore,
+    WorkspaceBaselineRecord,
+    WorkspaceExperimentRecord,
     WorkspaceLineage,
     WorkspacePhase,
     WorkspaceUpdate,
+    WorkspaceSpecificationRecord,
 )
 from foundry_opt.orchestration.workspace_verifier import WorkspaceVerifier
 from foundry_opt.preflight.interfaces import CommandResult
@@ -82,7 +85,7 @@ def _workspace(tmp_path: Path):
     branch = "foundry-opt/workspace/issue-31"
     _run(repository, "branch", branch, head)
     _run(repository, "remote", "add", "origin", str(origin))
-    _run(repository, "push", "origin", f"main:main", f"{branch}:{branch}")
+    _run(repository, "push", "origin", "main:main", f"{branch}:{branch}")
     lineage = WorkspaceLineage(
         spec_sha256="a" * 64,
         base_commit=base,
@@ -119,7 +122,53 @@ def _workspace(tmp_path: Path):
                 f"candidate-1:tree:{lineage.expected_tree}",
                 f"workspace_commit:{head}",
             ),
+            experiments=(
+                WorkspaceExperimentRecord(
+                    candidate_id="candidate-1",
+                    patch_sha256=lineage.patch_sha256,
+                    bundle_sha256=lineage.bundle_sha256,
+                    evidence_sha256=lineage.evidence_sha256,
+                    idempotency_key="d" * 64,
+                    operation_sha256="e" * 64,
+                    status="completed",
+                    executor="direct_oidc",
+                    draft_id="draft-1",
+                    evaluation_id="evaluation-1",
+                    run_id="run-1",
+                    metrics={"quality": 0.9},
+                    guardrails={"safety": "pass"},
+                ),
+            ),
             lineage=lineage,
+            specification=WorkspaceSpecificationRecord(
+                status="policy_approved",
+                spec_sha256=lineage.spec_sha256,
+                base_commit=base,
+                target="support-agent",
+                environment="development",
+                asset_ids=("development", "validation", "quality"),
+                metric_names=("quality",),
+                policy_reason=(
+                    "repository policy approved immutable assets"
+                ),
+            ),
+            baseline=WorkspaceBaselineRecord(
+                status="completed",
+                operation_sha256="1" * 64,
+                idempotency_key="2" * 64,
+                bundle_sha256="3" * 64,
+                evidence_sha256="4" * 64,
+                dataset_ids=("development", "validation"),
+                evaluator_ids=("quality",),
+                split="development",
+                sample_count=12,
+                executor="direct_oidc",
+                draft_id="baseline-draft",
+                evaluation_id="baseline-evaluation",
+                run_id="baseline-run",
+                metrics={"quality": 0.8},
+                guardrails={"safety": "pass"},
+            ),
         ),
     )
     pull = {

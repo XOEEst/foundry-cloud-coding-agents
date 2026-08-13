@@ -14,12 +14,14 @@ from foundry_opt.orchestration import (
     OptimizationWorkspace,
     TrustedWorkspaceEventContext,
     WorkspaceAdvanceRequest,
+    WorkspaceBaselineRecord,
     WorkspaceExperimentRecord,
     WorkspaceIssueStatusProjectionIntent,
     WorkspacePhase,
     WorkspacePullRequest,
     WorkspaceResult,
     WorkspaceSnapshot,
+    WorkspaceSpecificationRecord,
     WorkspaceTrigger,
     build_production_workspace,
 )
@@ -71,6 +73,39 @@ def test_production_builder_uses_git_state_and_gh_pull_requests(
     assert isinstance(workspace, OptimizationWorkspace)
     assert isinstance(workspace._store, GitWorkspaceStore)
     assert isinstance(workspace._pull_requests, GhWorkspacePullRequests)
+
+
+def _trusted_specification() -> WorkspaceSpecificationRecord:
+    return WorkspaceSpecificationRecord(
+        status="policy_approved",
+        spec_sha256="f" * 64,
+        base_commit="b" * 40,
+        target="support-agent",
+        environment="development",
+        asset_ids=("development", "validation", "quality"),
+        metric_names=("quality",),
+        policy_reason="repository policy approved immutable assets",
+    )
+
+
+def _trusted_baseline() -> WorkspaceBaselineRecord:
+    return WorkspaceBaselineRecord(
+        status="completed",
+        operation_sha256="1" * 64,
+        idempotency_key="2" * 64,
+        bundle_sha256="3" * 64,
+        evidence_sha256="4" * 64,
+        dataset_ids=("development", "validation"),
+        evaluator_ids=("quality",),
+        split="development",
+        sample_count=12,
+        executor="direct_oidc",
+        draft_id="baseline-draft",
+        evaluation_id="baseline-evaluation",
+        run_id="baseline-run",
+        metrics={"quality": 0.8},
+        guardrails={"safety": "pass"},
+    )
 
 
 def test_production_builder_wires_candidate_coordinator(
@@ -199,6 +234,8 @@ def test_production_assignment_uses_state_workspace_pr_for_candidate_work(
         external_operation_ids=(),
         experiments=(),
         lineage=None,
+        specification=_trusted_specification(),
+        baseline=_trusted_baseline(),
     )
     monkeypatch.setattr(
         workspace_production,
@@ -295,6 +332,45 @@ def test_production_assignment_skips_human_merge_wait_without_token(
     assert result.assigned is False
     assert result.status == "not_required"
     assert result.next_action == "merge_workspace_pull_request"
+
+
+def test_production_assignment_skips_spec_review_and_baseline_waits() -> None:
+    review = WorkspaceSnapshot(
+        issue_number=31,
+        revision="a" * 40,
+        phase=WorkspacePhase.SPECIFICATION,
+        workspace_pull_request_number=104,
+        candidates=(),
+        selected_patch=None,
+        external_operation_ids=(),
+        experiments=(),
+        lineage=None,
+        specification=WorkspaceSpecificationRecord(
+            status="human_review_required",
+            spec_sha256=None,
+            base_commit="b" * 40,
+            target="support-agent",
+            environment="development",
+            asset_ids=("development", "validation", "quality"),
+            metric_names=("quality",),
+            policy_reason="custom assets require review",
+        ),
+    )
+    baseline = WorkspaceSnapshot(
+        **{
+            **review.__dict__,
+            "specification": _trusted_specification(),
+        }
+    )
+
+    assert workspace_production._copilot_assignment_action(review) == (
+        "review_specification",
+        False,
+    )
+    assert workspace_production._copilot_assignment_action(baseline) == (
+        "establish_baseline",
+        False,
+    )
 
 
 def test_production_assignment_skips_pending_actions_experiment(

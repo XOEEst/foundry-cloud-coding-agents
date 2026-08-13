@@ -278,6 +278,33 @@ class WorkspaceVerifier:
             compact_lineage = markers <= set(
                 snapshot.external_operation_ids
             )
+            selected_experiment = next(
+                (
+                    item
+                    for item in snapshot.experiments
+                    if item.candidate_id
+                    == lineage.selected_candidate_id
+                ),
+                None,
+            )
+            compact_lineage = compact_lineage and (
+                snapshot.specification is not None
+                and snapshot.specification.status == "policy_approved"
+                and snapshot.specification.spec_sha256
+                == lineage.spec_sha256
+                and snapshot.specification.base_commit
+                == lineage.base_commit
+                and snapshot.baseline is not None
+                and snapshot.baseline.status == "completed"
+                and selected_experiment is not None
+                and selected_experiment.status == "completed"
+                and selected_experiment.patch_sha256
+                == lineage.patch_sha256
+                and selected_experiment.evidence_sha256
+                == lineage.evidence_sha256
+                and selected_experiment.bundle_sha256
+                == lineage.bundle_sha256
+            )
             checks.append(
                 _check(
                     "state_lineage",

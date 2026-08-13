@@ -108,13 +108,21 @@ from foundry_opt.orchestration.workspace_experiments import (
     WorkspaceExperimentRequestBuilder,
     normalize_workspace_experiment_result,
 )
+from foundry_opt.orchestration.workspace_baseline import (
+    WorkspaceBaselineExecutionResult,
+    WorkspaceBaselineExecutor,
+    WorkspaceBaselinePlan,
+    WorkspaceBaselineRequestBuilder,
+)
 from foundry_opt.orchestration.workspace_store import (
     AuditBundle,
     CandidateSummary,
     InMemoryWorkspaceStore,
+    WorkspaceBaselineRecord,
     WorkspaceSnapshot,
     WorkspaceLineage,
     WorkspaceExperimentRecord,
+    WorkspaceSpecificationRecord,
     WorkspaceUpdate,
 )
 from foundry_opt.orchestration.workspace_runtime import WorkspaceStore
@@ -514,6 +522,12 @@ __all__ = [
     "WorkspaceIssue",
     "WorkspaceLineage",
     "WorkspaceExperimentRecord",
+    "WorkspaceBaselineRecord",
+    "WorkspaceBaselineExecutionResult",
+    "WorkspaceBaselineExecutor",
+    "WorkspaceBaselinePlan",
+    "WorkspaceBaselineRequestBuilder",
+    "WorkspaceSpecificationRecord",
     "WorkspaceIssueStatusProjectionIntent",
     "WorkspaceCandidate",
     "WorkspaceCandidateProposal",
