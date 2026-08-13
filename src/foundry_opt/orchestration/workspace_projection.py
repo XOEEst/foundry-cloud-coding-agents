@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -62,6 +62,8 @@ class GhWorkspaceIssueProjector:
         self._root = repository_root
         self._repository = repository
         self._renderer = renderer or PublicEvidenceRenderer()
+        self._authenticated_author: Mapping[str, Any] | None = None
+        self._authenticated_author_loaded = False
 
     def project(
         self,
@@ -143,7 +145,11 @@ class GhWorkspaceIssueProjector:
         body: str,
     ) -> bool:
         marker = _status_marker(intent.issue_number)
-        existing = _marked_comment(comments, marker)
+        existing = _marked_comment(
+            comments,
+            marker,
+            self._author_is_trusted,
+        )
         if existing is None:
             self._write(
                 "POST",
@@ -173,7 +179,11 @@ class GhWorkspaceIssueProjector:
         marker: str,
         body: str,
     ) -> bool:
-        existing = _marked_comment(comments, marker)
+        existing = _marked_comment(
+            comments,
+            marker,
+            self._author_is_trusted,
+        )
         if existing is not None:
             if existing["body"] != body:
                 raise RuntimeError(
@@ -208,11 +218,41 @@ class GhWorkspaceIssueProjector:
             or response.get("body") != body
             or type(response.get("id")) is not int
             or response["id"] < 1
-            or not _trusted_comment_author(response.get("user"))
+            or not self._author_is_trusted(response.get("user"))
         ):
             raise RuntimeError(
                 "workspace issue projection was not confirmed"
             )
+
+    def _author_is_trusted(self, value: Any) -> bool:
+        if _trusted_comment_author(value):
+            return True
+        actor = self._current_authenticated_author()
+        return (
+            isinstance(value, Mapping)
+            and value.get("login") == actor.get("login")
+            and value.get("id") == actor.get("id")
+            and value.get("type") == actor.get("type")
+        )
+
+    def _current_authenticated_author(self) -> Mapping[str, Any]:
+        if not self._authenticated_author_loaded:
+            response = self._json(("gh", "api", "user"))
+            if (
+                not isinstance(response, Mapping)
+                or not isinstance(response.get("login"), str)
+                or not response["login"]
+                or type(response.get("id")) is not int
+                or response["id"] < 1
+                or response.get("type") not in {"Bot", "User"}
+            ):
+                raise RuntimeError(
+                    "workspace projection authenticated author is invalid"
+                )
+            self._authenticated_author = response
+            self._authenticated_author_loaded = True
+        assert self._authenticated_author is not None
+        return self._authenticated_author
 
     def _json(
         self,
@@ -246,6 +286,7 @@ class GhWorkspaceIssueProjector:
 def _marked_comment(
     comments: list[dict[str, Any]],
     marker: str,
+    author_is_trusted: Callable[[Any], bool],
 ) -> dict[str, Any] | None:
     matches = [
         item
@@ -265,7 +306,7 @@ def _marked_comment(
     if (
         type(comment.get("id")) is not int
         or comment["id"] < 1
-        or not _trusted_comment_author(user)
+        or not author_is_trusted(user)
     ):
         raise RuntimeError("workspace issue projection marker is untrusted")
     return comment

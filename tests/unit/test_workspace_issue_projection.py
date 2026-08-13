@@ -18,10 +18,17 @@ from foundry_opt.preflight.interfaces import CommandResult
 
 
 class GitHubComments:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        author: dict | None = None,
+        authenticated_author: dict | None = None,
+    ) -> None:
         self.comments: list[dict] = []
         self.writes: list[tuple[str, str]] = []
         self.next_id = 1
+        self.author = author or {"login": "github-actions[bot]"}
+        self.authenticated_author = authenticated_author or self.author
 
     def run(
         self,
@@ -34,6 +41,12 @@ class GitHubComments:
     ) -> CommandResult:
         del cwd, environment, input_bytes
         command = tuple(arguments)
+        if command == ("gh", "api", "user"):
+            return CommandResult(
+                0,
+                json.dumps(self.authenticated_author),
+                "",
+            )
         if "--paginate" in command:
             return CommandResult(0, json.dumps([self.comments]), "")
         payload = json.loads(input_text or "{}")
@@ -45,7 +58,7 @@ class GitHubComments:
             comment = {
                 "id": self.next_id,
                 "body": payload["body"],
-                "user": {"login": "github-actions[bot]"},
+                "user": self.author,
             }
             self.next_id += 1
             self.comments.append(comment)
@@ -146,6 +159,55 @@ def test_issue_projection_updates_status_and_appends_milestones_once(
         "approved base `" + "2" * 40 + "`" in item["body"]
         for item in commands.comments
     ) == 1
+
+
+def test_issue_projection_accepts_exact_authenticated_user_token(
+    tmp_path: Path,
+) -> None:
+    actor = {"id": 123, "login": "octocat", "type": "User"}
+    commands = GitHubComments(
+        author=actor,
+        authenticated_author=actor,
+    )
+    projector = GhWorkspaceIssueProjector(
+        commands,
+        repository_root=tmp_path,
+        repository="octo-org/optimizer",
+    )
+
+    result = projector.project(
+        _intent(WorkspacePhase.SPECIFICATION),
+        base_commit="a" * 40,
+    )
+
+    assert result.status_changed is True
+
+
+def test_issue_projection_rejects_different_user_token_author(
+    tmp_path: Path,
+) -> None:
+    commands = GitHubComments(
+        author={"id": 456, "login": "attacker", "type": "User"},
+        authenticated_author={
+            "id": 123,
+            "login": "octocat",
+            "type": "User",
+        },
+    )
+    projector = GhWorkspaceIssueProjector(
+        commands,
+        repository_root=tmp_path,
+        repository="octo-org/optimizer",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="projection was not confirmed",
+    ):
+        projector.project(
+            _intent(WorkspacePhase.SPECIFICATION),
+            base_commit="a" * 40,
+        )
 
 
 def test_candidate_ready_evidence_is_identical_on_issue_and_pr(
