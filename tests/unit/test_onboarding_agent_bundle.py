@@ -390,6 +390,9 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
     assert "gh pr comment" not in text
     assert "@copilot" not in text
     assert "head -25" in text
+    assert text.count(
+        "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    ) == 1
     assert (
         'if [ "$TRUSTED_EVENT_NAME" = "push" ] &&'
         in text

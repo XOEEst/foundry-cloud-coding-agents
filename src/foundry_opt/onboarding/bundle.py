@@ -805,6 +805,7 @@ jobs:
       - uses: {_SETUP_UV_ACTION} # v9.0.0
       - name: Execute trusted workspace operations
         env:
+          GH_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
           REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
