@@ -324,6 +324,35 @@ class GitWorkspaceCandidateStore(PendingCandidateExperimentStore):
             ),
             None,
         )
+        if (
+            pending is None
+            and snapshot.phase is WorkspacePhase.EVALUATING
+            and snapshot.specification is not None
+            and snapshot.experiments
+            and all(
+                item.status == "completed"
+                for item in snapshot.experiments
+            )
+        ):
+            config = load_config(
+                self._root / ".github" / "foundry-optimizer.yaml"
+            )
+            target = config.targets.get(snapshot.specification.target)
+            if target is None:
+                raise ValueError(
+                    "workspace candidate target is not configured"
+                )
+            candidate_limit = (
+                target.campaign_overrides.max_changed_candidates
+                if (
+                    target.campaign_overrides is not None
+                    and target.campaign_overrides.max_changed_candidates
+                    is not None
+                )
+                else config.campaign.max_changed_candidates
+            )
+            if len(snapshot.experiments) == candidate_limit:
+                pending = snapshot.experiments[-1]
         if pending is None:
             return None
         payload = self._operations.load_candidate_manifest(
