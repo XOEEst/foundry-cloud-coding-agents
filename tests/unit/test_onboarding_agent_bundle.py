@@ -364,6 +364,10 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
         " ".join(text.split())
     )
     assert "gh run download" in text
+    assert "workspace-resume.ndjson" in text
+    assert "gh pr comment" in text
+    assert 'repos/{repository}/issues/{pull_request}/comments' in text
+    assert "@copilot" in text
     assert "head -25" in text
     assert "ref: ${{ github.event.repository.default_branch }}" in text
     for forbidden in (
@@ -376,6 +380,24 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
         "campaign-evaluate",
     ):
         assert forbidden not in text
+
+
+def test_operations_workflow_resumes_same_workspace_pull_request_without_creating_new_work() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-optimization-operations.yml")
+    ]
+
+    assert "Resume same workspace pull request when trusted state needs Copilot" in text
+    assert "workspace resume payload is invalid" in text
+    assert "gh pr comment" in text
+    assert "gh pr create" not in text
+    assert "gh issue edit" not in text
+    assert "--add-assignee" not in text
+    assert "worker issue" not in text
 
 
 def test_bundle_preserves_customer_deployment_workflow() -> None:

@@ -12,10 +12,14 @@ from foundry_opt.orchestration.candidate_experiments import (
     PersistedCandidateExperimentOperation,
 )
 from foundry_opt.orchestration.workspace import (
+    WorkspaceNextAction,
+    WorkspaceNextActionKind,
     WorkspacePhase,
     WorkspaceResult,
+    WorkspaceTrigger,
 )
 from foundry_opt.orchestration.workspace_operations_executor import (
+    StoredCandidateExperimentResult,
     TrustedWorkspaceArtifactContext,
     TrustedWorkspaceExecutionContext,
     WorkspaceCompletionRequest,
@@ -182,7 +186,8 @@ class RecordingCandidateStore:
         operation: PersistedCandidateExperimentOperation | None,
     ) -> None:
         self.operation = operation
-        self.result: CandidateExperimentResult | None = None
+        self.result: StoredCandidateExperimentResult | None = None
+        self.workspace: WorkspaceResult | None = None
         self.persist_calls = 0
         self.failures: list[Exception] = []
 
@@ -195,19 +200,22 @@ class RecordingCandidateStore:
     def load_result(
         self,
         operation: PersistedCandidateExperimentOperation,
-    ) -> CandidateExperimentResult | None:
+    ) -> StoredCandidateExperimentResult | None:
         return self.result
 
     def persist_result(
         self,
         operation: PersistedCandidateExperimentOperation,
         result: CandidateExperimentResult,
-    ) -> CandidateExperimentResult:
+    ) -> StoredCandidateExperimentResult:
         self.persist_calls += 1
         if self.failures:
             raise self.failures.pop(0)
-        self.result = result
-        return result
+        self.result = StoredCandidateExperimentResult(
+            result=result,
+            workspace=self.workspace,
+        )
+        return self.result
 
 
 class RecordingCandidateExecutor:
@@ -316,12 +324,30 @@ class RecordingFinalizer:
         )
 
 
-def _workspace_result(phase: WorkspacePhase, *, recorded: bool) -> WorkspaceResult:
+def _workspace_result(
+    phase: WorkspacePhase,
+    *,
+    recorded: bool,
+    next_action: WorkspaceNextActionKind | None = None,
+    workspace_pull_request_number: int | None = None,
+) -> WorkspaceResult:
     return WorkspaceResult(
         phase=phase,
         workspace_pull_request=None,
         planned_effect_kinds=(),
         recorded=recorded,
+        next_action=(
+            WorkspaceNextAction(
+                kind=next_action,
+                issue_number=31,
+                workspace_pull_request_number=(
+                    workspace_pull_request_number
+                ),
+                trigger=WorkspaceTrigger.EXPERIMENTS_COMPLETED,
+            )
+            if next_action is not None
+            else None
+        ),
     )
 
 
@@ -351,6 +377,79 @@ def test_candidate_fallback_is_idempotent_across_retries(
     assert store.persist_calls == 1
 
 
+def test_candidate_fallback_resumes_same_workspace_pull_request(
+    tmp_path: Path,
+) -> None:
+    persisted = _persisted_candidate_operation()
+    store = RecordingCandidateStore(persisted)
+    store.workspace = _workspace_result(
+        WorkspacePhase.EVALUATING,
+        recorded=True,
+        next_action=WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS,
+        workspace_pull_request_number=104,
+    )
+    service = WorkspaceOperationsService(
+        candidate_store=store,
+        candidate_executor=RecordingCandidateExecutor(
+            reconciled=[None],
+            executed=[_candidate_result(persisted)],
+        ),
+    )
+
+    result = service.execute(_execute_request(tmp_path))
+
+    assert result.status is WorkspaceOperationsStatus.CANDIDATE_RECORDED
+    assert result.workspace_pull_request_number == 104
+    assert result.resume is not None
+    assert result.resume.workspace_pull_request_number == 104
+    assert "@copilot" in result.resume.comment_body
+    assert "same workspace pull request" in result.resume.comment_body
+
+
+@pytest.mark.parametrize(
+    ("phase", "next_action"),
+    (
+        (
+            WorkspacePhase.AWAITING_SELECTION,
+            WorkspaceNextActionKind.MERGE_WORKSPACE_PULL_REQUEST,
+        ),
+        (
+            WorkspacePhase.COMPLETED,
+            WorkspaceNextActionKind.NONE,
+        ),
+        (
+            WorkspacePhase.RETENTION,
+            WorkspaceNextActionKind.COMPLETE_RETENTION,
+        ),
+    ),
+)
+def test_candidate_fallback_skips_resume_outside_copilot_actions(
+    tmp_path: Path,
+    phase: WorkspacePhase,
+    next_action: WorkspaceNextActionKind,
+) -> None:
+    persisted = _persisted_candidate_operation()
+    store = RecordingCandidateStore(persisted)
+    store.workspace = _workspace_result(
+        phase,
+        recorded=True,
+        next_action=next_action,
+        workspace_pull_request_number=104,
+    )
+    service = WorkspaceOperationsService(
+        candidate_store=store,
+        candidate_executor=RecordingCandidateExecutor(
+            reconciled=[None],
+            executed=[_candidate_result(persisted)],
+        ),
+    )
+
+    result = service.execute(_execute_request(tmp_path))
+
+    assert result.status is WorkspaceOperationsStatus.CANDIDATE_RECORDED
+    assert result.resume is None
+
+
 def test_candidate_fallback_recovers_after_persist_ack_loss(
     tmp_path: Path,
 ) -> None:
@@ -377,7 +476,8 @@ def test_candidate_fallback_recovers_after_persist_ack_loss(
     assert executor.execute_calls == 1
     assert executor.reconcile_calls == 2
     assert store.persist_calls == 2
-    assert store.result == result
+    assert store.result is not None
+    assert store.result.result == result
 
 
 def test_candidate_fallback_rejects_tampered_result(

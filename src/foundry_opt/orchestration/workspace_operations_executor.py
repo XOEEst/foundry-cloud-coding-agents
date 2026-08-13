@@ -18,6 +18,7 @@ from foundry_opt.orchestration.candidate_experiments import (
     PersistedCandidateExperimentOperation,
 )
 from foundry_opt.orchestration.workspace import (
+    WorkspaceNextActionKind,
     WorkspaceOperation,
     WorkspacePhase,
     WorkspaceResult,
@@ -144,6 +145,79 @@ def _url(
 def _safe_text(value: str, name: str) -> None:
     if not isinstance(value, str) or _SAFE_TEXT.fullmatch(value) is None:
         raise ValueError(f"{name} is invalid")
+
+
+def _workspace_pull_request_number(
+    workspace: WorkspaceResult | None,
+) -> int | None:
+    if workspace is None:
+        return None
+    next_action = workspace.next_action
+    if next_action is not None and (
+        type(next_action.workspace_pull_request_number) is int
+        and next_action.workspace_pull_request_number > 0
+    ):
+        return next_action.workspace_pull_request_number
+    if (
+        workspace.workspace_pull_request is not None
+        and type(workspace.workspace_pull_request.number) is int
+        and workspace.workspace_pull_request.number > 0
+    ):
+        return workspace.workspace_pull_request.number
+    projection = workspace.issue_status_projection_intent
+    if projection is not None and (
+        type(projection.workspace_pull_request_number) is int
+        and projection.workspace_pull_request_number > 0
+    ):
+        return projection.workspace_pull_request_number
+    return None
+
+
+def _workspace_resume_request(
+    *,
+    issue_number: int,
+    operation_key: str,
+    workspace: WorkspaceResult | None,
+) -> WorkspaceResumeRequest | None:
+    if workspace is None or workspace.next_action is None:
+        return None
+    if (
+        workspace.next_action.kind
+        is not WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS
+    ):
+        return None
+    pull_request_number = _workspace_pull_request_number(workspace)
+    if pull_request_number is None:
+        return None
+    marker_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "issue_number": issue_number,
+                "next_action": workspace.next_action.kind.value,
+                "operation_key": operation_key,
+                "pull_request_number": pull_request_number,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    marker = (
+        "<!-- foundry-opt:workspace-resume:v1:"
+        f"issue-{issue_number}:pr-{pull_request_number}:{marker_digest} -->"
+    )
+    return WorkspaceResumeRequest(
+        workspace_pull_request_number=pull_request_number,
+        comment_marker=marker,
+        comment_body="\n".join(
+            (
+                marker,
+                "@copilot continue this same workspace pull request from "
+                f"the trusted workspace state for issue #{issue_number}.",
+                "Run `foundry-opt workspace advance --issue "
+                f"{issue_number} --json` and continue only if the returned "
+                "next action still requires Copilot work.",
+            )
+        ),
+    )
 
 
 class WorkspaceOperationsStatus(StrEnum):
@@ -522,6 +596,36 @@ class WorkspaceFinalizationEffect:
 
 
 @dataclass(frozen=True)
+class WorkspaceResumeRequest:
+    workspace_pull_request_number: int
+    comment_marker: str
+    comment_body: str
+
+    def __post_init__(self) -> None:
+        _positive_integer(
+            self.workspace_pull_request_number,
+            "workspace pull request number",
+        )
+        _safe_text(self.comment_marker, "workspace resume marker")
+        if (
+            not isinstance(self.comment_body, str)
+            or not self.comment_body.strip()
+            or self.comment_marker not in self.comment_body
+            or "@copilot" not in self.comment_body
+        ):
+            raise ValueError("workspace resume comment is invalid")
+
+    def to_dict(self) -> dict[str, str | int]:
+        return {
+            "comment_body": self.comment_body,
+            "comment_marker": self.comment_marker,
+            "workspace_pull_request_number": (
+                self.workspace_pull_request_number
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class WorkspaceCompletionRequest:
     repository_root: Path
     target: WorkspaceDeploymentTarget
@@ -593,6 +697,7 @@ class WorkspaceOperationsResult:
     deployment_run_id: int | None = None
     deployment_run_url: str | None = None
     finalization: WorkspaceFinalizationEffect | None = None
+    resume: WorkspaceResumeRequest | None = None
 
     def __post_init__(self) -> None:
         _positive_integer(self.issue_number, "workspace issue number")
@@ -621,6 +726,11 @@ class WorkspaceOperationsResult:
             WorkspaceFinalizationEffect,
         ):
             raise ValueError("workspace finalization effect is invalid")
+        if self.resume is not None and not isinstance(
+            self.resume,
+            WorkspaceResumeRequest,
+        ):
+            raise ValueError("workspace resume request is invalid")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -635,6 +745,11 @@ class WorkspaceOperationsResult:
             "operation_id": self.operation_id,
             "phase": self.phase.value if self.phase is not None else None,
             "recorded": self.recorded,
+            "resume": (
+                self.resume.to_dict()
+                if self.resume is not None
+                else None
+            ),
             "status": self.status.value,
             "workspace_pull_request_number": (
                 self.workspace_pull_request_number
@@ -891,6 +1006,21 @@ def normalize_workspace_deployment_artifact(
     )
 
 
+@dataclass(frozen=True)
+class StoredCandidateExperimentResult:
+    result: CandidateExperimentResult
+    workspace: WorkspaceResult | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.result, CandidateExperimentResult):
+            raise ValueError("candidate experiment result is invalid")
+        if self.workspace is not None and not isinstance(
+            self.workspace,
+            WorkspaceResult,
+        ):
+            raise ValueError("candidate workspace result is invalid")
+
+
 class PendingCandidateExperimentStore(Protocol):
     def load_pending(
         self,
@@ -900,13 +1030,13 @@ class PendingCandidateExperimentStore(Protocol):
     def load_result(
         self,
         operation: PersistedCandidateExperimentOperation,
-    ) -> CandidateExperimentResult | None: ...
+    ) -> StoredCandidateExperimentResult | None: ...
 
     def persist_result(
         self,
         operation: PersistedCandidateExperimentOperation,
         result: CandidateExperimentResult,
-    ) -> CandidateExperimentResult: ...
+    ) -> StoredCandidateExperimentResult: ...
 
 
 class CandidateExperimentOperationExecutor(Protocol):
@@ -984,15 +1114,15 @@ class EmptyPendingCandidateExperimentStore:
     def load_result(
         self,
         operation: PersistedCandidateExperimentOperation,
-    ) -> CandidateExperimentResult | None:
+    ) -> StoredCandidateExperimentResult | None:
         return None
 
     def persist_result(
         self,
         operation: PersistedCandidateExperimentOperation,
         result: CandidateExperimentResult,
-    ) -> CandidateExperimentResult:
-        return result
+    ) -> StoredCandidateExperimentResult:
+        return StoredCandidateExperimentResult(result=result)
 
 
 class NoopCandidateExperimentOperationExecutor:
@@ -1305,10 +1435,12 @@ class WorkspaceOperationsService:
     ) -> WorkspaceOperationsResult:
         if operation.operation.issue_number != request.issue_number:
             raise ValueError("candidate experiment issue changed")
-        result = self._candidate_store.load_result(operation)
+        stored = self._candidate_store.load_result(operation)
         recorded = False
-        if result is None:
+        if stored is None:
             result = self._candidate_executor.reconcile(operation)
+        else:
+            result = stored.result
         if result is None:
             result = self._candidate_executor.execute(operation)
             if result is None:
@@ -1321,20 +1453,40 @@ class WorkspaceOperationsService:
         _validate_candidate_result(operation, result)
         existing = self._candidate_store.load_result(operation)
         if existing is not None:
-            _validate_candidate_result(operation, existing)
+            _validate_candidate_result(operation, existing.result)
+            workspace = existing.workspace
             return WorkspaceOperationsResult(
                 issue_number=request.issue_number,
                 status=WorkspaceOperationsStatus.CANDIDATE_RECORDED,
                 recorded=False,
                 operation_id=operation.sha256,
+                phase=workspace.phase if workspace is not None else None,
+                workspace_pull_request_number=(
+                    _workspace_pull_request_number(workspace)
+                ),
+                resume=_workspace_resume_request(
+                    issue_number=request.issue_number,
+                    operation_key=operation.sha256,
+                    workspace=workspace,
+                ),
             )
-        self._candidate_store.persist_result(operation, result)
+        persisted = self._candidate_store.persist_result(operation, result)
         recorded = True
+        workspace = persisted.workspace
         return WorkspaceOperationsResult(
             issue_number=request.issue_number,
             status=WorkspaceOperationsStatus.CANDIDATE_RECORDED,
             recorded=recorded,
             operation_id=operation.sha256,
+            phase=workspace.phase if workspace is not None else None,
+            workspace_pull_request_number=(
+                _workspace_pull_request_number(workspace)
+            ),
+            resume=_workspace_resume_request(
+                issue_number=request.issue_number,
+                operation_key=operation.sha256,
+                workspace=workspace,
+            ),
         )
 
 
@@ -1372,6 +1524,7 @@ __all__ = [
     "PlanningWorkspaceCompletionFinalizer",
     "PlanningWorkspaceDeploymentWorkflowExecutor",
     "PendingCandidateExperimentStore",
+    "StoredCandidateExperimentResult",
     "TrustedWorkspaceArtifactContext",
     "TrustedWorkspaceExecutionContext",
     "UnavailableWorkspaceRetentionEvaluator",
@@ -1393,6 +1546,7 @@ __all__ = [
     "WorkspaceOperationsService",
     "WorkspaceOperationsStatus",
     "WorkspaceReadyForHumanRequest",
+    "WorkspaceResumeRequest",
     "WorkspaceRetentionEvaluator",
     "WorkspaceRetentionOutcome",
     "WorkspaceRetentionStatus",

@@ -780,8 +780,12 @@ jobs:
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
           TRUSTED_WORKFLOW_RUN_ID: ${{{{ github.event.workflow_run.id }}}}
+          WORKSPACE_RESUME_FILE: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
         shell: bash
         run: |
+          mkdir -p "$(dirname "$WORKSPACE_RESUME_FILE")"
+          : > "$WORKSPACE_RESUME_FILE"
           issues=()
           if [ -n "$REQUESTED_ISSUE" ]; then
             if [[ ! "$REQUESTED_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
@@ -817,9 +821,13 @@ jobs:
             if [[ "$TRUSTED_WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
               args+=(--workflow-run-id "$TRUSTED_WORKFLOW_RUN_ID")
             fi
-            uv run --no-project --no-config --no-env-file \
-              --with "$OPTIMIZER_PACKAGE" \
-              "${{args[@]}}"
+            result_json="$(
+              uv run --no-project --no-config --no-env-file \
+                --with "$OPTIMIZER_PACKAGE" \
+                "${{args[@]}}"
+            )"
+            printf '%s\\n' "$result_json"
+            printf '%s\\n' "$result_json" >> "$WORKSPACE_RESUME_FILE"
           done
       - name: Reconcile authenticated deployment result
         if: github.event_name == 'workflow_run'
@@ -827,12 +835,15 @@ jobs:
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_WORKFLOW_RUN_ID: ${{{{ github.event.workflow_run.id }}}}
+          WORKSPACE_RESUME_FILE: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
         shell: bash
         run: |
           if [[ ! "$TRUSTED_WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
             echo "Invalid workflow run ID" >&2
             exit 1
           fi
+          mkdir -p "$(dirname "$WORKSPACE_RESUME_FILE")"
           result_dir="$GITHUB_WORKSPACE/.foundry-optimizer/deployment-result"
           mkdir -p "$result_dir"
           gh run download "$TRUSTED_WORKFLOW_RUN_ID" \
@@ -850,16 +861,83 @@ jobs:
             RESULT_FILE="${{result_files[0]}}" python -c \
               "import json, os; value = json.load(open(os.environ['RESULT_FILE'], encoding='utf-8')); issue = value.get('issue_number'); assert type(issue) is int and issue > 0; print(issue)"
           )"
-          uv run --no-project --no-config --no-env-file \
-            --with "$OPTIMIZER_PACKAGE" \
-            foundry-opt workspace operations reconcile \
-            --issue "$issue" \
-            --result "${{result_files[0]}}" \
-            --repository "$TRUSTED_REPOSITORY" \
-            --repository-id "$TRUSTED_REPOSITORY_ID" \
-            --run-id "$TRUSTED_WORKFLOW_RUN_ID" \
-            --artifact-name foundry-optimization-deployment-result \
-            --json
+          result_json="$(
+            uv run --no-project --no-config --no-env-file \
+              --with "$OPTIMIZER_PACKAGE" \
+              foundry-opt workspace operations reconcile \
+              --issue "$issue" \
+              --result "${{result_files[0]}}" \
+              --repository "$TRUSTED_REPOSITORY" \
+              --repository-id "$TRUSTED_REPOSITORY_ID" \
+              --run-id "$TRUSTED_WORKFLOW_RUN_ID" \
+              --artifact-name foundry-optimization-deployment-result \
+              --json
+          )"
+          printf '%s\\n' "$result_json"
+          printf '%s\\n' "$result_json" >> "$WORKSPACE_RESUME_FILE"
+      - name: Resume same workspace pull request when trusted state needs Copilot
+        env:
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          WORKSPACE_RESUME_FILE: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          resume_path = Path(os.environ["WORKSPACE_RESUME_FILE"])
+          if not resume_path.is_file():
+              raise SystemExit(0)
+
+          entries: dict[tuple[int, str], str] = {{}}
+          for line in resume_path.read_text(encoding="utf-8").splitlines():
+              if not line.strip():
+                  continue
+              document = json.loads(line)
+              resume = document.get("resume")
+              if resume is None:
+                  continue
+              if not isinstance(resume, dict):
+                  raise SystemExit("workspace resume payload is invalid")
+              pull_request = resume.get("workspace_pull_request_number")
+              marker = resume.get("comment_marker")
+              body = resume.get("comment_body")
+              if (
+                  type(pull_request) is not int
+                  or pull_request < 1
+                  or not isinstance(marker, str)
+                  or not marker
+                  or not isinstance(body, str)
+                  or marker not in body
+                  or "@copilot" not in body
+              ):
+                  raise SystemExit("workspace resume payload is invalid")
+              entries[(pull_request, marker)] = body
+
+          repository = os.environ["TRUSTED_REPOSITORY"]
+          for (pull_request, marker), body in sorted(entries.items()):
+              comments = json.loads(
+                  subprocess.run(
+                      f"gh api repos/{{repository}}/issues/{{pull_request}}/comments --paginate".split(),
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+              )
+              if any(
+                  isinstance(comment, dict)
+                  and marker in str(comment.get("body", ""))
+                  for comment in comments
+              ):
+                  continue
+              subprocess.run(
+                  f"gh pr comment {{pull_request}} --repo {{repository}} --body-file -".split(),
+                  check=True,
+                  input=body,
+                  text=True,
+              )
 """
 
 

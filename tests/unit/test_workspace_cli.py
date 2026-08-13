@@ -275,6 +275,7 @@ def test_workspace_operations_execute_emits_stable_json(
         "operation_id": "2" * 64,
         "phase": "evaluating",
         "recorded": True,
+        "resume": None,
         "status": "candidate_recorded",
         "workspace_pull_request_number": None,
     }
