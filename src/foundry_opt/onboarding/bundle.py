@@ -1236,6 +1236,7 @@ jobs:
 
           package = os.environ["OPTIMIZER_PACKAGE"]
           environment = dict(os.environ)
+          environment["GH_TOKEN"] = environment["COPILOT_ASSIGNMENT_TOKEN"]
           for issue in sorted(entries):
               result = subprocess.run(
                   [
