@@ -84,11 +84,17 @@ from foundry_opt.orchestration.workspace_operations import (
 from foundry_opt.orchestration.workspace_policy import (
     ConfiguredWorkspaceSelector,
 )
+from foundry_opt.orchestration.workspace_verifier import (
+    WorkspaceVerificationCheck,
+    WorkspaceVerificationResult,
+    WorkspaceVerifier,
+)
 from foundry_opt.orchestration.workspace_store import (
     AuditBundle,
     CandidateSummary,
     InMemoryWorkspaceStore,
     WorkspaceSnapshot,
+    WorkspaceLineage,
     WorkspaceUpdate,
 )
 from foundry_opt.orchestration.workspace_runtime import WorkspaceStore
@@ -486,6 +492,7 @@ __all__ = [
     "TrustedDeploymentWorkflowContext",
     "UnresolvedSpecification",
     "WorkspaceIssue",
+    "WorkspaceLineage",
     "WorkspaceIssueStatusProjectionIntent",
     "WorkspaceCandidate",
     "WorkspaceCandidateCoordinator",
@@ -520,6 +527,9 @@ __all__ = [
     "WorkspaceStore",
     "WorkspaceStoreError",
     "WorkspaceUpdate",
+    "WorkspaceVerificationCheck",
+    "WorkspaceVerificationResult",
+    "WorkspaceVerifier",
     "NormalizedWorkspaceEvent",
     "ProductionWorkspaceError",
     "ProductionWorkspaceService",

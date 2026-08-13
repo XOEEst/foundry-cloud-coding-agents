@@ -26,6 +26,7 @@ from foundry_opt.orchestration.models import (
 from foundry_opt.orchestration.workspace import WorkspacePhase
 from foundry_opt.orchestration.workspace_store import (
     CandidateSummary,
+    WorkspaceLineage,
     WorkspaceUpdate,
 )
 from foundry_opt.security import reject_secret_content
@@ -273,6 +274,11 @@ def _conversion_transitions(
         phase = _workspace_phase(state.phase)
         candidates = _candidate_summaries(state, metadata)
         selected_patch = _selected_patch(snapshot, state, metadata)
+        lineage = _selected_lineage(
+            state,
+            metadata,
+            selected_patch,
+        )
         external_ids = _external_operation_ids(
             snapshot,
             state,
@@ -282,11 +288,16 @@ def _conversion_transitions(
             WorkspaceUpdate(
                 issue_number=state.issue_number,
                 phase=phase,
-                workspace_pull_request_number=None,
+                workspace_pull_request_number=(
+                    lineage.workspace_pull_request_number
+                    if lineage is not None
+                    else None
+                ),
                 semantic_event=event.kind.value,
                 candidates=candidates,
                 selected_patch=selected_patch,
                 external_operation_ids=external_ids,
+                lineage=lineage,
             )
         )
         prior = state
@@ -396,6 +407,8 @@ def _merge_candidate_metadata(
             )
         normalized_metrics[name] = float(value)
     normalized = {
+        "base_commit": document.get("base_commit"),
+        "bundle_sha256": document.get("bundle_sha256"),
         "candidate_id": candidate_id,
         "draft_id": document.get("draft_id"),
         "eligible": document.get("eligible"),
@@ -403,6 +416,17 @@ def _merge_candidate_metadata(
         "evidence_sha256": document.get("evidence_sha256"),
         "metrics": normalized_metrics,
         "patch_sha256": document.get("patch_sha256"),
+        "expected_tree": document.get(
+            "expected_tree",
+            document.get("tree_sha"),
+        ),
+        "required_checks": document.get("required_checks"),
+        "required_checks_provenance": document.get(
+            "required_checks_provenance"
+        ),
+        "workspace_pull_request_number": document.get(
+            "workspace_pull_request_number"
+        ),
     }
     key = (generation, candidate_id)
     existing = metadata.get(key)
@@ -513,6 +537,61 @@ def _selected_patch(
             "selected patch lineage violates v4 privacy"
         ) from error
     return patch
+
+
+def _selected_lineage(
+    state: CampaignState,
+    metadata: Mapping[tuple[int, str], Mapping[str, Any]],
+    selected_patch: bytes | None,
+) -> WorkspaceLineage | None:
+    selected = state.selected_candidate_id
+    if selected is None or selected_patch is None:
+        return None
+    details = metadata.get((state.generation, selected))
+    candidate = next(
+        (
+            item
+            for item in state.candidates
+            if item.candidate_id == selected
+        ),
+        None,
+    )
+    if details is None or candidate is None:
+        return None
+    values = (
+        state.spec_sha256,
+        details.get("base_commit"),
+        details.get("patch_sha256"),
+        details.get("evidence_sha256"),
+        details.get("bundle_sha256"),
+        details.get("expected_tree"),
+        details.get("workspace_pull_request_number"),
+        details.get("required_checks"),
+        details.get("required_checks_provenance"),
+    )
+    if any(value is None for value in values):
+        return None
+    try:
+        return WorkspaceLineage(
+            spec_sha256=state.spec_sha256,
+            base_commit=details["base_commit"],
+            patch_sha256=details["patch_sha256"],
+            evidence_sha256=details["evidence_sha256"],
+            bundle_sha256=details["bundle_sha256"],
+            expected_tree=details["expected_tree"],
+            selected_candidate_id=selected,
+            workspace_pull_request_number=(
+                details["workspace_pull_request_number"]
+            ),
+            required_checks=details["required_checks"],
+            required_checks_provenance=(
+                details["required_checks_provenance"]
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise WorkspaceStateConversionError(
+            "selected workspace lineage cannot be represented"
+        ) from error
 
 
 def _external_operation_ids(
@@ -630,6 +709,30 @@ def _transition_document(update: WorkspaceUpdate) -> dict[str, Any]:
         ],
         "external_operation_ids": list(update.external_operation_ids),
         "issue_number": update.issue_number,
+        "lineage": (
+            {
+                "base_commit": update.lineage.base_commit,
+                "bundle_sha256": update.lineage.bundle_sha256,
+                "evidence_sha256": update.lineage.evidence_sha256,
+                "expected_tree": update.lineage.expected_tree,
+                "patch_sha256": update.lineage.patch_sha256,
+                "required_checks": dict(
+                    update.lineage.required_checks
+                ),
+                "required_checks_provenance": (
+                    update.lineage.required_checks_provenance
+                ),
+                "selected_candidate_id": (
+                    update.lineage.selected_candidate_id
+                ),
+                "spec_sha256": update.lineage.spec_sha256,
+                "workspace_pull_request_number": (
+                    update.lineage.workspace_pull_request_number
+                ),
+            }
+            if update.lineage is not None
+            else None
+        ),
         "phase": update.phase.value,
         "selected_patch": patch_text,
         "semantic_event": update.semantic_event,

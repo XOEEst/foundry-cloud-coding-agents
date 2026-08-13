@@ -28,6 +28,7 @@ from foundry_opt.orchestration.workspace_state_migration import (
 from foundry_opt.orchestration.workspace_store import (
     AuditBundle,
     CandidateSummary,
+    WorkspaceLineage,
     WorkspaceSnapshot,
     WorkspaceUpdate,
 )
@@ -143,11 +144,18 @@ class GitWorkspaceStore:
 
         journal: tuple[dict[str, Any], ...] = ()
         if current_revision is not None:
-            _, journal = self._load_active(
+            current_snapshot, journal = self._load_active(
                 update.issue_number,
                 current_revision,
                 paths,
             )
+            if (
+                current_snapshot.lineage is not None
+                and update.lineage != current_snapshot.lineage
+            ):
+                raise WorkspaceConflictError(
+                    "workspace lineage changed"
+                )
         candidates_content = (
             _canonical_json(_candidates_to_document(update.candidates))
             if update.candidates
@@ -219,6 +227,7 @@ class GitWorkspaceStore:
             candidates=update.candidates,
             selected_patch=update.selected_patch,
             external_operation_ids=update.external_operation_ids,
+            lineage=update.lineage,
         )
 
     def finalize(self, issue_number: int) -> AuditBundle:
@@ -308,6 +317,7 @@ class GitWorkspaceStore:
             candidates=snapshot.candidates,
             selected_patch=snapshot.selected_patch,
             external_operation_ids=snapshot.external_operation_ids,
+            lineage=snapshot.lineage,
             retained_paths=tuple(retained_paths),
         )
 
@@ -390,6 +400,7 @@ class GitWorkspaceStore:
             candidates=final_update.candidates,
             selected_patch=final_update.selected_patch,
             external_operation_ids=final_update.external_operation_ids,
+            lineage=final_update.lineage,
         )
 
     def _load_active(
@@ -520,6 +531,17 @@ class GitWorkspaceStore:
             raise WorkspaceCorruptionError(
                 "workspace phase is invalid"
             ) from error
+        lineage = _lineage_from_document(state_document["lineage"])
+        if lineage is not None:
+            _validate_lineage_state(
+                lineage,
+                candidates=candidates,
+                selected_patch=selected_patch,
+                workspace_pull_request_number=(
+                    state_document["workspace_pull_request_number"]
+                ),
+                error_type=WorkspaceCorruptionError,
+            )
         return (
             WorkspaceSnapshot(
                 issue_number=issue_number,
@@ -533,6 +555,7 @@ class GitWorkspaceStore:
                 external_operation_ids=tuple(
                     state_document["external_operation_ids"]
                 ),
+                lineage=lineage,
             ),
             journal,
         )
@@ -785,6 +808,7 @@ _STATE_KEYS = (
     "candidates_sha256",
     "external_operation_ids",
     "issue_number",
+    "lineage",
     "phase",
     "selected_patch_sha256",
     "workspace_pull_request_number",
@@ -801,6 +825,7 @@ def _state_document(
         "candidates_sha256": candidates_sha256,
         "external_operation_ids": list(update.external_operation_ids),
         "issue_number": update.issue_number,
+        "lineage": _lineage_to_document(update.lineage),
         "phase": update.phase.value,
         "selected_patch_sha256": selected_patch_sha256,
         "workspace_pull_request_number": (
@@ -896,6 +921,16 @@ def _validate_update(update: WorkspaceUpdate) -> None:
     )
     if update.selected_patch is not None:
         _validate_patch(update.selected_patch, WorkspacePrivacyError)
+    if update.lineage is not None:
+        _validate_lineage_state(
+            update.lineage,
+            candidates=update.candidates,
+            selected_patch=update.selected_patch,
+            workspace_pull_request_number=(
+                update.workspace_pull_request_number
+            ),
+            error_type=WorkspacePrivacyError,
+        )
     _validate_privacy(
         {
             "semantic_event": update.semantic_event,
@@ -1090,7 +1125,95 @@ def _validate_state_document(document: Any, issue_number: int) -> None:
         tuple(external_ids),
         WorkspaceCorruptionError,
     )
+    _lineage_from_document(document["lineage"])
     _validate_privacy(document)
+
+
+def _lineage_to_document(
+    lineage: WorkspaceLineage | None,
+) -> dict[str, Any] | None:
+    if lineage is None:
+        return None
+    return {
+        "base_commit": lineage.base_commit,
+        "bundle_sha256": lineage.bundle_sha256,
+        "evidence_sha256": lineage.evidence_sha256,
+        "expected_tree": lineage.expected_tree,
+        "patch_sha256": lineage.patch_sha256,
+        "required_checks": dict(lineage.required_checks),
+        "required_checks_provenance": (
+            lineage.required_checks_provenance
+        ),
+        "selected_candidate_id": lineage.selected_candidate_id,
+        "spec_sha256": lineage.spec_sha256,
+        "workspace_pull_request_number": (
+            lineage.workspace_pull_request_number
+        ),
+    }
+
+
+def _lineage_from_document(value: Any) -> WorkspaceLineage | None:
+    if value is None:
+        return None
+    _exact_keys(
+        value,
+        {
+            "base_commit",
+            "bundle_sha256",
+            "evidence_sha256",
+            "expected_tree",
+            "patch_sha256",
+            "required_checks",
+            "required_checks_provenance",
+            "selected_candidate_id",
+            "spec_sha256",
+            "workspace_pull_request_number",
+        },
+        "workspace lineage",
+    )
+    try:
+        return WorkspaceLineage(
+            spec_sha256=value["spec_sha256"],
+            base_commit=value["base_commit"],
+            patch_sha256=value["patch_sha256"],
+            evidence_sha256=value["evidence_sha256"],
+            bundle_sha256=value["bundle_sha256"],
+            expected_tree=value["expected_tree"],
+            selected_candidate_id=value["selected_candidate_id"],
+            workspace_pull_request_number=(
+                value["workspace_pull_request_number"]
+            ),
+            required_checks=value["required_checks"],
+            required_checks_provenance=(
+                value["required_checks_provenance"]
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise WorkspaceCorruptionError(
+            "workspace lineage is invalid"
+        ) from error
+
+
+def _validate_lineage_state(
+    lineage: WorkspaceLineage,
+    *,
+    candidates: tuple[CandidateSummary, ...],
+    selected_patch: bytes | None,
+    workspace_pull_request_number: int | None,
+    error_type: type[WorkspaceCorruptionError],
+) -> None:
+    selected = tuple(item for item in candidates if item.selected)
+    if (
+        selected_patch is None
+        or hashlib.sha256(selected_patch).hexdigest()
+        != lineage.patch_sha256
+        or workspace_pull_request_number
+        != lineage.workspace_pull_request_number
+        or len(selected) != 1
+        or selected[0].candidate_id
+        != lineage.selected_candidate_id
+    ):
+        raise error_type("workspace lineage does not match state")
 
 
 def _validate_journal_entry(

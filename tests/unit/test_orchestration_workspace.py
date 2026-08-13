@@ -9,6 +9,7 @@ from foundry_opt.orchestration import (
     InMemoryWorkspaceStore,
     OptimizationWorkspace,
     WorkspaceIssue,
+    WorkspaceLineage,
     WorkspaceOperation,
     WorkspacePhase,
     WorkspacePullRequest,
@@ -410,6 +411,20 @@ def test_lifecycle_triggers_advance_same_workspace_and_preserve_selection(
                 f"candidate-2:patch:{patch_sha256}",
                 f"candidate-2:bundle:{bundle_sha256}",
                 f"candidate-2:evidence:{evidence_sha256}",
+            ),
+            lineage=WorkspaceLineage(
+                spec_sha256="a" * 64,
+                base_commit=issue.base_commit,
+                patch_sha256=patch_sha256,
+                evidence_sha256=evidence_sha256,
+                bundle_sha256=bundle_sha256,
+                expected_tree="f" * 40,
+                selected_candidate_id="candidate-2",
+                workspace_pull_request_number=104,
+                required_checks={"tests": "success"},
+                required_checks_provenance=(
+                    f"trusted-selector:head:{'c' * 40}"
+                ),
             ),
         ),
     )

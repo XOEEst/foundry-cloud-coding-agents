@@ -284,6 +284,21 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     )
     assert result.report.bundle_sha256 == "5" * 64
     assert result.report.evidence_sha256 == "7" * 64
+    assert snapshot.lineage is not None
+    assert snapshot.lineage.patch_sha256 == result.report.patch_sha256
+    assert snapshot.lineage.evidence_sha256 == (
+        result.report.evidence_sha256
+    )
+    assert snapshot.lineage.bundle_sha256 == result.report.bundle_sha256
+    assert snapshot.lineage.spec_sha256 == result.report.spec_sha256
+    assert snapshot.lineage.expected_tree == result.report.expected_tree
+    assert snapshot.lineage.required_checks == {
+        "Foundry exact candidate check": "success",
+        "tests": "success",
+    }
+    assert snapshot.lineage.required_checks_provenance == (
+        f"trusted-selector:head:{'c' * 40}"
+    )
     document = result.to_dict()
     assert document["next_action"]["kind"] == (
         "merge_workspace_pull_request"
@@ -489,13 +504,17 @@ def test_candidate_completion_resumes_partial_and_duplicates_without_rerun(
     ]
 
     completed = workspace.advance(request)
-    completed_revision = store.load(31).revision
+    completed_snapshot = store.load(31)
+    completed_revision = completed_snapshot.revision
+    completed_lineage = completed_snapshot.lineage
     duplicate = workspace.advance(request)
 
     assert runner.calls == ["candidate-1", "candidate-2", "candidate-2"]
     assert completed.recorded is True
     assert duplicate.recorded is False
     assert store.load(31).revision == completed_revision
+    assert store.load(31).lineage == completed_lineage
+    assert duplicate.report.patch_sha256 == completed_lineage.patch_sha256
 
 
 def test_github_finalizer_preserves_workspace_identity_without_marking_pr_ready(

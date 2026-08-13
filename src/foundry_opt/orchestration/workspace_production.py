@@ -60,6 +60,10 @@ from foundry_opt.orchestration.workspace_manifest import (
 from foundry_opt.orchestration.workspace_policy import (
     ConfiguredWorkspaceSelector,
 )
+from foundry_opt.orchestration.workspace_verifier import (
+    WorkspaceVerificationResult,
+    WorkspaceVerifier,
+)
 from foundry_opt.orchestration.workspace_operations import (
     NormalizedWorkspaceOperation,
     TrustedWorkspaceOperationContext,
@@ -427,6 +431,33 @@ class ProductionWorkspaceService:
                 ),
                 selector=selector,
             )
+        )
+
+    def verify(
+        self,
+        *,
+        repository_root: Path,
+        issue_number: int,
+        pull_request_number: int,
+    ) -> WorkspaceVerificationResult:
+        root = repository_root.expanduser().resolve()
+        if (
+            type(issue_number) is not int
+            or issue_number < 1
+            or type(pull_request_number) is not int
+            or pull_request_number < 1
+        ):
+            raise ValueError("workspace verification identity is invalid")
+        context = self._repository_context(root)
+        return WorkspaceVerifier(
+            store=GitWorkspaceStore(root),
+            commands=self._commands,
+            repository=context.repository,
+            base_branch=context.default_branch,
+        ).verify(
+            root,
+            issue_number=issue_number,
+            pull_request_number=pull_request_number,
         )
 
     def ingest(

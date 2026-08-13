@@ -114,6 +114,8 @@ def _install_selected_v3(
         AdvanceRequest(31, None, events)
     ).state
     candidate = {
+        "base_commit": "d" * 40,
+        "bundle_sha256": "e" * 64,
         "candidate_id": "candidate-1",
         "draft_id": "draft-1",
         "eligible": True,
@@ -122,6 +124,12 @@ def _install_selected_v3(
         "issue_number": 31,
         "metrics": {"policy_coverage": 0.75},
         "patch_sha256": patch_sha256,
+        "expected_tree": "f" * 40,
+        "required_checks": {"tests": "success"},
+        "required_checks_provenance": (
+            f"trusted-selector:head:{'c' * 40}"
+        ),
+        "workspace_pull_request_number": 104,
     }
     candidate_content = (
         json.dumps(
@@ -227,6 +235,13 @@ def test_v3_conversion_is_canonical_one_way_and_idempotent(
         "draft-1",
         "candidate-eval-1",
         "merge_commit:" + "c" * 40,
+    )
+    assert first_payload.transitions[-1].lineage is not None
+    assert first_payload.transitions[-1].lineage.spec_sha256 == "a" * 64
+    assert first_payload.transitions[-1].lineage.bundle_sha256 == "e" * 64
+    assert (
+        first_payload.transitions[-1].workspace_pull_request_number
+        == 104
     )
 
     store = GitWorkspaceStore(repository)

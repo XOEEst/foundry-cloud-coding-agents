@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+import foundry_opt.orchestration.workspace_production as workspace_production
 from foundry_opt.orchestration import (
     GitWorkspaceStore,
     OptimizationWorkspace,
@@ -96,6 +97,68 @@ def test_production_builder_wires_candidate_coordinator(
     )
 
     assert workspace._candidate_coordinator is not None
+
+
+def test_production_service_wires_trusted_workspace_verifier(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    commands = FakeCommands(
+        {
+            ("git", "remote", "get-url", "origin"): (
+                "https://github.com/octo-org/optimizer.git\n"
+            ),
+            (
+                "gh",
+                "repo",
+                "view",
+                "octo-org/optimizer",
+                "--json",
+                "nameWithOwner,defaultBranchRef",
+            ): json.dumps(
+                {
+                    "nameWithOwner": "octo-org/optimizer",
+                    "defaultBranchRef": {"name": "main"},
+                }
+            ),
+        }
+    )
+    recorded = {}
+
+    class Verifier:
+        def __init__(self, **kwargs):
+            recorded.update(kwargs)
+
+        def verify(
+            self,
+            root,
+            *,
+            issue_number,
+            pull_request_number,
+        ):
+            recorded["root"] = root
+            recorded["issue"] = issue_number
+            recorded["pr"] = pull_request_number
+            return "verified"
+
+    monkeypatch.setattr(workspace_production, "WorkspaceVerifier", Verifier)
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceStore",
+        lambda root: f"store:{root}",
+    )
+
+    result = ProductionWorkspaceService(commands=commands).verify(
+        repository_root=tmp_path,
+        issue_number=31,
+        pull_request_number=104,
+    )
+
+    assert result == "verified"
+    assert recorded["repository"] == "octo-org/optimizer"
+    assert recorded["base_branch"] == "main"
+    assert recorded["issue"] == 31
+    assert recorded["pr"] == 104
 
 
 def test_production_service_loads_issue_and_reuses_recorded_pr(

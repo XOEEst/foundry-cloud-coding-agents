@@ -17,6 +17,7 @@ from foundry_opt.orchestration import (
     WorkspaceConflictError,
     WorkspaceCorruptionError,
     WorkspaceMigrationRequiredError,
+    WorkspaceLineage,
     WorkspacePhase,
     WorkspacePrivacyError,
     WorkspaceUpdate,
@@ -65,6 +66,21 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
 ) -> None:
     repository, _ = _repository(tmp_path)
     store = GitWorkspaceStore(repository)
+    patch = b"diff --git a/agent.py b/agent.py\n"
+    lineage = WorkspaceLineage(
+        spec_sha256="a" * 64,
+        base_commit="b" * 40,
+        patch_sha256=hashlib.sha256(patch).hexdigest(),
+        evidence_sha256="c" * 64,
+        bundle_sha256="d" * 64,
+        expected_tree="e" * 40,
+        selected_candidate_id="candidate-1",
+        workspace_pull_request_number=104,
+        required_checks={"tests": "success"},
+        required_checks_provenance=(
+            f"trusted-selector:head:{'f' * 40}"
+        ),
+    )
 
     first = store.commit(
         expected_revision=None,
@@ -90,12 +106,14 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
                     selected=True,
                 ),
             ),
-            selected_patch=b"diff --git a/agent.py b/agent.py\n",
+            selected_patch=patch,
             external_operation_ids=("evalrun-123",),
+            lineage=lineage,
         ),
     )
 
     assert store.load(31) == second
+    assert second.lineage == lineage
     assert _tree(repository, second.revision) == (
         "evidence/candidates.json",
         "journal.jsonl",
@@ -119,6 +137,7 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
         )
         + "\n"
     ).encode()
+    assert snapshot["state"]["lineage"]["spec_sha256"] == "a" * 64
     journal = _run(
         ("git", "show", f"{second.revision}:journal.jsonl"),
         repository,

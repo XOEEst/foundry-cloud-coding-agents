@@ -66,6 +66,7 @@ def test_lifecycle_rejects_forged_trusted_operation_lineage(
         InMemoryWorkspaceStore,
         OptimizationWorkspace,
         WorkspaceIssue,
+        WorkspaceLineage,
         WorkspacePhase,
         WorkspacePullRequest,
         WorkspaceRequest,
@@ -112,6 +113,20 @@ def test_lifecycle_rejects_forged_trusted_operation_lineage(
                 f"candidate-2:patch:{patch_sha}",
                 f"candidate-2:bundle:{'b' * 64}",
                 f"candidate-2:evidence:{'c' * 64}",
+            ),
+            lineage=WorkspaceLineage(
+                spec_sha256="a" * 64,
+                base_commit="f" * 40,
+                patch_sha256=patch_sha,
+                evidence_sha256="c" * 64,
+                bundle_sha256="b" * 64,
+                expected_tree="e" * 40,
+                selected_candidate_id="candidate-2",
+                workspace_pull_request_number=104,
+                required_checks={"tests": "success"},
+                required_checks_provenance=(
+                    f"trusted-selector:head:{'d' * 40}"
+                ),
             ),
         ),
     )

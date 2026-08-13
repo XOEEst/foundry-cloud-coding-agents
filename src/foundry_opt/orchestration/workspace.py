@@ -718,9 +718,11 @@ class OptimizationWorkspace:
             item for item in snapshot.candidates if item.selected
         )
         patch = snapshot.selected_patch
+        lineage = snapshot.lineage
         if (
             len(selected) != 1
             or patch is None
+            or lineage is None
             or operation.workspace_pull_request_number
             != snapshot.workspace_pull_request_number
             or operation.candidate_id != selected[0].candidate_id
@@ -728,6 +730,16 @@ class OptimizationWorkspace:
             != operation.patch_sha256
         ):
             raise ValueError("workspace operation selection lineage changed")
+        if (
+            operation.workspace_pull_request_number
+            != lineage.workspace_pull_request_number
+            or operation.candidate_id
+            != lineage.selected_candidate_id
+            or operation.patch_sha256 != lineage.patch_sha256
+            or operation.bundle_sha256 != lineage.bundle_sha256
+            or operation.evidence_sha256 != lineage.evidence_sha256
+        ):
+            raise ValueError("workspace operation lineage changed")
         markers = {
             (
                 f"{operation.candidate_id}:patch:"
@@ -874,6 +886,7 @@ class OptimizationWorkspace:
                     else ()
                 )
             ),
+            lineage=snapshot.lineage if snapshot is not None else None,
         )
 
     @staticmethod

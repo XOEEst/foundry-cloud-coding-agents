@@ -35,6 +35,7 @@ from foundry_opt.orchestration.workspace_github import (
 )
 from foundry_opt.orchestration.workspace_store import (
     CandidateSummary,
+    WorkspaceLineage,
     WorkspaceSnapshot,
     WorkspaceUpdate,
 )
@@ -534,6 +535,7 @@ class WorkspaceCandidateCoordinator:
                     external_operation_ids=(
                         snapshot.external_operation_ids
                     ),
+                    lineage=snapshot.lineage,
                 ),
             )
         experiments, snapshot = self._evaluate_candidates(
@@ -562,7 +564,45 @@ class WorkspaceCandidateCoordinator:
             or not set(decision.eligible_candidate_ids) <= set(by_id)
         ):
             raise ValueError("workspace selector changed candidate binding")
+        if snapshot.phase is WorkspacePhase.AWAITING_SELECTION:
+            existing_lineage = snapshot.lineage
+            if existing_lineage is None:
+                raise ValueError(
+                    "workspace committed selection lineage is missing"
+                )
+            existing_candidate = by_id.get(
+                existing_lineage.selected_candidate_id
+            )
+            existing_experiment = experiment_by_id.get(
+                existing_lineage.selected_candidate_id
+            )
+            if (
+                decision.selected_candidate_id
+                != existing_lineage.selected_candidate_id
+                or existing_candidate is None
+                or existing_experiment is None
+                or request.report_context.spec_sha256
+                != existing_lineage.spec_sha256
+                or request.issue.base_commit
+                != existing_lineage.base_commit
+                or existing_candidate.experiment.patch_sha256
+                != existing_lineage.patch_sha256
+                or existing_candidate.expected_tree
+                != existing_lineage.expected_tree
+                or existing_experiment.evidence_sha256
+                != existing_lineage.evidence_sha256
+                or existing_experiment.bundle_sha256
+                != existing_lineage.bundle_sha256
+                or dict(decision.required_checks)
+                != dict(existing_lineage.required_checks)
+            ):
+                raise ValueError(
+                    "workspace committed selection lineage changed"
+                )
         selected = by_id[decision.selected_candidate_id]
+        selected_experiment = experiment_by_id[
+            decision.selected_candidate_id
+        ]
         exact = self._exact_publisher.publish(
             request.repository_root,
             pull_request,
@@ -615,6 +655,24 @@ class WorkspaceCandidateCoordinator:
             f"workspace_commit:{exact.commit_sha}",
         )
         external_ids = tuple(dict.fromkeys(external_ids))
+        if pull_request.number is None:
+            raise ValueError(
+                "workspace lineage requires a pull request number"
+            )
+        lineage = WorkspaceLineage(
+            spec_sha256=request.report_context.spec_sha256,
+            base_commit=request.issue.base_commit,
+            patch_sha256=selected.experiment.patch_sha256,
+            evidence_sha256=selected_experiment.evidence_sha256,
+            bundle_sha256=selected_experiment.bundle_sha256,
+            expected_tree=selected.expected_tree,
+            selected_candidate_id=decision.selected_candidate_id,
+            workspace_pull_request_number=pull_request.number,
+            required_checks=decision.required_checks,
+            required_checks_provenance=(
+                f"trusted-selector:head:{exact.commit_sha}"
+            ),
+        )
         committed = (
             self._store.commit(
                 expected_revision=snapshot.revision,
@@ -626,6 +684,7 @@ class WorkspaceCandidateCoordinator:
                     candidates=compact,
                     selected_patch=selected.exact_patch,
                     external_operation_ids=external_ids,
+                    lineage=lineage,
                 ),
             )
             if recorded
@@ -634,6 +693,7 @@ class WorkspaceCandidateCoordinator:
         if not recorded and (
             committed.candidates != compact
             or committed.selected_patch != selected.exact_patch
+            or committed.lineage != lineage
         ):
             raise ValueError("workspace committed selection changed")
         report = self._report(
@@ -721,6 +781,7 @@ class WorkspaceCandidateCoordinator:
                             *snapshot.external_operation_ids,
                             *operation_ids,
                         ),
+                        lineage=snapshot.lineage,
                     ),
                 )
                 completed[candidate_id] = partial[-1]
@@ -760,6 +821,9 @@ class WorkspaceCandidateCoordinator:
     ) -> OptimizationReport:
         context = request.report_context
         assert context is not None
+        lineage = snapshot.lineage
+        if lineage is None:
+            raise ValueError("workspace report lineage is missing")
         selected_state = next(
             item for item in snapshot.candidates if item.selected
         )
@@ -812,13 +876,13 @@ class WorkspaceCandidateCoordinator:
             foundry_operations=selected.foundry_operations,
             changed_paths=selected.changed_paths,
             validation=selected.validation,
-            spec_sha256=context.spec_sha256,
-            base_commit=request.issue.base_commit,
-            patch_sha256=selected.experiment.patch_sha256,
-            evidence_sha256=selected_experiment.evidence_sha256,
-            bundle_sha256=selected_experiment.bundle_sha256,
-            expected_tree=selected.expected_tree,
-            required_checks=decision.required_checks,
+            spec_sha256=lineage.spec_sha256,
+            base_commit=lineage.base_commit,
+            patch_sha256=lineage.patch_sha256,
+            evidence_sha256=lineage.evidence_sha256,
+            bundle_sha256=lineage.bundle_sha256,
+            expected_tree=lineage.expected_tree,
+            required_checks=lineage.required_checks,
             merge_gate=EvidenceMergeGate.ELIGIBLE,
         )
 
