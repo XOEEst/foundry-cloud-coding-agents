@@ -30,6 +30,9 @@ from foundry_opt.orchestration import (
     build_production_workspace,
 )
 from foundry_opt.orchestration.workspace_github import GhWorkspacePullRequests
+from foundry_opt.orchestration.workspace_execution_production import (
+    LiveWorkspaceExperimentAdapter,
+)
 from foundry_opt.orchestration.workspace_production import (
     ProductionWorkspaceError,
     ProductionWorkspaceService,
@@ -91,6 +94,22 @@ def test_build_production_workspace_service_uses_real_baseline_and_experiment_bi
     assert isinstance(service, ProductionWorkspaceService)
     assert service._experiment_runner is not None
     assert service._baseline_request_builder is not None
+
+
+def test_actions_workspace_service_executes_live_operations_directly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    monkeypatch.chdir(repository_root)
+
+    service = build_production_workspace_service(
+        actions_execution=True,
+    )
+
+    assert isinstance(
+        service._experiment_runner,
+        LiveWorkspaceExperimentAdapter,
+    )
 
 
 def test_issue_created_plans_baseline_before_candidate_assignment(

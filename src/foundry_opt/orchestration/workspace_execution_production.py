@@ -505,6 +505,7 @@ def build_production_workspace_service_bindings(
     *,
     commands: CommandRunner | None = None,
     config_path: Path = _DEFAULT_CONFIG_PATH,
+    actions_execution: bool = False,
 ) -> dict[str, object]:
     root = repository_root.expanduser().resolve(strict=True)
     runner = commands or SubprocessCommandRunner()
@@ -513,16 +514,18 @@ def build_production_workspace_service_bindings(
         commands=runner,
         config_path=config_path,
     )
-    experiment_runner = CandidateExperimentRunner(
-        direct=build_production_direct_candidate_experiment_adapter(
-            repository_root=root,
-            operation=direct_operation,
-            auth_probe=build_production_auth_probe(),
-        ),
-        fallback=ActionsCandidateExperimentAdapter(
-            GitWorkspaceActionsGateway(root)
-        ),
-    )
+    experiment_runner: CandidateExperimentAdapter = direct_operation
+    if not actions_execution:
+        experiment_runner = CandidateExperimentRunner(
+            direct=build_production_direct_candidate_experiment_adapter(
+                repository_root=root,
+                operation=direct_operation,
+                auth_probe=build_production_auth_probe(),
+            ),
+            fallback=ActionsCandidateExperimentAdapter(
+                GitWorkspaceActionsGateway(root)
+            ),
+        )
     return {
         "baseline_request_builder": GitWorkspaceBaselineBuilder(
             commands=runner,

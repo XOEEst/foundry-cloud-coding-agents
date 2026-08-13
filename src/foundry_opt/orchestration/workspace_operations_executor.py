@@ -2383,7 +2383,9 @@ def build_production_workspace_operations_service() -> (
         build_production_workspace_operations_bindings,
     )
 
-    workspace_service = build_production_workspace_service()
+    workspace_service = build_production_workspace_service(
+        actions_execution=True,
+    )
     return WorkspaceOperationsService(
         **build_production_workspace_operations_bindings(
             Path.cwd(),

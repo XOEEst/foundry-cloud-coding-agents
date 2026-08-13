@@ -283,10 +283,14 @@ def build_production_workspace(
     )
 
 
-def build_production_workspace_service() -> ProductionWorkspaceService:
+def build_production_workspace_service(
+    *,
+    actions_execution: bool = False,
+) -> ProductionWorkspaceService:
     return ProductionWorkspaceService(
         **build_production_workspace_service_bindings(
             Path.cwd(),
+            actions_execution=actions_execution,
         )
     )
 
