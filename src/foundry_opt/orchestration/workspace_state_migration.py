@@ -318,6 +318,9 @@ def _workspace_phase(phase: CampaignPhase) -> WorkspacePhase:
         CampaignPhase.DEPLOYMENT: WorkspacePhase.DEPLOYMENT,
         CampaignPhase.RETENTION: WorkspacePhase.RETENTION,
         CampaignPhase.COMPLETED: WorkspacePhase.COMPLETED,
+        # Compact v4 audits use one terminal phase; the journal preserves
+        # the exact legacy event and reason that blocked the campaign.
+        CampaignPhase.BLOCKED: WorkspacePhase.COMPLETED,
     }
     try:
         return mapping[phase]

@@ -1,6 +1,11 @@
 from foundry_opt.orchestration import (
+    CampaignPhase,
+    WorkspacePhase,
     WorkspaceStateMigrationPlan,
     workspace_state_v3_migration_plan,
+)
+from foundry_opt.orchestration.workspace_state_migration import (
+    _workspace_phase,
 )
 
 
@@ -16,7 +21,6 @@ def test_v3_migration_plan_is_read_only_and_preserves_legacy_paths() -> None:
             "objects/evidence/" + "b" * 64 + ".json",
         ),
     )
-
     assert plan == WorkspaceStateMigrationPlan(
         issue_number=31,
         source_ref="refs/heads/foundry-opt/state/issue-31",
@@ -32,3 +36,7 @@ def test_v3_migration_plan_is_read_only_and_preserves_legacy_paths() -> None:
         ),
         read_only=True,
     )
+
+
+def test_blocked_v3_campaign_maps_to_terminal_compact_audit_phase() -> None:
+    assert _workspace_phase(CampaignPhase.BLOCKED) is WorkspacePhase.COMPLETED
