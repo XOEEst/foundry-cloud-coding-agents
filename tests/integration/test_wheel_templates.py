@@ -33,6 +33,9 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
             "foundry-agent-optimizer/SKILL.md"
         )
         names = set(archive.namelist())
+        metadata_path = next(
+            name for name in names if name.endswith(".dist-info/METADATA")
+        )
         assert skill_path in names
         assert "foundry_opt/onboarding/bundle.py" in names
         assert "foundry_opt/onboarding/generation.py" in names
@@ -47,12 +50,14 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
             "foundry_opt/onboarding/generation.py"
         ).decode("utf-8")
         skill = archive.read(skill_path).decode("utf-8")
+        metadata = archive.read(metadata_path).decode("utf-8")
     current_bundle_source = bundle.split(
         "def _issue_intake_workflow",
         1,
     )[0]
 
     assert "Create one `[Optimize]` issue" in skill
+    assert "Requires-Dist: httpx>=0.27.0" in metadata
     assert "foundry-opt workspace advance --issue <number>" in skill
     assert "next_actions" in skill
     assert "FOUNDRY_OPT_COPILOT_GIT_PROXY=1" in generation
