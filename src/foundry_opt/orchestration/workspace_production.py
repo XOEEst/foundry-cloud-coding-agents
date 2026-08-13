@@ -1629,6 +1629,7 @@ def _copilot_assignment_action(
         ),
         WorkspacePhase.RETENTION: ("complete_retention", False),
         WorkspacePhase.COMPLETED: ("none", False),
+        WorkspacePhase.BLOCKED: ("none", False),
     }[snapshot.phase]
 
 

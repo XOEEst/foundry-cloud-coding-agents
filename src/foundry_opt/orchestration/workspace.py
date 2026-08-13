@@ -42,6 +42,7 @@ class WorkspacePhase(StrEnum):
     DEPLOYMENT = "deployment"
     RETENTION = "retention"
     COMPLETED = "completed"
+    BLOCKED = "blocked"
 
 
 class WorkspaceTrigger(StrEnum):
@@ -573,6 +574,7 @@ class OptimizationWorkspace:
                 WorkspacePhase.DEPLOYMENT,
                 WorkspacePhase.RETENTION,
                 WorkspacePhase.COMPLETED,
+                WorkspacePhase.BLOCKED,
             }
         ):
             pull_request = self._resolved_pull_request(
@@ -950,6 +952,10 @@ class OptimizationWorkspace:
                 WorkspaceTrigger.RETENTION_COMPLETED,
             ),
             WorkspacePhase.COMPLETED: (
+                WorkspaceNextActionKind.NONE,
+                None,
+            ),
+            WorkspacePhase.BLOCKED: (
                 WorkspaceNextActionKind.NONE,
                 None,
             ),
