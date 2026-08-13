@@ -440,6 +440,8 @@ def test_operations_workflow_resumes_same_workspace_pull_request_without_creatin
     assert "gh pr comment" not in text
     assert "COPILOT_ASSIGNMENT_TOKEN" in text
     assert 'GH_TOKEN: ""' in text
+    assert 'print(result.stderr, end="", file=sys.stderr)' in text
+    assert "raise SystemExit(result.returncode)" in text
     assert "gh pr create" not in text
     assert "gh issue edit" not in text
     assert "--add-assignee" not in text

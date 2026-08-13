@@ -1202,6 +1202,7 @@ jobs:
           import json
           import os
           import subprocess
+          import sys
           from pathlib import Path
 
           resume_path = Path(os.environ["WORKSPACE_RESUME_FILE"])
@@ -1252,13 +1253,17 @@ jobs:
                       str(issue),
                       "--json",
                   ],
-                  check=True,
+                  check=False,
                   capture_output=True,
                   text=True,
                   env=environment,
               )
               if result.stdout:
                   print(result.stdout, end="")
+              if result.stderr:
+                  print(result.stderr, end="", file=sys.stderr)
+              if result.returncode != 0:
+                  raise SystemExit(result.returncode)
 """
 
 
