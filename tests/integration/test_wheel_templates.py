@@ -63,6 +63,9 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
     assert "pull_request_target" in bundle
     assert "foundry-optimization-workspace.yml" in bundle
     assert "foundry-optimization-operations.yml" in bundle
+    assert "gh workflow run foundry-optimization-operations.yml" in (
+        current_bundle_source
+    )
     assert "foundry-opt workspace operations execute" in (
         current_bundle_source
     )

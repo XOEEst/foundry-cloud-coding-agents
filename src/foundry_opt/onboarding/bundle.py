@@ -583,6 +583,7 @@ on:
         type: number
 
 permissions:
+  actions: write
   contents: write
   issues: write
   pull-requests: write
@@ -688,6 +689,16 @@ jobs:
           uv run --no-project --no-config --no-env-file
           --with "$OPTIMIZER_PACKAGE"
           foundry-opt workspace advance --issue "$ISSUE" --json
+      - name: Dispatch trusted workspace operations
+        env:
+          DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+          ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
+        shell: bash
+        run: >-
+          gh workflow run foundry-optimization-operations.yml
+          --repo "$GITHUB_REPOSITORY"
+          --ref "$DEFAULT_BRANCH"
+          -f "issue=$ISSUE"
 """
 
 

@@ -309,6 +309,7 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         "workflow_dispatch",
     }
     assert workflow["permissions"] == {
+        "actions": "write",
         "contents": "write",
         "issues": "write",
         "pull-requests": "write",
@@ -317,6 +318,10 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
     assert "foundry-opt workspace advance --issue \"$ISSUE\" --json" in (
         " ".join(text.split())
     )
+    assert "Dispatch trusted workspace operations" in text
+    assert "gh workflow run foundry-optimization-operations.yml" in text
+    assert '--ref "$DEFAULT_BRANCH"' in text
+    assert '-f "issue=$ISSUE"' in text
     assert "continue the same Copilot pull request" in text
     assert "foundry-opt:workspace-pr:issue-" in text
     assert "pull_request_target" in text
