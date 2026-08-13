@@ -171,6 +171,15 @@ def build_workspace_operations_service():
     return build_production_workspace_operations_service()
 
 
+def build_workspace_verification_service():
+    """Return the trusted workspace verification service."""
+    from foundry_opt.orchestration.workspace_verification import (
+        build_production_workspace_verification_service,
+    )
+
+    return build_production_workspace_verification_service()
+
+
 def build_workspace_migration_service():
     """Return the production legacy workspace migration service."""
     from foundry_opt.orchestration.workspace_migration import (
@@ -666,6 +675,71 @@ def workspace_operation_complete(
             f"Workspace operation {result.event.operation.operation_id}: "
             f"{result.workspace.phase.value}"
         )
+
+
+@workspace_app.command("verify")
+def workspace_verify(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    candidate_id: Annotated[
+        str,
+        typer.Option(
+            "--candidate",
+            help="Trusted selected candidate identifier.",
+        ),
+    ] = ...,
+    workspace_pull_request_number: Annotated[
+        int | None,
+        typer.Option(
+            "--pull-request",
+            min=1,
+            help="Expected workspace pull request number.",
+        ),
+    ] = None,
+    head_sha: Annotated[
+        str | None,
+        typer.Option(
+            "--head-sha",
+            help="Trusted workspace pull request head commit.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Verify trusted workspace candidate lineage and exact head tree."""
+    from foundry_opt.orchestration.workspace_verification import (
+        WorkspaceVerifyRequest,
+    )
+
+    try:
+        result = build_workspace_verification_service().verify(
+            WorkspaceVerifyRequest(
+                repository_root=Path.cwd(),
+                issue_number=issue_number,
+                candidate_id=candidate_id,
+                workspace_pull_request_number=(
+                    workspace_pull_request_number
+                ),
+                head_sha=head_sha,
+            )
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(result.summary_markdown)
+    raise typer.Exit(result.exit_code)
 
 
 @workspace_operations_app.command("execute")

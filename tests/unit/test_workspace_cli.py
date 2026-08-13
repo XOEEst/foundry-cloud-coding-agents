@@ -19,6 +19,12 @@ from foundry_opt.orchestration.workspace_operations_executor import (
     WorkspaceOperationsResult,
     WorkspaceOperationsStatus,
 )
+from foundry_opt.orchestration.workspace_verification import (
+    WorkspaceEvidenceLink,
+    WorkspaceMetricVerification,
+    WorkspaceVerifyResult,
+    WorkspaceVerifyStatus,
+)
 
 
 runner = CliRunner()
@@ -118,6 +124,7 @@ def test_workspace_help_exposes_production_lifecycle_commands() -> None:
     assert "intake" in completed.stdout
     assert "experiments-complete" in completed.stdout
     assert "operation-complete" in completed.stdout
+    assert "verify" in completed.stdout
     assert "operations" in completed.stdout
 
     operations = runner.invoke(app, ["workspace", "operations", "--help"])
@@ -219,6 +226,134 @@ def test_workspace_operation_complete_uses_trusted_context(
 
     assert completed.exit_code == 0
     assert json.loads(completed.stdout)["event"]["operation_id"] == "deploy-1"
+
+
+def test_workspace_verify_emits_stable_json(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    class Service:
+        def verify(self, request):
+            assert request.repository_root == tmp_path
+            assert request.issue_number == 31
+            assert request.candidate_id == "candidate-2"
+            assert request.workspace_pull_request_number == 104
+            assert request.head_sha == "a" * 40
+            return WorkspaceVerifyResult(
+                issue_number=31,
+                candidate_id="candidate-2",
+                status=WorkspaceVerifyStatus.VERIFIED,
+                repository="octo-org/optimizer",
+                target="support-agent",
+                phase=WorkspacePhase.AWAITING_SELECTION,
+                workspace_pull_request_number=104,
+                head_sha="a" * 40,
+                head_tree="b" * 40,
+                expected_tree="b" * 40,
+                patch_sha256="1" * 64,
+                bundle_sha256="2" * 64,
+                evidence=WorkspaceEvidenceLink(
+                    path="evidence/candidates.json",
+                    url=(
+                        "https://github.com/octo-org/optimizer/blob/"
+                        + "c" * 40
+                        + "/evidence/candidates.json"
+                    ),
+                    state_revision="c" * 40,
+                    sha256="3" * 64,
+                ),
+                metric_table=(
+                    WorkspaceMetricVerification(
+                        name="quality",
+                        value=0.9,
+                        threshold=0.7,
+                        materiality=0.1,
+                        hard_guardrail=False,
+                        guardrail_status=None,
+                    ),
+                    WorkspaceMetricVerification(
+                        name="safety",
+                        value=1.0,
+                        threshold=1.0,
+                        materiality=0.0,
+                        hard_guardrail=True,
+                        guardrail_status="pass",
+                    ),
+                ),
+                guardrails={"safety": "pass"},
+                summary_markdown="## Trusted workspace verification",
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "build_workspace_verification_service",
+        lambda: Service(),
+    )
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "verify",
+            "--issue",
+            "31",
+            "--candidate",
+            "candidate-2",
+            "--pull-request",
+            "104",
+            "--head-sha",
+            "a" * 40,
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout) == {
+        "bundle_sha256": "2" * 64,
+        "candidate_id": "candidate-2",
+        "evidence": {
+            "path": "evidence/candidates.json",
+            "sha256": "3" * 64,
+            "state_revision": "c" * 40,
+            "url": (
+                "https://github.com/octo-org/optimizer/blob/"
+                + "c" * 40
+                + "/evidence/candidates.json"
+            ),
+        },
+        "expected_tree": "b" * 40,
+        "guardrails": {"safety": "pass"},
+        "head_sha": "a" * 40,
+        "head_tree": "b" * 40,
+        "issue_number": 31,
+        "metric_table": [
+            {
+                "guardrail_status": None,
+                "hard_guardrail": False,
+                "materiality": 0.1,
+                "name": "quality",
+                "threshold": 0.7,
+                "value": 0.9,
+            },
+            {
+                "guardrail_status": "pass",
+                "hard_guardrail": True,
+                "materiality": 0.0,
+                "name": "safety",
+                "threshold": 1.0,
+                "value": 1.0,
+            },
+        ],
+        "patch_sha256": "1" * 64,
+        "phase": "awaiting_selection",
+        "repository": "octo-org/optimizer",
+        "status": "verified",
+        "summary_markdown": "## Trusted workspace verification",
+        "target": "support-agent",
+        "workspace_pull_request_number": 104,
+    }
 
 
 def test_workspace_operations_execute_emits_stable_json(

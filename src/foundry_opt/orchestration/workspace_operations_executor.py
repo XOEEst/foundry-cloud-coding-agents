@@ -13,7 +13,11 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from foundry_opt.deployment import DeploymentTrigger
+from foundry_opt.evaluation import EvaluationPolicy
+from foundry_opt.evidence import EvaluationAssetReference
 from foundry_opt.orchestration.candidate_experiments import (
+    CandidateExperimentOperation,
+    CandidateExperimentRequest,
     CandidateExperimentResult,
     PersistedCandidateExperimentOperation,
 )
@@ -97,6 +101,44 @@ def _relative_paths(
         normalized.append(value)
         seen.add(value)
     return tuple(normalized)
+
+
+def _command_arguments(
+    values: tuple[tuple[str, ...], ...],
+    name: str,
+) -> tuple[tuple[str, ...], ...]:
+    normalized: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for command in values:
+        if type(command) is not tuple or not command:
+            raise ValueError(f"{name} is invalid")
+        parsed: list[str] = []
+        for argument in command:
+            if (
+                not isinstance(argument, str)
+                or not argument
+                or len(argument) > 256
+                or any(ord(character) < 32 for character in argument)
+            ):
+                raise ValueError(f"{name} is invalid")
+            parsed.append(argument)
+        normalized_command = tuple(parsed)
+        if normalized_command in seen:
+            raise ValueError(f"{name} must be unique")
+        normalized.append(normalized_command)
+        seen.add(normalized_command)
+    return tuple(normalized)
+
+
+def _validated_glob(value: str, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith(("/", "\\"))
+        or ".." in re.split(r"[\\/]", value)
+    ):
+        raise ValueError(f"{name} is invalid")
+    return value
 
 
 def _frozen_metrics(values: Mapping[str, float]) -> Mapping[str, float]:
@@ -1021,11 +1063,162 @@ class StoredCandidateExperimentResult:
             raise ValueError("candidate workspace result is invalid")
 
 
+@dataclass(frozen=True)
+class PendingCandidateExperimentExecution:
+    operation: PersistedCandidateExperimentOperation
+    request_payload: Mapping[str, Any] = MappingProxyType({})
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.operation,
+            PersistedCandidateExperimentOperation,
+        ):
+            raise ValueError("pending candidate experiment is invalid")
+        if not isinstance(self.request_payload, Mapping):
+            raise ValueError(
+                "pending candidate experiment payload is invalid"
+            )
+        object.__setattr__(
+            self,
+            "request_payload",
+            MappingProxyType(dict(self.request_payload)),
+        )
+
+
+@dataclass(frozen=True)
+class TrustedCandidatePackagingContract:
+    include: tuple[str, ...]
+    exclude: tuple[str, ...] = ()
+    dependency_resolution: str = "remote_build"
+    evidence_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.include:
+            raise ValueError("candidate packaging include is invalid")
+        object.__setattr__(
+            self,
+            "include",
+            tuple(
+                _validated_glob(item, "candidate packaging include")
+                for item in self.include
+            ),
+        )
+        object.__setattr__(
+            self,
+            "exclude",
+            tuple(
+                _validated_glob(item, "candidate packaging exclude")
+                for item in self.exclude
+            ),
+        )
+        object.__setattr__(
+            self,
+            "evidence_paths",
+            _relative_paths(
+                self.evidence_paths,
+                "candidate packaging evidence paths",
+            ),
+        )
+        if self.dependency_resolution not in {"remote_build", "bundled"}:
+            raise ValueError(
+                "candidate packaging dependency resolution is invalid"
+            )
+
+
+@dataclass(frozen=True)
+class TrustedCandidateExecutionPlan:
+    operation: PersistedCandidateExperimentOperation
+    request: CandidateExperimentRequest
+    base_commit: str
+    target_name: str
+    base_agent_version: int
+    allowed_paths: tuple[str, ...]
+    allowed_mutations: frozenset[str]
+    validation_commands: tuple[tuple[str, ...], ...]
+    packaging: TrustedCandidatePackagingContract
+    assets: tuple[EvaluationAssetReference, ...]
+    evaluation_policy: EvaluationPolicy
+    candidate_limit: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(
+            self.operation,
+            PersistedCandidateExperimentOperation,
+        ):
+            raise ValueError("candidate execution operation is invalid")
+        if not isinstance(self.request, CandidateExperimentRequest):
+            raise ValueError("candidate execution request is invalid")
+        expected = CandidateExperimentOperation.from_request(self.request)
+        if self.operation.operation != expected or self.operation.sha256 != (
+            expected.sha256
+        ):
+            raise ValueError("candidate execution lineage is invalid")
+        _commit(self.base_commit, "candidate execution base commit")
+        _identifier(self.target_name, "candidate execution target")
+        _positive_integer(
+            self.base_agent_version,
+            "candidate execution base agent version",
+        )
+        if not self.allowed_paths:
+            raise ValueError("candidate execution allowed paths are invalid")
+        object.__setattr__(
+            self,
+            "allowed_paths",
+            _relative_paths(
+                self.allowed_paths,
+                "candidate execution allowed paths",
+            ),
+        )
+        if not self.allowed_mutations:
+            raise ValueError(
+                "candidate execution allowed mutations are invalid"
+            )
+        normalized_mutations: set[str] = set()
+        for mutation in self.allowed_mutations:
+            _identifier(mutation, "candidate execution allowed mutation")
+            normalized_mutations.add(mutation)
+        object.__setattr__(
+            self,
+            "allowed_mutations",
+            frozenset(sorted(normalized_mutations)),
+        )
+        if not self.validation_commands:
+            raise ValueError(
+                "candidate execution validation commands are invalid"
+            )
+        object.__setattr__(
+            self,
+            "validation_commands",
+            _command_arguments(
+                self.validation_commands,
+                "candidate execution validation commands",
+            ),
+        )
+        if not isinstance(self.packaging, TrustedCandidatePackagingContract):
+            raise ValueError("candidate execution packaging is invalid")
+        assets = tuple(self.assets)
+        if not assets or any(
+            not isinstance(asset, EvaluationAssetReference)
+            for asset in assets
+        ):
+            raise ValueError("candidate execution assets are invalid")
+        object.__setattr__(self, "assets", assets)
+        if not isinstance(self.evaluation_policy, EvaluationPolicy):
+            raise ValueError(
+                "candidate execution evaluation policy is invalid"
+            )
+        if (
+            type(self.candidate_limit) is not int
+            or not 1 <= self.candidate_limit <= 32
+        ):
+            raise ValueError("candidate execution candidate limit is invalid")
+
+
 class PendingCandidateExperimentStore(Protocol):
     def load_pending(
         self,
         issue_number: int,
-    ) -> PersistedCandidateExperimentOperation | None: ...
+    ) -> PendingCandidateExperimentExecution | None: ...
 
     def load_result(
         self,
@@ -1039,15 +1232,23 @@ class PendingCandidateExperimentStore(Protocol):
     ) -> StoredCandidateExperimentResult: ...
 
 
+class CandidateExperimentExecutionPlanner(Protocol):
+    def resolve(
+        self,
+        repository_root: Path,
+        pending: PendingCandidateExperimentExecution,
+    ) -> TrustedCandidateExecutionPlan: ...
+
+
 class CandidateExperimentOperationExecutor(Protocol):
     def reconcile(
         self,
-        operation: PersistedCandidateExperimentOperation,
+        plan: TrustedCandidateExecutionPlan,
     ) -> CandidateExperimentResult | None: ...
 
     def execute(
         self,
-        operation: PersistedCandidateExperimentOperation,
+        plan: TrustedCandidateExecutionPlan,
     ) -> CandidateExperimentResult | None: ...
 
 
@@ -1108,7 +1309,7 @@ class EmptyPendingCandidateExperimentStore:
     def load_pending(
         self,
         issue_number: int,
-    ) -> PersistedCandidateExperimentOperation | None:
+    ) -> PendingCandidateExperimentExecution | None:
         return None
 
     def load_result(
@@ -1125,16 +1326,27 @@ class EmptyPendingCandidateExperimentStore:
         return StoredCandidateExperimentResult(result=result)
 
 
+class UnavailableCandidateExperimentExecutionPlanner:
+    def resolve(
+        self,
+        repository_root: Path,
+        pending: PendingCandidateExperimentExecution,
+    ) -> TrustedCandidateExecutionPlan:
+        raise RuntimeError(
+            "trusted candidate execution planner is not configured"
+        )
+
+
 class NoopCandidateExperimentOperationExecutor:
     def reconcile(
         self,
-        operation: PersistedCandidateExperimentOperation,
+        plan: TrustedCandidateExecutionPlan,
     ) -> CandidateExperimentResult | None:
         return None
 
     def execute(
         self,
-        operation: PersistedCandidateExperimentOperation,
+        plan: TrustedCandidateExecutionPlan,
     ) -> CandidateExperimentResult | None:
         return None
 
@@ -1210,6 +1422,9 @@ class WorkspaceOperationsService:
         self,
         *,
         candidate_store: PendingCandidateExperimentStore | None = None,
+        candidate_planner: (
+            CandidateExperimentExecutionPlanner | None
+        ) = None,
         candidate_executor: CandidateExperimentOperationExecutor | None = None,
         deployment_loader: WorkspaceDeploymentStateLoader | None = None,
         deployment_executor: (
@@ -1224,6 +1439,11 @@ class WorkspaceOperationsService:
             candidate_store
             if candidate_store is not None
             else EmptyPendingCandidateExperimentStore()
+        )
+        self._candidate_planner = (
+            candidate_planner
+            if candidate_planner is not None
+            else UnavailableCandidateExperimentExecutionPlanner()
         )
         self._candidate_executor = (
             candidate_executor
@@ -1263,7 +1483,11 @@ class WorkspaceOperationsService:
     ) -> WorkspaceOperationsResult:
         pending = self._candidate_store.load_pending(request.issue_number)
         if pending is not None:
-            return self._execute_candidate(request, pending)
+            plan = self._candidate_planner.resolve(
+                request.repository_root,
+                pending,
+            )
+            return self._execute_candidate(request, plan)
         target = self._deployment_loader.load(request.issue_number)
         if target is None or target.phase is not WorkspacePhase.DEPLOYMENT:
             return WorkspaceOperationsResult(
@@ -1431,18 +1655,19 @@ class WorkspaceOperationsService:
     def _execute_candidate(
         self,
         request: WorkspaceOperationsExecuteRequest,
-        operation: PersistedCandidateExperimentOperation,
+        plan: TrustedCandidateExecutionPlan,
     ) -> WorkspaceOperationsResult:
-        if operation.operation.issue_number != request.issue_number:
+        operation = plan.operation
+        if plan.request.issue_number != request.issue_number:
             raise ValueError("candidate experiment issue changed")
         stored = self._candidate_store.load_result(operation)
         recorded = False
         if stored is None:
-            result = self._candidate_executor.reconcile(operation)
+            result = self._candidate_executor.reconcile(plan)
         else:
             result = stored.result
         if result is None:
-            result = self._candidate_executor.execute(operation)
+            result = self._candidate_executor.execute(plan)
             if result is None:
                 return WorkspaceOperationsResult(
                     issue_number=request.issue_number,
@@ -1517,16 +1742,21 @@ def build_production_workspace_operations_service() -> (
 
 
 __all__ = [
+    "CandidateExperimentExecutionPlanner",
     "CandidateExperimentOperationExecutor",
     "EmptyPendingCandidateExperimentStore",
     "EmptyWorkspaceDeploymentStateLoader",
     "NoopWorkspaceDeploymentRunVerifier",
+    "PendingCandidateExperimentExecution",
     "PlanningWorkspaceCompletionFinalizer",
     "PlanningWorkspaceDeploymentWorkflowExecutor",
     "PendingCandidateExperimentStore",
     "StoredCandidateExperimentResult",
+    "TrustedCandidateExecutionPlan",
+    "TrustedCandidatePackagingContract",
     "TrustedWorkspaceArtifactContext",
     "TrustedWorkspaceExecutionContext",
+    "UnavailableCandidateExperimentExecutionPlanner",
     "UnavailableWorkspaceRetentionEvaluator",
     "WorkspaceCompletionFinalizer",
     "WorkspaceCompletionRequest",

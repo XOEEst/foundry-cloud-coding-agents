@@ -5,6 +5,13 @@ from pathlib import Path
 import pytest
 
 from foundry_opt.deployment import DeploymentTrigger
+from foundry_opt.evaluation import (
+    EvaluationPolicy,
+    MetricDirection,
+    MetricPolicy,
+    UndefinedBehavior,
+)
+from foundry_opt.evidence import EvaluationAssetReference
 from foundry_opt.orchestration.candidate_experiments import (
     CandidateExperimentOperation,
     CandidateExperimentRequest,
@@ -20,8 +27,12 @@ from foundry_opt.orchestration.workspace import (
 )
 from foundry_opt.orchestration.workspace_operations_executor import (
     StoredCandidateExperimentResult,
+    PendingCandidateExperimentExecution,
     TrustedWorkspaceArtifactContext,
+    TrustedCandidateExecutionPlan,
+    TrustedCandidatePackagingContract,
     TrustedWorkspaceExecutionContext,
+    CandidateExperimentExecutionPlanner,
     WorkspaceCompletionRequest,
     WorkspaceDeploymentArtifact,
     WorkspaceDeploymentTarget,
@@ -79,6 +90,91 @@ def _candidate_result(
     }
     values.update(overrides)
     return CandidateExperimentResult(**values)
+
+
+def _pending_candidate_execution(
+    operation: PersistedCandidateExperimentOperation,
+    *,
+    request_payload: dict[str, object] | None = None,
+) -> PendingCandidateExperimentExecution:
+    return PendingCandidateExperimentExecution(
+        operation=operation,
+        request_payload=request_payload or {},
+    )
+
+
+def _candidate_plan(
+    pending: PendingCandidateExperimentExecution,
+    **overrides,
+) -> TrustedCandidateExecutionPlan:
+    operation = pending.operation
+    values = {
+        "operation": operation,
+        "request": CandidateExperimentRequest(
+            issue_number=operation.operation.issue_number,
+            candidate_id=operation.operation.candidate_id,
+            patch_sha256=operation.operation.patch_sha256,
+            bundle_sha256=operation.operation.bundle_sha256,
+            evidence_sha256=operation.operation.evidence_sha256,
+            idempotency_key=operation.operation.idempotency_key,
+        ),
+        "base_commit": "a" * 40,
+        "target_name": "support-agent",
+        "base_agent_version": 7,
+        "allowed_paths": ("src/agent.py", "tests/test_agent.py"),
+        "allowed_mutations": frozenset({"python_logic"}),
+        "validation_commands": (("python", "-m", "pytest", "-q"),),
+        "packaging": TrustedCandidatePackagingContract(
+            include=("src/**", "tests/**"),
+            exclude=(".venv/**",),
+            dependency_resolution="remote_build",
+            evidence_paths=(".foundry-optimizer/campaigns",),
+        ),
+        "assets": (
+            EvaluationAssetReference(
+                asset_id="dataset-development",
+                kind="dataset",
+                source="foundry",
+                role="development",
+                name="support-dev",
+                version="1",
+                remote_id="foundry:dataset:support-dev:1",
+            ),
+            EvaluationAssetReference(
+                asset_id="dataset-validation",
+                kind="dataset",
+                source="foundry",
+                role="validation",
+                name="support-val",
+                version="1",
+                remote_id="foundry:dataset:support-val:1",
+            ),
+            EvaluationAssetReference(
+                asset_id="evaluator-quality",
+                kind="evaluator",
+                source="builtin",
+                name="quality-evaluator",
+                version="1",
+                remote_id="builtin:quality-evaluator:1",
+                metrics=("quality",),
+            ),
+        ),
+        "evaluation_policy": EvaluationPolicy(
+            metrics=(
+                MetricPolicy(
+                    name="quality",
+                    direction=MetricDirection.MAXIMIZE,
+                    threshold=0.7,
+                    materiality=0.1,
+                    hard_guardrail=False,
+                    undefined_behavior=UndefinedBehavior.FAIL,
+                ),
+            )
+        ),
+        "candidate_limit": 3,
+    }
+    values.update(overrides)
+    return TrustedCandidateExecutionPlan(**values)
 
 
 def _deployment_target(
@@ -183,9 +279,9 @@ def _reconcile_request(
 class RecordingCandidateStore:
     def __init__(
         self,
-        operation: PersistedCandidateExperimentOperation | None,
+        pending: PendingCandidateExperimentExecution | None,
     ) -> None:
-        self.operation = operation
+        self.pending = pending
         self.result: StoredCandidateExperimentResult | None = None
         self.workspace: WorkspaceResult | None = None
         self.persist_calls = 0
@@ -194,8 +290,8 @@ class RecordingCandidateStore:
     def load_pending(
         self,
         issue_number: int,
-    ) -> PersistedCandidateExperimentOperation | None:
-        return self.operation if issue_number == 31 else None
+    ) -> PendingCandidateExperimentExecution | None:
+        return self.pending if issue_number == 31 else None
 
     def load_result(
         self,
@@ -229,20 +325,46 @@ class RecordingCandidateExecutor:
         self._executed = executed
         self.reconcile_calls = 0
         self.execute_calls = 0
+        self.plans: list[TrustedCandidateExecutionPlan] = []
 
     def reconcile(
         self,
-        operation: PersistedCandidateExperimentOperation,
+        plan: TrustedCandidateExecutionPlan,
     ) -> CandidateExperimentResult | None:
         self.reconcile_calls += 1
+        self.plans.append(plan)
         return self._reconciled.pop(0)
 
     def execute(
         self,
-        operation: PersistedCandidateExperimentOperation,
+        plan: TrustedCandidateExecutionPlan,
     ) -> CandidateExperimentResult | None:
         self.execute_calls += 1
+        self.plans.append(plan)
         return self._executed.pop(0)
+
+
+class RecordingCandidatePlanner:
+    def __init__(
+        self,
+        plan: TrustedCandidateExecutionPlan | None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.plan = plan
+        self.error = error
+        self.calls: list[tuple[Path, PendingCandidateExperimentExecution]] = []
+
+    def resolve(
+        self,
+        repository_root: Path,
+        pending: PendingCandidateExperimentExecution,
+    ) -> TrustedCandidateExecutionPlan:
+        self.calls.append((repository_root, pending))
+        if self.error is not None:
+            raise self.error
+        assert self.plan is not None
+        return self.plan
 
 
 class StaticDeploymentLoader:
@@ -355,13 +477,16 @@ def test_candidate_fallback_is_idempotent_across_retries(
     tmp_path: Path,
 ) -> None:
     persisted = _persisted_candidate_operation()
-    store = RecordingCandidateStore(persisted)
+    pending = _pending_candidate_execution(persisted)
+    store = RecordingCandidateStore(pending)
+    planner = RecordingCandidatePlanner(_candidate_plan(pending))
     executor = RecordingCandidateExecutor(
         reconciled=[None],
         executed=[_candidate_result(persisted)],
     )
     service = WorkspaceOperationsService(
         candidate_store=store,
+        candidate_planner=planner,
         candidate_executor=executor,
     )
 
@@ -375,21 +500,25 @@ def test_candidate_fallback_is_idempotent_across_retries(
     assert executor.execute_calls == 1
     assert executor.reconcile_calls == 1
     assert store.persist_calls == 1
+    assert len(planner.calls) == 2
 
 
 def test_candidate_fallback_resumes_same_workspace_pull_request(
     tmp_path: Path,
 ) -> None:
     persisted = _persisted_candidate_operation()
-    store = RecordingCandidateStore(persisted)
+    pending = _pending_candidate_execution(persisted)
+    store = RecordingCandidateStore(pending)
     store.workspace = _workspace_result(
         WorkspacePhase.EVALUATING,
         recorded=True,
         next_action=WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS,
         workspace_pull_request_number=104,
     )
+    planner = RecordingCandidatePlanner(_candidate_plan(pending))
     service = WorkspaceOperationsService(
         candidate_store=store,
+        candidate_planner=planner,
         candidate_executor=RecordingCandidateExecutor(
             reconciled=[None],
             executed=[_candidate_result(persisted)],
@@ -429,15 +558,18 @@ def test_candidate_fallback_skips_resume_outside_copilot_actions(
     next_action: WorkspaceNextActionKind,
 ) -> None:
     persisted = _persisted_candidate_operation()
-    store = RecordingCandidateStore(persisted)
+    pending = _pending_candidate_execution(persisted)
+    store = RecordingCandidateStore(pending)
     store.workspace = _workspace_result(
         phase,
         recorded=True,
         next_action=next_action,
         workspace_pull_request_number=104,
     )
+    planner = RecordingCandidatePlanner(_candidate_plan(pending))
     service = WorkspaceOperationsService(
         candidate_store=store,
+        candidate_planner=planner,
         candidate_executor=RecordingCandidateExecutor(
             reconciled=[None],
             executed=[_candidate_result(persisted)],
@@ -455,14 +587,17 @@ def test_candidate_fallback_recovers_after_persist_ack_loss(
 ) -> None:
     persisted = _persisted_candidate_operation()
     result = _candidate_result(persisted)
-    store = RecordingCandidateStore(persisted)
+    pending = _pending_candidate_execution(persisted)
+    store = RecordingCandidateStore(pending)
     store.failures.append(RuntimeError("ack lost"))
+    planner = RecordingCandidatePlanner(_candidate_plan(pending))
     executor = RecordingCandidateExecutor(
         reconciled=[None, result],
         executed=[result],
     )
     service = WorkspaceOperationsService(
         candidate_store=store,
+        candidate_planner=planner,
         candidate_executor=executor,
     )
 
@@ -484,6 +619,7 @@ def test_candidate_fallback_rejects_tampered_result(
     tmp_path: Path,
 ) -> None:
     persisted = _persisted_candidate_operation()
+    pending = _pending_candidate_execution(persisted)
     executor = RecordingCandidateExecutor(
         reconciled=[
             _candidate_result(
@@ -494,7 +630,10 @@ def test_candidate_fallback_rejects_tampered_result(
         executed=[],
     )
     service = WorkspaceOperationsService(
-        candidate_store=RecordingCandidateStore(persisted),
+        candidate_store=RecordingCandidateStore(pending),
+        candidate_planner=RecordingCandidatePlanner(
+            _candidate_plan(pending)
+        ),
         candidate_executor=executor,
     )
 
@@ -502,6 +641,63 @@ def test_candidate_fallback_rejects_tampered_result(
         service.execute(_execute_request(tmp_path))
 
     assert executor.execute_calls == 0
+
+
+def test_candidate_fallback_rejects_forged_untrusted_request_payload(
+    tmp_path: Path,
+) -> None:
+    persisted = _persisted_candidate_operation()
+    pending = _pending_candidate_execution(
+        persisted,
+        request_payload={
+            "allowed_paths": ["src/agent.py", "../secrets.env"],
+            "validation_commands": [
+                ["python", "-m", "pytest", "-q"],
+                ["powershell", "-File", "invoke-forged.ps1"],
+            ],
+            "asset_ids": [
+                "dataset-development",
+                "forged-customer-asset",
+            ],
+        },
+    )
+    store = RecordingCandidateStore(pending)
+
+    class RejectingPlanner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def resolve(
+            self,
+            repository_root: Path,
+            pending_execution: PendingCandidateExperimentExecution,
+        ) -> TrustedCandidateExecutionPlan:
+            self.calls += 1
+            payload = pending_execution.request_payload
+            assert payload["asset_ids"] == [
+                "dataset-development",
+                "forged-customer-asset",
+            ]
+            raise ValueError(
+                "candidate execution request violates trusted config binding"
+            )
+
+    planner = RejectingPlanner()
+    executor = RecordingCandidateExecutor(reconciled=[None], executed=[None])
+    service = WorkspaceOperationsService(
+        candidate_store=store,
+        candidate_planner=planner,
+        candidate_executor=executor,
+    )
+
+    with pytest.raises(ValueError, match="trusted config binding"):
+        service.execute(_execute_request(tmp_path))
+
+    assert planner.calls == 1
+    assert executor.reconcile_calls == 0
+    assert executor.execute_calls == 0
+    assert store.persist_calls == 0
+    assert store.result is None
 
 
 @pytest.mark.parametrize(

@@ -69,6 +69,9 @@ def test_built_wheel_contains_issue_only_onboarding_templates(
     assert "foundry-opt workspace operations reconcile" in (
         current_bundle_source
     )
+    assert '"workspace",' in bundle
+    assert '"verify",' in bundle
+    assert "GITHUB_STEP_SUMMARY" in bundle
     assert "gh pr comment" in current_bundle_source
     assert "gh pr create" not in current_bundle_source
     assert "foundry-candidate-designer.agent.md" not in bundle.split(

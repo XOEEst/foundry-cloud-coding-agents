@@ -1445,12 +1445,75 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"candidate={{candidate}}\\n")
               output.write(f"issue={{marker.group(1)}}\\n")
-      - name: Verify exact candidate metadata and tree
+      - name: Verify trusted workspace candidate and publish required-check summary
         env:
           CANDIDATE: ${{{{ steps.metadata.outputs.candidate }}}}
           ISSUE: ${{{{ steps.metadata.outputs.issue }}}}
-        shell: bash
-        run: foundry-opt optimize apply --issue "$ISSUE" --candidate "$CANDIDATE" --verify-only
+          PULL_REQUEST_NUMBER: ${{{{ github.event.pull_request.number }}}}
+          PULL_REQUEST_HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}
+          VERIFY_JSON_PATH: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-verify.json
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          verify_json_path = Path(os.environ["VERIFY_JSON_PATH"])
+          verify_json_path.parent.mkdir(parents=True, exist_ok=True)
+          command = [
+              "foundry-opt",
+              "workspace",
+              "verify",
+              "--issue",
+              os.environ["ISSUE"],
+              "--candidate",
+              os.environ["CANDIDATE"],
+              "--pull-request",
+              os.environ["PULL_REQUEST_NUMBER"],
+              "--head-sha",
+              os.environ["PULL_REQUEST_HEAD_SHA"],
+              "--json",
+          ]
+          completed = subprocess.run(
+              command,
+              check=False,
+              capture_output=True,
+              text=True,
+          )
+          if completed.stdout:
+              print(completed.stdout, end="")
+              verify_json_path.write_text(
+                  completed.stdout,
+                  encoding="utf-8",
+              )
+              document = json.loads(completed.stdout)
+              summary = document.get("summary_markdown")
+              if not isinstance(summary, str) or not summary.strip():
+                  raise SystemExit("workspace verify summary is invalid")
+              with open(
+                  os.environ["GITHUB_STEP_SUMMARY"],
+                  "a",
+                  encoding="utf-8",
+              ) as output:
+                  output.write(summary)
+                  if not summary.endswith("\\n"):
+                      output.write("\\n")
+          else:
+              with open(
+                  os.environ["GITHUB_STEP_SUMMARY"],
+                  "a",
+                  encoding="utf-8",
+              ) as output:
+                  output.write(
+                      "## Trusted workspace verification\\n\\n"
+                      "No trusted workspace verify JSON was produced.\\n"
+                  )
+          if completed.stderr:
+              print(completed.stderr, end="", file=sys.stderr)
+          raise SystemExit(completed.returncode)
 """
 
 

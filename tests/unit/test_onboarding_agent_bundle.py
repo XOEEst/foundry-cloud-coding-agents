@@ -203,7 +203,6 @@ def test_every_emitted_foundry_opt_command_resolves_against_cli() -> None:
         "workspace advance",
         "workspace operations execute",
         "workspace operations reconcile",
-        "optimize apply",
     } <= resolved
 
 
@@ -430,13 +429,18 @@ def test_exact_check_never_executes_untrusted_pull_request_code() -> None:
 
     assert "shell: python" in text
     assert "PR_BODY: ${{ github.event.pull_request.body }}" in text
-    assert 'run: foundry-opt optimize apply --issue "$ISSUE"' in text
+    assert '"foundry-opt",' in text
+    assert '"workspace",' in text
+    assert '"verify",' in text
+    assert 'GITHUB_STEP_SUMMARY' in text
+    assert 'summary_markdown' in text
     assert "source " not in text
     assert "eval " not in text
     assert "bash -c" not in text
     assert "${{ github.event.pull_request.body }}" not in "\n".join(
         line for line in text.splitlines() if line.lstrip().startswith("run:")
     )
+    assert 'optimize apply --issue "$ISSUE"' not in text
 
 
 def test_generated_workflows_are_yaml_safe_and_action_pinned() -> None:
