@@ -469,6 +469,46 @@ def workspace_advance(
         )
 
 
+@workspace_app.command("assign")
+def workspace_assign(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Assign Copilot only when v4 state requires candidate work."""
+    assignment_token = os.environ.pop(
+        "COPILOT_ASSIGNMENT_TOKEN",
+        None,
+    )
+    try:
+        result = build_workspace_service().assign_copilot(
+            repository_root=Path.cwd(),
+            issue_number=issue_number,
+            assignment_token=assignment_token,
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace PR "
+            f"#{result.workspace_pull_request_number or 'unknown'}: "
+            f"Copilot assignment {result.status}"
+        )
+
+
 @workspace_app.command("intake")
 def workspace_intake(
     event_path: Annotated[

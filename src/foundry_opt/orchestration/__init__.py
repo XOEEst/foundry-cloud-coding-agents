@@ -67,10 +67,14 @@ from foundry_opt.orchestration.workspace_production import (
     ProductionWorkspaceError,
     ProductionWorkspaceService,
     WorkspaceAdvanceRequest,
+    WorkspaceCopilotAssignmentResult,
     WorkspaceIntakeResult,
     WorkspaceOperationIntakeResult,
     build_production_workspace,
     build_production_workspace_service,
+)
+from foundry_opt.orchestration.workspace_assignment import (
+    GhWorkspaceCopilotAssigner,
 )
 from foundry_opt.orchestration.workspace_manifest import (
     WorkspaceCandidateManifest,
@@ -553,11 +557,13 @@ __all__ = [
     "ProductionWorkspaceService",
     "TrustedWorkspaceEventContext",
     "WorkspaceAdvanceRequest",
+    "WorkspaceCopilotAssignmentResult",
     "WorkspaceEventKind",
     "WorkspaceIntakeResult",
     "WorkspaceOperationIntakeResult",
     "WorkspaceExperimentManifest",
     "WorkspaceCandidateManifest",
+    "GhWorkspaceCopilotAssigner",
     "ConfiguredWorkspaceSelector",
     "NormalizedWorkspaceOperation",
     "TrustedWorkspaceOperationContext",

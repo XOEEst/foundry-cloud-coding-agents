@@ -123,6 +123,7 @@ def test_workspace_help_exposes_production_lifecycle_commands() -> None:
 
     assert completed.exit_code == 0
     assert "advance" in completed.stdout
+    assert "assign" in completed.stdout
     assert "intake" in completed.stdout
     assert "experiment" in completed.stdout
     assert "experiment-result" in completed.stdout
@@ -136,6 +137,52 @@ def test_workspace_help_exposes_production_lifecycle_commands() -> None:
     assert operations.exit_code == 0
     assert "execute" in operations.stdout
     assert "reconcile" in operations.stdout
+
+
+def test_workspace_assign_uses_secret_without_emitting_it(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "COPILOT_ASSIGNMENT_TOKEN",
+        "assignment-token",
+    )
+
+    class Result:
+        def to_dict(self):
+            return {
+                "assigned": True,
+                "issue_number": 31,
+                "next_action": "run_candidate_experiments",
+                "status": "assigned",
+                "workspace_pull_request_number": 104,
+            }
+
+    class Service:
+        def assign_copilot(
+            self,
+            *,
+            repository_root,
+            issue_number,
+            assignment_token,
+        ):
+            assert repository_root == tmp_path
+            assert issue_number == 31
+            assert assignment_token == "assignment-token"
+            assert "COPILOT_ASSIGNMENT_TOKEN" not in __import__("os").environ
+            return Result()
+
+    monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
+
+    completed = runner.invoke(
+        app,
+        ["workspace", "assign", "--issue", "31", "--json"],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["workspace_pull_request_number"] == 104
+    assert "assignment-token" not in completed.stdout
 
 
 def test_workspace_experiments_complete_ingests_manifest(

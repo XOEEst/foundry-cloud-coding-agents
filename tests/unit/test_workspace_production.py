@@ -14,7 +14,9 @@ from foundry_opt.orchestration import (
     OptimizationWorkspace,
     TrustedWorkspaceEventContext,
     WorkspaceAdvanceRequest,
+    WorkspaceExperimentRecord,
     WorkspacePhase,
+    WorkspaceSnapshot,
     WorkspaceTrigger,
     build_production_workspace,
 )
@@ -92,6 +94,169 @@ def test_production_builder_wires_candidate_coordinator(
     )
 
     assert workspace._candidate_coordinator is not None
+
+
+def test_production_assignment_uses_state_workspace_pr_for_candidate_work(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = WorkspaceSnapshot(
+        issue_number=31,
+        revision="a" * 40,
+        phase=WorkspacePhase.SPECIFICATION,
+        workspace_pull_request_number=104,
+        candidates=(),
+        selected_patch=None,
+        external_operation_ids=(),
+        experiments=(),
+        lineage=None,
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceStore",
+        lambda root: type(
+            "Store",
+            (),
+            {"load": lambda self, issue: snapshot},
+        )(),
+    )
+    assigned: dict[str, Any] = {}
+
+    class Assigner:
+        def assign(self, *, issue_number, pull_request_number):
+            assigned["issue"] = issue_number
+            assigned["pr"] = pull_request_number
+            return True
+
+    service = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+        copilot_assigner_factory=lambda **kwargs: (
+            assigned.update(kwargs) or Assigner()
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_repository_context",
+        lambda root: type(
+            "Context",
+            (),
+            {
+                "repository": "octo-org/optimizer",
+                "default_branch": "main",
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_existing_workspace_pull_request",
+        lambda root, repository, issue: (104, "b" * 40),
+    )
+
+    result = service.assign_copilot(
+        repository_root=tmp_path,
+        issue_number=31,
+        assignment_token="assignment-token",
+    )
+
+    assert result.assigned is True
+    assert result.workspace_pull_request_number == 104
+    assert result.next_action == "run_candidate_experiments"
+    assert assigned["issue"] == 31
+    assert assigned["pr"] == 104
+    assert assigned["assignment_token"] == "assignment-token"
+
+
+def test_production_assignment_skips_human_merge_wait_without_token(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = WorkspaceSnapshot(
+        issue_number=31,
+        revision="a" * 40,
+        phase=WorkspacePhase.AWAITING_SELECTION,
+        workspace_pull_request_number=104,
+        candidates=(),
+        selected_patch=None,
+        external_operation_ids=(),
+        experiments=(),
+        lineage=None,
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceStore",
+        lambda root: type(
+            "Store",
+            (),
+            {"load": lambda self, issue: snapshot},
+        )(),
+    )
+    service = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+        copilot_assigner_factory=lambda **_: pytest.fail(
+            "human merge wait must not assign Copilot"
+        ),
+    )
+
+    result = service.assign_copilot(
+        repository_root=tmp_path,
+        issue_number=31,
+        assignment_token=None,
+    )
+
+    assert result.assigned is False
+    assert result.status == "not_required"
+    assert result.next_action == "merge_workspace_pull_request"
+
+
+def test_production_assignment_skips_pending_actions_experiment(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = WorkspaceSnapshot(
+        issue_number=31,
+        revision="a" * 40,
+        phase=WorkspacePhase.EVALUATING,
+        workspace_pull_request_number=104,
+        candidates=(),
+        selected_patch=None,
+        external_operation_ids=(),
+        experiments=(
+            WorkspaceExperimentRecord(
+                candidate_id="candidate-1",
+                patch_sha256="1" * 64,
+                bundle_sha256="2" * 64,
+                evidence_sha256="3" * 64,
+                idempotency_key="4" * 64,
+                operation_sha256="5" * 64,
+                status="pending",
+            ),
+        ),
+        lineage=None,
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceStore",
+        lambda root: type(
+            "Store",
+            (),
+            {"load": lambda self, issue: snapshot},
+        )(),
+    )
+    service = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+        copilot_assigner_factory=lambda **_: pytest.fail(
+            "pending Actions experiment must not assign Copilot"
+        ),
+    )
+
+    result = service.assign_copilot(
+        repository_root=tmp_path,
+        issue_number=31,
+        assignment_token=None,
+    )
+
+    assert result.assigned is False
+    assert result.next_action == "await_trusted_actions_result"
 
 
 def test_production_service_wires_trusted_workspace_verifier(

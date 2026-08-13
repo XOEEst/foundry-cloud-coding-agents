@@ -34,11 +34,15 @@ from foundry_opt.orchestration.workspace import (
     WorkspaceCandidateProposal,
     WorkspaceIssue,
     WorkspaceOperation,
+    WorkspacePhase,
     WorkspacePullRequest,
     WorkspaceReportContext,
     WorkspaceRequest,
     WorkspaceResult,
     WorkspaceTrigger,
+)
+from foundry_opt.orchestration.workspace_assignment import (
+    GhWorkspaceCopilotAssigner,
 )
 from foundry_opt.orchestration.workspace_coordinator import (
     GhWorkspacePullRequestFinalizer,
@@ -53,6 +57,7 @@ from foundry_opt.orchestration.workspace_github import (
 from foundry_opt.orchestration.workspace_git_store import GitWorkspaceStore
 from foundry_opt.orchestration.workspace_store import (
     WorkspaceExperimentRecord,
+    WorkspaceSnapshot,
 )
 from foundry_opt.orchestration.workspace_intake import (
     NormalizedWorkspaceEvent,
@@ -181,12 +186,37 @@ class WorkspaceOperationIntakeResult:
 
 
 @dataclass(frozen=True)
+class WorkspaceCopilotAssignmentResult:
+    issue_number: int
+    workspace_pull_request_number: int | None
+    next_action: str
+    status: str
+    assigned: bool
+
+    @property
+    def exit_code(self) -> int:
+        return 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assigned": self.assigned,
+            "issue_number": self.issue_number,
+            "next_action": self.next_action,
+            "status": self.status,
+            "workspace_pull_request_number": (
+                self.workspace_pull_request_number
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class _RepositoryContext:
     repository: str
     default_branch: str
 
 
 WorkspaceFactory = Callable[..., OptimizationWorkspace]
+CopilotAssignerFactory = Callable[..., GhWorkspaceCopilotAssigner]
 
 
 def build_production_workspace(
@@ -247,11 +277,75 @@ class ProductionWorkspaceService:
         experiment_request_builder: (
             WorkspaceExperimentRequestBuilder | None
         ) = None,
+        copilot_assigner_factory: CopilotAssignerFactory = (
+            GhWorkspaceCopilotAssigner
+        ),
     ) -> None:
         self._commands = commands or SubprocessCommandRunner()
         self._workspace_factory = workspace_factory
         self._experiment_runner = experiment_runner
         self._experiment_request_builder = experiment_request_builder
+        self._copilot_assigner_factory = copilot_assigner_factory
+
+    def assign_copilot(
+        self,
+        *,
+        repository_root: Path,
+        issue_number: int,
+        assignment_token: str | None,
+    ) -> WorkspaceCopilotAssignmentResult:
+        if type(issue_number) is not int or issue_number < 1:
+            raise ValueError("workspace assignment issue is invalid")
+        root = repository_root.expanduser().resolve()
+        snapshot = GitWorkspaceStore(root).load(issue_number)
+        if snapshot is None:
+            raise ProductionWorkspaceError(
+                "workspace state is unavailable"
+            )
+        next_action, requires_copilot = _copilot_assignment_action(snapshot)
+        pull_request_number = snapshot.workspace_pull_request_number
+        if not requires_copilot:
+            return WorkspaceCopilotAssignmentResult(
+                issue_number=issue_number,
+                workspace_pull_request_number=pull_request_number,
+                next_action=next_action,
+                status="not_required",
+                assigned=False,
+            )
+        if pull_request_number is None:
+            raise ProductionWorkspaceError(
+                "workspace Copilot assignment requires its pull request"
+            )
+        if not assignment_token:
+            raise ProductionWorkspaceError(
+                "Copilot assignment token is required"
+            )
+        context = self._repository_context(root)
+        existing = self._existing_workspace_pull_request(
+            root,
+            context.repository,
+            issue_number,
+        )
+        if existing is None or existing[0] != pull_request_number:
+            raise ProductionWorkspaceError(
+                "workspace assignment pull request identity changed"
+            )
+        assigned = self._copilot_assigner_factory(
+            commands=self._commands,
+            repository_root=root,
+            repository=context.repository,
+            assignment_token=assignment_token,
+        ).assign(
+            issue_number=issue_number,
+            pull_request_number=pull_request_number,
+        )
+        return WorkspaceCopilotAssignmentResult(
+            issue_number=issue_number,
+            workspace_pull_request_number=pull_request_number,
+            next_action=next_action,
+            status="assigned" if assigned else "already_assigned",
+            assigned=assigned,
+        )
 
     def advance(self, request: WorkspaceAdvanceRequest) -> WorkspaceResult:
         if (
@@ -945,3 +1039,29 @@ def _trusted_candidates(
             )
         )
     return tuple(candidates)
+
+
+def _copilot_assignment_action(
+    snapshot: WorkspaceSnapshot,
+) -> tuple[str, bool]:
+    if snapshot.phase is WorkspacePhase.SPECIFICATION:
+        return "run_candidate_experiments", True
+    if snapshot.phase is WorkspacePhase.EVALUATING:
+        if any(
+            experiment.status == "pending"
+            for experiment in snapshot.experiments
+        ):
+            return "await_trusted_actions_result", False
+        return "run_candidate_experiments", True
+    return {
+        WorkspacePhase.AWAITING_SELECTION: (
+            "merge_workspace_pull_request",
+            False,
+        ),
+        WorkspacePhase.DEPLOYMENT: (
+            "deploy_selected_candidate",
+            False,
+        ),
+        WorkspacePhase.RETENTION: ("complete_retention", False),
+        WorkspacePhase.COMPLETED: ("none", False),
+    }[snapshot.phase]
