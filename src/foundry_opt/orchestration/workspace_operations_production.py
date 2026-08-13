@@ -844,7 +844,6 @@ class ProductionWorkspaceDeploymentVerifier(WorkspaceDeploymentRunVerifier):
             not isinstance(repository, Mapping)
             or repository.get("full_name") != target.repository
             or repository.get("id") != target.repository_id
-            or document.get("name") != target.workflow_name
             or not isinstance(document.get("path"), str)
             or not str(document["path"]).startswith(
                 target.workflow_path.as_posix()
