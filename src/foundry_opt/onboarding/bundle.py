@@ -1189,21 +1189,21 @@ jobs:
               if not line.strip():
                   continue
               document = json.loads(line)
+              issue = document.get("issue_number")
+              if type(issue) is not int or issue < 1:
+                  raise SystemExit("workspace resume payload is invalid")
+              entries.add(issue)
               resume = document.get("resume")
               if resume is None:
                   continue
               if not isinstance(resume, dict):
                   raise SystemExit("workspace resume payload is invalid")
-              issue = document.get("issue_number")
               pull_request = resume.get("workspace_pull_request_number")
               if (
-                  type(issue) is not int
-                  or issue < 1
-                  or type(pull_request) is not int
+                  type(pull_request) is not int
                   or pull_request < 1
               ):
                   raise SystemExit("workspace resume payload is invalid")
-              entries.add(issue)
 
           package = os.environ["OPTIMIZER_PACKAGE"]
           environment = dict(os.environ)
