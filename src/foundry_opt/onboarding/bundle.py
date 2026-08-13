@@ -675,7 +675,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"issue={{issue}}\\n")
               output.write(f"pull_request={{pull_request}}\\n")
-      - name: Advance workspace and continue the same Copilot pull request
+      - name: Ingest trusted event or retry the workspace
         env:
           COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
           ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
@@ -686,10 +686,30 @@ jobs:
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
-        run: >-
-          uv run --no-project --no-config --no-env-file
-          --with "$OPTIMIZER_PACKAGE"
-          foundry-opt workspace advance --issue "$ISSUE" --json
+        shell: bash
+        run: |
+          command=(
+            uv run --no-project --no-config --no-env-file
+            --with "$OPTIMIZER_PACKAGE"
+            foundry-opt workspace
+          )
+          if [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ]; then
+            "${{command[@]}}" advance --issue "$ISSUE" --json
+          else
+            args=(
+              intake
+              --event-path "$TRUSTED_EVENT_PATH"
+              --event-name "$TRUSTED_EVENT_NAME"
+              --delivery-id "$TRUSTED_RUN_ID"
+              --repository "$TRUSTED_REPOSITORY"
+              --repository-id "$TRUSTED_REPOSITORY_ID"
+              --json
+            )
+            if [ "$TRUSTED_EVENT_NAME" = "issues" ]; then
+              args+=(--base-commit "$(git rev-parse HEAD)")
+            fi
+            "${{command[@]}}" "${{args[@]}}"
+          fi
       - name: Dispatch trusted workspace operations
         env:
           DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}

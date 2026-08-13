@@ -318,14 +318,16 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         "pull-requests": "write",
     }
     assert "COPILOT_ASSIGNMENT_TOKEN" in text
-    assert "foundry-opt workspace advance --issue \"$ISSUE\" --json" in (
-        " ".join(text.split())
-    )
+    assert '"${command[@]}" advance --issue "$ISSUE" --json' in text
+    assert "intake" in text
+    assert '--event-path "$TRUSTED_EVENT_PATH"' in text
+    assert '--event-name "$TRUSTED_EVENT_NAME"' in text
+    assert '--delivery-id "$TRUSTED_RUN_ID"' in text
+    assert 'args+=(--base-commit "$(git rev-parse HEAD)")' in text
     assert "Dispatch trusted workspace operations" in text
     assert "gh workflow run foundry-optimization-operations.yml" in text
     assert '--ref "$DEFAULT_BRANCH"' in text
     assert '-f "issue=$ISSUE"' in text
-    assert "continue the same Copilot pull request" in text
     assert "foundry-opt:workspace-pr:issue-" in text
     assert "pull_request_target" in text
     assert "github.event.repository.default_branch" in text
