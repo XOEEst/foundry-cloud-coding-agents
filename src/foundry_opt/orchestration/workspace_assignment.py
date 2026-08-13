@@ -13,7 +13,6 @@ _REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
 )
-_COPILOT = "copilot-swe-agent[bot]"
 _CUSTOM_AGENT = "foundry-optimization-steward"
 
 
@@ -58,56 +57,69 @@ class GhWorkspaceCopilotAssigner:
             raise RuntimeError(
                 "workspace assignment target is not an open pull request"
             )
-        assignees = pull_request.get("assignees")
-        if not isinstance(assignees, list):
+        actor = self._api(("gh", "api", "user"))
+        if not _trusted_user(actor):
             raise RuntimeError(
-                "workspace pull request assignees are invalid"
+                "workspace assignment author is invalid"
             )
-        if any(
-            isinstance(item, Mapping)
-            and item.get("login") == _COPILOT
-            for item in assignees
-        ):
-            return False
-        body = {
-            "agent_assignment": {
-                "custom_agent": _CUSTOM_AGENT,
-                "custom_instructions": (
-                    f"Continue optimization issue #{issue_number} in "
-                    f"this existing workspace pull request "
-                    f"#{pull_request_number} only. Run `foundry-opt "
-                    f"workspace advance --issue {issue_number} --json`, "
-                    "follow only returned candidate-work next actions, "
-                    "and do not create another issue or pull request."
+        marker = (
+            "<!-- foundry-opt:workspace-copilot-assignment:"
+            f"issue-{issue_number}:v1 -->"
+        )
+        pages = self._api(
+            (
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                (
+                    f"{endpoint}/comments?per_page=100"
                 ),
-                "target_repo": self._repository,
-            },
-            "assignees": [_COPILOT],
-        }
+            )
+        )
+        comments = _comments(pages)
+        matches = [
+            item
+            for item in comments
+            if isinstance(item.get("body"), str)
+            and marker in item["body"]
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "workspace assignment marker is ambiguous"
+            )
+        if matches:
+            if not _same_user(matches[0].get("user"), actor):
+                raise RuntimeError(
+                    "workspace assignment marker is untrusted"
+                )
+            return False
+        body = (
+            f"{marker}\n"
+            "@copilot Continue this existing workspace pull request "
+            f"#{pull_request_number} for optimization issue "
+            f"#{issue_number}. Read and follow "
+            f"`.github/agents/{_CUSTOM_AGENT}.agent.md`. Run "
+            f"`foundry-opt workspace advance --issue {issue_number} "
+            "--json`, perform only returned candidate-work next actions, "
+            "and do not create another issue or pull request."
+        )
         response = self._api(
             (
                 "gh",
                 "api",
                 "--method",
                 "POST",
-                f"{endpoint}/assignees",
+                f"{endpoint}/comments",
                 "--input",
                 "-",
             ),
-            input_document=body,
-        )
-        assigned = (
-            response.get("assignees")
-            if isinstance(response, Mapping)
-            else None
+            input_document={"body": body},
         )
         if (
-            not isinstance(assigned, list)
-            or not any(
-                isinstance(item, Mapping)
-                and item.get("login") == _COPILOT
-                for item in assigned
-            )
+            not isinstance(response, Mapping)
+            or response.get("body") != body
+            or not _same_user(response.get("user"), actor)
         ):
             raise RuntimeError(
                 "workspace Copilot assignment was not confirmed"
@@ -147,6 +159,52 @@ class GhWorkspaceCopilotAssigner:
 def _positive(value: int, name: str) -> None:
     if type(value) is not int or value < 1:
         raise ValueError(f"{name} is invalid")
+
+
+def _trusted_user(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and isinstance(value.get("login"), str)
+        and bool(value["login"])
+        and type(value.get("id")) is int
+        and value["id"] > 0
+        and value.get("type") == "User"
+    )
+
+
+def _same_user(value: Any, expected: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("login") == expected.get("login")
+        and value.get("id") == expected.get("id")
+        and value.get("type") == expected.get("type")
+    )
+
+
+def _comments(value: Any) -> list[Mapping[str, Any]]:
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(page, list) for page in value)
+        or any(
+            not isinstance(item, Mapping)
+            for page in value
+            if isinstance(page, list)
+            for item in page
+        )
+    ):
+        raise RuntimeError(
+            "workspace assignment comments are invalid"
+        )
+    comments = [
+        item
+        for page in value
+        for item in page
+    ]
+    if len(comments) > 10_000:
+        raise RuntimeError(
+            "workspace assignment comment history is too large"
+        )
+    return comments
 
 
 __all__ = ["GhWorkspaceCopilotAssigner"]

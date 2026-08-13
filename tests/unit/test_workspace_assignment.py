@@ -47,11 +47,28 @@ def test_workspace_assignment_targets_existing_pull_request_only(
                 }
             ),
             json.dumps(
+                {"id": 123, "login": "octocat", "type": "User"}
+            ),
+            json.dumps([[]]),
+            json.dumps(
                 {
-                    "number": 104,
-                    "assignees": [
-                        {"login": "copilot-swe-agent[bot]"}
-                    ],
+                    "body": (
+                        "<!-- foundry-opt:workspace-copilot-assignment:"
+                        "issue-31:v1 -->\n"
+                        "@copilot Continue this existing workspace pull "
+                        "request #104 for optimization issue #31. Read and "
+                        "follow `.github/agents/"
+                        "foundry-optimization-steward.agent.md`. Run "
+                        "`foundry-opt workspace advance --issue 31 "
+                        "--json`, perform only returned candidate-work "
+                        "next actions, and do not create another issue or "
+                        "pull request."
+                    ),
+                    "user": {
+                        "id": 123,
+                        "login": "octocat",
+                        "type": "User",
+                    },
                 }
             ),
         ]
@@ -65,7 +82,7 @@ def test_workspace_assignment_targets_existing_pull_request_only(
     ).assign(issue_number=31, pull_request_number=104)
 
     assert assigned is True
-    assert len(commands.calls) == 2
+    assert len(commands.calls) == 4
     assert commands.calls[0][0] == (
         "gh",
         "api",
@@ -74,24 +91,34 @@ def test_workspace_assignment_targets_existing_pull_request_only(
     assert commands.calls[1][0] == (
         "gh",
         "api",
+        "user",
+    )
+    assert commands.calls[2][0] == (
+        "gh",
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/octo-org/optimizer/issues/104/comments?per_page=100",
+    )
+    assert commands.calls[3][0] == (
+        "gh",
+        "api",
         "--method",
         "POST",
-        "repos/octo-org/optimizer/issues/104/assignees",
+        "repos/octo-org/optimizer/issues/104/comments",
         "--input",
         "-",
     )
-    assert commands.calls[0][1] == {"GH_TOKEN": "assignment-token"}
-    assert commands.calls[1][1] == {"GH_TOKEN": "assignment-token"}
-    body = json.loads(commands.calls[1][2])
-    assert body["assignees"] == ["copilot-swe-agent[bot]"]
-    assert body["agent_assignment"]["custom_agent"] == (
-        "foundry-optimization-steward"
+    assert all(
+        environment == {"GH_TOKEN": "assignment-token"}
+        for _, environment, _ in commands.calls
     )
-    assert "pull request #104" in body["agent_assignment"][
-        "custom_instructions"
-    ]
-    assert "issue #31" in body["agent_assignment"]["custom_instructions"]
-    assert "assignment-token" not in commands.calls[1][2]
+    body = json.loads(commands.calls[3][2])["body"]
+    assert "@copilot" in body
+    assert "pull request #104" in body
+    assert "issue #31" in body
+    assert "foundry-optimization-steward.agent.md" in body
+    assert "assignment-token" not in body
 
 
 def test_workspace_assignment_is_noop_while_already_assigned(
@@ -104,11 +131,28 @@ def test_workspace_assignment_is_noop_while_already_assigned(
                     "number": 104,
                     "state": "open",
                     "pull_request": {"url": "https://example.invalid/pr/104"},
-                    "assignees": [
-                        {"login": "copilot-swe-agent[bot]"}
-                    ],
+                    "assignees": [],
                 }
-            )
+            ),
+            json.dumps(
+                {"id": 123, "login": "octocat", "type": "User"}
+            ),
+            json.dumps(
+                [[
+                    {
+                        "body": (
+                            "<!-- foundry-opt:"
+                            "workspace-copilot-assignment:"
+                            "issue-31:v1 -->"
+                        ),
+                        "user": {
+                            "id": 123,
+                            "login": "octocat",
+                            "type": "User",
+                        },
+                    }
+                ]]
+            ),
         ]
     )
 
@@ -120,4 +164,4 @@ def test_workspace_assignment_is_noop_while_already_assigned(
     ).assign(issue_number=31, pull_request_number=104)
 
     assert assigned is False
-    assert len(commands.calls) == 1
+    assert len(commands.calls) == 3
