@@ -486,8 +486,8 @@ Own exactly one persistent draft workspace pull request. Advance it only with:
 
 Read the returned durable workspace state and `next_action`. Perform only the
 listed action and compare bounded candidates internally through the candidate
-work contract; never create another review surface. Update the same pull
-request only when trusted finalization supplies the selected exact patch.
+work contract; never create another review surface. Update the same pull request
+only when trusted finalization supplies the selected exact patch.
 
 When `next_action.kind` is `run_candidate_experiments`, execute exactly one
 candidate from `next_action.candidate_work`. Treat its target, base commit,
