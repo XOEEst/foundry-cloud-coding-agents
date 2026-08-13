@@ -292,6 +292,18 @@ def build_production_workspace(
 ) -> OptimizationWorkspace:
     runner = commands or SubprocessCommandRunner()
     store = GitWorkspaceStore(repository_root)
+    if _trusted_copilot_repository_context() is not None:
+        from foundry_opt.orchestration.workspace_runtime import (
+            PlanningWorkspacePullRequests,
+        )
+
+        pull_requests = PlanningWorkspacePullRequests()
+    else:
+        pull_requests = GhWorkspacePullRequests(
+            runner,
+            repository=repository,
+            base_branch=base_branch,
+        )
     candidate_coordinator = None
     configured = (
         candidate_count,
@@ -316,11 +328,7 @@ def build_production_workspace(
         )
     return OptimizationWorkspace(
         store=store,
-        pull_requests=GhWorkspacePullRequests(
-            runner,
-            repository=repository,
-            base_branch=base_branch,
-        ),
+        pull_requests=pull_requests,
         candidate_coordinator=candidate_coordinator,
     )
 
@@ -692,6 +700,8 @@ class ProductionWorkspaceService:
         repository: str,
         result: WorkspaceResult,
     ) -> None:
+        if _trusted_copilot_repository_context() is not None:
+            return
         intent = result.issue_status_projection_intent
         if intent is None:
             return
@@ -1123,6 +1133,23 @@ class ProductionWorkspaceService:
                 root,
             )
         except CommandError as error:
+            copilot = _trusted_copilot_repository_context()
+            snapshot = GitWorkspaceStore(root).load(issue_number)
+            if (
+                copilot is not None
+                and snapshot is not None
+                and snapshot.specification is not None
+            ):
+                return {
+                    "title": (
+                        f"[Optimize] Persisted workspace issue "
+                        f"#{issue_number}"
+                    ),
+                    "body": (
+                        "Immutable specification already persisted by "
+                        "trusted issue intake."
+                    ),
+                }
             raise ProductionWorkspaceError(
                 "workspace issue is unavailable"
             ) from error
@@ -1150,6 +1177,18 @@ class ProductionWorkspaceService:
         repository: str,
         issue_number: int,
     ) -> tuple[int, str] | None:
+        copilot = _trusted_copilot_repository_context()
+        if copilot is not None:
+            snapshot = GitWorkspaceStore(root).load(issue_number)
+            if (
+                snapshot is not None
+                and snapshot.specification is not None
+                and snapshot.workspace_pull_request_number is not None
+            ):
+                return (
+                    snapshot.workspace_pull_request_number,
+                    snapshot.specification.base_commit,
+                )
         branch = f"foundry-opt/workspace/issue-{issue_number}"
         commands = (
             (

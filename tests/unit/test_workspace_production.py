@@ -30,6 +30,9 @@ from foundry_opt.orchestration import (
     build_production_workspace,
 )
 from foundry_opt.orchestration.workspace_github import GhWorkspacePullRequests
+from foundry_opt.orchestration.workspace_runtime import (
+    PlanningWorkspacePullRequests,
+)
 from foundry_opt.orchestration.workspace_execution_production import (
     LiveWorkspaceExperimentAdapter,
 )
@@ -38,6 +41,7 @@ from foundry_opt.orchestration.workspace_production import (
     ProductionWorkspaceService,
     build_production_workspace_service,
 )
+from foundry_opt.adapters.commands import CommandExitError
 from foundry_opt.preflight.interfaces import CommandResult
 
 
@@ -60,6 +64,17 @@ class FakeCommands:
         if command not in self.responses:
             raise AssertionError(f"unexpected command: {command}")
         return CommandResult(0, self.responses[command], "")
+
+
+class FailingCommands:
+    def run(self, arguments, **kwargs):
+        del kwargs
+        raise CommandExitError(
+            arguments,
+            exit_code=1,
+            stdout="",
+            stderr="blocked",
+        )
 
 
 def test_production_builder_uses_git_state_and_gh_pull_requests(
@@ -125,6 +140,62 @@ def test_repository_context_uses_verified_copilot_proxy_metadata(
     assert context.default_branch == "main"
     assert repository_id == 12345
     assert commands.calls == []
+
+
+def test_copilot_proxy_continuation_uses_persisted_workspace_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    values = {
+        "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
+        "COPILOT_AGENT_START_TIME_SEC": "1786600000",
+        "COPILOT_AGENT_TIMEOUT_MIN": "59",
+        "COPILOT_AGENT_SESSION_ID": "session-123456789",
+        "FOUNDRY_OPT_COPILOT_GIT_PROXY": "1",
+        "FOUNDRY_OPT_REPOSITORY": "octo-org/optimizer",
+        "FOUNDRY_OPT_REPOSITORY_ID": "12345",
+        "FOUNDRY_OPT_DEFAULT_BRANCH": "main",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    store = InMemoryWorkspaceStore()
+    store.commit(
+        expected_revision=None,
+        update=WorkspaceUpdate(
+            issue_number=31,
+            phase=WorkspacePhase.EVALUATING,
+            workspace_pull_request_number=104,
+            semantic_event="baseline_completed",
+            specification=_trusted_specification(),
+            baseline=_trusted_baseline(),
+        ),
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceStore",
+        lambda root: store,
+    )
+    service = ProductionWorkspaceService(commands=FailingCommands())
+
+    issue = service._issue(tmp_path, "octo-org/optimizer", 31)
+    existing = service._existing_workspace_pull_request(
+        tmp_path,
+        "octo-org/optimizer",
+        31,
+    )
+    workspace = build_production_workspace(
+        tmp_path,
+        repository="octo-org/optimizer",
+        base_branch="main",
+        commands=FailingCommands(),
+    )
+
+    assert issue["title"] == "[Optimize] Persisted workspace issue #31"
+    assert existing == (104, "b" * 40)
+    assert isinstance(
+        workspace._pull_requests,
+        PlanningWorkspacePullRequests,
+    )
 
 
 def test_actions_workspace_service_executes_live_operations_directly(
