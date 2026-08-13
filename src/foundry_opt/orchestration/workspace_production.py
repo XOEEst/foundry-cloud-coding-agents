@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -115,6 +116,13 @@ _COMMIT = re.compile(r"^[0-9a-fA-F]{40}$")
 _REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
+)
+_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@+-]{0,199}$")
+_COPILOT_MARKERS = (
+    "COPILOT_AGENT_SOURCE_ENVIRONMENT",
+    "COPILOT_AGENT_START_TIME_SEC",
+    "COPILOT_AGENT_TIMEOUT_MIN",
+    "COPILOT_AGENT_SESSION_ID",
 )
 
 
@@ -232,6 +240,40 @@ class WorkspaceCopilotAssignmentResult:
 class _RepositoryContext:
     repository: str
     default_branch: str
+
+
+def _trusted_copilot_repository_context() -> (
+    tuple[_RepositoryContext, int] | None
+):
+    if os.environ.get("FOUNDRY_OPT_COPILOT_GIT_PROXY") != "1":
+        return None
+    markers = tuple(os.environ.get(name, "") for name in _COPILOT_MARKERS)
+    if (
+        any(not value for value in markers)
+        or not markers[1].isdigit()
+        or not markers[2].isdigit()
+        or len(markers[3]) < 16
+    ):
+        return None
+    repository = os.environ.get("FOUNDRY_OPT_REPOSITORY", "")
+    repository_id = os.environ.get("FOUNDRY_OPT_REPOSITORY_ID", "")
+    default_branch = os.environ.get("FOUNDRY_OPT_DEFAULT_BRANCH", "")
+    if (
+        _REPOSITORY.fullmatch(repository) is None
+        or not repository_id.isdigit()
+        or int(repository_id) < 1
+        or _BRANCH.fullmatch(default_branch) is None
+        or ".." in default_branch
+        or "//" in default_branch
+        or default_branch.endswith("/")
+    ):
+        raise ProductionWorkspaceError(
+            "trusted Copilot repository context is invalid"
+        )
+    return (
+        _RepositoryContext(repository, default_branch),
+        int(repository_id),
+    )
 
 
 WorkspaceFactory = Callable[..., OptimizationWorkspace]
@@ -984,6 +1026,9 @@ class ProductionWorkspaceService:
         )
 
     def _repository_context(self, root: Path) -> _RepositoryContext:
+        copilot = _trusted_copilot_repository_context()
+        if copilot is not None:
+            return copilot[0]
         try:
             remote = self._commands.run(
                 ("git", "remote", "get-url", "origin"),
@@ -1028,6 +1073,14 @@ class ProductionWorkspaceService:
         return _RepositoryContext(repository, default_branch)
 
     def _repository_id(self, root: Path, repository: str) -> int:
+        copilot = _trusted_copilot_repository_context()
+        if copilot is not None:
+            context, repository_id = copilot
+            if context.repository.casefold() != repository.casefold():
+                raise ProductionWorkspaceError(
+                    "workspace repository ID context changed"
+                )
+            return repository_id
         try:
             value = self._commands.run(
                 (

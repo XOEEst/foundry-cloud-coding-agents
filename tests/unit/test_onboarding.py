@@ -308,14 +308,27 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         step
         for step in workflow_document["jobs"]["copilot-setup-steps"]["steps"]
         if step.get("name")
-        == "Export non-secret Foundry Copilot Git proxy marker"
+        == "Export non-secret Foundry Copilot repository context"
     )
     assert marker_step == {
-        "name": "Export non-secret Foundry Copilot Git proxy marker",
+        "name": "Export non-secret Foundry Copilot repository context",
+        "env": {
+            "FOUNDRY_OPT_REPOSITORY": "${{ github.repository }}",
+            "FOUNDRY_OPT_REPOSITORY_ID": "${{ github.repository_id }}",
+            "FOUNDRY_OPT_DEFAULT_BRANCH": (
+                "${{ github.event.repository.default_branch }}"
+            ),
+        },
         "shell": "bash",
         "run": (
             "printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' "
-            '>> "$GITHUB_ENV"'
+            '>> "$GITHUB_ENV"\n'
+            "printf '%s=%s\\n' FOUNDRY_OPT_REPOSITORY "
+            '"$FOUNDRY_OPT_REPOSITORY" >> "$GITHUB_ENV"\n'
+            "printf '%s=%s\\n' FOUNDRY_OPT_REPOSITORY_ID "
+            '"$FOUNDRY_OPT_REPOSITORY_ID" >> "$GITHUB_ENV"\n'
+            "printf '%s=%s\\n' FOUNDRY_OPT_DEFAULT_BRANCH "
+            '"$FOUNDRY_OPT_DEFAULT_BRANCH" >> "$GITHUB_ENV"\n'
         ),
     }
     assert "${{" not in marker_step["run"]
@@ -485,10 +498,22 @@ def test_generated_change_set_has_content_addressed_ownership_manifest(
     } <= set(manifest["accepted_previous_normalized_sha256"])
     workflow_path = Path(".github/workflows/copilot-setup-steps.yml")
     marker_block = (
-        "      - name: Export non-secret Foundry Copilot Git proxy marker\n"
+        "      - name: Export non-secret Foundry Copilot repository context\n"
+        "        env:\n"
+        "          FOUNDRY_OPT_REPOSITORY: ${{ github.repository }}\n"
+        "          FOUNDRY_OPT_REPOSITORY_ID: ${{ github.repository_id }}\n"
+        "          FOUNDRY_OPT_DEFAULT_BRANCH: "
+        "${{ github.event.repository.default_branch }}\n"
         "        shell: bash\n"
-        "        run: printf '%s\\n' "
-        "'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> \"$GITHUB_ENV\"\n"
+        "        run: |\n"
+        "          printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' "
+        ">> \"$GITHUB_ENV\"\n"
+        "          printf '%s=%s\\n' FOUNDRY_OPT_REPOSITORY "
+        "\"$FOUNDRY_OPT_REPOSITORY\" >> \"$GITHUB_ENV\"\n"
+        "          printf '%s=%s\\n' FOUNDRY_OPT_REPOSITORY_ID "
+        "\"$FOUNDRY_OPT_REPOSITORY_ID\" >> \"$GITHUB_ENV\"\n"
+        "          printf '%s=%s\\n' FOUNDRY_OPT_DEFAULT_BRANCH "
+        "\"$FOUNDRY_OPT_DEFAULT_BRANCH\" >> \"$GITHUB_ENV\"\n"
     )
     warmup_start = contents[workflow_path].index(
         "      - name: Verify optimizer identity and warm Azure token cache\n"

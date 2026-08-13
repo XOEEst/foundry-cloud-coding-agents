@@ -157,9 +157,17 @@ jobs:
         run: foundry-opt workspace advance --help
 """
     if export_proxy_marker:
-        workflow += """      - name: Export non-secret Foundry Copilot Git proxy marker
+        workflow += """      - name: Export non-secret Foundry Copilot repository context
+        env:
+          FOUNDRY_OPT_REPOSITORY: ${{ github.repository }}
+          FOUNDRY_OPT_REPOSITORY_ID: ${{ github.repository_id }}
+          FOUNDRY_OPT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         shell: bash
-        run: printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> "$GITHUB_ENV"
+        run: |
+          printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> "$GITHUB_ENV"
+          printf '%s=%s\\n' FOUNDRY_OPT_REPOSITORY "$FOUNDRY_OPT_REPOSITORY" >> "$GITHUB_ENV"
+          printf '%s=%s\\n' FOUNDRY_OPT_REPOSITORY_ID "$FOUNDRY_OPT_REPOSITORY_ID" >> "$GITHUB_ENV"
+          printf '%s=%s\\n' FOUNDRY_OPT_DEFAULT_BRANCH "$FOUNDRY_OPT_DEFAULT_BRANCH" >> "$GITHUB_ENV"
 """
     return workflow
 

@@ -96,6 +96,37 @@ def test_build_production_workspace_service_uses_real_baseline_and_experiment_bi
     assert service._baseline_request_builder is not None
 
 
+def test_repository_context_uses_verified_copilot_proxy_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    values = {
+        "COPILOT_AGENT_SOURCE_ENVIRONMENT": "production",
+        "COPILOT_AGENT_START_TIME_SEC": "1786600000",
+        "COPILOT_AGENT_TIMEOUT_MIN": "59",
+        "COPILOT_AGENT_SESSION_ID": "session-123456789",
+        "FOUNDRY_OPT_COPILOT_GIT_PROXY": "1",
+        "FOUNDRY_OPT_REPOSITORY": "octo-org/optimizer",
+        "FOUNDRY_OPT_REPOSITORY_ID": "12345",
+        "FOUNDRY_OPT_DEFAULT_BRANCH": "main",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    commands = FakeCommands({})
+    service = ProductionWorkspaceService(commands=commands)
+
+    context = service._repository_context(tmp_path)
+    repository_id = service._repository_id(
+        tmp_path,
+        context.repository,
+    )
+
+    assert context.repository == "octo-org/optimizer"
+    assert context.default_branch == "main"
+    assert repository_id == 12345
+    assert commands.calls == []
+
+
 def test_actions_workspace_service_executes_live_operations_directly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
