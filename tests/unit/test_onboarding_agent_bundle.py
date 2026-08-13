@@ -390,6 +390,10 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
     assert "gh pr comment" not in text
     assert "@copilot" not in text
     assert "head -25" in text
+    assert (
+        'if [ "$TRUSTED_EVENT_NAME" = "push" ] &&'
+        in text
+    )
     assert "ref: ${{ github.event.repository.default_branch }}" in text
     assert "push:" not in text
     for forbidden in (

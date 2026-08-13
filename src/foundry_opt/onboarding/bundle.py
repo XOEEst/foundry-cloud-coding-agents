@@ -846,7 +846,8 @@ jobs:
               --repository-id "$TRUSTED_REPOSITORY_ID"
               --json
             )
-            if [ -n "$TRUSTED_STATE_REF" ]; then
+            if [ "$TRUSTED_EVENT_NAME" = "push" ] && \
+              [ -n "$TRUSTED_STATE_REF" ]; then
               args+=(--state-ref "$TRUSTED_STATE_REF")
             fi
             if [[ "$TRUSTED_WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
