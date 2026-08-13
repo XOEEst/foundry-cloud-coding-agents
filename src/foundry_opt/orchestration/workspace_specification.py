@@ -63,7 +63,7 @@ class TrustedWorkspaceSpecificationResolver:
             )
         if any(
             item.approval_gate is not ApprovalGate.POLICY
-            or item.source not in {"foundry", "builtin"}
+            or item.source not in {"foundry", "builtin", "repository"}
             for item in assets
         ):
             return WorkspaceSpecificationRecord(

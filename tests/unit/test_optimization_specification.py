@@ -1193,6 +1193,72 @@ def test_workspace_resolver_approves_existing_policy_assets_without_spec_pr(
     )
 
 
+def test_workspace_resolver_approves_existing_repository_assets(
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / ".foundry" / "datasets"
+    evaluator_root = tmp_path / ".foundry" / "evaluators"
+    dataset_root.mkdir(parents=True)
+    evaluator_root.mkdir(parents=True)
+    (dataset_root / "development.jsonl").write_text(
+        '{"input":"development"}\n',
+        encoding="utf-8",
+    )
+    (dataset_root / "validation.jsonl").write_text(
+        '{"input":"validation"}\n',
+        encoding="utf-8",
+    )
+    (evaluator_root / "quality.json").write_text(
+        '{"metric":"quality"}\n',
+        encoding="utf-8",
+    )
+    datasets = dedent(
+        """
+        - asset_id: development-data
+          source: repository
+          path: .foundry/datasets/development.jsonl
+          role: development
+        - asset_id: validation-data
+          source: repository
+          path: .foundry/datasets/validation.jsonl
+          role: validation
+        """
+    ).strip()
+    evaluators = dedent(
+        """
+        - asset_id: quality-evaluator
+          source: repository
+          path: .foundry/evaluators/quality.json
+          metrics:
+            - quality
+        """
+    ).strip()
+    config = _config(
+        allowed_dataset_sources=["repository"],
+        allowed_evaluator_sources=["repository"],
+        allow_spec_auto_approval=True,
+    )
+
+    record = TrustedWorkspaceSpecificationResolver().resolve(
+        repository_root=tmp_path,
+        repository="octo-org/optimizer",
+        base_branch="main",
+        issue=WorkspaceIssue(
+            number=31,
+            title="[Optimize] Improve support quality",
+            body=_issue_body(
+                datasets=datasets,
+                evaluators=evaluators,
+            ),
+            base_commit="b" * 40,
+        ),
+        config=config,
+    )
+
+    assert record.status == "policy_approved"
+    assert record.spec_sha256 is not None
+
+
 def test_workspace_resolver_fails_closed_for_human_gated_assets(
     tmp_path: Path,
 ) -> None:
