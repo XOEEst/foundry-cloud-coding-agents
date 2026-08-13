@@ -93,6 +93,9 @@ def test_bundle_generates_single_workspace_customer_surfaces() -> None:
     assert "one persistent draft workspace pull request" in normalized_steward
     assert "compare bounded candidates internally" in normalized_steward
     assert "Update the same pull request" in normalized_steward
+    assert "Never create another issue" in normalized_steward
+    assert "a handoff artifact" in normalized_steward
+    assert "or a second optimization pull request" in normalized_steward
     assert (
         "returned durable workspace state and `next_actions`"
         in normalized_steward

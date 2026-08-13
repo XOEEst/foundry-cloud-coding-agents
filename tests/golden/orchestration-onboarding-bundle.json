@@ -1,6 +1,6 @@
 {
   ".github/ISSUE_TEMPLATE/foundry-optimization.yml": "02d4571290388b076b589a74ba62f04697e4825203450fa691463812b156a05f",
-  ".github/agents/foundry-optimization-steward.agent.md": "a91a2d396dbe265053e536e5310e94278d8b0a1f3f17180c42f6322a71d7f996",
+  ".github/agents/foundry-optimization-steward.agent.md": "63de614f2dd0d0b598585497cb7a21d06b8fa601186e7c4ccfb3d1d05e0cef14",
   ".github/skills/foundry-agent-optimizer/ADAPTER_MAPPING.md": "f460566a9c86ec2e12685ca7f1a0a211a7ae5a8530eb19f29f99b3c5ab2b34a2",
   ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md": "1881fdea764d0fdac9e5d0cfb1917774e3cc8fdab8b4f02175df5aa958378a1d",
   ".github/skills/foundry-agent-optimizer/SKILL.md": "059a6d2539047ea4b585633f90240dd1da637af5311c36734ad95837fd1480bf",

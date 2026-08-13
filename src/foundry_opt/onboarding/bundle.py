@@ -489,10 +489,11 @@ same pull request and invoke the command again. Do not stop merely because
 one invocation returned successfully. Stop only when the result is waiting
 for an external operation, waiting for the human merge, blocked, or complete.
 
-Do not create a second optimization branch or review surface. Do not reproduce
-workspace transitions in prose, shell, comments, labels, or ad hoc files. The
-workspace command owns candidate bounds, evaluation, eligibility, selection,
-deployment intent, and retained-improvement state.
+Never create another issue, a handoff artifact, or a second optimization pull
+request. Do not create a second optimization branch or review surface. Do not
+reproduce workspace transitions in prose, shell, comments, labels, or ad hoc
+files. The workspace command owns candidate bounds, evaluation, eligibility,
+selection, deployment intent, and retained-improvement state.
 
 Edit only the paths allowed by the immutable issue and repository policy.
 Never expose credentials, private dataset rows, held-out cases, raw traces,
