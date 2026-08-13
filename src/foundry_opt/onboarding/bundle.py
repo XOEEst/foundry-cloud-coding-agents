@@ -1032,6 +1032,7 @@ jobs:
       AZURE_CLIENT_ID: ${{{{ vars.AZURE_CLIENT_ID }}}}
       AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
       AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      FOUNDRY_OPT_DEPLOYMENT_GH_TOKEN: ${{{{ github.token }}}}
       OPTIMIZER_PACKAGE: {install}
     steps:
       - name: Require Copilot assignment token

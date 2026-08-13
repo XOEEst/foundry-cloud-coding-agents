@@ -327,6 +327,7 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         "pull-requests": "write",
     }
     assert "COPILOT_ASSIGNMENT_TOKEN" in text
+    assert "FOUNDRY_OPT_DEPLOYMENT_GH_TOKEN: ${{ github.token }}" in text
     assert (
         "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
         in text

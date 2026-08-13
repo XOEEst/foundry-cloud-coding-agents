@@ -664,11 +664,17 @@ class GhWorkflowRunGateway:
         command_runner: CommandRunner,
         *,
         run_limit: int = 50,
+        dispatch_environment: Mapping[str, str] | None = None,
     ) -> None:
         if not 1 <= run_limit <= 200:
             raise ValueError("run_limit must be between 1 and 200")
         self._commands = command_runner
         self._run_limit = run_limit
+        self._dispatch_environment = (
+            dict(dispatch_environment)
+            if dispatch_environment is not None
+            else None
+        )
         self._repository: dict[Path, str] = {}
         self._default_branch: dict[Path, str] = {}
 
@@ -816,7 +822,15 @@ class GhWorkflowRunGateway:
         cwd: Path,
     ) -> str:
         try:
-            return self._commands.run(arguments, cwd=cwd).stdout
+            return self._commands.run(
+                arguments,
+                cwd=cwd,
+                environment=(
+                    self._dispatch_environment
+                    if operation == "dispatch"
+                    else None
+                ),
+            ).stdout
         except CommandError as error:
             raise OptimizationDeploymentError(
                 f"GitHub workflow operation failed: {operation}"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -762,7 +763,17 @@ class ProductionWorkspaceDeploymentExecutor(
     ) -> None:
         self._root = repository_root.expanduser().resolve(strict=True)
         self._commands = commands or SubprocessCommandRunner()
-        self._gateway = GhWorkflowRunGateway(self._commands)
+        deployment_token = os.environ.get(
+            "FOUNDRY_OPT_DEPLOYMENT_GH_TOKEN"
+        )
+        self._gateway = GhWorkflowRunGateway(
+            self._commands,
+            dispatch_environment=(
+                {"GH_TOKEN": deployment_token}
+                if deployment_token
+                else None
+            ),
+        )
 
     def execute(
         self,
