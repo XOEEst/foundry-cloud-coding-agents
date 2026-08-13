@@ -569,7 +569,7 @@ class ProductionWorkspaceCandidateSelection(
                 for item in experiments
             ],
             "issue_number": request.issue_number,
-            "schema_version": 1,
+            "schema_version": 4,
             "target": request.plan.target_name,
         }
         return self._workspace_service.complete_experiments(
