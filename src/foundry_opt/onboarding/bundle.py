@@ -678,6 +678,7 @@ jobs:
       - name: Ingest trusted event or retry the workspace
         env:
           COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          GH_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
           ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}

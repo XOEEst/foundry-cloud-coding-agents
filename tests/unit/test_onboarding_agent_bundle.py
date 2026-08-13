@@ -318,6 +318,10 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         "pull-requests": "write",
     }
     assert "COPILOT_ASSIGNMENT_TOKEN" in text
+    assert (
+        "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+        in text
+    )
     assert '"${command[@]}" advance --issue "$ISSUE" --json' in text
     assert "intake" in text
     assert '--event-path "$TRUSTED_EVENT_PATH"' in text
