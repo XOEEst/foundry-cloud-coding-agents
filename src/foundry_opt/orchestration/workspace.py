@@ -149,6 +149,63 @@ class WorkspaceCandidate:
 
 
 @dataclass(frozen=True)
+class WorkspaceCandidateProposal:
+    candidate_id: str
+    exact_patch: bytes
+    idempotency_key: str
+    experiment_reference: str
+    summary: str
+    changed_paths: tuple[str, ...]
+    validation: tuple[str, ...]
+    expected_tree: str
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            self.candidate_id,
+        ) is None:
+            raise ValueError("workspace proposal candidate is invalid")
+        if (
+            not isinstance(self.exact_patch, bytes)
+            or not self.exact_patch
+            or re.fullmatch(r"[0-9a-f]{64}", self.idempotency_key)
+            is None
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}",
+                self.experiment_reference,
+            )
+            is None
+        ):
+            raise ValueError("workspace proposal experiment is invalid")
+        if (
+            not isinstance(self.summary, str)
+            or not self.summary.strip()
+            or len(self.summary) > 4096
+            or re.fullmatch(r"[0-9a-f]{40}", self.expected_tree) is None
+        ):
+            raise ValueError("workspace proposal metadata is invalid")
+        if any(
+            not isinstance(path, str)
+            or not path
+            or path.startswith(("/", "\\"))
+            or ".." in Path(path).parts
+            for path in self.changed_paths
+        ):
+            raise ValueError("workspace proposal changed paths are invalid")
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in self.validation
+        ):
+            raise ValueError("workspace proposal validation is invalid")
+        object.__setattr__(self, "changed_paths", tuple(self.changed_paths))
+        object.__setattr__(self, "validation", tuple(self.validation))
+
+    @property
+    def patch_sha256(self) -> str:
+        return hashlib.sha256(self.exact_patch).hexdigest()
+
+
+@dataclass(frozen=True)
 class WorkspaceReportContext:
     baseline_metrics: Mapping[str, float]
     policy: EvaluationPolicy
@@ -886,6 +943,7 @@ class OptimizationWorkspace:
                     else ()
                 )
             ),
+            experiments=snapshot.experiments if snapshot is not None else (),
             lineage=snapshot.lineage if snapshot is not None else None,
         )
 

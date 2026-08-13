@@ -16,6 +16,7 @@ from foundry_opt.orchestration import (
     WorkspaceCompletedError,
     WorkspaceConflictError,
     WorkspaceCorruptionError,
+    WorkspaceExperimentRecord,
     WorkspaceMigrationRequiredError,
     WorkspaceLineage,
     WorkspacePhase,
@@ -108,6 +109,23 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
             ),
             selected_patch=patch,
             external_operation_ids=("evalrun-123",),
+            experiments=(
+                WorkspaceExperimentRecord(
+                    candidate_id="candidate-1",
+                    patch_sha256=hashlib.sha256(patch).hexdigest(),
+                    bundle_sha256="d" * 64,
+                    evidence_sha256="c" * 64,
+                    idempotency_key="1" * 64,
+                    operation_sha256="2" * 64,
+                    status="completed",
+                    executor="direct_oidc",
+                    draft_id="draft-1",
+                    evaluation_id="evaluation-1",
+                    run_id="run-1",
+                    metrics={"policy_coverage": 0.5},
+                    guardrails={"safety": "pass"},
+                ),
+            ),
             lineage=lineage,
         ),
     )
@@ -138,6 +156,10 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
         + "\n"
     ).encode()
     assert snapshot["state"]["lineage"]["spec_sha256"] == "a" * 64
+    assert snapshot["state"]["experiments"][0]["status"] == "completed"
+    assert snapshot["state"]["experiments"][0]["metrics"] == {
+        "policy_coverage": 0.5
+    }
     journal = _run(
         ("git", "show", f"{second.revision}:journal.jsonl"),
         repository,

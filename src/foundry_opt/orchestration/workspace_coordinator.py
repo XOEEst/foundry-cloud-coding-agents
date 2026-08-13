@@ -9,7 +9,6 @@ from typing import Protocol
 
 from foundry_opt.adapters.commands import CommandError
 from foundry_opt.orchestration.candidate_experiments import (
-    CandidateExperimentAdapter,
     CandidateExperimentResult,
 )
 from foundry_opt.orchestration.candidate_search import CandidateSearchSummary
@@ -476,7 +475,6 @@ class WorkspaceCandidateCoordinator:
         self,
         *,
         store: WorkspaceStore,
-        runner: CandidateExperimentAdapter,
         selector: TrustedWorkspaceSelector,
         exact_publisher: WorkspaceExactBranchPublisher,
         candidate_count: int,
@@ -490,7 +488,6 @@ class WorkspaceCandidateCoordinator:
         ):
             raise ValueError("candidate_count must be between 1 and 32")
         self._store = store
-        self._runner = runner
         self._selector = selector
         self._exact_publisher = exact_publisher
         self._candidate_count = candidate_count
@@ -535,6 +532,7 @@ class WorkspaceCandidateCoordinator:
                     external_operation_ids=(
                         snapshot.external_operation_ids
                     ),
+                    experiments=snapshot.experiments,
                     lineage=snapshot.lineage,
                 ),
             )
@@ -684,6 +682,7 @@ class WorkspaceCandidateCoordinator:
                     candidates=compact,
                     selected_patch=selected.exact_patch,
                     external_operation_ids=external_ids,
+                    experiments=snapshot.experiments,
                     lineage=lineage,
                 ),
             )
@@ -735,63 +734,57 @@ class WorkspaceCandidateCoordinator:
         snapshot: WorkspaceSnapshot,
         pull_request: WorkspacePullRequest,
     ) -> tuple[tuple[CandidateSearchSummary, ...], WorkspaceSnapshot]:
-        completed = {item.candidate_id: item for item in snapshot.candidates}
+        del pull_request
+        records = {
+            item.candidate_id: item for item in snapshot.experiments
+        }
+        if (
+            len(records) != self._candidate_count
+            or set(records)
+            != {
+                item.experiment.candidate_id for item in candidates
+            }
+        ):
+            raise ValueError(
+                "workspace requires all configured trusted experiments"
+            )
         summaries: list[CandidateSearchSummary] = []
         for candidate in candidates:
             candidate_id = candidate.experiment.candidate_id
             prepared = candidate.experiment_result
-            existing = completed.get(candidate_id)
-            if existing is None:
-                result = self._runner.evaluate(candidate.experiment)
-                if result != prepared:
-                    raise ValueError(
-                        "workspace experiment result changed prepared lineage"
-                    )
-                operation_ids = _experiment_operation_ids(
-                    candidate_id,
-                    result,
-                )
-                if set(operation_ids) & set(
-                    snapshot.external_operation_ids
-                ):
-                    raise ValueError(
-                        "workspace candidate operation IDs must be unique"
-                    )
-                partial = (
-                    *snapshot.candidates,
-                    CandidateSummary(
-                        candidate_id=candidate_id,
-                        metrics=result.metrics,
-                        eligible=False,
-                        selected=False,
-                    ),
-                )
-                snapshot = self._store.commit(
-                    expected_revision=snapshot.revision,
-                    update=WorkspaceUpdate(
-                        issue_number=request.issue.number,
-                        phase=WorkspacePhase.EVALUATING,
-                        workspace_pull_request_number=pull_request.number,
-                        semantic_event=(
-                            f"candidate_experiment_completed_{candidate_id}"
-                        ),
-                        candidates=partial,
-                        selected_patch=snapshot.selected_patch,
-                        external_operation_ids=(
-                            *snapshot.external_operation_ids,
-                            *operation_ids,
-                        ),
-                        lineage=snapshot.lineage,
-                    ),
-                )
-                completed[candidate_id] = partial[-1]
-            elif existing.metrics != prepared.metrics:
+            record = records[candidate_id]
+            if record.status != "completed":
                 raise ValueError(
-                    "workspace persisted experiment result changed"
+                    "workspace trusted experiment is still pending"
                 )
-            expected_ids = set(
-                _experiment_operation_ids(candidate_id, prepared)
+            trusted = CandidateExperimentResult(
+                candidate_id=record.candidate_id,
+                executor=record.executor or "",
+                metrics=record.metrics,
+                guardrails=record.guardrails,
+                draft_id=record.draft_id or "",
+                evaluation_id=record.evaluation_id or "",
+                run_id=record.run_id or "",
+                bundle_sha256=record.bundle_sha256,
+                evidence_sha256=record.evidence_sha256,
+                operation_sha256=record.operation_sha256,
+                idempotency_key=record.idempotency_key,
             )
+            if (
+                candidate.experiment.patch_sha256
+                != record.patch_sha256
+                or candidate.experiment.bundle_sha256
+                != record.bundle_sha256
+                or candidate.experiment.evidence_sha256
+                != record.evidence_sha256
+                or candidate.experiment.idempotency_key
+                != record.idempotency_key
+                or prepared != trusted
+            ):
+                raise ValueError(
+                    "workspace proposal changed trusted experiment lineage"
+                )
+            expected_ids = set(_experiment_operation_ids(candidate_id, trusted))
             if not expected_ids <= set(snapshot.external_operation_ids):
                 raise ValueError(
                     "workspace persisted experiment lineage is incomplete"
@@ -800,12 +793,12 @@ class WorkspaceCandidateCoordinator:
                 CandidateSearchSummary(
                     candidate_id=candidate_id,
                     patch_sha256=candidate.experiment.patch_sha256,
-                    bundle_sha256=prepared.bundle_sha256,
-                    evidence_sha256=prepared.evidence_sha256,
+                    bundle_sha256=record.bundle_sha256,
+                    evidence_sha256=record.evidence_sha256,
                     idempotency_key=candidate.experiment.idempotency_key,
-                    executor=prepared.executor,
-                    metrics=prepared.metrics,
-                    guardrails=prepared.guardrails,
+                    executor=trusted.executor,
+                    metrics=trusted.metrics,
+                    guardrails=trusted.guardrails,
                 )
             )
         return tuple(summaries), snapshot

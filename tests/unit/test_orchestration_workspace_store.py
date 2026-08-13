@@ -3,6 +3,7 @@ import hashlib
 from foundry_opt.orchestration import (
     CandidateSummary,
     InMemoryWorkspaceStore,
+    WorkspaceExperimentRecord,
     WorkspaceLineage,
     WorkspacePhase,
     WorkspaceUpdate,
@@ -31,6 +32,25 @@ def test_finalize_retains_only_the_minimal_audit_bundle() -> None:
             external_operation_ids=(
                 "evalrun-123",
                 "deployment-run-456",
+            ),
+            experiments=(
+                WorkspaceExperimentRecord(
+                    candidate_id="candidate-1",
+                    patch_sha256=hashlib.sha256(
+                        b"diff --git a/agent.py b/agent.py\n"
+                    ).hexdigest(),
+                    bundle_sha256="e" * 64,
+                    evidence_sha256="d" * 64,
+                    idempotency_key="1" * 64,
+                    operation_sha256="2" * 64,
+                    status="completed",
+                    executor="direct_oidc",
+                    draft_id="draft-1",
+                    evaluation_id="evaluation-1",
+                    run_id="run-1",
+                    metrics={"policy_coverage": 0.5},
+                    guardrails={"safety": "pass"},
+                ),
             ),
             lineage=WorkspaceLineage(
                 spec_sha256="a" * 64,
@@ -63,6 +83,7 @@ def test_finalize_retains_only_the_minimal_audit_bundle() -> None:
         "evalrun-123",
         "deployment-run-456",
     )
+    assert audit.experiments == snapshot.experiments
     assert audit.lineage == snapshot.lineage
     assert audit.retained_paths == (
         "snapshot.json",

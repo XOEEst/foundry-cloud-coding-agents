@@ -124,6 +124,8 @@ def test_workspace_help_exposes_production_lifecycle_commands() -> None:
     assert completed.exit_code == 0
     assert "advance" in completed.stdout
     assert "intake" in completed.stdout
+    assert "experiment" in completed.stdout
+    assert "experiment-result" in completed.stdout
     assert "experiments-complete" in completed.stdout
     assert "operation-complete" in completed.stdout
     assert "verify" in completed.stdout
@@ -176,6 +178,123 @@ def test_workspace_experiments_complete_ingests_manifest(
 
     assert completed.exit_code == 0
     assert json.loads(completed.stdout) == _result().to_dict()
+
+
+def test_workspace_experiment_executes_untrusted_candidate_manifest(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    manifest = tmp_path / "candidate.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "issue_number": 31,
+                "target": "support-agent",
+                "base_commit": "a" * 40,
+                "candidate": {"candidate_id": "candidate-1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Result:
+        candidate_id = "candidate-1"
+        status = "completed"
+        next_action = "experiments_complete"
+
+        def to_dict(self):
+            return {
+                "candidate_id": self.candidate_id,
+                "status": self.status,
+                "next_action": self.next_action,
+            }
+
+    class Service:
+        def execute_experiment(self, payload, *, repository_root):
+            assert payload["candidate"] == {
+                "candidate_id": "candidate-1"
+            }
+            assert repository_root == tmp_path
+            return Result()
+
+    monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "experiment",
+            "--issue",
+            "31",
+            "--candidate-manifest",
+            str(manifest),
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["status"] == "completed"
+
+
+def test_workspace_experiment_result_uses_trusted_context(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result_path = tmp_path / "experiment-result.json"
+    result_path.write_text(
+        json.dumps({"schema_version": 1, "issue_number": 31}),
+        encoding="utf-8",
+    )
+
+    class Result:
+        candidate_id = "candidate-1"
+        status = "completed"
+
+        def to_dict(self):
+            return {
+                "candidate_id": self.candidate_id,
+                "status": self.status,
+            }
+
+    class Service:
+        def ingest_experiment_result(
+            self,
+            payload,
+            context,
+            *,
+            repository_root,
+        ):
+            assert payload["issue_number"] == 31
+            assert context.delivery_id == "delivery-123"
+            assert context.repository == "octo-org/optimizer"
+            assert context.repository_id == 123
+            assert repository_root == tmp_path
+            return Result()
+
+    monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "experiment-result",
+            "--result",
+            str(result_path),
+            "--delivery-id",
+            "delivery-123",
+            "--repository",
+            "octo-org/optimizer",
+            "--repository-id",
+            "123",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["candidate_id"] == "candidate-1"
 
 
 def test_workspace_operation_complete_uses_trusted_context(

@@ -14,6 +14,7 @@ from foundry_opt.evaluation import (
     MetricPolicy,
 )
 from foundry_opt.orchestration import (
+    CandidateExperimentOperation,
     CandidateExperimentRequest,
     CandidateExperimentResult,
     GhWorkspacePullRequestFinalizer,
@@ -22,6 +23,7 @@ from foundry_opt.orchestration import (
     OptimizationWorkspace,
     WorkspaceCandidate,
     WorkspaceCandidateCoordinator,
+    WorkspaceExperimentRecord,
     WorkspaceExactPatchResult,
     WorkspaceIssue,
     WorkspaceNextActionKind,
@@ -31,6 +33,7 @@ from foundry_opt.orchestration import (
     WorkspaceRequest,
     WorkspaceSelectionDecision,
     WorkspaceTrigger,
+    WorkspaceUpdate,
 )
 from foundry_opt.adapters.commands import SubprocessCommandRunner
 from foundry_opt.orchestration.public_evidence import PullRequestProjection
@@ -59,6 +62,9 @@ def _candidate(index: int) -> WorkspaceCandidate:
         evidence_sha256=f"{index + 5:x}" * 64,
         idempotency_key=f"{index + 8:x}" * 64,
     )
+    operation_sha256 = CandidateExperimentOperation.from_request(
+        experiment
+    ).sha256
     return WorkspaceCandidate(
         experiment=experiment,
         experiment_result=CandidateExperimentResult(
@@ -71,6 +77,8 @@ def _candidate(index: int) -> WorkspaceCandidate:
             run_id=f"run-{index}",
             bundle_sha256=experiment.bundle_sha256,
             evidence_sha256=experiment.evidence_sha256,
+            operation_sha256=operation_sha256,
+            idempotency_key=experiment.idempotency_key,
         ),
         exact_patch=patch,
         summary=f"Exact summary for {candidate_id}.",
@@ -84,27 +92,87 @@ def _candidate(index: int) -> WorkspaceCandidate:
     )
 
 
-class RecordingRunner:
-    def __init__(self) -> None:
-        self.calls: list[str] = []
+def _record(
+    candidate: WorkspaceCandidate,
+    *,
+    status: str = "completed",
+) -> WorkspaceExperimentRecord:
+    result = candidate.experiment_result
+    return WorkspaceExperimentRecord(
+        candidate_id=candidate.experiment.candidate_id,
+        patch_sha256=candidate.experiment.patch_sha256,
+        bundle_sha256=candidate.experiment.bundle_sha256,
+        evidence_sha256=candidate.experiment.evidence_sha256,
+        idempotency_key=candidate.experiment.idempotency_key,
+        operation_sha256=(
+            CandidateExperimentOperation.from_request(
+                candidate.experiment
+            ).sha256
+        ),
+        status=status,
+        executor=result.executor if status == "completed" else None,
+        draft_id=result.draft_id if status == "completed" else None,
+        evaluation_id=(
+            result.evaluation_id if status == "completed" else None
+        ),
+        run_id=result.run_id if status == "completed" else None,
+        metrics=result.metrics if status == "completed" else {},
+        guardrails=result.guardrails if status == "completed" else {},
+    )
 
-    def evaluate(
-        self,
-        request: CandidateExperimentRequest,
-    ) -> CandidateExperimentResult:
-        self.calls.append(request.candidate_id)
-        index = int(request.candidate_id.rsplit("-", 1)[1])
-        return CandidateExperimentResult(
-            candidate_id=request.candidate_id,
-            executor="direct_oidc",
-            metrics={"quality": float(index)},
-            guardrails={"safety": "pass"},
-            draft_id=f"draft-{index}",
-            evaluation_id=f"evaluation-{index}",
-            run_id=f"run-{index}",
-            bundle_sha256=request.bundle_sha256,
-            evidence_sha256=request.evidence_sha256,
+
+def _seed_records(
+    store: InMemoryWorkspaceStore,
+    candidates: tuple[WorkspaceCandidate, ...],
+    *,
+    pending: str | None = None,
+) -> None:
+    snapshot = store.load(31)
+    assert snapshot is not None
+    records = tuple(
+        _record(
+            candidate,
+            status=(
+                "pending"
+                if candidate.experiment.candidate_id == pending
+                else "completed"
+            ),
         )
+        for candidate in candidates
+    )
+    external_ids = tuple(
+        value
+        for record in records
+        for value in (
+            f"experiment_operation:{record.operation_sha256}",
+            *(
+                (
+                    record.draft_id,
+                    record.evaluation_id,
+                    record.run_id,
+                    f"{record.candidate_id}:bundle:{record.bundle_sha256}",
+                    (
+                        f"{record.candidate_id}:evidence:"
+                        f"{record.evidence_sha256}"
+                    ),
+                )
+                if record.status == "completed"
+                else ()
+            ),
+        )
+        if value is not None
+    )
+    store.commit(
+        expected_revision=snapshot.revision,
+        update=WorkspaceUpdate(
+            issue_number=31,
+            phase=WorkspacePhase.EVALUATING,
+            workspace_pull_request_number=104,
+            semantic_event="trusted_experiments_recorded",
+            external_operation_ids=external_ids,
+            experiments=records,
+        ),
+    )
 
 
 class SelectSecondCandidate:
@@ -201,12 +269,10 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     tmp_path: Path,
 ) -> None:
     store = InMemoryWorkspaceStore()
-    runner = RecordingRunner()
     finalizer = RecordingFinalizer()
     publisher = RecordingExactPublisher()
     coordinator = WorkspaceCandidateCoordinator(
         store=store,
-        runner=runner,
         selector=SelectSecondCandidate(),
         exact_publisher=publisher,
         finalizer=finalizer,
@@ -224,6 +290,7 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
             workspace_pull_request=_pull_request(),
         )
     )
+    _seed_records(store, (_candidate(1), _candidate(2)))
 
     result = workspace.advance(
         WorkspaceRequest(
@@ -237,7 +304,6 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     )
 
     snapshot = store.load(31)
-    assert runner.calls == ["candidate-1", "candidate-2"]
     assert snapshot is not None
     assert snapshot.phase is WorkspacePhase.AWAITING_SELECTION
     assert [item.candidate_id for item in snapshot.candidates] == [
@@ -246,7 +312,7 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     ]
     assert [item.selected for item in snapshot.candidates] == [False, True]
     assert snapshot.selected_patch == _candidate(2).exact_patch
-    assert snapshot.external_operation_ids[:10] == (
+    assert {
         "draft-1",
         "evaluation-1",
         "run-1",
@@ -257,7 +323,7 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
         "run-2",
         f"candidate-2:bundle:{'5' * 64}",
         f"candidate-2:evidence:{'7' * 64}",
-    )
+    } <= set(snapshot.external_operation_ids)
     assert f"candidate-2:patch:{_candidate(2).experiment.patch_sha256}" in (
         snapshot.external_operation_ids
     )
@@ -313,10 +379,8 @@ def test_candidate_completion_requires_configured_count_before_evaluation(
     tmp_path: Path,
 ) -> None:
     store = InMemoryWorkspaceStore()
-    runner = RecordingRunner()
     coordinator = WorkspaceCandidateCoordinator(
         store=store,
-        runner=runner,
         selector=SelectSecondCandidate(),
         exact_publisher=RecordingExactPublisher(),
         finalizer=RecordingFinalizer(),
@@ -348,7 +412,6 @@ def test_candidate_completion_requires_configured_count_before_evaluation(
             )
         )
 
-    assert runner.calls == []
     assert store.load(31) == before
 
 
@@ -366,11 +429,9 @@ def test_candidate_completion_fails_closed_before_selection_without_checks(
             )
 
     store = InMemoryWorkspaceStore()
-    runner = RecordingRunner()
     finalizer = RecordingFinalizer()
     coordinator = WorkspaceCandidateCoordinator(
         store=store,
-        runner=runner,
         selector=UnsafeSelector(),
         exact_publisher=RecordingExactPublisher(),
         finalizer=finalizer,
@@ -388,6 +449,7 @@ def test_candidate_completion_fails_closed_before_selection_without_checks(
             workspace_pull_request=_pull_request(),
         )
     )
+    _seed_records(store, (_candidate(1), _candidate(2)))
 
     with pytest.raises(ValueError, match="successful trusted checks"):
         workspace.advance(
@@ -401,7 +463,6 @@ def test_candidate_completion_fails_closed_before_selection_without_checks(
             )
         )
 
-    assert runner.calls == ["candidate-1", "candidate-2"]
     assert store.load(31).phase is WorkspacePhase.EVALUATING
     assert finalizer.calls == []
 
@@ -413,7 +474,6 @@ def test_candidate_completion_never_commits_or_readies_unverified_tree(
     finalizer = RecordingFinalizer()
     coordinator = WorkspaceCandidateCoordinator(
         store=store,
-        runner=RecordingRunner(),
         selector=SelectSecondCandidate(),
         exact_publisher=RecordingExactPublisher(tree="f" * 40),
         finalizer=finalizer,
@@ -431,6 +491,7 @@ def test_candidate_completion_never_commits_or_readies_unverified_tree(
             workspace_pull_request=_pull_request(),
         )
     )
+    _seed_records(store, (_candidate(1), _candidate(2)))
 
     with pytest.raises(ValueError, match="exact candidate tree"):
         workspace.advance(
@@ -448,26 +509,12 @@ def test_candidate_completion_never_commits_or_readies_unverified_tree(
     assert finalizer.calls == []
 
 
-def test_candidate_completion_resumes_partial_and_duplicates_without_rerun(
+def test_candidate_completion_waits_for_all_trusted_results_and_reconciles(
     tmp_path: Path,
 ) -> None:
-    class FailsSecondOnce(RecordingRunner):
-        def __init__(self) -> None:
-            super().__init__()
-            self.failed = False
-
-        def evaluate(self, request):
-            if request.candidate_id == "candidate-2" and not self.failed:
-                self.failed = True
-                self.calls.append(request.candidate_id)
-                raise RuntimeError("candidate pending")
-            return super().evaluate(request)
-
     store = InMemoryWorkspaceStore()
-    runner = FailsSecondOnce()
     coordinator = WorkspaceCandidateCoordinator(
         store=store,
-        runner=runner,
         selector=SelectSecondCandidate(),
         exact_publisher=RecordingExactPublisher(),
         finalizer=RecordingFinalizer(),
@@ -493,15 +540,50 @@ def test_candidate_completion_resumes_partial_and_duplicates_without_rerun(
             workspace_pull_request=_pull_request(),
         )
     )
+    _seed_records(
+        store,
+        (_candidate(1), _candidate(2)),
+        pending="candidate-2",
+    )
 
-    with pytest.raises(RuntimeError, match="pending"):
+    with pytest.raises(ValueError, match="still pending"):
         workspace.advance(request)
 
     partial = store.load(31)
     assert partial.phase is WorkspacePhase.EVALUATING
-    assert [item.candidate_id for item in partial.candidates] == [
-        "candidate-1"
-    ]
+    assert partial.candidates == ()
+    completed_record = _record(_candidate(2))
+    store.commit(
+        expected_revision=partial.revision,
+        update=WorkspaceUpdate(
+            issue_number=31,
+            phase=WorkspacePhase.EVALUATING,
+            workspace_pull_request_number=104,
+            semantic_event="trusted_result_ingested",
+            external_operation_ids=tuple(
+                dict.fromkeys(
+                    (
+                        *partial.external_operation_ids,
+                        completed_record.draft_id,
+                        completed_record.evaluation_id,
+                        completed_record.run_id,
+                        (
+                            f"candidate-2:bundle:"
+                            f"{completed_record.bundle_sha256}"
+                        ),
+                        (
+                            f"candidate-2:evidence:"
+                            f"{completed_record.evidence_sha256}"
+                        ),
+                    )
+                )
+            ),
+            experiments=(
+                partial.experiments[0],
+                completed_record,
+            ),
+        ),
+    )
 
     completed = workspace.advance(request)
     completed_snapshot = store.load(31)
@@ -509,7 +591,6 @@ def test_candidate_completion_resumes_partial_and_duplicates_without_rerun(
     completed_lineage = completed_snapshot.lineage
     duplicate = workspace.advance(request)
 
-    assert runner.calls == ["candidate-1", "candidate-2", "candidate-2"]
     assert completed.recorded is True
     assert duplicate.recorded is False
     assert store.load(31).revision == completed_revision

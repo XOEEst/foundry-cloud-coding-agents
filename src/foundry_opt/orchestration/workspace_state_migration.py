@@ -708,6 +708,7 @@ def _transition_document(update: WorkspaceUpdate) -> dict[str, Any]:
             for item in update.candidates
         ],
         "external_operation_ids": list(update.external_operation_ids),
+        "experiments": [],
         "issue_number": update.issue_number,
         "lineage": (
             {

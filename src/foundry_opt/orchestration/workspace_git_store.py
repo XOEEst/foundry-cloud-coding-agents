@@ -28,6 +28,7 @@ from foundry_opt.orchestration.workspace_state_migration import (
 from foundry_opt.orchestration.workspace_store import (
     AuditBundle,
     CandidateSummary,
+    WorkspaceExperimentRecord,
     WorkspaceLineage,
     WorkspaceSnapshot,
     WorkspaceUpdate,
@@ -156,6 +157,11 @@ class GitWorkspaceStore:
                 raise WorkspaceConflictError(
                     "workspace lineage changed"
                 )
+            _validate_experiment_transition(
+                current_snapshot.experiments,
+                update.experiments,
+                WorkspaceConflictError,
+            )
         candidates_content = (
             _canonical_json(_candidates_to_document(update.candidates))
             if update.candidates
@@ -227,6 +233,7 @@ class GitWorkspaceStore:
             candidates=update.candidates,
             selected_patch=update.selected_patch,
             external_operation_ids=update.external_operation_ids,
+            experiments=update.experiments,
             lineage=update.lineage,
         )
 
@@ -317,6 +324,7 @@ class GitWorkspaceStore:
             candidates=snapshot.candidates,
             selected_patch=snapshot.selected_patch,
             external_operation_ids=snapshot.external_operation_ids,
+            experiments=snapshot.experiments,
             lineage=snapshot.lineage,
             retained_paths=tuple(retained_paths),
         )
@@ -400,6 +408,7 @@ class GitWorkspaceStore:
             candidates=final_update.candidates,
             selected_patch=final_update.selected_patch,
             external_operation_ids=final_update.external_operation_ids,
+            experiments=final_update.experiments,
             lineage=final_update.lineage,
         )
 
@@ -554,6 +563,9 @@ class GitWorkspaceStore:
                 selected_patch=selected_patch,
                 external_operation_ids=tuple(
                     state_document["external_operation_ids"]
+                ),
+                experiments=_experiments_from_document(
+                    state_document["experiments"]
                 ),
                 lineage=lineage,
             ),
@@ -807,6 +819,7 @@ class GitWorkspaceStore:
 _STATE_KEYS = (
     "candidates_sha256",
     "external_operation_ids",
+    "experiments",
     "issue_number",
     "lineage",
     "phase",
@@ -824,6 +837,10 @@ def _state_document(
     return {
         "candidates_sha256": candidates_sha256,
         "external_operation_ids": list(update.external_operation_ids),
+        "experiments": [
+            _experiment_to_document(item)
+            for item in update.experiments
+        ],
         "issue_number": update.issue_number,
         "lineage": _lineage_to_document(update.lineage),
         "phase": update.phase.value,
@@ -919,6 +936,10 @@ def _validate_update(update: WorkspaceUpdate) -> None:
         update.external_operation_ids,
         WorkspacePrivacyError,
     )
+    _validate_experiments(
+        update.experiments,
+        WorkspacePrivacyError,
+    )
     if update.selected_patch is not None:
         _validate_patch(update.selected_patch, WorkspacePrivacyError)
     if update.lineage is not None:
@@ -943,6 +964,10 @@ def _validate_update(update: WorkspaceUpdate) -> None:
                     "metrics": dict(item.metrics),
                 }
                 for item in update.candidates
+            ],
+            "experiments": [
+                _experiment_to_document(item)
+                for item in update.experiments
             ],
         }
     )
@@ -1125,8 +1150,124 @@ def _validate_state_document(document: Any, issue_number: int) -> None:
         tuple(external_ids),
         WorkspaceCorruptionError,
     )
+    _experiments_from_document(document["experiments"])
     _lineage_from_document(document["lineage"])
     _validate_privacy(document)
+
+
+def _experiment_to_document(
+    record: WorkspaceExperimentRecord,
+) -> dict[str, Any]:
+    return {
+        "bundle_sha256": record.bundle_sha256,
+        "candidate_id": record.candidate_id,
+        "draft_id": record.draft_id,
+        "evaluation_id": record.evaluation_id,
+        "evidence_sha256": record.evidence_sha256,
+        "executor": record.executor,
+        "guardrails": dict(record.guardrails),
+        "idempotency_key": record.idempotency_key,
+        "metrics": dict(record.metrics),
+        "operation_sha256": record.operation_sha256,
+        "patch_sha256": record.patch_sha256,
+        "run_id": record.run_id,
+        "status": record.status,
+    }
+
+
+def _experiments_from_document(
+    value: Any,
+) -> tuple[WorkspaceExperimentRecord, ...]:
+    if type(value) is not list:
+        raise WorkspaceCorruptionError(
+            "workspace experiments are invalid"
+        )
+    try:
+        records = tuple(
+            WorkspaceExperimentRecord(
+                candidate_id=item["candidate_id"],
+                patch_sha256=item["patch_sha256"],
+                bundle_sha256=item["bundle_sha256"],
+                evidence_sha256=item["evidence_sha256"],
+                idempotency_key=item["idempotency_key"],
+                operation_sha256=item["operation_sha256"],
+                status=item["status"],
+                executor=item["executor"],
+                draft_id=item["draft_id"],
+                evaluation_id=item["evaluation_id"],
+                run_id=item["run_id"],
+                metrics=item["metrics"],
+                guardrails=item["guardrails"],
+            )
+            for item in value
+            if _experiment_document(item)
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise WorkspaceCorruptionError(
+            "workspace experiment record is invalid"
+        ) from error
+    _validate_experiments(records, WorkspaceCorruptionError)
+    return records
+
+
+def _experiment_document(value: Any) -> bool:
+    _exact_keys(
+        value,
+        {
+            "bundle_sha256",
+            "candidate_id",
+            "draft_id",
+            "evaluation_id",
+            "evidence_sha256",
+            "executor",
+            "guardrails",
+            "idempotency_key",
+            "metrics",
+            "operation_sha256",
+            "patch_sha256",
+            "run_id",
+            "status",
+        },
+        "workspace experiment",
+    )
+    return True
+
+
+def _validate_experiments(
+    records: tuple[WorkspaceExperimentRecord, ...],
+    error_type: type[WorkspaceCorruptionError],
+) -> None:
+    if (
+        type(records) is not tuple
+        or any(type(item) is not WorkspaceExperimentRecord for item in records)
+        or len({item.candidate_id for item in records}) != len(records)
+        or len({item.idempotency_key for item in records}) != len(records)
+        or len({item.operation_sha256 for item in records}) != len(records)
+    ):
+        raise error_type("workspace experiment records are invalid")
+
+
+def _validate_experiment_transition(
+    previous: tuple[WorkspaceExperimentRecord, ...],
+    current: tuple[WorkspaceExperimentRecord, ...],
+    error_type: type[WorkspaceCorruptionError],
+) -> None:
+    _validate_experiments(current, error_type)
+    current_by_id = {item.candidate_id: item for item in current}
+    for prior in previous:
+        item = current_by_id.get(prior.candidate_id)
+        if item is None:
+            raise error_type("workspace experiment record was removed")
+        if prior.status == "completed" and item != prior:
+            raise error_type("completed workspace experiment changed")
+        if prior.status == "pending" and (
+            item.patch_sha256 != prior.patch_sha256
+            or item.bundle_sha256 != prior.bundle_sha256
+            or item.evidence_sha256 != prior.evidence_sha256
+            or item.idempotency_key != prior.idempotency_key
+            or item.operation_sha256 != prior.operation_sha256
+        ):
+            raise error_type("workspace experiment lineage changed")
 
 
 def _lineage_to_document(

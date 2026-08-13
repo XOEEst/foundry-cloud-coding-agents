@@ -9,7 +9,7 @@ from foundry_opt.evaluation import (
     MetricPolicy,
 )
 from foundry_opt.orchestration import (
-    PreparedCandidateResultRunner,
+    parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
 )
 
@@ -27,10 +27,23 @@ def _policy() -> EvaluationPolicy:
     )
 
 
-def _payload() -> dict:
+def _candidate() -> dict:
     patch = b"diff --git a/agent.py b/agent.py\n"
     return {
-        "schema_version": 1,
+        "candidate_id": "candidate-1",
+        "idempotency_key": "e" * 64,
+        "experiment_reference": "target:support-agent",
+        "patch_base64": base64.b64encode(patch).decode("ascii"),
+        "summary": "Improve policy coverage.",
+        "changed_paths": ["agent.py"],
+        "validation": ["pytest: passed"],
+        "expected_tree": "f" * 40,
+    }
+
+
+def _payload() -> dict:
+    return {
+        "schema_version": 2,
         "issue_number": 31,
         "target": "support-agent",
         "base_commit": "a" * 40,
@@ -40,55 +53,58 @@ def _payload() -> dict:
             "split": "development",
             "spec_sha256": "d" * 64,
         },
-        "candidates": [
-            {
-                "candidate_id": "candidate-1",
-                "idempotency_key": "e" * 64,
-                "patch_base64": base64.b64encode(patch).decode("ascii"),
-                "bundle_sha256": "b" * 64,
-                "evidence_sha256": "c" * 64,
-                "summary": "Improve policy coverage.",
-                "changed_paths": ["agent.py"],
-                "validation": ["pytest: passed"],
-                "expected_tree": "f" * 40,
-                "foundry_operations": [],
-                "result": {
-                    "executor": "actions",
-                    "metrics": {"quality": 0.9},
-                    "guardrails": {"safety": "pass"},
-                    "draft_id": "draft-1",
-                    "evaluation_id": "evaluation-1",
-                    "run_id": "run-1",
-                    "operation_sha256": "1" * 64,
-                },
-            }
-        ],
+        "candidates": [_candidate()],
     }
 
 
-def test_manifest_preserves_exact_patch_and_real_result_lineage() -> None:
+def test_manifest_contains_only_untrusted_candidate_proposal() -> None:
     manifest = parse_workspace_experiment_manifest(
         _payload(),
         policy=_policy(),
     )
-    candidate = manifest.candidates[0]
+    proposal = manifest.candidates[0]
 
-    assert candidate.experiment.patch_sha256 == hashlib.sha256(
-        candidate.exact_patch
+    assert proposal.patch_sha256 == hashlib.sha256(
+        proposal.exact_patch
     ).hexdigest()
-    assert candidate.experiment_result.bundle_sha256 == "b" * 64
-    assert candidate.experiment_result.evidence_sha256 == "c" * 64
-    assert (
-        PreparedCandidateResultRunner(manifest.candidates).evaluate(
-            candidate.experiment
-        )
-        == candidate.experiment_result
-    )
+    assert proposal.experiment_reference == "target:support-agent"
+    assert not hasattr(proposal, "experiment_result")
 
 
-def test_manifest_rejects_non_public_experiment_rows() -> None:
+@pytest.mark.parametrize(
+    "forged_field",
+    (
+        "metrics",
+        "guardrails",
+        "result",
+        "bundle_sha256",
+        "evidence_sha256",
+        "draft_id",
+        "evaluation_id",
+        "run_id",
+        "executor",
+        "required_checks",
+    ),
+)
+def test_manifest_rejects_model_supplied_result_fields(
+    forged_field: str,
+) -> None:
     payload = _payload()
-    payload["candidates"][0]["raw_rows"] = [{"prompt": "private"}]
+    payload["candidates"][0][forged_field] = {"quality": 99.0}
 
     with pytest.raises(ValueError, match="candidate fields"):
         parse_workspace_experiment_manifest(payload, policy=_policy())
+
+
+def test_single_candidate_manifest_uses_same_proposal_contract() -> None:
+    payload = {
+        "schema_version": 2,
+        "issue_number": 31,
+        "target": "support-agent",
+        "base_commit": "a" * 40,
+        "candidate": _candidate(),
+    }
+
+    manifest = parse_workspace_candidate_manifest(payload)
+
+    assert manifest.candidate.candidate_id == "candidate-1"

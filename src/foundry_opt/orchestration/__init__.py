@@ -31,6 +31,7 @@ from foundry_opt.orchestration.public_evidence import (
 from foundry_opt.orchestration.workspace import (
     OptimizationWorkspace,
     WorkspaceCandidate,
+    WorkspaceCandidateProposal,
     WorkspaceIssue,
     WorkspaceIssueStatusProjectionIntent,
     WorkspaceNextAction,
@@ -72,8 +73,9 @@ from foundry_opt.orchestration.workspace_production import (
     build_production_workspace_service,
 )
 from foundry_opt.orchestration.workspace_manifest import (
-    PreparedCandidateResultRunner,
+    WorkspaceCandidateManifest,
     WorkspaceExperimentManifest,
+    parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
 )
 from foundry_opt.orchestration.workspace_operations import (
@@ -89,12 +91,21 @@ from foundry_opt.orchestration.workspace_verifier import (
     WorkspaceVerificationResult,
     WorkspaceVerifier,
 )
+from foundry_opt.orchestration.workspace_experiments import (
+    NormalizedWorkspaceExperimentResult,
+    TrustedWorkspaceExperimentResultContext,
+    WorkspaceExperimentExecutionResult,
+    WorkspaceExperimentExecutor,
+    WorkspaceExperimentRequestBuilder,
+    normalize_workspace_experiment_result,
+)
 from foundry_opt.orchestration.workspace_store import (
     AuditBundle,
     CandidateSummary,
     InMemoryWorkspaceStore,
     WorkspaceSnapshot,
     WorkspaceLineage,
+    WorkspaceExperimentRecord,
     WorkspaceUpdate,
 )
 from foundry_opt.orchestration.workspace_runtime import WorkspaceStore
@@ -493,8 +504,10 @@ __all__ = [
     "UnresolvedSpecification",
     "WorkspaceIssue",
     "WorkspaceLineage",
+    "WorkspaceExperimentRecord",
     "WorkspaceIssueStatusProjectionIntent",
     "WorkspaceCandidate",
+    "WorkspaceCandidateProposal",
     "WorkspaceCandidateCoordinator",
     "WorkspaceCandidateCoordinatorResult",
     "WorkspaceExactBranchPublisher",
@@ -530,6 +543,11 @@ __all__ = [
     "WorkspaceVerificationCheck",
     "WorkspaceVerificationResult",
     "WorkspaceVerifier",
+    "NormalizedWorkspaceExperimentResult",
+    "TrustedWorkspaceExperimentResultContext",
+    "WorkspaceExperimentExecutionResult",
+    "WorkspaceExperimentExecutor",
+    "WorkspaceExperimentRequestBuilder",
     "NormalizedWorkspaceEvent",
     "ProductionWorkspaceError",
     "ProductionWorkspaceService",
@@ -539,7 +557,7 @@ __all__ = [
     "WorkspaceIntakeResult",
     "WorkspaceOperationIntakeResult",
     "WorkspaceExperimentManifest",
-    "PreparedCandidateResultRunner",
+    "WorkspaceCandidateManifest",
     "ConfiguredWorkspaceSelector",
     "NormalizedWorkspaceOperation",
     "TrustedWorkspaceOperationContext",
@@ -549,7 +567,9 @@ __all__ = [
     "TrustedWorkspaceSelector",
     "normalize_workspace_event",
     "normalize_workspace_operation",
+    "normalize_workspace_experiment_result",
     "parse_workspace_experiment_manifest",
+    "parse_workspace_candidate_manifest",
     "candidate_pr_body",
     "candidate_pr_marker",
     "candidate_pull_request_event_from_payload",

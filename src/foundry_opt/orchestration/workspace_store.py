@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
+from math import isfinite
 import re
 from types import MappingProxyType
 from typing import Mapping
@@ -98,6 +99,94 @@ class WorkspaceLineage:
 
 
 @dataclass(frozen=True)
+class WorkspaceExperimentRecord:
+    candidate_id: str
+    patch_sha256: str
+    bundle_sha256: str
+    evidence_sha256: str
+    idempotency_key: str
+    operation_sha256: str
+    status: str
+    executor: str | None = None
+    draft_id: str | None = None
+    evaluation_id: str | None = None
+    run_id: str | None = None
+    metrics: Mapping[str, float] = field(default_factory=dict)
+    guardrails: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+            self.candidate_id,
+        ) is None:
+            raise ValueError("workspace experiment candidate is invalid")
+        for value, name in (
+            (self.patch_sha256, "patch"),
+            (self.bundle_sha256, "bundle"),
+            (self.evidence_sha256, "evidence"),
+            (self.idempotency_key, "idempotency"),
+            (self.operation_sha256, "operation"),
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(
+                    f"workspace experiment {name} digest is invalid"
+                )
+        if self.status not in {"pending", "completed"}:
+            raise ValueError("workspace experiment status is invalid")
+        metrics = dict(self.metrics)
+        guardrails = dict(self.guardrails)
+        if any(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name)
+            is None
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not isfinite(value)
+            for name, value in metrics.items()
+        ):
+            raise ValueError("workspace experiment metrics are invalid")
+        if any(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name)
+            is None
+            or not isinstance(value, str)
+            or not value
+            or len(value) > 512
+            for name, value in guardrails.items()
+        ):
+            raise ValueError("workspace experiment guardrails are invalid")
+        completed_values = (
+            self.executor,
+            self.draft_id,
+            self.evaluation_id,
+            self.run_id,
+        )
+        if self.status == "pending":
+            if (
+                any(value is not None for value in completed_values)
+                or metrics
+                or guardrails
+            ):
+                raise ValueError(
+                    "pending workspace experiment has result fields"
+                )
+        elif (
+            any(
+                not isinstance(value, str) or not value
+                for value in completed_values
+            )
+            or not metrics
+        ):
+            raise ValueError(
+                "completed workspace experiment result is incomplete"
+            )
+        object.__setattr__(self, "metrics", MappingProxyType(metrics))
+        object.__setattr__(
+            self,
+            "guardrails",
+            MappingProxyType(guardrails),
+        )
+
+
+@dataclass(frozen=True)
 class WorkspaceUpdate:
     issue_number: int
     phase: WorkspacePhase
@@ -106,6 +195,7 @@ class WorkspaceUpdate:
     candidates: tuple[CandidateSummary, ...] = ()
     selected_patch: bytes | None = None
     external_operation_ids: tuple[str, ...] = ()
+    experiments: tuple[WorkspaceExperimentRecord, ...] = ()
     lineage: WorkspaceLineage | None = None
 
 
@@ -118,6 +208,7 @@ class WorkspaceSnapshot:
     candidates: tuple[CandidateSummary, ...]
     selected_patch: bytes | None
     external_operation_ids: tuple[str, ...]
+    experiments: tuple[WorkspaceExperimentRecord, ...]
     lineage: WorkspaceLineage | None
 
 
@@ -129,6 +220,7 @@ class AuditBundle:
     candidates: tuple[CandidateSummary, ...]
     selected_patch: bytes | None
     external_operation_ids: tuple[str, ...]
+    experiments: tuple[WorkspaceExperimentRecord, ...]
     lineage: WorkspaceLineage | None
     retained_paths: tuple[str, ...]
 
@@ -157,6 +249,10 @@ class InMemoryWorkspaceStore:
             and update.lineage != current.lineage
         ):
             raise ValueError("workspace lineage changed")
+        _validate_experiment_records(
+            update.experiments,
+            current.experiments if current is not None else (),
+        )
         _validate_lineage_update(update)
         revision = str(int(current_revision or "0") + 1)
         snapshot = WorkspaceSnapshot(
@@ -169,6 +265,7 @@ class InMemoryWorkspaceStore:
             candidates=update.candidates,
             selected_patch=update.selected_patch,
             external_operation_ids=update.external_operation_ids,
+            experiments=update.experiments,
             lineage=update.lineage,
         )
         self._snapshots[update.issue_number] = snapshot
@@ -193,6 +290,7 @@ class InMemoryWorkspaceStore:
             candidates=snapshot.candidates,
             selected_patch=snapshot.selected_patch,
             external_operation_ids=snapshot.external_operation_ids,
+            experiments=snapshot.experiments,
             lineage=snapshot.lineage,
             retained_paths=tuple(retained_paths),
         )
@@ -216,3 +314,32 @@ def _validate_lineage_update(update: WorkspaceUpdate) -> None:
         != lineage.selected_candidate_id
     ):
         raise ValueError("workspace lineage does not match state")
+
+
+def _validate_experiment_records(
+    records: tuple[WorkspaceExperimentRecord, ...],
+    previous: tuple[WorkspaceExperimentRecord, ...],
+) -> None:
+    if (
+        type(records) is not tuple
+        or any(type(item) is not WorkspaceExperimentRecord for item in records)
+        or len({item.candidate_id for item in records}) != len(records)
+        or len({item.idempotency_key for item in records}) != len(records)
+        or len({item.operation_sha256 for item in records}) != len(records)
+    ):
+        raise ValueError("workspace experiment records are invalid")
+    current_by_id = {item.candidate_id: item for item in records}
+    for prior in previous:
+        current = current_by_id.get(prior.candidate_id)
+        if current is None:
+            raise ValueError("workspace experiment record was removed")
+        if prior.status == "completed" and current != prior:
+            raise ValueError("completed workspace experiment changed")
+        if prior.status == "pending" and (
+            current.patch_sha256 != prior.patch_sha256
+            or current.bundle_sha256 != prior.bundle_sha256
+            or current.evidence_sha256 != prior.evidence_sha256
+            or current.idempotency_key != prior.idempotency_key
+            or current.operation_sha256 != prior.operation_sha256
+        ):
+            raise ValueError("workspace experiment lineage changed")

@@ -78,10 +78,6 @@ def test_production_builder_wires_candidate_coordinator(
         capture_output=True,
     )
 
-    class Runner:
-        def evaluate(self, request):
-            raise AssertionError("not evaluated while building")
-
     class Selector:
         def select(self, request):
             raise AssertionError("not selected while building")
@@ -92,7 +88,6 @@ def test_production_builder_wires_candidate_coordinator(
         base_branch="main",
         commands=FakeCommands({}),
         candidate_count=2,
-        experiment_runner=Runner(),
         selector=Selector(),
     )
 

@@ -25,10 +25,13 @@ from foundry_opt.evaluation import (
 )
 from foundry_opt.orchestration.candidate_experiments import (
     CandidateExperimentAdapter,
+    CandidateExperimentRequest,
+    CandidateExperimentResult,
 )
 from foundry_opt.orchestration.workspace import (
     OptimizationWorkspace,
     WorkspaceCandidate,
+    WorkspaceCandidateProposal,
     WorkspaceIssue,
     WorkspaceOperation,
     WorkspacePullRequest,
@@ -48,13 +51,17 @@ from foundry_opt.orchestration.workspace_github import (
     workspace_pull_request_base_commit,
 )
 from foundry_opt.orchestration.workspace_git_store import GitWorkspaceStore
+from foundry_opt.orchestration.workspace_store import (
+    WorkspaceExperimentRecord,
+)
 from foundry_opt.orchestration.workspace_intake import (
     NormalizedWorkspaceEvent,
     TrustedWorkspaceEventContext,
     normalize_workspace_event,
 )
 from foundry_opt.orchestration.workspace_manifest import (
-    PreparedCandidateResultRunner,
+    WorkspaceCandidateManifest,
+    parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
 )
 from foundry_opt.orchestration.workspace_policy import (
@@ -63,6 +70,13 @@ from foundry_opt.orchestration.workspace_policy import (
 from foundry_opt.orchestration.workspace_verifier import (
     WorkspaceVerificationResult,
     WorkspaceVerifier,
+)
+from foundry_opt.orchestration.workspace_experiments import (
+    TrustedWorkspaceExperimentResultContext,
+    WorkspaceExperimentExecutionResult,
+    WorkspaceExperimentExecutor,
+    WorkspaceExperimentRequestBuilder,
+    normalize_workspace_experiment_result,
 )
 from foundry_opt.orchestration.workspace_operations import (
     NormalizedWorkspaceOperation,
@@ -96,7 +110,6 @@ class WorkspaceAdvanceRequest:
     candidates: tuple[WorkspaceCandidate, ...] = ()
     report_context: WorkspaceReportContext | None = None
     candidate_count: int | None = None
-    experiment_runner: CandidateExperimentAdapter | None = None
     selector: TrustedWorkspaceSelector | None = None
     operation: WorkspaceOperation | None = None
 
@@ -183,7 +196,6 @@ def build_production_workspace(
     base_branch: str,
     commands: CommandRunner | None = None,
     candidate_count: int | None = None,
-    experiment_runner: CandidateExperimentAdapter | None = None,
     selector: TrustedWorkspaceSelector | None = None,
 ) -> OptimizationWorkspace:
     runner = commands or SubprocessCommandRunner()
@@ -191,7 +203,6 @@ def build_production_workspace(
     candidate_coordinator = None
     configured = (
         candidate_count,
-        experiment_runner,
         selector,
     )
     if any(item is not None for item in configured):
@@ -200,11 +211,9 @@ def build_production_workspace(
                 "workspace candidate production wiring is incomplete"
             )
         assert candidate_count is not None
-        assert experiment_runner is not None
         assert selector is not None
         candidate_coordinator = WorkspaceCandidateCoordinator(
             store=store,
-            runner=experiment_runner,
             selector=selector,
             exact_publisher=GitWorkspaceExactBranchPublisher(runner),
             candidate_count=candidate_count,
@@ -234,9 +243,15 @@ class ProductionWorkspaceService:
         *,
         commands: CommandRunner | None = None,
         workspace_factory: WorkspaceFactory = build_production_workspace,
+        experiment_runner: CandidateExperimentAdapter | None = None,
+        experiment_request_builder: (
+            WorkspaceExperimentRequestBuilder | None
+        ) = None,
     ) -> None:
         self._commands = commands or SubprocessCommandRunner()
         self._workspace_factory = workspace_factory
+        self._experiment_runner = experiment_runner
+        self._experiment_request_builder = experiment_request_builder
 
     def advance(self, request: WorkspaceAdvanceRequest) -> WorkspaceResult:
         if (
@@ -345,7 +360,6 @@ class ProductionWorkspaceService:
             base_branch=context.default_branch,
             commands=self._commands,
             candidate_count=request.candidate_count,
-            experiment_runner=request.experiment_runner,
             selector=request.selector,
         )
         return workspace.advance(
@@ -416,6 +430,16 @@ class ProductionWorkspaceService:
                 config.automation_policy.required_checks
             ),
         )
+        snapshot = GitWorkspaceStore(root).load(manifest.issue_number)
+        if snapshot is None:
+            raise ProductionWorkspaceError(
+                "workspace state is unavailable"
+            )
+        candidates = _trusted_candidates(
+            manifest.issue_number,
+            manifest.candidates,
+            snapshot.experiments,
+        )
         return self.advance(
             WorkspaceAdvanceRequest(
                 repository_root=root,
@@ -423,14 +447,82 @@ class ProductionWorkspaceService:
                 trigger=WorkspaceTrigger.EXPERIMENTS_COMPLETED,
                 base_commit=manifest.base_commit,
                 expected_repository=context.repository,
-                candidates=manifest.candidates,
+                candidates=candidates,
                 report_context=manifest.report_context,
                 candidate_count=candidate_count,
-                experiment_runner=PreparedCandidateResultRunner(
-                    manifest.candidates
-                ),
                 selector=selector,
             )
+        )
+
+    def execute_experiment(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        repository_root: Path,
+    ) -> WorkspaceExperimentExecutionResult:
+        root = repository_root.expanduser().resolve()
+        manifest = parse_workspace_candidate_manifest(payload)
+        config = load_config(
+            root / ".github" / "foundry-optimizer.yaml"
+        )
+        if manifest.target not in config.targets:
+            raise ProductionWorkspaceError(
+                "workspace candidate target is not configured"
+            )
+        context = self._repository_context(root)
+        existing = self._existing_workspace_pull_request(
+            root,
+            context.repository,
+            manifest.issue_number,
+        )
+        if existing is None or existing[1] != manifest.base_commit:
+            raise ProductionWorkspaceError(
+                "workspace candidate base does not match workspace PR"
+            )
+        if (
+            self._experiment_runner is None
+            or self._experiment_request_builder is None
+        ):
+            raise ProductionWorkspaceError(
+                "workspace experiment executor is not configured"
+            )
+        return WorkspaceExperimentExecutor(
+            store=GitWorkspaceStore(root),
+            runner=self._experiment_runner,
+            request_builder=self._experiment_request_builder,
+        ).execute(
+            repository_root=root,
+            issue_number=manifest.issue_number,
+            target=manifest.target,
+            base_commit=manifest.base_commit,
+            proposal=manifest.candidate,
+        )
+
+    def ingest_experiment_result(
+        self,
+        payload: Mapping[str, Any],
+        context: TrustedWorkspaceExperimentResultContext,
+        *,
+        repository_root: Path,
+    ) -> WorkspaceExperimentExecutionResult:
+        event = normalize_workspace_experiment_result(payload, context)
+        root = repository_root.expanduser().resolve()
+        repository = self._repository_context(root).repository
+        if repository.casefold() != event.repository.casefold():
+            raise ProductionWorkspaceError(
+                "trusted experiment repository does not match origin"
+            )
+        if self._repository_id(root, repository) != event.repository_id:
+            raise ProductionWorkspaceError(
+                "trusted experiment repository ID does not match GitHub"
+            )
+        return WorkspaceExperimentExecutor(
+            store=GitWorkspaceStore(root),
+            runner=None,
+            request_builder=None,
+        ).ingest_result(
+            issue_number=event.issue_number,
+            result=event.result,
         )
 
     def verify(
@@ -795,3 +887,61 @@ def _evaluation_policy(
             for name, value in configured.items()
         )
     )
+
+
+def _trusted_candidates(
+    issue_number: int,
+    proposals: tuple[WorkspaceCandidateProposal, ...],
+    records: tuple[WorkspaceExperimentRecord, ...],
+) -> tuple[WorkspaceCandidate, ...]:
+    by_id = {item.candidate_id: item for item in records}
+    if len(by_id) != len(proposals) or set(by_id) != {
+        item.candidate_id for item in proposals
+    }:
+        raise ProductionWorkspaceError(
+            "workspace trusted experiment set is incomplete"
+        )
+    candidates: list[WorkspaceCandidate] = []
+    for proposal in proposals:
+        record = by_id[proposal.candidate_id]
+        if (
+            record.status != "completed"
+            or record.patch_sha256 != proposal.patch_sha256
+            or record.idempotency_key != proposal.idempotency_key
+        ):
+            raise ProductionWorkspaceError(
+                "workspace proposal does not match trusted experiment"
+            )
+        request = CandidateExperimentRequest(
+            issue_number=issue_number,
+            candidate_id=record.candidate_id,
+            patch_sha256=record.patch_sha256,
+            bundle_sha256=record.bundle_sha256,
+            evidence_sha256=record.evidence_sha256,
+            idempotency_key=record.idempotency_key,
+        )
+        result = CandidateExperimentResult(
+            candidate_id=record.candidate_id,
+            executor=record.executor or "",
+            metrics=record.metrics,
+            guardrails=record.guardrails,
+            draft_id=record.draft_id or "",
+            evaluation_id=record.evaluation_id or "",
+            run_id=record.run_id or "",
+            bundle_sha256=record.bundle_sha256,
+            evidence_sha256=record.evidence_sha256,
+            operation_sha256=record.operation_sha256,
+            idempotency_key=record.idempotency_key,
+        )
+        candidates.append(
+            WorkspaceCandidate(
+                experiment=request,
+                experiment_result=result,
+                exact_patch=proposal.exact_patch,
+                summary=proposal.summary,
+                changed_paths=proposal.changed_paths,
+                validation=proposal.validation,
+                expected_tree=proposal.expected_tree,
+            )
+        )
+    return tuple(candidates)
