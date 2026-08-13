@@ -670,6 +670,8 @@ class GitWorkspaceDeploymentLoader(WorkspaceDeploymentStateLoader):
         issue_number: int,
     ) -> WorkspaceDeploymentTarget | None:
         snapshot = self._store.load(issue_number)
+        if snapshot is None:
+            snapshot = self._store.load_audit(issue_number)
         if (
             snapshot is None
             or snapshot.phase

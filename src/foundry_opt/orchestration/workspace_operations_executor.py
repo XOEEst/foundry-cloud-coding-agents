@@ -2047,17 +2047,26 @@ class WorkspaceOperationsService:
             target,
             artifact,
         )
-        deployment = self._workspace_service.advance(
-            WorkspaceAdvanceRequest(
-                repository_root=request.repository_root,
-                issue_number=request.issue_number,
-                trigger=WorkspaceTrigger.DEPLOYMENT_COMPLETED,
-                expected_repository=request.context.repository,
-                trusted_repository_id=request.context.repository_id,
-                operation=artifact.operation,
-            )
+        completed_before_reconcile = (
+            target.phase is WorkspacePhase.COMPLETED
         )
-        if deployment.phase not in {
+        if completed_before_reconcile:
+            deployment_phase = WorkspacePhase.COMPLETED
+            deployment_recorded = False
+        else:
+            deployment = self._workspace_service.advance(
+                WorkspaceAdvanceRequest(
+                    repository_root=request.repository_root,
+                    issue_number=request.issue_number,
+                    trigger=WorkspaceTrigger.DEPLOYMENT_COMPLETED,
+                    expected_repository=request.context.repository,
+                    trusted_repository_id=request.context.repository_id,
+                    operation=artifact.operation,
+                )
+            )
+            deployment_phase = deployment.phase
+            deployment_recorded = deployment.recorded
+        if deployment_phase not in {
             WorkspacePhase.RETENTION,
             WorkspacePhase.COMPLETED,
         }:
@@ -2073,8 +2082,8 @@ class WorkspaceOperationsService:
             return WorkspaceOperationsResult(
                 issue_number=request.issue_number,
                 status=WorkspaceOperationsStatus.RETENTION_PENDING,
-                recorded=deployment.recorded,
-                phase=deployment.phase,
+                recorded=deployment_recorded,
+                phase=deployment_phase,
                 operation_id=artifact.operation.operation_id,
                 workspace_pull_request_number=(
                     target.workspace_pull_request_number
@@ -2093,7 +2102,7 @@ class WorkspaceOperationsService:
                 issue_number=request.issue_number,
                 status=WorkspaceOperationsStatus.READY_FOR_HUMAN,
                 recorded=True,
-                phase=deployment.phase,
+                phase=deployment_phase,
                 operation_id=retention.operation_id,
                 workspace_pull_request_number=(
                     target.workspace_pull_request_number
@@ -2101,29 +2110,32 @@ class WorkspaceOperationsService:
                 finalization=effect,
             )
         assert retention.operation_id is not None
-        completed = self._workspace_service.advance(
-            WorkspaceAdvanceRequest(
-                repository_root=request.repository_root,
-                issue_number=request.issue_number,
-                trigger=WorkspaceTrigger.RETENTION_COMPLETED,
-                expected_repository=request.context.repository,
-                trusted_repository_id=request.context.repository_id,
-                operation=WorkspaceOperation(
+        completed_recorded = False
+        if not completed_before_reconcile:
+            completed = self._workspace_service.advance(
+                WorkspaceAdvanceRequest(
+                    repository_root=request.repository_root,
+                    issue_number=request.issue_number,
                     trigger=WorkspaceTrigger.RETENTION_COMPLETED,
-                    operation_id=retention.operation_id,
-                    workspace_pull_request_number=(
-                        target.workspace_pull_request_number
+                    expected_repository=request.context.repository,
+                    trusted_repository_id=request.context.repository_id,
+                    operation=WorkspaceOperation(
+                        trigger=WorkspaceTrigger.RETENTION_COMPLETED,
+                        operation_id=retention.operation_id,
+                        workspace_pull_request_number=(
+                            target.workspace_pull_request_number
+                        ),
+                        candidate_id=target.candidate_id,
+                        patch_sha256=target.patch_sha256,
+                        bundle_sha256=target.bundle_sha256,
+                        evidence_sha256=target.evidence_sha256,
+                        predecessor_operation_id=(
+                            artifact.operation.operation_id
+                        ),
                     ),
-                    candidate_id=target.candidate_id,
-                    patch_sha256=target.patch_sha256,
-                    bundle_sha256=target.bundle_sha256,
-                    evidence_sha256=target.evidence_sha256,
-                    predecessor_operation_id=(
-                        artifact.operation.operation_id
-                    ),
-                ),
+                )
             )
-        )
+            completed_recorded = completed.recorded
         effect = self._finalizer.complete(
             WorkspaceCompletionRequest(
                 repository_root=request.repository_root,
@@ -2135,8 +2147,8 @@ class WorkspaceOperationsService:
         return WorkspaceOperationsResult(
             issue_number=request.issue_number,
             status=WorkspaceOperationsStatus.COMPLETED,
-            recorded=completed.recorded,
-            phase=completed.phase,
+            recorded=completed_recorded,
+            phase=WorkspacePhase.COMPLETED,
             operation_id=retention.operation_id,
             workspace_pull_request_number=(
                 target.workspace_pull_request_number

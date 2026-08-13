@@ -120,6 +120,19 @@ class GitWorkspaceStore:
             return None
         return self._load_active(issue_number, revision, paths)[0]
 
+    def load_audit(self, issue_number: int) -> WorkspaceSnapshot | None:
+        _positive_integer(issue_number, "issue_number")
+        ref = _audit_ref(issue_number)
+        revision = self._remote_revision(ref)
+        if revision is None:
+            return None
+        self._fetch(ref, revision)
+        return self._load_active(
+            issue_number,
+            revision,
+            self._paths(revision),
+        )[0]
+
     def commit(
         self,
         *,

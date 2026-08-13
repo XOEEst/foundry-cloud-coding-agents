@@ -1295,12 +1295,7 @@ def test_reconcile_duplicate_completed_deployment_retries_finalization(
     tmp_path: Path,
 ) -> None:
     target = _deployment_target(phase=WorkspacePhase.COMPLETED)
-    workspace = RecordingWorkspaceService(
-        [
-            _workspace_result(WorkspacePhase.COMPLETED, recorded=False),
-            _workspace_result(WorkspacePhase.COMPLETED, recorded=False),
-        ]
-    )
+    workspace = RecordingWorkspaceService([])
     evaluator = RecordingRetentionEvaluator(
         WorkspaceRetentionOutcome(
             status=WorkspaceRetentionStatus.RETAINED_IMPROVEMENT,
@@ -1323,7 +1318,7 @@ def test_reconcile_duplicate_completed_deployment_retries_finalization(
 
     assert result.status is WorkspaceOperationsStatus.COMPLETED
     assert result.recorded is False
-    assert len(workspace.requests) == 2
+    assert not workspace.requests
     assert len(evaluator.calls) == 1
     assert len(finalizer.complete_calls) == 1
     assert not finalizer.ready_calls
