@@ -134,7 +134,14 @@ class WorkspaceBaselineExecutor:
         base_commit: str,
     ) -> WorkspaceBaselineExecutionResult:
         snapshot = self._store.load(issue_number)
-        if snapshot is None or snapshot.phase is not WorkspacePhase.SPECIFICATION:
+        if snapshot is None or (
+            snapshot.phase is not WorkspacePhase.SPECIFICATION
+            and not (
+                snapshot.phase is WorkspacePhase.EVALUATING
+                and snapshot.baseline is not None
+                and snapshot.baseline.status == "completed"
+            )
+        ):
             raise ValueError("workspace baseline state is unavailable")
         specification = snapshot.specification
         if (
@@ -227,7 +234,7 @@ class WorkspaceBaselineExecutor:
             expected_revision=snapshot.revision,
             update=WorkspaceUpdate(
                 issue_number=snapshot.issue_number,
-                phase=snapshot.phase,
+                phase=WorkspacePhase.EVALUATING,
                 workspace_pull_request_number=(
                     snapshot.workspace_pull_request_number
                 ),

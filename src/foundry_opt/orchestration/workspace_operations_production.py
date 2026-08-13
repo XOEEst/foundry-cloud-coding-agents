@@ -91,6 +91,7 @@ from foundry_opt.orchestration.workspace_production import (
 from foundry_opt.orchestration.workspace_store import (
     WorkspaceBaselineRecord,
     WorkspaceExperimentRecord,
+    WorkspaceUpdate,
 )
 from foundry_opt.preflight.interfaces import CommandRunner
 
@@ -109,7 +110,11 @@ class GitWorkspaceBaselineStore(PendingWorkspaceBaselineStore):
             snapshot is None
             or snapshot.specification is None
             or snapshot.baseline is None
-            or snapshot.baseline.status != "pending"
+            or snapshot.baseline.status not in {"pending", "completed"}
+            or (
+                snapshot.baseline.status == "completed"
+                and snapshot.phase is not WorkspacePhase.SPECIFICATION
+            )
         ):
             return None
         operation = _baseline_operation(
@@ -254,6 +259,36 @@ class ProductionWorkspaceBaselineCompletion(
         self,
         request: WorkspaceBaselineCompletionRequest,
     ):
+        store = GitWorkspaceStore(request.repository_root)
+        snapshot = store.load(request.issue_number)
+        if (
+            snapshot is not None
+            and snapshot.phase is WorkspacePhase.SPECIFICATION
+            and snapshot.baseline is not None
+            and snapshot.baseline.status == "completed"
+        ):
+            snapshot = store.commit(
+                expected_revision=snapshot.revision,
+                update=WorkspaceUpdate(
+                    issue_number=snapshot.issue_number,
+                    phase=WorkspacePhase.EVALUATING,
+                    workspace_pull_request_number=(
+                        snapshot.workspace_pull_request_number
+                    ),
+                    semantic_event=(
+                        "baseline_completion_acknowledged"
+                    ),
+                    candidates=snapshot.candidates,
+                    selected_patch=snapshot.selected_patch,
+                    external_operation_ids=(
+                        snapshot.external_operation_ids
+                    ),
+                    experiments=snapshot.experiments,
+                    lineage=snapshot.lineage,
+                    specification=snapshot.specification,
+                    baseline=snapshot.baseline,
+                ),
+            )
         return self._workspace_service.advance(
             WorkspaceAdvanceRequest(
                 repository_root=request.repository_root,
