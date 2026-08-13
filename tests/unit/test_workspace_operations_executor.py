@@ -1291,17 +1291,23 @@ def test_reconcile_regression_leaves_issue_open_ready_for_human(
     assert len(finalizer.ready_calls) == 1
 
 
-def test_reconcile_duplicate_completed_deployment_skips_re_evaluation(
+def test_reconcile_duplicate_completed_deployment_retries_finalization(
     tmp_path: Path,
 ) -> None:
     target = _deployment_target(phase=WorkspacePhase.COMPLETED)
     workspace = RecordingWorkspaceService(
-        [_workspace_result(WorkspacePhase.COMPLETED, recorded=False)]
+        [
+            _workspace_result(WorkspacePhase.COMPLETED, recorded=False),
+            _workspace_result(WorkspacePhase.COMPLETED, recorded=False),
+        ]
     )
     evaluator = RecordingRetentionEvaluator(
         WorkspaceRetentionOutcome(
             status=WorkspaceRetentionStatus.RETAINED_IMPROVEMENT,
             operation_id="retention-123",
+            baseline_metrics={"quality": 0.70},
+            selected_metrics={"quality": 0.90},
+            deployed_metrics={"quality": 0.89},
         )
     )
     finalizer = RecordingFinalizer()
@@ -1317,8 +1323,9 @@ def test_reconcile_duplicate_completed_deployment_skips_re_evaluation(
 
     assert result.status is WorkspaceOperationsStatus.COMPLETED
     assert result.recorded is False
-    assert not evaluator.calls
-    assert not finalizer.complete_calls
+    assert len(workspace.requests) == 2
+    assert len(evaluator.calls) == 1
+    assert len(finalizer.complete_calls) == 1
     assert not finalizer.ready_calls
 
 

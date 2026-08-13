@@ -2057,18 +2057,10 @@ class WorkspaceOperationsService:
                 operation=artifact.operation,
             )
         )
-        if deployment.phase is WorkspacePhase.COMPLETED:
-            return WorkspaceOperationsResult(
-                issue_number=request.issue_number,
-                status=WorkspaceOperationsStatus.COMPLETED,
-                recorded=deployment.recorded,
-                phase=deployment.phase,
-                operation_id=artifact.operation.operation_id,
-                workspace_pull_request_number=(
-                    target.workspace_pull_request_number
-                ),
-            )
-        if deployment.phase is not WorkspacePhase.RETENTION:
+        if deployment.phase not in {
+            WorkspacePhase.RETENTION,
+            WorkspacePhase.COMPLETED,
+        }:
             raise RuntimeError(
                 "workspace deployment transition did not reach retention"
             )
