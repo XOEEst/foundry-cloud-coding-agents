@@ -317,6 +317,7 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         "issue_comment",
         "pull_request_target",
         "schedule",
+        "workflow_run",
         "workflow_dispatch",
     }
     assert workflow["permissions"] == {
@@ -490,6 +491,8 @@ def test_workspace_workflow_scans_candidate_envelopes_from_trusted_schedule() ->
     assert "foundry-opt/state/issue-" in text
     assert '"foundry-optimization-workspace.yml"' in text
     assert 'f"issue={issue}"' in text
+    assert 'workflows: ["CodeQL"]' in text
+    assert "github.event.workflow_run.conclusion == 'success'" in text
 
 
 def test_workspace_workflow_imports_after_copilot_completion_comment() -> None:

@@ -612,6 +612,9 @@ on:
     types: [opened, synchronize, reopened, edited, ready_for_review, closed]
   schedule:
     - cron: "*/5 * * * *"
+  workflow_run:
+    workflows: ["CodeQL"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       issue:
@@ -631,7 +634,10 @@ concurrency:
 
 jobs:
   scan-candidate-envelopes:
-    if: github.event_name == 'schedule'
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch trusted imports for current candidate envelopes
