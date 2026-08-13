@@ -63,16 +63,6 @@ from foundry_opt.orchestration.workspace_intake import (
     WorkspaceEventKind,
     normalize_workspace_event,
 )
-from foundry_opt.orchestration.workspace_production import (
-    ProductionWorkspaceError,
-    ProductionWorkspaceService,
-    WorkspaceAdvanceRequest,
-    WorkspaceCopilotAssignmentResult,
-    WorkspaceIntakeResult,
-    WorkspaceOperationIntakeResult,
-    build_production_workspace,
-    build_production_workspace_service,
-)
 from foundry_opt.orchestration.workspace_assignment import (
     GhWorkspaceCopilotAssigner,
 )
@@ -152,6 +142,28 @@ from foundry_opt.orchestration.workspace_state_migration import (
     validate_workspace_state_conversion_payload,
     workspace_state_v3_migration_plan,
 )
+
+
+_LAZY_WORKSPACE_PRODUCTION_EXPORTS = frozenset(
+    {
+        "ProductionWorkspaceError",
+        "ProductionWorkspaceService",
+        "WorkspaceAdvanceRequest",
+        "WorkspaceCopilotAssignmentResult",
+        "WorkspaceIntakeResult",
+        "WorkspaceOperationIntakeResult",
+        "build_production_workspace",
+        "build_production_workspace_service",
+    }
+)
+
+
+def __getattr__(name: str):
+    if name not in _LAZY_WORKSPACE_PRODUCTION_EXPORTS:
+        raise AttributeError(name)
+    from foundry_opt.orchestration import workspace_production
+
+    return getattr(workspace_production, name)
 from foundry_opt.orchestration.git_state import (
     GitStateRef,
     OutboxRecord,
