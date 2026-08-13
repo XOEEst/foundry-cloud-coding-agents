@@ -225,8 +225,8 @@ def test_probe_reports_post_setup_direct_operation_eligibility(
         result.refresh_reacquisition.reason
         == "requires_delayed_live_acceptance_probe"
     )
-    assert result.direct_operations_eligible is True
-    assert result.exit_code == 0
+    assert result.direct_operations_eligible is False
+    assert result.exit_code == 1
 
 
 def test_probe_requires_actions_oidc_variables_for_direct_eligibility(

@@ -238,6 +238,7 @@ class OidcProbe:
             token_acquisition=token_acquisition,
             errors=errors,
         )
+        refresh_reacquisition = RefreshReacquisitionProbe()
         direct_operations_eligible = (
             environment_kind is EnvironmentKind.COPILOT_AGENT_POST_SETUP
             and self._environment.get("GITHUB_ACTIONS") == "true"
@@ -253,6 +254,7 @@ class OidcProbe:
             and foundry.authentication_mode == AuthenticationMode.OIDC.value
             and foundry.firewall_reachable is True
             and foundry.read_only_access_success is True
+            and refresh_reacquisition.status == "passed"
         )
         return AuthProbeResult(
             scope=request.scope,
@@ -261,7 +263,7 @@ class OidcProbe:
             azure_principal=principal,
             token_acquisition=token_acquisition,
             foundry_connectivity=foundry,
-            refresh_reacquisition=RefreshReacquisitionProbe(),
+            refresh_reacquisition=refresh_reacquisition,
             direct_operations_eligible=direct_operations_eligible,
             errors=tuple(errors),
         )
