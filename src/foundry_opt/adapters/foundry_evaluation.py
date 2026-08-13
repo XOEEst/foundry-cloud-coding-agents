@@ -123,10 +123,25 @@ class FoundryEvaluationTransport(EvaluationTransport):
                 "Foundry evaluation definition pagination exceeded its bound."
             )
         if len(matches) > 1:
-            raise EvaluationConflictError(
-                "Multiple Foundry evaluation definitions have the same "
-                "binding fingerprint."
-            )
+            signatures = {
+                (
+                    match["version"],
+                    json.dumps(
+                        self._bindings[str(match["id"])].profiles,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
+                for match in matches
+            }
+            if len(signatures) != 1:
+                raise EvaluationConflictError(
+                    "Multiple Foundry evaluation definitions have the same "
+                    "binding fingerprint but different bindings."
+                )
+            return sorted(matches, key=lambda item: str(item["id"]))[0]
         return matches[0] if matches else None
 
     def create_definition(

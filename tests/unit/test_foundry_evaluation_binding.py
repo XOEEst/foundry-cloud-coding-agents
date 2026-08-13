@@ -503,7 +503,7 @@ def test_find_definition_reuses_exact_fingerprint_and_restores_profile() -> None
     assert second_client.evals.runs.create_calls
 
 
-def test_find_definition_rejects_duplicate_fingerprint() -> None:
+def test_find_definition_reuses_equivalent_duplicate_fingerprint() -> None:
     transport, client = _transport()
     payload = _definition_payload()
 
@@ -514,7 +514,37 @@ def test_find_definition_rejects_duplicate_fingerprint() -> None:
     client.evals.create = create  # type: ignore[method-assign]
     transport.create_definition(payload)
     provider = create(**client.evals.create_calls[0])
-    client.evals.list_response = FakePage([provider, provider])
+    duplicate = {**provider, "id": "eval-definition-2"}
+    client.evals.list_response = FakePage([duplicate, provider])
+
+    assert transport.find_definition("sha256:definition") == {
+        "id": "eval-definition",
+        "version": "7",
+        "fingerprint": "sha256:definition",
+        "portal_url": None,
+    }
+
+
+def test_find_definition_rejects_conflicting_duplicate_fingerprint() -> None:
+    transport, client = _transport()
+    payload = _definition_payload()
+
+    def create(**kwargs: object) -> object:
+        client.evals.create_calls.append(kwargs)
+        return _created_definition(kwargs)
+
+    client.evals.create = create  # type: ignore[method-assign]
+    transport.create_definition(payload)
+    provider = create(**client.evals.create_calls[0])
+    conflicting = {
+        **provider,
+        "id": "eval-definition-2",
+        "metadata": {
+            **provider["metadata"],
+            "foundry_opt_schema_version": "8",
+        },
+    }
+    client.evals.list_response = FakePage([provider, conflicting])
 
     with pytest.raises(EvaluationConflictError):
         transport.find_definition("sha256:definition")
