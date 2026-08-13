@@ -425,9 +425,17 @@ class ProductionWorkspaceCandidatePlanner(
             )
             else inputs.config.campaign.max_changed_candidates
         )
+        operation = pending.operation.operation
         return TrustedCandidateExecutionPlan(
             operation=pending.operation,
-            request=pending.operation.operation.request,
+            request=CandidateExperimentRequest(
+                issue_number=operation.issue_number,
+                candidate_id=operation.candidate_id,
+                patch_sha256=operation.patch_sha256,
+                bundle_sha256=operation.bundle_sha256,
+                evidence_sha256=operation.evidence_sha256,
+                idempotency_key=operation.idempotency_key,
+            ),
             base_commit=inputs.spec.base_commit,
             target_name=inputs.request.target,
             base_agent_version=int(target.base_agent_version),
