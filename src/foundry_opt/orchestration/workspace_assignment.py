@@ -90,15 +90,16 @@ class GhWorkspaceCopilotAssigner:
             if isinstance(item.get("body"), str)
             and marker in item["body"]
         ]
-        if len(matches) > 1:
+        trusted_matches = [
+            item
+            for item in matches
+            if _same_user(item.get("user"), actor)
+        ]
+        if len(trusted_matches) > 1:
             raise RuntimeError(
                 "workspace assignment marker is ambiguous"
             )
-        if matches:
-            if not _same_user(matches[0].get("user"), actor):
-                raise RuntimeError(
-                    "workspace assignment marker is untrusted"
-                )
+        if trusted_matches:
             return False
         body = (
             f"{marker}\n"

@@ -315,6 +315,7 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
     assert set(workflow[True]) == {
         "issues",
         "pull_request_target",
+        "schedule",
         "workflow_dispatch",
     }
     assert workflow["permissions"] == {
@@ -464,11 +465,30 @@ def test_workspace_workflow_imports_candidate_envelope_from_exact_pr_head() -> N
     ]
 
     assert "workspace-candidate.json" in text
-    assert 'git fetch --no-tags origin "$TRUSTED_HEAD_SHA"' in text
-    assert 'git show "$TRUSTED_HEAD_SHA:$envelope_path"' in text
+    assert 'git fetch --no-tags origin "$head_sha"' in text
+    assert 'git show "$head_sha:$envelope_path"' in text
     assert 'envelope["kind"] != "workspace_candidate_proposal"' in text
     assert "Workspace candidate envelope is stale" in text
     assert '--candidate-manifest "$manifest_file"' in text
+    assert 'branch="foundry-opt/workspace/issue-$ISSUE"' in text
+
+
+def test_workspace_workflow_scans_candidate_envelopes_from_trusted_schedule() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-optimization-workspace.yml")
+    ]
+
+    assert 'cron: "*/5 * * * *"' in text
+    assert "scan-candidate-envelopes:" in text
+    assert "github.event_name == 'schedule'" in text
+    assert ".foundry-optimizer/workspace-candidate.json" in text
+    assert "foundry-opt/state/issue-" in text
+    assert '"foundry-optimization-workspace.yml"' in text
+    assert 'f"issue={issue}"' in text
 
 
 def test_bundle_preserves_customer_deployment_workflow() -> None:

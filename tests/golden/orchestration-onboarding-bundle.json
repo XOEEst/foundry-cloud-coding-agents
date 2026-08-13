@@ -6,5 +6,5 @@
   ".github/skills/foundry-agent-optimizer/SKILL.md": "90eed6d6691037a784bf84432398977c2098186bc6f2fd095a6a3fdb98e9b603",
   ".github/workflows/foundry-exact-candidate-check.yml": "1b40b038a2da5f8f8b914141f001fe37bcb839f81be747c947ba5a1835bc4293",
   ".github/workflows/foundry-optimization-operations.yml": "66cf464021737c167e34a0cfc48100b29040c72a0566199c59f0cf05cee211e5",
-  ".github/workflows/foundry-optimization-workspace.yml": "4676a8aa15001b123ede78ee20d565e50ad5db2d589459a2fe7800fa09f3386d"
+  ".github/workflows/foundry-optimization-workspace.yml": "6e505df89b2b3446850a9c51cbd1a7b089ae85c20b713f444e9ce33a7371b7c5"
 }

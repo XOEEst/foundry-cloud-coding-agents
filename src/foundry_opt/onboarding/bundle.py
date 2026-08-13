@@ -608,6 +608,8 @@ on:
     types: [opened, edited, reopened, closed]
   pull_request_target:
     types: [opened, synchronize, reopened, edited, ready_for_review, closed]
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       issue:
@@ -626,8 +628,120 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  scan-candidate-envelopes:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch trusted imports for current candidate envelopes
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
+          TRUSTED_DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+        shell: python
+        run: |
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+
+          repository = os.environ["TRUSTED_REPOSITORY"]
+          pages = json.loads(
+              subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      "--paginate",
+                      "--slurp",
+                      f"repos/{{repository}}/pulls?state=open&per_page=100",
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+          )
+          for pull_request in [
+              item for page in pages for item in page
+          ]:
+              head = pull_request.get("head", {{}})
+              base = pull_request.get("base", {{}})
+              branch = head.get("ref")
+              repository_data = head.get("repo") or {{}}
+              match = (
+                  re.fullmatch(
+                      r"foundry-opt/workspace/issue-([1-9][0-9]*)",
+                      branch or "",
+                  )
+                  if repository_data.get("full_name") == repository
+                  and base.get("ref") == os.environ["TRUSTED_DEFAULT_BRANCH"]
+                  else None
+              )
+              if match is None:
+                  continue
+              issue = int(match.group(1))
+              head_sha = head.get("sha")
+              if not isinstance(head_sha, str):
+                  continue
+              envelope = subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      "--method",
+                      "GET",
+                      (
+                          f"repos/{{repository}}/contents/"
+                          ".foundry-optimizer/workspace-candidate.json"
+                      ),
+                      "-f",
+                      f"ref={{head_sha}}",
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if envelope.returncode != 0:
+                  continue
+              document = json.loads(envelope.stdout)
+              payload = json.loads(
+                  base64.b64decode(document["content"]).decode("utf-8")
+              )
+              expected = payload.get("expected_revision")
+              state = subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      (
+                          f"repos/{{repository}}/git/ref/heads/"
+                          f"foundry-opt/state/issue-{{issue}}"
+                      ),
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if state.returncode != 0:
+                  continue
+              current = json.loads(state.stdout).get("object", {{}}).get("sha")
+              if current != expected:
+                  continue
+              subprocess.run(
+                  [
+                      "gh",
+                      "workflow",
+                      "run",
+                      "foundry-optimization-workspace.yml",
+                      "--repo",
+                      repository,
+                      "--ref",
+                      os.environ["TRUSTED_DEFAULT_BRANCH"],
+                      "-f",
+                      f"issue={{issue}}",
+                  ],
+                  check=True,
+              )
   advance:
     if: >-
+      github.event_name != 'schedule' &&
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issues' &&
       (github.event.action != 'opened' ||
@@ -727,19 +841,27 @@ jobs:
             --with "$OPTIMIZER_PACKAGE"
             foundry-opt workspace
           )
+          head_sha="$TRUSTED_HEAD_SHA"
           if [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ]; then
-            "${{command[@]}}" advance --issue "$ISSUE" --json
-          else
-            envelope_path=".foundry-optimizer/workspace-candidate.json"
-            envelope_file="$RUNNER_TEMP/workspace-candidate-envelope.json"
-            manifest_file="$RUNNER_TEMP/workspace-candidate-manifest.json"
-            if (
-              [ "$TRUSTED_EVENT_NAME" = "pull_request_target" ] &&
-              [[ "$TRUSTED_HEAD_SHA" =~ ^[0-9a-f]{{40}}$ ]] &&
-              git fetch --no-tags origin "$TRUSTED_HEAD_SHA" &&
-              git cat-file -e "$TRUSTED_HEAD_SHA:$envelope_path" 2>/dev/null
-            ); then
-              git show "$TRUSTED_HEAD_SHA:$envelope_path" > "$envelope_file"
+            owner="${{TRUSTED_REPOSITORY%%/*}}"
+            branch="foundry-opt/workspace/issue-$ISSUE"
+            head_sha="$(
+              gh api --method GET \
+                "repos/$TRUSTED_REPOSITORY/pulls" \
+                -f state=open \
+                -f head="$owner:$branch" \
+                --jq 'if length == 1 then .[0].head.sha else "" end'
+            )"
+          fi
+          envelope_path=".foundry-optimizer/workspace-candidate.json"
+          envelope_file="$RUNNER_TEMP/workspace-candidate-envelope.json"
+          manifest_file="$RUNNER_TEMP/workspace-candidate-manifest.json"
+          if (
+            [[ "$head_sha" =~ ^[0-9a-f]{{40}}$ ]] &&
+            git fetch --no-tags origin "$head_sha" &&
+            git cat-file -e "$head_sha:$envelope_path" 2>/dev/null
+          ); then
+              git show "$head_sha:$envelope_path" > "$envelope_file"
               expected_revision="$(
                 python - "$envelope_file" "$manifest_file" "$ISSUE" <<'PY'
           import json
@@ -794,7 +916,10 @@ jobs:
                 --candidate-manifest "$manifest_file" \
                 --json
               exit 0
-            fi
+          fi
+          if [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ]; then
+            "${{command[@]}}" advance --issue "$ISSUE" --json
+          else
             args=(
               intake
               --event-path "$TRUSTED_EVENT_PATH"

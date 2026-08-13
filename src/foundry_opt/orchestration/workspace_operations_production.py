@@ -32,7 +32,13 @@ from foundry_opt.orchestration.candidate_experiments import (
     CandidateExperimentResult,
     PersistedCandidateExperimentOperation,
 )
-from foundry_opt.orchestration.workspace import WorkspacePhase, WorkspaceTrigger
+from foundry_opt.orchestration.workspace import (
+    WorkspaceNextAction,
+    WorkspaceNextActionKind,
+    WorkspacePhase,
+    WorkspaceResult,
+    WorkspaceTrigger,
+)
 from foundry_opt.orchestration.workspace_execution_production import (
     _trusted_execution_inputs,
     _workspace_spec_base,
@@ -601,10 +607,46 @@ class ProductionWorkspaceCandidateSelection(
             "schema_version": 4,
             "target": request.plan.target_name,
         }
-        return self._workspace_service.complete_experiments(
-            payload,
-            repository_root=request.repository_root,
-        )
+        try:
+            return self._workspace_service.complete_experiments(
+                payload,
+                repository_root=request.repository_root,
+            )
+        except ValueError as error:
+            if str(error) != "workspace policy found no eligible candidate":
+                raise
+            blocked = self._store.commit(
+                expected_revision=snapshot.revision,
+                update=WorkspaceUpdate(
+                    issue_number=snapshot.issue_number,
+                    phase=WorkspacePhase.BLOCKED,
+                    workspace_pull_request_number=(
+                        snapshot.workspace_pull_request_number
+                    ),
+                    semantic_event="candidate_selection_no_eligible_candidate",
+                    candidates=snapshot.candidates,
+                    selected_patch=snapshot.selected_patch,
+                    external_operation_ids=snapshot.external_operation_ids,
+                    experiments=snapshot.experiments,
+                    lineage=snapshot.lineage,
+                    specification=snapshot.specification,
+                    baseline=snapshot.baseline,
+                ),
+            )
+            return WorkspaceResult(
+                phase=WorkspacePhase.BLOCKED,
+                workspace_pull_request=None,
+                planned_effect_kinds=(),
+                recorded=True,
+                next_action=WorkspaceNextAction(
+                    kind=WorkspaceNextActionKind.NONE,
+                    issue_number=blocked.issue_number,
+                    workspace_pull_request_number=(
+                        blocked.workspace_pull_request_number
+                    ),
+                    trigger=None,
+                ),
+            )
 
 
 class GitWorkspaceDeploymentLoader(WorkspaceDeploymentStateLoader):

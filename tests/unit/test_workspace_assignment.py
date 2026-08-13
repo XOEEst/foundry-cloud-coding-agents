@@ -67,7 +67,20 @@ def test_workspace_assignment_targets_existing_pull_request_only(
                             "login": "octocat",
                             "type": "User",
                         },
-                    }
+                    },
+                    {
+                        "body": (
+                            "> <!-- foundry-opt:"
+                            "workspace-copilot-assignment:"
+                            f"issue-31:{marker_hash}:v1 -->\n"
+                            "Copilot quoted the assignment while reporting."
+                        ),
+                        "user": {
+                            "id": 999,
+                            "login": "copilot",
+                            "type": "Bot",
+                        },
+                    },
                 ]]
             ),
             json.dumps(
