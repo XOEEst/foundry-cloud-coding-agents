@@ -330,6 +330,10 @@ class LiveWorkspaceExperimentAdapter(CandidateExperimentAdapter):
             root=self._root,
             config_path=self._config_path,
             issue_number=request.issue_number,
+            base_commit=_workspace_spec_base(
+                self._root,
+                request.issue_number,
+            ),
         )
         if request.patch_sha256 != inputs.spec.sha256:
             raise ValueError("workspace baseline lineage changed")
@@ -381,6 +385,10 @@ class LiveWorkspaceExperimentAdapter(CandidateExperimentAdapter):
             root=self._root,
             config_path=self._config_path,
             issue_number=request.issue_number,
+            base_commit=_workspace_spec_base(
+                self._root,
+                request.issue_number,
+            ),
         )
         if (
             manifest.target != inputs.request.target
@@ -544,6 +552,7 @@ def _trusted_execution_inputs(
     root: Path,
     config_path: Path,
     issue_number: int,
+    base_commit: str | None = None,
 ) -> _TrustedExecutionInputs:
     config = load_config(root / config_path)
     repository = _repository_name(commands, root)
@@ -554,16 +563,30 @@ def _trusted_execution_inputs(
         issue_number,
     )
     base_branch = _default_branch_name(commands, root)
-    base_commit = _default_branch_commit(
+    resolved_base_commit = base_commit or _default_branch_commit(
         commands,
         root,
         base_branch,
+    )
+    if (
+        not isinstance(resolved_base_commit, str)
+        or len(resolved_base_commit) != 40
+    ):
+        raise ValueError("workspace execution base commit is invalid")
+    commands.run(
+        (
+            "git",
+            "cat-file",
+            "-e",
+            f"{resolved_base_commit}^{{commit}}",
+        ),
+        cwd=root,
     )
     issue = WorkspaceIssue(
         number=issue_number,
         title=issue_payload["title"],
         body=issue_payload["body"],
-        base_commit=base_commit,
+        base_commit=resolved_base_commit,
     )
     issue_request = _parse_issue_request(
         issue_number=issue_number,
@@ -587,7 +610,9 @@ def _trusted_execution_inputs(
             base_branch=base_branch,
             issue=issue,
         ),
-        publisher=_ReadOnlySpecificationPublisher(base_commit),
+        publisher=_ReadOnlySpecificationPublisher(
+            resolved_base_commit
+        ),
         require_issue_label=False,
     ).prepare_specification(root, issue_number, publish=False)
     if (
@@ -628,6 +653,13 @@ def _trusted_execution_inputs(
         spec=spec_result.spec,
         assets=assets,
     )
+
+
+def _workspace_spec_base(root: Path, issue_number: int) -> str:
+    snapshot = GitWorkspaceStore(root).load(issue_number)
+    if snapshot is None or snapshot.specification is None:
+        raise ValueError("workspace specification is unavailable")
+    return snapshot.specification.base_commit
 
 
 def _asset_reference_is_complete(

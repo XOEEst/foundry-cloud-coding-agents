@@ -35,6 +35,7 @@ from foundry_opt.orchestration.candidate_experiments import (
 from foundry_opt.orchestration.workspace import WorkspacePhase, WorkspaceTrigger
 from foundry_opt.orchestration.workspace_execution_production import (
     _trusted_execution_inputs,
+    _workspace_spec_base,
 )
 from foundry_opt.orchestration.workspace_git_store import GitWorkspaceStore
 from foundry_opt.orchestration.workspace_manifest import (
@@ -177,6 +178,10 @@ class ProductionWorkspaceBaselinePlanner(WorkspaceBaselineExecutionPlanner):
             root=repository_root.expanduser().resolve(strict=True),
             config_path=Path(".github/foundry-optimizer.yaml"),
             issue_number=pending.operation.operation.issue_number,
+            base_commit=_workspace_spec_base(
+                repository_root,
+                pending.operation.operation.issue_number,
+            ),
         )
         operation = pending.operation
         request = WorkspaceBaselineRequest(
@@ -397,6 +402,10 @@ class ProductionWorkspaceCandidatePlanner(
             root=repository_root.expanduser().resolve(strict=True),
             config_path=Path(".github/foundry-optimizer.yaml"),
             issue_number=pending.operation.operation.issue_number,
+            base_commit=_workspace_spec_base(
+                repository_root,
+                pending.operation.operation.issue_number,
+            ),
         )
         target = inputs.target
         if (
@@ -790,6 +799,10 @@ class ProductionWorkspaceRetentionEvaluator(WorkspaceRetentionEvaluator):
             root=self._root,
             config_path=Path(".github/foundry-optimizer.yaml"),
             issue_number=target.issue_number,
+            base_commit=_workspace_spec_base(
+                self._root,
+                target.issue_number,
+            ),
         )
         snapshot = self._store.load(target.issue_number)
         if snapshot is None or snapshot.baseline is None:
