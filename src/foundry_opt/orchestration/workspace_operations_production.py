@@ -1368,7 +1368,7 @@ def _issue_comments(
     repository: str,
     issue_number: int,
 ) -> list[dict[str, Any]]:
-    value = _gh_api(
+    value = _gh_api_json(
         commands,
         root,
         (
@@ -1397,6 +1397,24 @@ def _gh_api(
     *,
     input_document: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    value = _gh_api_json(
+        commands,
+        root,
+        arguments,
+        input_document=input_document,
+    )
+    if not isinstance(value, dict):
+        raise ValueError("trusted GitHub response is invalid")
+    return value
+
+
+def _gh_api_json(
+    commands: CommandRunner,
+    root: Path,
+    arguments: tuple[str, ...],
+    *,
+    input_document: Mapping[str, Any] | None = None,
+) -> Any:
     try:
         raw = commands.run(
             arguments,
@@ -1415,10 +1433,7 @@ def _gh_api(
         ).stdout
     except CommandError as error:
         raise RuntimeError("trusted GitHub operation failed") from error
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError("trusted GitHub response is invalid")
-    return value
+    return json.loads(raw)
 
 
 def _commit_tree(

@@ -14,6 +14,9 @@ from foundry_opt.orchestration import (
 from foundry_opt.orchestration.workspace_projection import (
     GhWorkspaceIssueProjector,
 )
+from foundry_opt.orchestration.workspace_operations_production import (
+    _issue_comments,
+)
 from foundry_opt.preflight.interfaces import CommandResult
 
 
@@ -73,6 +76,22 @@ class GitHubComments:
             self.writes.append(("PATCH", payload["body"]))
             return CommandResult(0, json.dumps(comment), "")
         raise AssertionError(f"unexpected method: {method}")
+
+
+def test_workspace_completion_reads_paginated_issue_comments(
+    tmp_path: Path,
+) -> None:
+    commands = GitHubComments()
+    commands.comments.append(
+        {"id": 7, "body": "<!-- final -->\nComplete."}
+    )
+
+    assert _issue_comments(
+        commands,
+        tmp_path,
+        "octo-org/optimizer",
+        31,
+    ) == commands.comments
 
 
 def _intent(phase: WorkspacePhase) -> WorkspaceIssueStatusProjectionIntent:
