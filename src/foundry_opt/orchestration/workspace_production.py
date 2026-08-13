@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from foundry_opt.adapters.github import github_repository_from_remote_url
 from foundry_opt.config import load_config
 from foundry_opt.config.models import (
     MetricDirection as ConfigMetricDirection,
+    OptimizerConfig,
     UndefinedBehavior as ConfigUndefinedBehavior,
 )
 from foundry_opt.evaluation import (
@@ -80,6 +82,7 @@ from foundry_opt.orchestration.workspace_intake import (
     normalize_workspace_event,
 )
 from foundry_opt.orchestration.workspace_manifest import (
+    WorkspaceCandidateManifest,
     parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
 )
@@ -646,14 +649,9 @@ class ProductionWorkspaceService:
             raise ProductionWorkspaceError(
                 "workspace candidate target is not configured"
             )
-        candidate_limit = (
-            target.campaign_overrides.max_changed_candidates
-            if (
-                target.campaign_overrides is not None
-                and target.campaign_overrides.max_changed_candidates
-                is not None
-            )
-            else config.campaign.max_changed_candidates
+        candidate_limit = _configured_candidate_limit(
+            config,
+            specification.target,
         )
         completed = tuple(
             experiment
@@ -921,6 +919,13 @@ class ProductionWorkspaceService:
             raise ProductionWorkspaceError(
                 "workspace experiment executor is not configured"
             )
+        if _trusted_copilot_repository_context() is not None:
+            return self._write_candidate_proxy_envelope(
+                root,
+                payload=payload,
+                manifest=manifest,
+                config=config,
+            )
         request_builder = (
             self._experiment_request_builder
             or GitWorkspaceCandidatePreparer(
@@ -938,6 +943,80 @@ class ProductionWorkspaceService:
             target=manifest.target,
             base_commit=manifest.base_commit,
             proposal=manifest.candidate,
+        )
+
+    def _write_candidate_proxy_envelope(
+        self,
+        root: Path,
+        *,
+        payload: Mapping[str, Any],
+        manifest: WorkspaceCandidateManifest,
+        config: OptimizerConfig,
+    ) -> WorkspaceExperimentExecutionResult:
+        snapshot = GitWorkspaceStore(root).load(manifest.issue_number)
+        if (
+            snapshot is None
+            or snapshot.phase is not WorkspacePhase.EVALUATING
+            or snapshot.specification is None
+            or snapshot.specification.status != "policy_approved"
+            or snapshot.specification.target != manifest.target
+            or snapshot.specification.base_commit != manifest.base_commit
+            or snapshot.baseline is None
+            or snapshot.baseline.status != "completed"
+            or any(
+                experiment.status == "pending"
+                for experiment in snapshot.experiments
+            )
+        ):
+            raise ProductionWorkspaceError(
+                "workspace candidate proxy state is unavailable"
+            )
+        candidate_number = len(snapshot.experiments) + 1
+        candidate_limit = _configured_candidate_limit(
+            config,
+            manifest.target,
+        )
+        if (
+            candidate_number > candidate_limit
+            or manifest.candidate.candidate_id
+            != f"candidate-{candidate_number}"
+        ):
+            raise ProductionWorkspaceError(
+                "workspace candidate proxy slot is invalid"
+            )
+        document = {
+            "expected_revision": snapshot.revision,
+            "kind": "workspace_candidate_proposal",
+            "manifest": dict(payload),
+            "schema_version": 1,
+        }
+        content = (
+            json.dumps(
+                document,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        envelope_path = (
+            root / ".foundry-optimizer" / "workspace-candidate.json"
+        )
+        envelope_path.parent.mkdir(parents=True, exist_ok=True)
+        envelope_path.write_bytes(content)
+        digest = hashlib.sha256(content).hexdigest()
+        return WorkspaceExperimentExecutionResult(
+            issue_number=manifest.issue_number,
+            candidate_id=manifest.candidate.candidate_id,
+            status="proxy_import_required",
+            recorded=False,
+            operation_sha256=digest,
+            idempotency_key=digest,
+            next_action=(
+                "commit_workspace_candidate_envelope:"
+                ".foundry-optimizer/workspace-candidate.json"
+            ),
         )
 
     def ingest_experiment_result(
@@ -1493,6 +1572,23 @@ def _trusted_candidates(
             )
         )
     return tuple(candidates)
+
+
+def _configured_candidate_limit(
+    config: OptimizerConfig,
+    target_name: str,
+) -> int:
+    target = config.targets.get(target_name)
+    if target is None:
+        raise ProductionWorkspaceError(
+            "workspace candidate target is not configured"
+        )
+    if (
+        target.campaign_overrides is not None
+        and target.campaign_overrides.max_changed_candidates is not None
+    ):
+        return target.campaign_overrides.max_changed_candidates
+    return config.campaign.max_changed_candidates
 
 
 def _copilot_assignment_action(

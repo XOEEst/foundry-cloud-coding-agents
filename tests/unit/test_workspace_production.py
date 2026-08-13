@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping, Sequence
 import json
 from pathlib import Path
@@ -430,6 +431,110 @@ def test_production_enriches_candidate_action_with_trusted_work_contract(
     assert contract["candidate_number"] == 1
     assert contract["candidate_limit"] == 2
     assert contract["allowed_mutations"] == ["system_instructions"]
+
+
+def test_copilot_experiment_writes_revision_bound_proxy_envelope(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = SimpleNamespace(
+        campaign=SimpleNamespace(max_changed_candidates=2),
+        targets={
+            "support-agent": SimpleNamespace(
+                allowed_mutations=("system_instructions",),
+                campaign_overrides=None,
+            )
+        },
+    )
+    snapshot = WorkspaceSnapshot(
+        issue_number=31,
+        revision="a" * 40,
+        phase=WorkspacePhase.EVALUATING,
+        workspace_pull_request_number=104,
+        candidates=(),
+        selected_patch=None,
+        external_operation_ids=(),
+        experiments=(),
+        lineage=None,
+        specification=_trusted_specification(),
+        baseline=_trusted_baseline(),
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "load_config",
+        lambda path: config,
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceStore",
+        lambda root: SimpleNamespace(load=lambda issue: snapshot),
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "_trusted_copilot_repository_context",
+        lambda: (
+            SimpleNamespace(
+                repository="octo-org/optimizer",
+                default_branch="main",
+            ),
+            123,
+        ),
+    )
+    service = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+        experiment_runner=object(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_repository_context",
+        lambda root: SimpleNamespace(
+            repository="octo-org/optimizer",
+            default_branch="main",
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_existing_workspace_pull_request",
+        lambda root, repository, issue: (104, "b" * 40),
+    )
+    payload = {
+        "schema_version": 3,
+        "issue_number": 31,
+        "target": "support-agent",
+        "base_commit": "b" * 40,
+        "candidate": {
+            "candidate_id": "candidate-1",
+            "mutation_class": "system_instructions",
+            "summary": "Improve policy coverage.",
+            "patch_base64": base64.b64encode(
+                b"diff --git a/agent.py b/agent.py\n"
+            ).decode("ascii"),
+        },
+    }
+
+    result = service.execute_experiment(
+        payload,
+        repository_root=tmp_path,
+    )
+
+    envelope = json.loads(
+        (
+            tmp_path
+            / ".foundry-optimizer"
+            / "workspace-candidate.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert result.status == "proxy_import_required"
+    assert result.recorded is False
+    assert result.next_action.endswith(
+        ".foundry-optimizer/workspace-candidate.json"
+    )
+    assert envelope == {
+        "expected_revision": "a" * 40,
+        "kind": "workspace_candidate_proposal",
+        "manifest": payload,
+        "schema_version": 1,
+    }
 
 
 def _trusted_baseline() -> WorkspaceBaselineRecord:

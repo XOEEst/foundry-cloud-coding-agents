@@ -104,6 +104,8 @@ def test_bundle_generates_single_workspace_customer_surfaces() -> None:
     assert "schema-v3 JSON manifest" in normalized_steward
     assert "--candidate-manifest <manifest.json> --json" in normalized_steward
     assert "revision-bound continuation" in normalized_steward
+    assert "proxy_import_required" in normalized_steward
+    assert ".foundry-optimizer/workspace-candidate.json" in steward
     assert "Do not stop merely because" in normalized_steward
     assert "waiting for an external operation" in normalized_steward
     assert "waiting for the human merge" in normalized_steward
@@ -450,6 +452,23 @@ def test_operations_workflow_resumes_same_workspace_pull_request_without_creatin
     assert "gh issue edit" not in text
     assert "--add-assignee" not in text
     assert "worker issue" not in text
+
+
+def test_workspace_workflow_imports_candidate_envelope_from_exact_pr_head() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-optimization-workspace.yml")
+    ]
+
+    assert "workspace-candidate.json" in text
+    assert 'git fetch --no-tags origin "$TRUSTED_HEAD_SHA"' in text
+    assert 'git show "$TRUSTED_HEAD_SHA:$envelope_path"' in text
+    assert 'envelope["kind"] != "workspace_candidate_proposal"' in text
+    assert "Workspace candidate envelope is stale" in text
+    assert '--candidate-manifest "$manifest_file"' in text
 
 
 def test_bundle_preserves_customer_deployment_workflow() -> None:

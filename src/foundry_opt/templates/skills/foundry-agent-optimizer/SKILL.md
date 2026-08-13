@@ -82,9 +82,12 @@ candidate from `next_action.candidate_work`:
   `foundry-opt workspace experiment --issue <N>
   --candidate-manifest <manifest.json> --json`.
 - Remove the disposable worktree and manifest after successful submission.
-  Stop on `await_trusted_actions_result`. Trusted Actions derives validation,
-  the exact tree and bundle, Foundry IDs, metrics, guardrails, and evidence. A
-  revision-bound continuation supplies the next candidate slot.
+  If the result is `proxy_import_required`, commit and push only
+  `.foundry-optimizer/workspace-candidate.json` on the existing workspace PR
+  branch, then stop. Stop directly on `await_trusted_actions_result`. Trusted
+  Actions imports the envelope and derives validation, the exact tree and
+  bundle, Foundry IDs, metrics, guardrails, and evidence. A revision-bound
+  continuation supplies the next candidate slot.
 
 The workspace command owns durable lifecycle transitions. Agent prose, shell
 scripts, workflow YAML, issue comments, and labels are projections only.

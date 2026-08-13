@@ -510,8 +510,12 @@ redacted experiment results, and command as authoritative:
    `foundry-opt workspace experiment --issue <number>
    --candidate-manifest <manifest.json> --json`.
 7. Remove the disposable worktree and manifest after successful submission.
-   Stop when the result says `await_trusted_actions_result`; trusted Actions
-   evaluates it and a revision-bound continuation requests the next slot.
+   If the result says `proxy_import_required`, add only
+   `.foundry-optimizer/workspace-candidate.json`, commit it on the existing
+   workspace PR branch, push that branch, and stop. If it says
+   `await_trusted_actions_result`, stop directly. Trusted Actions imports and
+   evaluates the proposal, then a revision-bound continuation requests the
+   next slot.
 
 Do not stop merely because an internal invocation returned successfully. Stop
 only when the result is waiting for an external operation, waiting for the
@@ -710,6 +714,7 @@ jobs:
           ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}
           TRUSTED_PULL_REQUEST_NUMBER: >-
             ${{{{ steps.workspace.outputs.pull_request }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
@@ -725,6 +730,71 @@ jobs:
           if [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ]; then
             "${{command[@]}}" advance --issue "$ISSUE" --json
           else
+            envelope_path=".foundry-optimizer/workspace-candidate.json"
+            envelope_file="$RUNNER_TEMP/workspace-candidate-envelope.json"
+            manifest_file="$RUNNER_TEMP/workspace-candidate-manifest.json"
+            if (
+              [ "$TRUSTED_EVENT_NAME" = "pull_request_target" ] &&
+              [[ "$TRUSTED_HEAD_SHA" =~ ^[0-9a-f]{{40}}$ ]] &&
+              git fetch --no-tags origin "$TRUSTED_HEAD_SHA" &&
+              git cat-file -e "$TRUSTED_HEAD_SHA:$envelope_path" 2>/dev/null
+            ); then
+              git show "$TRUSTED_HEAD_SHA:$envelope_path" > "$envelope_file"
+              expected_revision="$(
+                python - "$envelope_file" "$manifest_file" "$ISSUE" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          envelope = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              not isinstance(envelope, dict)
+              or set(envelope) != {{
+                  "expected_revision",
+                  "kind",
+                  "manifest",
+                  "schema_version",
+              }}
+              or envelope["schema_version"] != 1
+              or envelope["kind"] != "workspace_candidate_proposal"
+              or re.fullmatch(
+                  r"[0-9a-f]{{40}}",
+                  envelope["expected_revision"],
+              )
+              is None
+              or not isinstance(envelope["manifest"], dict)
+              or envelope["manifest"].get("issue_number") != int(sys.argv[3])
+          ):
+              raise SystemExit("workspace candidate envelope is invalid")
+          Path(sys.argv[2]).write_text(
+              json.dumps(
+                  envelope["manifest"],
+                  ensure_ascii=True,
+                  allow_nan=False,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ),
+              encoding="utf-8",
+          )
+          print(envelope["expected_revision"])
+          PY
+              )"
+              current_revision="$(
+                git ls-remote origin \
+                  "refs/heads/foundry-opt/state/issue-$ISSUE" |
+                  awk '{{print $1}}'
+              )"
+              if [ "$current_revision" != "$expected_revision" ]; then
+                echo "Workspace candidate envelope is stale" >&2
+                exit 1
+              fi
+              "${{command[@]}}" experiment \
+                --issue "$ISSUE" \
+                --candidate-manifest "$manifest_file" \
+                --json
+              exit 0
+            fi
             args=(
               intake
               --event-path "$TRUSTED_EVENT_PATH"
