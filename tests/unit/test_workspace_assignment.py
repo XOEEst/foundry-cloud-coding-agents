@@ -1,4 +1,5 @@
 from collections.abc import Mapping, Sequence
+import hashlib
 import json
 from pathlib import Path
 
@@ -36,6 +37,10 @@ class Commands:
 def test_workspace_assignment_targets_existing_pull_request_only(
     tmp_path: Path,
 ) -> None:
+    assignment_key = "revision-1"
+    marker_hash = hashlib.sha256(
+        assignment_key.encode("utf-8")
+    ).hexdigest()[:16]
     commands = Commands(
         [
             json.dumps(
@@ -49,12 +54,27 @@ def test_workspace_assignment_targets_existing_pull_request_only(
             json.dumps(
                 {"id": 123, "login": "octocat", "type": "User"}
             ),
-            json.dumps([[]]),
+            json.dumps(
+                [[
+                    {
+                        "body": (
+                            "<!-- foundry-opt:"
+                            "workspace-copilot-assignment:"
+                            "issue-31:old-revision:v1 -->"
+                        ),
+                        "user": {
+                            "id": 123,
+                            "login": "octocat",
+                            "type": "User",
+                        },
+                    }
+                ]]
+            ),
             json.dumps(
                 {
                     "body": (
                         "<!-- foundry-opt:workspace-copilot-assignment:"
-                        "issue-31:v1 -->\n"
+                        f"issue-31:{marker_hash}:v1 -->\n"
                         "@copilot Continue this existing workspace pull "
                         "request #104 for optimization issue #31. Read and "
                         "follow `.github/agents/"
@@ -79,7 +99,11 @@ def test_workspace_assignment_targets_existing_pull_request_only(
         repository_root=tmp_path,
         repository="octo-org/optimizer",
         assignment_token="assignment-token",
-    ).assign(issue_number=31, pull_request_number=104)
+    ).assign(
+        issue_number=31,
+        pull_request_number=104,
+        assignment_key=assignment_key,
+    )
 
     assert assigned is True
     assert len(commands.calls) == 4
@@ -124,6 +148,10 @@ def test_workspace_assignment_targets_existing_pull_request_only(
 def test_workspace_assignment_is_noop_while_already_assigned(
     tmp_path: Path,
 ) -> None:
+    assignment_key = "revision-1"
+    marker_hash = hashlib.sha256(
+        assignment_key.encode("utf-8")
+    ).hexdigest()[:16]
     commands = Commands(
         [
             json.dumps(
@@ -143,7 +171,7 @@ def test_workspace_assignment_is_noop_while_already_assigned(
                         "body": (
                             "<!-- foundry-opt:"
                             "workspace-copilot-assignment:"
-                            "issue-31:v1 -->"
+                            f"issue-31:{marker_hash}:v1 -->"
                         ),
                         "user": {
                             "id": 123,
@@ -161,7 +189,11 @@ def test_workspace_assignment_is_noop_while_already_assigned(
         repository_root=tmp_path,
         repository="octo-org/optimizer",
         assignment_token="assignment-token",
-    ).assign(issue_number=31, pull_request_number=104)
+    ).assign(
+        issue_number=31,
+        pull_request_number=104,
+        assignment_key=assignment_key,
+    )
 
     assert assigned is False
     assert len(commands.calls) == 3

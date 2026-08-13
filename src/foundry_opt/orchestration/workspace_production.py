@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -32,6 +32,7 @@ from foundry_opt.orchestration.candidate_experiments import (
 from foundry_opt.orchestration.workspace import (
     OptimizationWorkspace,
     WorkspaceCandidate,
+    WorkspaceCandidateWorkContract,
     WorkspaceCandidateProposal,
     WorkspaceIssue,
     WorkspaceOperation,
@@ -39,6 +40,7 @@ from foundry_opt.orchestration.workspace import (
     WorkspaceNextActionKind,
     WorkspacePhase,
     WorkspacePullRequest,
+    WorkspacePriorExperiment,
     WorkspaceReportContext,
     WorkspaceRequest,
     WorkspaceResult,
@@ -431,6 +433,7 @@ class ProductionWorkspaceService:
         ).assign(
             issue_number=issue_number,
             pull_request_number=pull_request_number,
+            assignment_key=snapshot.revision,
         )
         return WorkspaceCopilotAssignmentResult(
             issue_number=issue_number,
@@ -563,6 +566,7 @@ class ProductionWorkspaceService:
                 )
                 gated = _trusted_intake_gate(snapshot, pull_request)
                 if gated is not None:
+                    gated = self._with_candidate_work(root, gated, snapshot)
                     self._project_workspace_result(
                         root,
                         repository=context.repository,
@@ -611,12 +615,82 @@ class ProductionWorkspaceService:
                     )
                     or result
                 )
+                result = self._with_candidate_work(root, result, snapshot)
         self._project_workspace_result(
             root,
             repository=context.repository,
             result=result,
         )
         return result
+
+    def _with_candidate_work(
+        self,
+        root: Path,
+        result: WorkspaceResult,
+        snapshot: WorkspaceSnapshot,
+    ) -> WorkspaceResult:
+        action = result.next_action
+        specification = snapshot.specification
+        if (
+            action is None
+            or action.kind
+            is not WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS
+            or specification is None
+        ):
+            return result
+        config = load_config(
+            root / ".github" / "foundry-optimizer.yaml"
+        )
+        target = config.targets.get(specification.target)
+        if target is None:
+            raise ProductionWorkspaceError(
+                "workspace candidate target is not configured"
+            )
+        candidate_limit = (
+            target.campaign_overrides.max_changed_candidates
+            if (
+                target.campaign_overrides is not None
+                and target.campaign_overrides.max_changed_candidates
+                is not None
+            )
+            else config.campaign.max_changed_candidates
+        )
+        completed = tuple(
+            experiment
+            for experiment in snapshot.experiments
+            if experiment.status == "completed"
+        )
+        candidate_number = len(snapshot.experiments) + 1
+        if candidate_number > candidate_limit:
+            raise ProductionWorkspaceError(
+                "workspace candidate action exceeds configured limit"
+            )
+        contract = WorkspaceCandidateWorkContract(
+            issue_number=snapshot.issue_number,
+            target=specification.target,
+            base_commit=specification.base_commit,
+            candidate_id=f"candidate-{candidate_number}",
+            candidate_number=candidate_number,
+            candidate_limit=candidate_limit,
+            allowed_mutations=tuple(
+                getattr(item, "value", str(item))
+                for item in target.allowed_mutations
+            ),
+            prior_experiments=tuple(
+                WorkspacePriorExperiment(
+                    candidate_id=experiment.candidate_id,
+                    mutation_class=experiment.mutation_class,
+                    metrics=experiment.metrics,
+                    guardrails=experiment.guardrails,
+                    changed_paths=experiment.changed_paths,
+                )
+                for experiment in completed
+            ),
+        )
+        return replace(
+            result,
+            next_action=replace(action, candidate_work=contract),
+        )
 
     def _ensure_trusted_specification(
         self,

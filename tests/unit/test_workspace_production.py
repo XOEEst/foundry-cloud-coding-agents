@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -35,6 +36,10 @@ from foundry_opt.orchestration.workspace_runtime import (
 )
 from foundry_opt.orchestration.workspace_execution_production import (
     LiveWorkspaceExperimentAdapter,
+)
+from foundry_opt.orchestration.workspace import (
+    WorkspaceNextAction,
+    WorkspaceNextActionKind,
 )
 from foundry_opt.orchestration.workspace_production import (
     ProductionWorkspaceError,
@@ -363,6 +368,70 @@ def _trusted_specification() -> WorkspaceSpecificationRecord:
     )
 
 
+def test_production_enriches_candidate_action_with_trusted_work_contract(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = SimpleNamespace(
+        campaign=SimpleNamespace(max_changed_candidates=2),
+        targets={
+            "support-agent": SimpleNamespace(
+                allowed_mutations=("system_instructions",),
+                campaign_overrides=None,
+            )
+        },
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "load_config",
+        lambda path: config,
+    )
+    snapshot = WorkspaceSnapshot(
+        issue_number=31,
+        revision="a" * 40,
+        phase=WorkspacePhase.EVALUATING,
+        workspace_pull_request_number=104,
+        candidates=(),
+        selected_patch=None,
+        external_operation_ids=(),
+        experiments=(),
+        lineage=None,
+        specification=_trusted_specification(),
+        baseline=_trusted_baseline(),
+    )
+    result = WorkspaceResult(
+        phase=WorkspacePhase.EVALUATING,
+        workspace_pull_request=WorkspacePullRequest(
+            number=104,
+            issue_number=31,
+            branch="foundry-opt/workspace/issue-31",
+            title="[Optimize] #31 workspace",
+            draft=True,
+            reuse_existing=True,
+            base_commit="b" * 40,
+        ),
+        planned_effect_kinds=(),
+        next_action=WorkspaceNextAction(
+            kind=WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS,
+            issue_number=31,
+            workspace_pull_request_number=104,
+            trigger=WorkspaceTrigger.CONTINUE,
+        ),
+    )
+
+    enriched = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+    )._with_candidate_work(tmp_path, result, snapshot)
+
+    contract = enriched.to_dict()["next_action"]["candidate_work"]
+    assert contract["target"] == "support-agent"
+    assert contract["base_commit"] == "b" * 40
+    assert contract["candidate_id"] == "candidate-1"
+    assert contract["candidate_number"] == 1
+    assert contract["candidate_limit"] == 2
+    assert contract["allowed_mutations"] == ["system_instructions"]
+
+
 def _trusted_baseline() -> WorkspaceBaselineRecord:
     return WorkspaceBaselineRecord(
         status="completed",
@@ -524,9 +593,16 @@ def test_production_assignment_uses_state_workspace_pr_for_candidate_work(
     assigned: dict[str, Any] = {}
 
     class Assigner:
-        def assign(self, *, issue_number, pull_request_number):
+        def assign(
+            self,
+            *,
+            issue_number,
+            pull_request_number,
+            assignment_key,
+        ):
             assigned["issue"] = issue_number
             assigned["pr"] = pull_request_number
+            assigned["key"] = assignment_key
             return True
 
     service = ProductionWorkspaceService(
@@ -564,6 +640,7 @@ def test_production_assignment_uses_state_workspace_pr_for_candidate_work(
     assert result.next_action == "design_candidates"
     assert assigned["issue"] == 31
     assert assigned["pr"] == 104
+    assert assigned["key"] == "a" * 40
     assert assigned["assignment_token"] == "assignment-token"
 
 

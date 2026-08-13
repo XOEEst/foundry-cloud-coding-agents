@@ -97,9 +97,13 @@ def test_bundle_generates_single_workspace_customer_surfaces() -> None:
     assert "a handoff artifact" in normalized_steward
     assert "or a second optimization pull request" in normalized_steward
     assert (
-        "returned durable workspace state and `next_actions`"
+        "returned durable workspace state and `next_action`"
         in normalized_steward
     )
+    assert "`next_action.candidate_work`" in normalized_steward
+    assert "schema-v3 JSON manifest" in normalized_steward
+    assert "--candidate-manifest <manifest.json> --json" in normalized_steward
+    assert "revision-bound continuation" in normalized_steward
     assert "Do not stop merely because" in normalized_steward
     assert "waiting for an external operation" in normalized_steward
     assert "waiting for the human merge" in normalized_steward

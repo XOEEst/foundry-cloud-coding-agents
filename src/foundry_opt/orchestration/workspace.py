@@ -66,14 +66,65 @@ class WorkspaceNextActionKind(StrEnum):
 
 
 @dataclass(frozen=True)
+class WorkspacePriorExperiment:
+    candidate_id: str
+    mutation_class: str
+    metrics: Mapping[str, float]
+    guardrails: Mapping[str, str]
+    changed_paths: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_id": self.candidate_id,
+            "changed_paths": list(self.changed_paths),
+            "guardrails": dict(sorted(self.guardrails.items())),
+            "metrics": dict(sorted(self.metrics.items())),
+            "mutation_class": self.mutation_class,
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceCandidateWorkContract:
+    issue_number: int
+    target: str
+    base_commit: str
+    candidate_id: str
+    candidate_number: int
+    candidate_limit: int
+    allowed_mutations: tuple[str, ...]
+    prior_experiments: tuple[WorkspacePriorExperiment, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "allowed_mutations": list(self.allowed_mutations),
+            "base_commit": self.base_commit,
+            "candidate_id": self.candidate_id,
+            "candidate_limit": self.candidate_limit,
+            "candidate_number": self.candidate_number,
+            "command": (
+                "foundry-opt workspace experiment "
+                f"--issue {self.issue_number} "
+                "--candidate-manifest <manifest.json> --json"
+            ),
+            "issue_number": self.issue_number,
+            "manifest_schema_version": 3,
+            "prior_experiments": [
+                item.to_dict() for item in self.prior_experiments
+            ],
+            "target": self.target,
+        }
+
+
+@dataclass(frozen=True)
 class WorkspaceNextAction:
     kind: WorkspaceNextActionKind
     issue_number: int
     workspace_pull_request_number: int | None
     trigger: WorkspaceTrigger | None
+    candidate_work: WorkspaceCandidateWorkContract | None = None
 
-    def to_dict(self) -> dict[str, int | str | None]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        result = {
             "issue_number": self.issue_number,
             "kind": self.kind.value,
             "trigger": self.trigger.value if self.trigger is not None else None,
@@ -81,6 +132,9 @@ class WorkspaceNextAction:
                 self.workspace_pull_request_number
             ),
         }
+        if self.candidate_work is not None:
+            result["candidate_work"] = self.candidate_work.to_dict()
+        return result
 
 
 @dataclass(frozen=True)

@@ -6,6 +6,10 @@ import pytest
 from foundry_opt.orchestration import (
     parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
+    WorkspaceCandidateWorkContract,
+    WorkspaceNextAction,
+    WorkspaceNextActionKind,
+    WorkspacePriorExperiment,
 )
 
 
@@ -27,6 +31,54 @@ def _payload() -> dict:
         "base_commit": "a" * 40,
         "candidates": [_candidate()],
     }
+
+
+def test_candidate_action_exposes_an_executable_manifest_contract() -> None:
+    action = WorkspaceNextAction(
+        kind=WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS,
+        issue_number=31,
+        workspace_pull_request_number=104,
+        trigger=None,
+        candidate_work=WorkspaceCandidateWorkContract(
+            issue_number=31,
+            target="support-agent",
+            base_commit="a" * 40,
+            candidate_id="candidate-2",
+            candidate_number=2,
+            candidate_limit=2,
+            allowed_mutations=("instructions",),
+            prior_experiments=(
+                WorkspacePriorExperiment(
+                    candidate_id="candidate-1",
+                    mutation_class="instructions",
+                    metrics={"policy_coverage": 0.5},
+                    guardrails={"advisory_safety": "pass"},
+                    changed_paths=("agent.py",),
+                ),
+            ),
+        ),
+    )
+
+    contract = action.to_dict()["candidate_work"]
+
+    assert contract["manifest_schema_version"] == 3
+    assert contract["candidate_id"] == "candidate-2"
+    assert contract["candidate_number"] == 2
+    assert contract["candidate_limit"] == 2
+    assert contract["allowed_mutations"] == ["instructions"]
+    assert contract["prior_experiments"] == [
+        {
+            "candidate_id": "candidate-1",
+            "changed_paths": ["agent.py"],
+            "guardrails": {"advisory_safety": "pass"},
+            "metrics": {"policy_coverage": 0.5},
+            "mutation_class": "instructions",
+        }
+    ]
+    assert contract["command"] == (
+        "foundry-opt workspace experiment --issue 31 "
+        "--candidate-manifest <manifest.json> --json"
+    )
 
 
 def test_manifest_contains_only_untrusted_candidate_proposal() -> None:

@@ -98,9 +98,10 @@ def _repository_context(
         "- The steward compares bounded candidates internally, updates the "
         "same workspace pull request, and creates no secondary optimization "
         "branches or review surfaces.\n"
-        "- The steward follows durable workspace `next_actions`, continuing "
-        "internal work and pausing only for an external operation, the human "
-        "merge, a blocked state, or completion.\n"
+        "- The steward follows the durable workspace `next_action`; candidate "
+        "actions include the exact work contract and submission command. It "
+        "pauses for external operations, the human merge, a blocked state, "
+        "or completion.\n"
         "- Normal user action: watch the issue and its one workspace pull "
         "request, then merge that pull request when it becomes eligible.\n"
     )
@@ -483,11 +484,38 @@ Own exactly one persistent draft workspace pull request. Advance it only with:
 
 `foundry-opt workspace advance --issue <number> --json`
 
-Read the returned durable workspace state and `next_actions`. Perform only
-listed internal actions and compare bounded candidates internally. Update the
-same pull request and invoke the command again. Do not stop merely because
-one invocation returned successfully. Stop only when the result is waiting
-for an external operation, waiting for the human merge, blocked, or complete.
+Read the returned durable workspace state and `next_action`. Perform only the
+listed action and compare bounded candidates internally through the candidate
+work contract; never create another review surface. Update the same pull
+request only when trusted finalization supplies the selected exact patch.
+
+When `next_action.kind` is `run_candidate_experiments`, execute exactly one
+candidate from `next_action.candidate_work`. Treat its target, base commit,
+candidate ID and slot, configured limit, allowed mutation classes, prior
+redacted experiment results, and command as authoritative:
+
+1. Read the issue goal, target configuration, allowed edit paths, relevant
+   source, and prior experiment results.
+2. Create a disposable detached worktree at the supplied base commit. Make one
+   coherent change using one supplied mutation class. Never edit or commit on
+   the persistent workspace branch.
+3. Run the configured validation commands.
+4. Export a non-empty binary Git patch relative to the supplied base commit,
+   including new files, and base64-encode it.
+5. Write a schema-v3 JSON manifest containing only `schema_version`,
+   `issue_number`, `target`, `base_commit`, and `candidate`. The candidate
+   contains only `candidate_id`, `mutation_class`, `summary`, and
+   `patch_base64`. Copy every binding value from `candidate_work`.
+6. Run the exact `candidate_work.command`, currently
+   `foundry-opt workspace experiment --issue <number>
+   --candidate-manifest <manifest.json> --json`.
+7. Remove the disposable worktree and manifest after successful submission.
+   Stop when the result says `await_trusted_actions_result`; trusted Actions
+   evaluates it and a revision-bound continuation requests the next slot.
+
+Do not stop merely because an internal invocation returned successfully. Stop
+only when the result is waiting for an external operation, waiting for the
+human merge, blocked, or complete.
 
 Never create another issue, a handoff artifact, or a second optimization pull
 request. Do not create a second optimization branch or review surface. Do not
@@ -502,7 +530,7 @@ adapters; the optimizer-OIDC operations workflow performs persisted Foundry
 operations and post-deployment evaluation. Deployment remains isolated under
 the separate deployment identity.
 
-Never invent an action absent from `next_actions` or continue after an
+Never invent an action absent from `next_action` or continue after an
 external/human wait. Do not attempt a workaround for a blocked result.
 """
 

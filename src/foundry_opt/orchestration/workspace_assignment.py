@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -41,9 +42,12 @@ class GhWorkspaceCopilotAssigner:
         *,
         issue_number: int,
         pull_request_number: int,
+        assignment_key: str,
     ) -> bool:
         _positive(issue_number, "workspace issue")
         _positive(pull_request_number, "workspace pull request")
+        if not isinstance(assignment_key, str) or not assignment_key:
+            raise ValueError("workspace assignment key is invalid")
         endpoint = (
             f"repos/{self._repository}/issues/{pull_request_number}"
         )
@@ -64,7 +68,9 @@ class GhWorkspaceCopilotAssigner:
             )
         marker = (
             "<!-- foundry-opt:workspace-copilot-assignment:"
-            f"issue-{issue_number}:v1 -->"
+            f"issue-{issue_number}:"
+            f"{hashlib.sha256(assignment_key.encode('utf-8')).hexdigest()[:16]}"
+            ":v1 -->"
         )
         pages = self._api(
             (

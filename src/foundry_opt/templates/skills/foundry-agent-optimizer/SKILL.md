@@ -34,19 +34,57 @@ The steward advances only through:
 
 `foundry-opt workspace advance --issue <number> --json`
 
-Read the returned workspace state and `next_actions`. Perform only listed
-actions that are assigned to the steward and remain inside the same workspace
-pull request. Examples include editing allowlisted files, running repository
-validation, comparing the bounded candidate slate, updating redacted evidence,
-or applying the selected exact patch to the workspace branch. After completing
-an internal action, invoke the workspace command again and continue from its
-new durable result.
+Read the returned workspace state and `next_action`. Perform only the listed
+action and remain inside the same workspace pull request.
 
 Do not stop merely because one invocation returned successfully. Stop when the
 returned state is waiting for an external Foundry operation, waiting for the
 human merge, blocked, or complete. Never invent an action that is absent from
 `next_actions`, widen candidate limits, create another optimization branch, or
 reconstruct authority from comments, labels, or conversation history.
+
+### Executing a candidate action
+
+When `next_action.kind` is `run_candidate_experiments`, execute exactly one
+candidate from `next_action.candidate_work`:
+
+- Treat its target, base commit, candidate ID and number, configured candidate
+  limit, allowed mutation classes, prior redacted experiment results, and
+  submission command as authoritative.
+- Read the issue goal, target configuration, allowed edit paths, relevant
+  source, and prior results. Design one coherent bounded hypothesis that does
+  not repeat an ineffective prior change.
+- Create a disposable detached worktree at the supplied base commit. Make and
+  validate the change there. Do not edit or commit on the persistent workspace
+  PR branch.
+- Export a non-empty binary Git patch relative to the supplied base commit,
+  including new files, and base64-encode it.
+- Write a schema-v3 manifest containing exactly:
+
+```json
+{
+  "schema_version": 3,
+  "issue_number": 123,
+  "target": "configured-target",
+  "base_commit": "40-character-base-commit",
+  "candidate": {
+    "candidate_id": "candidate-1",
+    "mutation_class": "system_instructions",
+    "summary": "Concise hypothesis and expected improvement.",
+    "patch_base64": "BASE64_BINARY_GIT_PATCH"
+  }
+}
+```
+
+- Copy binding values from `candidate_work`; do not invent the issue, target,
+  base, candidate ID, or mutation vocabulary.
+- Run the exact returned command, currently
+  `foundry-opt workspace experiment --issue <N>
+  --candidate-manifest <manifest.json> --json`.
+- Remove the disposable worktree and manifest after successful submission.
+  Stop on `await_trusted_actions_result`. Trusted Actions derives validation,
+  the exact tree and bundle, Foundry IDs, metrics, guardrails, and evidence. A
+  revision-bound continuation supplies the next candidate slot.
 
 The workspace command owns durable lifecycle transitions. Agent prose, shell
 scripts, workflow YAML, issue comments, and labels are projections only.
