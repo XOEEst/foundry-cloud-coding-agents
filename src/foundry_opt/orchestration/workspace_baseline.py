@@ -96,6 +96,43 @@ class WorkspaceBaselineExecutor:
         target: str,
         base_commit: str,
     ) -> WorkspaceBaselineExecutionResult:
+        planned = self.plan(
+            repository_root=repository_root,
+            issue_number=issue_number,
+            target=target,
+            base_commit=base_commit,
+        )
+        snapshot = self._store.load(issue_number)
+        assert snapshot is not None
+        assert snapshot.specification is not None
+        assert snapshot.baseline is not None
+        if snapshot.baseline.status == "completed":
+            return planned
+        if self._runner is None:
+            raise ValueError("workspace baseline executor is unavailable")
+        plan = _plan_from_record(
+            issue_number,
+            snapshot.specification,
+            snapshot.baseline,
+        )
+        try:
+            result = self._runner.evaluate(plan.request)
+        except CandidateExperimentPending:
+            return _execution_result(
+                issue_number,
+                snapshot.baseline,
+                recorded=planned.recorded,
+            )
+        return self._complete(snapshot, plan, result)
+
+    def plan(
+        self,
+        *,
+        repository_root: Path,
+        issue_number: int,
+        target: str,
+        base_commit: str,
+    ) -> WorkspaceBaselineExecutionResult:
         snapshot = self._store.load(issue_number)
         if snapshot is None or snapshot.phase is not WorkspacePhase.SPECIFICATION:
             raise ValueError("workspace baseline state is unavailable")
@@ -108,63 +145,49 @@ class WorkspaceBaselineExecutor:
         ):
             raise ValueError("trusted workspace specification is required")
         if snapshot.baseline is not None:
-            if snapshot.baseline.status == "completed":
-                return _execution_result(
-                    issue_number, snapshot.baseline, recorded=False
-                )
-            plan = _plan_from_record(
-                issue_number, specification, snapshot.baseline
-            )
-            recorded = False
-        else:
-            if self._runner is None or self._request_builder is None:
-                raise ValueError("workspace baseline executor is unavailable")
-            plan = self._request_builder.build(
-                repository_root=repository_root,
-                issue_number=issue_number,
-                target=target,
-                base_commit=base_commit,
-                specification=specification,
-            )
-            _validate_plan(plan, issue_number, specification)
-            pending = _pending_record(plan)
-            snapshot = self._store.commit(
-                expected_revision=snapshot.revision,
-                update=WorkspaceUpdate(
-                    issue_number=issue_number,
-                    phase=snapshot.phase,
-                    workspace_pull_request_number=(
-                        snapshot.workspace_pull_request_number
-                    ),
-                    semantic_event="trusted_baseline_started",
-                    candidates=snapshot.candidates,
-                    selected_patch=snapshot.selected_patch,
-                    external_operation_ids=tuple(
-                        dict.fromkeys(
-                            (
-                                *snapshot.external_operation_ids,
-                                "baseline_operation:"
-                                f"{pending.operation_sha256}",
-                            )
-                        )
-                    ),
-                    experiments=snapshot.experiments,
-                    lineage=snapshot.lineage,
-                    specification=specification,
-                    baseline=pending,
-                ),
-            )
-            recorded = True
-        if self._runner is None:
-            raise ValueError("workspace baseline executor is unavailable")
-        try:
-            result = self._runner.evaluate(plan.request)
-        except CandidateExperimentPending:
-            assert snapshot.baseline is not None
             return _execution_result(
-                issue_number, snapshot.baseline, recorded=recorded
+                issue_number,
+                snapshot.baseline,
+                recorded=False,
             )
-        return self._complete(snapshot, plan, result)
+        if self._request_builder is None:
+            raise ValueError("workspace baseline executor is unavailable")
+        plan = self._request_builder.build(
+            repository_root=repository_root,
+            issue_number=issue_number,
+            target=target,
+            base_commit=base_commit,
+            specification=specification,
+        )
+        _validate_plan(plan, issue_number, specification)
+        pending = _pending_record(plan)
+        self._store.commit(
+            expected_revision=snapshot.revision,
+            update=WorkspaceUpdate(
+                issue_number=issue_number,
+                phase=snapshot.phase,
+                workspace_pull_request_number=(
+                    snapshot.workspace_pull_request_number
+                ),
+                semantic_event="trusted_baseline_started",
+                candidates=snapshot.candidates,
+                selected_patch=snapshot.selected_patch,
+                external_operation_ids=tuple(
+                    dict.fromkeys(
+                        (
+                            *snapshot.external_operation_ids,
+                            "baseline_operation:"
+                            f"{pending.operation_sha256}",
+                        )
+                    )
+                ),
+                experiments=snapshot.experiments,
+                lineage=snapshot.lineage,
+                specification=specification,
+                baseline=pending,
+            ),
+        )
+        return _execution_result(issue_number, pending, recorded=True)
 
     def ingest_result(
         self,
@@ -356,7 +379,7 @@ def _execution_result(
         recorded=recorded,
         operation_sha256=record.operation_sha256,
         next_action=(
-            "continue_workspace"
+            "design_candidates"
             if record.status == "completed"
             else "await_trusted_actions_result"
         ),

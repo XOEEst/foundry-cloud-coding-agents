@@ -496,6 +496,10 @@ class ProductionWorkspaceService:
                     issue=workspace_issue,
                     snapshot=snapshot,
                 )
+                snapshot = self._ensure_trusted_baseline_planned(
+                    root,
+                    snapshot=snapshot,
+                )
                 gated = _trusted_intake_gate(snapshot, pull_request)
                 if gated is not None:
                     self._project_workspace_result(
@@ -534,6 +538,10 @@ class ProductionWorkspaceService:
                     repository=context.repository,
                     base_branch=context.default_branch,
                     issue=workspace_issue,
+                    snapshot=snapshot,
+                )
+                snapshot = self._ensure_trusted_baseline_planned(
+                    root,
                     snapshot=snapshot,
                 )
                 result = (
@@ -592,6 +600,37 @@ class ProductionWorkspaceService:
                 baseline=snapshot.baseline,
             ),
         )
+
+    def _ensure_trusted_baseline_planned(
+        self,
+        root: Path,
+        *,
+        snapshot: WorkspaceSnapshot,
+    ) -> WorkspaceSnapshot:
+        specification = snapshot.specification
+        if (
+            specification is None
+            or specification.status != "policy_approved"
+            or snapshot.baseline is not None
+            or self._baseline_request_builder is None
+        ):
+            return snapshot
+        WorkspaceBaselineExecutor(
+            store=GitWorkspaceStore(root),
+            runner=None,
+            request_builder=self._baseline_request_builder,
+        ).plan(
+            repository_root=root,
+            issue_number=snapshot.issue_number,
+            target=specification.target,
+            base_commit=specification.base_commit,
+        )
+        planned = GitWorkspaceStore(root).load(snapshot.issue_number)
+        if planned is None or planned.baseline is None:
+            raise ProductionWorkspaceError(
+                "trusted baseline operation was not persisted"
+            )
+        return planned
 
     def _project_workspace_result(
         self,
@@ -1291,7 +1330,7 @@ def _copilot_assignment_action(
             return "establish_baseline", False
         if snapshot.baseline.status == "pending":
             return "await_trusted_actions_result", False
-        return "run_candidate_experiments", True
+        return "design_candidates", True
     if snapshot.phase is WorkspacePhase.EVALUATING:
         if any(
             experiment.status == "pending"
@@ -1335,7 +1374,7 @@ def _trusted_intake_gate(
     elif snapshot.baseline is None:
         kind = WorkspaceNextActionKind.ESTABLISH_BASELINE
     elif snapshot.baseline.status == "pending":
-        kind = WorkspaceNextActionKind.ESTABLISH_BASELINE
+        kind = WorkspaceNextActionKind.AWAIT_TRUSTED_ACTIONS_RESULT
     else:
         return None
     pull_request_number = snapshot.workspace_pull_request_number

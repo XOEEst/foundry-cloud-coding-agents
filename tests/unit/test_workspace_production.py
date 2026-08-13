@@ -10,11 +10,14 @@ import pytest
 
 import foundry_opt.orchestration.workspace_production as workspace_production
 from foundry_opt.orchestration import (
+    CandidateExperimentRequest,
     GitWorkspaceStore,
+    InMemoryWorkspaceStore,
     OptimizationWorkspace,
     TrustedWorkspaceEventContext,
     WorkspaceAdvanceRequest,
     WorkspaceBaselineRecord,
+    WorkspaceBaselinePlan,
     WorkspaceExperimentRecord,
     WorkspaceIssueStatusProjectionIntent,
     WorkspacePhase,
@@ -23,6 +26,7 @@ from foundry_opt.orchestration import (
     WorkspaceSnapshot,
     WorkspaceSpecificationRecord,
     WorkspaceTrigger,
+    WorkspaceUpdate,
     build_production_workspace,
 )
 from foundry_opt.orchestration.workspace_github import GhWorkspacePullRequests
@@ -73,6 +77,142 @@ def test_production_builder_uses_git_state_and_gh_pull_requests(
     assert isinstance(workspace, OptimizationWorkspace)
     assert isinstance(workspace._store, GitWorkspaceStore)
     assert isinstance(workspace._pull_requests, GhWorkspacePullRequests)
+
+
+def test_issue_created_plans_baseline_before_candidate_assignment(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    store = InMemoryWorkspaceStore()
+    pull_request = WorkspacePullRequest(
+        number=104,
+        issue_number=31,
+        branch="foundry-opt/workspace/issue-31",
+        title=(
+            "[Optimize] #31 workspace - draft, not yet selectable"
+        ),
+        draft=True,
+        reuse_existing=True,
+        base_commit="b" * 40,
+    )
+
+    class Workspace:
+        def advance(self, request):
+            store.commit(
+                expected_revision=None,
+                update=WorkspaceUpdate(
+                    issue_number=31,
+                    phase=WorkspacePhase.SPECIFICATION,
+                    workspace_pull_request_number=104,
+                    semantic_event="issue_created",
+                ),
+            )
+            return WorkspaceResult(
+                phase=WorkspacePhase.SPECIFICATION,
+                workspace_pull_request=pull_request,
+                planned_effect_kinds=("workspace_pr_created",),
+            )
+
+    class Resolver:
+        def resolve(self, **kwargs):
+            return _trusted_specification()
+
+    class BaselineBuilder:
+        def build(self, **kwargs):
+            specification = kwargs["specification"]
+            return WorkspaceBaselinePlan(
+                request=CandidateExperimentRequest(
+                    issue_number=31,
+                    candidate_id="baseline",
+                    patch_sha256=specification.spec_sha256,
+                    bundle_sha256="c" * 64,
+                    evidence_sha256="d" * 64,
+                    idempotency_key="e" * 64,
+                ),
+                dataset_ids=("development", "validation"),
+                evaluator_ids=("quality",),
+                sample_count=24,
+            )
+
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceStore",
+        lambda root: store,
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "_load_workspace_snapshot",
+        lambda root, issue: store.load(issue),
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "load_config",
+        lambda path: object(),
+    )
+    service = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+        workspace_factory=lambda **kwargs: Workspace(),
+        baseline_request_builder=BaselineBuilder(),
+        specification_resolver=Resolver(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_repository_context",
+        lambda root: type(
+            "Context",
+            (),
+            {
+                "repository": "octo-org/optimizer",
+                "default_branch": "main",
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_issue",
+        lambda root, repository, issue: {
+            "title": "[Optimize] Improve quality",
+            "body": "Trusted issue body.",
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_existing_workspace_pull_request",
+        lambda root, repository, issue: None,
+    )
+    monkeypatch.setattr(
+        service,
+        "_default_commit",
+        lambda root, branch: "b" * 40,
+    )
+    monkeypatch.setattr(
+        service,
+        "_project_workspace_result",
+        lambda *args, **kwargs: None,
+    )
+
+    result = service.advance(
+        WorkspaceAdvanceRequest(
+            repository_root=tmp_path,
+            issue_number=31,
+            trigger=WorkspaceTrigger.ISSUE_CREATED,
+        )
+    )
+    assignment = service.assign_copilot(
+        repository_root=tmp_path,
+        issue_number=31,
+        assignment_token=None,
+    )
+
+    snapshot = store.load(31)
+    assert snapshot.workspace_pull_request_number == 104
+    assert snapshot.specification == _trusted_specification()
+    assert snapshot.baseline.status == "pending"
+    assert result.next_action.kind.value == (
+        "await_trusted_actions_result"
+    )
+    assert assignment.assigned is False
+    assert assignment.next_action == "await_trusted_actions_result"
 
 
 def _trusted_specification() -> WorkspaceSpecificationRecord:
@@ -286,7 +426,7 @@ def test_production_assignment_uses_state_workspace_pr_for_candidate_work(
 
     assert result.assigned is True
     assert result.workspace_pull_request_number == 104
-    assert result.next_action == "run_candidate_experiments"
+    assert result.next_action == "design_candidates"
     assert assigned["issue"] == 31
     assert assigned["pr"] == 104
     assert assigned["assignment_token"] == "assignment-token"

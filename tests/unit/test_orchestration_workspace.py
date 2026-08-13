@@ -75,7 +75,7 @@ def test_issue_creation_plans_one_persistent_draft_workspace_pr(
     assert result.workspace_pull_request.base_commit == "a" * 40
     assert result.planned_effect_kinds == ("workspace_pr_sync",)
     assert result.next_action is not None
-    assert result.next_action.kind.value == "run_candidate_experiments"
+    assert result.next_action.kind.value == "design_candidates"
     assert result.next_action.trigger is (
         WorkspaceTrigger.EXPERIMENTS_COMPLETED
     )

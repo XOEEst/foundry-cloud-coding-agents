@@ -56,6 +56,8 @@ class WorkspaceTrigger(StrEnum):
 class WorkspaceNextActionKind(StrEnum):
     REVIEW_SPECIFICATION = "review_specification"
     ESTABLISH_BASELINE = "establish_baseline"
+    AWAIT_TRUSTED_ACTIONS_RESULT = "await_trusted_actions_result"
+    DESIGN_CANDIDATES = "design_candidates"
     RUN_CANDIDATE_EXPERIMENTS = "run_candidate_experiments"
     MERGE_WORKSPACE_PULL_REQUEST = "merge_workspace_pull_request"
     DEPLOY_SELECTED_CANDIDATE = "deploy_selected_candidate"
@@ -874,7 +876,7 @@ class OptimizationWorkspace:
     ) -> WorkspaceNextAction:
         kind, trigger = {
             WorkspacePhase.SPECIFICATION: (
-                WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS,
+                WorkspaceNextActionKind.DESIGN_CANDIDATES,
                 WorkspaceTrigger.EXPERIMENTS_COMPLETED,
             ),
             WorkspacePhase.EVALUATING: (

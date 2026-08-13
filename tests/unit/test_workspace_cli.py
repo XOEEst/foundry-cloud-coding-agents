@@ -360,7 +360,7 @@ def test_workspace_baseline_executes_from_trusted_state(
 
     class Result:
         status = "completed"
-        next_action = "continue_workspace"
+        next_action = "design_candidates"
 
         def to_dict(self):
             return {

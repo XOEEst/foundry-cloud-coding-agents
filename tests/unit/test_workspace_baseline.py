@@ -86,6 +86,38 @@ class Runner:
         )
 
 
+def test_baseline_plan_persists_pending_without_executing_foundry(
+    tmp_path: Path,
+) -> None:
+    store = _store()
+    runner = Runner()
+    executor = WorkspaceBaselineExecutor(
+        store=store,
+        runner=runner,
+        request_builder=Builder(),
+    )
+
+    first = executor.plan(
+        repository_root=tmp_path,
+        issue_number=31,
+        target="support-agent",
+        base_commit="b" * 40,
+    )
+    retry = executor.plan(
+        repository_root=tmp_path,
+        issue_number=31,
+        target="support-agent",
+        base_commit="b" * 40,
+    )
+
+    baseline = store.load(31).baseline
+    assert first.status == "pending"
+    assert first.next_action == "await_trusted_actions_result"
+    assert retry.recorded is False
+    assert runner.calls == 0
+    assert baseline.status == "pending"
+
+
 def test_trusted_baseline_persists_and_retry_does_not_rerun(
     tmp_path: Path,
 ) -> None:
