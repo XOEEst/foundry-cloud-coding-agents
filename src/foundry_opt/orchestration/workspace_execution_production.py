@@ -26,11 +26,14 @@ from foundry_opt.adapters.optimization_evaluation import (
 from foundry_opt.auth import build_production_auth_probe
 from foundry_opt.config import load_config
 from foundry_opt.evaluation import DatasetSplit
+from foundry_opt.optimization import materialize_prepared_asset
 from foundry_opt.optimization.models import EvaluationAssetContext
 from foundry_opt.optimization.production import (
     _DEFAULT_CONFIG_PATH,
+    _RegistrationGateway,
     _default_binder_factory,
     _default_credential_provider,
+    _default_registration_gateway_factory,
     _default_resolution_gateway_factory,
     _draft_request,
     build_specification_asset_registry,
@@ -599,9 +602,20 @@ def _trusted_execution_inputs(
         target=issue_request.target,
         issue_number=issue_number,
     )
-    assets = tuple(
-        _asset_reference(registry.prepare(asset, context).provenance)
+    prepared_assets = tuple(
+        registry.prepare(asset, context)
         for asset in (*issue_request.datasets, *issue_request.evaluators)
+    )
+    registration = _RegistrationGateway(
+        config,
+        target.environment,
+        _default_registration_gateway_factory(credential),
+    )
+    assets = tuple(
+        _asset_reference(
+            materialize_prepared_asset(prepared, registration)
+        )
+        for prepared in prepared_assets
     )
     if any(not _asset_reference_is_complete(asset) for asset in assets):
         raise RuntimeError("trusted workspace assets are incomplete")
