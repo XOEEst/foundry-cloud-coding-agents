@@ -38,5 +38,6 @@ def test_v3_migration_plan_is_read_only_and_preserves_legacy_paths() -> None:
     )
 
 
-def test_blocked_v3_campaign_maps_to_terminal_compact_audit_phase() -> None:
-    assert _workspace_phase(CampaignPhase.BLOCKED) is WorkspacePhase.COMPLETED
+def test_terminal_v3_campaigns_map_to_compact_audit_phase() -> None:
+    for phase in (CampaignPhase.BLOCKED, CampaignPhase.CANCELLED):
+        assert _workspace_phase(phase) is WorkspacePhase.COMPLETED
