@@ -1001,6 +1001,10 @@ on:
         description: Optional optimization issue number to retry
         required: false
         type: number
+      deployment_run_id:
+        description: Optional successful deployment run to reconcile
+        required: false
+        type: number
 
 permissions:
   actions: write
@@ -1014,6 +1018,7 @@ concurrency:
   group: >-
     foundry-optimization-operations-${{{{
       github.event.workflow_run.id ||
+      inputs.deployment_run_id ||
       inputs.issue ||
       github.ref_name ||
       github.run_id
@@ -1065,7 +1070,8 @@ jobs:
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
-          TRUSTED_WORKFLOW_RUN_ID: ${{{{ github.event.workflow_run.id }}}}
+          TRUSTED_WORKFLOW_RUN_ID: >-
+            ${{{{ github.event.workflow_run.id || inputs.deployment_run_id }}}}
           WORKSPACE_RESUME_FILE: >-
             ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
         shell: bash
@@ -1073,7 +1079,12 @@ jobs:
           mkdir -p "$(dirname "$WORKSPACE_RESUME_FILE")"
           : > "$WORKSPACE_RESUME_FILE"
           issues=()
-          if [ -n "$REQUESTED_ISSUE" ]; then
+          if (
+            [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] &&
+            [ -n "$TRUSTED_WORKFLOW_RUN_ID" ]
+          ); then
+            :
+          elif [ -n "$REQUESTED_ISSUE" ]; then
             if [[ ! "$REQUESTED_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
               echo "Invalid issue number" >&2
               exit 1
@@ -1117,11 +1128,14 @@ jobs:
             printf '%s\\n' "$result_json" >> "$WORKSPACE_RESUME_FILE"
           done
       - name: Reconcile authenticated deployment result
-        if: github.event_name == 'workflow_run'
+        if: >-
+          github.event_name == 'workflow_run' ||
+          inputs.deployment_run_id != ''
         env:
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
-          TRUSTED_WORKFLOW_RUN_ID: ${{{{ github.event.workflow_run.id }}}}
+          TRUSTED_WORKFLOW_RUN_ID: >-
+            ${{{{ github.event.workflow_run.id || inputs.deployment_run_id }}}}
           WORKSPACE_RESUME_FILE: >-
             ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
         shell: bash
