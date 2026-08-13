@@ -783,21 +783,8 @@ class ProductionWorkspaceDeploymentExecutor(
                 correlation_input_name="foundry_opt_effect_id",
                 correlation_id=target.lineage_sha256,
             )
-            run = self._gateway.find_run(
-                self._root,
-                query=WorkflowRunQuery(
-                    workflow_path=target.workflow_path,
-                    events=("workflow_dispatch",),
-                    head_sha=target.merge_commit,
-                    trigger=target.workflow_trigger,
-                    match_head_sha=False,
-                    display_title=target.lineage_sha256,
-                ),
-            )
             return WorkspaceDeploymentDispatchResult(
                 status=WorkspaceDeploymentDispatchStatus.DISPATCHED,
-                run_id=_run_id(run.url) if run is not None else None,
-                run_url=run.url if run is not None else None,
             )
         run = self._gateway.find_run(
             self._root,
