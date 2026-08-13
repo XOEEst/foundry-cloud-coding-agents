@@ -1252,6 +1252,37 @@ class CandidateExperimentOperationExecutor(Protocol):
     ) -> CandidateExperimentResult | None: ...
 
 
+@dataclass(frozen=True)
+class WorkspaceCandidateSelectionRequest:
+    repository_root: Path
+    issue_number: int
+    plan: TrustedCandidateExecutionPlan
+    result: CandidateExperimentResult
+
+    def __post_init__(self) -> None:
+        _positive_integer(self.issue_number, "workspace issue number")
+        if not isinstance(self.plan, TrustedCandidateExecutionPlan):
+            raise ValueError(
+                "workspace candidate selection plan is invalid"
+            )
+        if not isinstance(self.result, CandidateExperimentResult):
+            raise ValueError(
+                "workspace candidate selection result is invalid"
+            )
+        if self.plan.request.issue_number != self.issue_number:
+            raise ValueError(
+                "workspace candidate selection issue changed"
+            )
+        _validate_candidate_result(self.plan.operation, self.result)
+
+
+class WorkspaceCandidateSelectionService(Protocol):
+    def complete(
+        self,
+        request: WorkspaceCandidateSelectionRequest,
+    ) -> WorkspaceResult | None: ...
+
+
 class WorkspaceDeploymentStateLoader(Protocol):
     def load(
         self,
@@ -1351,6 +1382,14 @@ class NoopCandidateExperimentOperationExecutor:
         return None
 
 
+class NoopWorkspaceCandidateSelectionService:
+    def complete(
+        self,
+        request: WorkspaceCandidateSelectionRequest,
+    ) -> WorkspaceResult | None:
+        return None
+
+
 class EmptyWorkspaceDeploymentStateLoader:
     def load(
         self,
@@ -1426,6 +1465,9 @@ class WorkspaceOperationsService:
             CandidateExperimentExecutionPlanner | None
         ) = None,
         candidate_executor: CandidateExperimentOperationExecutor | None = None,
+        candidate_selection: (
+            WorkspaceCandidateSelectionService | None
+        ) = None,
         deployment_loader: WorkspaceDeploymentStateLoader | None = None,
         deployment_executor: (
             WorkspaceDeploymentWorkflowExecutor | None
@@ -1449,6 +1491,11 @@ class WorkspaceOperationsService:
             candidate_executor
             if candidate_executor is not None
             else NoopCandidateExperimentOperationExecutor()
+        )
+        self._candidate_selection = (
+            candidate_selection
+            if candidate_selection is not None
+            else NoopWorkspaceCandidateSelectionService()
         )
         self._deployment_loader = (
             deployment_loader
@@ -1661,7 +1708,6 @@ class WorkspaceOperationsService:
         if plan.request.issue_number != request.issue_number:
             raise ValueError("candidate experiment issue changed")
         stored = self._candidate_store.load_result(operation)
-        recorded = False
         if stored is None:
             result = self._candidate_executor.reconcile(plan)
         else:
@@ -1679,11 +1725,17 @@ class WorkspaceOperationsService:
         existing = self._candidate_store.load_result(operation)
         if existing is not None:
             _validate_candidate_result(operation, existing.result)
-            workspace = existing.workspace
+            workspace, workspace_recorded = (
+                self._complete_candidate_selection(
+                    request=request,
+                    plan=plan,
+                    stored=existing,
+                )
+            )
             return WorkspaceOperationsResult(
                 issue_number=request.issue_number,
                 status=WorkspaceOperationsStatus.CANDIDATE_RECORDED,
-                recorded=False,
+                recorded=workspace_recorded,
                 operation_id=operation.sha256,
                 phase=workspace.phase if workspace is not None else None,
                 workspace_pull_request_number=(
@@ -1696,12 +1748,15 @@ class WorkspaceOperationsService:
                 ),
             )
         persisted = self._candidate_store.persist_result(operation, result)
-        recorded = True
-        workspace = persisted.workspace
+        workspace, _workspace_recorded = self._complete_candidate_selection(
+            request=request,
+            plan=plan,
+            stored=persisted,
+        )
         return WorkspaceOperationsResult(
             issue_number=request.issue_number,
             status=WorkspaceOperationsStatus.CANDIDATE_RECORDED,
-            recorded=recorded,
+            recorded=True,
             operation_id=operation.sha256,
             phase=workspace.phase if workspace is not None else None,
             workspace_pull_request_number=(
@@ -1713,6 +1768,26 @@ class WorkspaceOperationsService:
                 workspace=workspace,
             ),
         )
+
+    def _complete_candidate_selection(
+        self,
+        *,
+        request: WorkspaceOperationsExecuteRequest,
+        plan: TrustedCandidateExecutionPlan,
+        stored: StoredCandidateExperimentResult,
+    ) -> tuple[WorkspaceResult | None, bool]:
+        workspace = stored.workspace
+        completed = self._candidate_selection.complete(
+            WorkspaceCandidateSelectionRequest(
+                repository_root=request.repository_root,
+                issue_number=request.issue_number,
+                plan=plan,
+                result=stored.result,
+            )
+        )
+        if completed is None:
+            return workspace, False
+        return completed, completed.recorded
 
 
 def _validate_candidate_result(
@@ -1754,6 +1829,8 @@ __all__ = [
     "StoredCandidateExperimentResult",
     "TrustedCandidateExecutionPlan",
     "TrustedCandidatePackagingContract",
+    "WorkspaceCandidateSelectionRequest",
+    "WorkspaceCandidateSelectionService",
     "TrustedWorkspaceArtifactContext",
     "TrustedWorkspaceExecutionContext",
     "UnavailableCandidateExperimentExecutionPlanner",

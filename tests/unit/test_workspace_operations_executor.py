@@ -27,6 +27,7 @@ from foundry_opt.orchestration.workspace import (
 )
 from foundry_opt.orchestration.workspace_operations_executor import (
     StoredCandidateExperimentResult,
+    WorkspaceCandidateSelectionRequest,
     PendingCandidateExperimentExecution,
     TrustedWorkspaceArtifactContext,
     TrustedCandidateExecutionPlan,
@@ -367,6 +368,22 @@ class RecordingCandidatePlanner:
         return self.plan
 
 
+class RecordingCandidateSelectionService:
+    def __init__(
+        self,
+        results: list[WorkspaceResult | None],
+    ) -> None:
+        self._results = results
+        self.requests: list[WorkspaceCandidateSelectionRequest] = []
+
+    def complete(
+        self,
+        request: WorkspaceCandidateSelectionRequest,
+    ) -> WorkspaceResult | None:
+        self.requests.append(request)
+        return self._results.pop(0)
+
+
 class StaticDeploymentLoader:
     def __init__(self, target: WorkspaceDeploymentTarget | None) -> None:
         self.target = target
@@ -533,6 +550,56 @@ def test_candidate_fallback_resumes_same_workspace_pull_request(
     assert result.resume.workspace_pull_request_number == 104
     assert "@copilot" in result.resume.comment_body
     assert "same workspace pull request" in result.resume.comment_body
+
+
+def test_candidate_fallback_final_result_promotes_ready_workspace_pr_in_actions(
+    tmp_path: Path,
+) -> None:
+    persisted = _persisted_candidate_operation()
+    pending = _pending_candidate_execution(persisted)
+    store = RecordingCandidateStore(pending)
+    store.workspace = _workspace_result(
+        WorkspacePhase.EVALUATING,
+        recorded=True,
+        next_action=WorkspaceNextActionKind.RUN_CANDIDATE_EXPERIMENTS,
+        workspace_pull_request_number=104,
+    )
+    planner = RecordingCandidatePlanner(_candidate_plan(pending))
+    selection = RecordingCandidateSelectionService(
+        [
+            _workspace_result(
+                WorkspacePhase.AWAITING_SELECTION,
+                recorded=True,
+                next_action=(
+                    WorkspaceNextActionKind.MERGE_WORKSPACE_PULL_REQUEST
+                ),
+                workspace_pull_request_number=104,
+            )
+        ]
+    )
+    service = WorkspaceOperationsService(
+        candidate_store=store,
+        candidate_planner=planner,
+        candidate_executor=RecordingCandidateExecutor(
+            reconciled=[None],
+            executed=[_candidate_result(persisted)],
+        ),
+        candidate_selection=selection,
+    )
+
+    result = service.execute(_execute_request(tmp_path))
+
+    assert result.status is WorkspaceOperationsStatus.CANDIDATE_RECORDED
+    assert result.recorded is True
+    assert result.phase is WorkspacePhase.AWAITING_SELECTION
+    assert result.workspace_pull_request_number == 104
+    assert result.resume is None
+    assert len(selection.requests) == 1
+    assert selection.requests[0].issue_number == 31
+    assert (
+        selection.requests[0].result.operation_sha256 == persisted.sha256
+    )
+    assert selection.requests[0].plan.request.candidate_id == "candidate-2"
 
 
 @pytest.mark.parametrize(
