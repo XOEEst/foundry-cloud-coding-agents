@@ -332,7 +332,11 @@ class GitWorkspaceCandidateStore(PendingCandidateExperimentStore):
         )
         if (
             pending is None
-            and snapshot.phase is WorkspacePhase.EVALUATING
+            and snapshot.phase
+            in {
+                WorkspacePhase.EVALUATING,
+                WorkspacePhase.AWAITING_SELECTION,
+            }
             and snapshot.specification is not None
             and snapshot.experiments
             and all(
