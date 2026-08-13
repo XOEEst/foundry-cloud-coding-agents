@@ -1,11 +1,14 @@
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 
 from foundry_opt.orchestration import (
     TrustedWorkspaceOperationContext,
     WorkspaceTrigger,
     normalize_workspace_operation,
 )
+from foundry_opt.orchestration.git_transport import SafePushRemote
+import foundry_opt.orchestration.workspace_operation_store as operation_store
 
 
 def _payload() -> dict:
@@ -34,6 +37,44 @@ def _context() -> TrustedWorkspaceOperationContext:
         repository="octo-org/optimizer",
         repository_id=123,
     )
+
+
+def test_operation_store_deletes_ref_through_validated_remote_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = object.__new__(operation_store.GitWorkspaceOperationStore)
+    store._root = tmp_path
+    store._remote = "origin"
+    store._git = SimpleNamespace(
+        _remote_revision=lambda ref: "a" * 40,
+    )
+    commands: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        operation_store,
+        "resolve_safe_push_remote",
+        lambda root, remote: SafePushRemote(
+            name=remote,
+            url="https://github.com/octo-org/optimizer.git",
+            isolated=False,
+        ),
+    )
+    monkeypatch.setattr(
+        operation_store,
+        "_run",
+        lambda *arguments: commands.append(arguments),
+    )
+
+    assert store.delete_ref(31) is True
+    assert commands == [
+        (
+            tmp_path,
+            "git",
+            "push",
+            "https://github.com/octo-org/optimizer.git",
+            ":refs/heads/foundry-opt/operations/issue-31",
+        )
+    ]
 
 
 def test_trusted_workspace_operation_normalizes_completed_lineage() -> None:

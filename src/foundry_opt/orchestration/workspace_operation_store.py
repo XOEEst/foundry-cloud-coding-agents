@@ -141,7 +141,7 @@ class GitWorkspaceOperationStore:
             raise WorkspaceConflictError(
                 "workspace operation push destination is not trusted"
             )
-        _run(self._root, "git", "push", safe_remote, f":{ref}")
+        _run(self._root, "git", "push", safe_remote.url, f":{ref}")
         return True
 
     def _candidate_files(self, issue_number: int) -> dict[str, bytes]:
