@@ -1462,7 +1462,6 @@ jobs:
               issue = document.get("issue_number")
               if type(issue) is not int or issue < 1:
                   raise SystemExit("workspace resume payload is invalid")
-              entries.add(issue)
               resume = document.get("resume")
               if resume is None:
                   continue
@@ -1474,6 +1473,7 @@ jobs:
                   or pull_request < 1
               ):
                   raise SystemExit("workspace resume payload is invalid")
+              entries.add(issue)
 
           package = os.environ["OPTIMIZER_PACKAGE"]
           environment = dict(os.environ)

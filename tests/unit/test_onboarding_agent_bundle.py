@@ -436,8 +436,8 @@ def test_operations_workflow_resumes_same_workspace_pull_request_without_creatin
         "Resume same workspace pull request when trusted state needs Copilot"
     )
     assert "workspace resume payload is invalid" in text
-    assert text.index("entries.add(issue)") < text.index(
-        'resume = document.get("resume")'
+    assert text.index('if resume is None:') < text.index(
+        "entries.add(issue)"
     )
     assert "foundry-opt" in text
     assert "workspace" in text
