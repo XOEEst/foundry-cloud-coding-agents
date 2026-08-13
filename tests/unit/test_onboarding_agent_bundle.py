@@ -377,11 +377,12 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
     assert '"workspace",' in text
     assert '"verify",' in text
     assert '"ready",' in text
-    assert "gh pr comment" in text
-    assert 'repos/{repository}/issues/{pull_request}/comments' in text
-    assert "@copilot" in text
+    assert '"assign",' in text
+    assert "gh pr comment" not in text
+    assert "@copilot" not in text
     assert "head -25" in text
     assert "ref: ${{ github.event.repository.default_branch }}" in text
+    assert "push:" not in text
     for forbidden in (
         "optimize reconcile",
         "capability_bridge",
@@ -410,7 +411,12 @@ def test_operations_workflow_resumes_same_workspace_pull_request_without_creatin
         "Resume same workspace pull request when trusted state needs Copilot"
     )
     assert "workspace resume payload is invalid" in text
-    assert "gh pr comment" in text
+    assert "foundry-opt" in text
+    assert "workspace" in text
+    assert "assign" in text
+    assert "gh pr comment" not in text
+    assert "COPILOT_ASSIGNMENT_TOKEN" in text
+    assert 'GH_TOKEN: ""' in text
     assert "gh pr create" not in text
     assert "gh issue edit" not in text
     assert "--add-assignee" not in text

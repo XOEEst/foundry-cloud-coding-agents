@@ -715,9 +715,6 @@ def _operations_workflow(
     return f"""name: Foundry optimization operations
 
 on:
-  push:
-    branches:
-      - foundry-opt/state/issue-*
   schedule:
     - cron: "*/5 * * * *"
   workflow_run:
@@ -1143,7 +1140,9 @@ jobs:
               raise SystemExit(1)
       - name: Resume same workspace pull request when trusted state needs Copilot
         env:
-          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          GH_TOKEN: ""
+          OPTIMIZER_PACKAGE: {install}
           WORKSPACE_RESUME_FILE: >-
             ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
         shell: python
@@ -1156,8 +1155,12 @@ jobs:
           resume_path = Path(os.environ["WORKSPACE_RESUME_FILE"])
           if not resume_path.is_file():
               raise SystemExit(0)
+          if not os.environ.get("COPILOT_ASSIGNMENT_TOKEN"):
+              raise SystemExit(
+                  "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN"
+              )
 
-          entries: dict[tuple[int, str], str] = {{}}
+          entries: set[int] = set()
           for line in resume_path.read_text(encoding="utf-8").splitlines():
               if not line.strip():
                   continue
@@ -1167,43 +1170,43 @@ jobs:
                   continue
               if not isinstance(resume, dict):
                   raise SystemExit("workspace resume payload is invalid")
+              issue = document.get("issue_number")
               pull_request = resume.get("workspace_pull_request_number")
-              marker = resume.get("comment_marker")
-              body = resume.get("comment_body")
               if (
-                  type(pull_request) is not int
+                  type(issue) is not int
+                  or issue < 1
+                  or type(pull_request) is not int
                   or pull_request < 1
-                  or not isinstance(marker, str)
-                  or not marker
-                  or not isinstance(body, str)
-                  or marker not in body
-                  or "@copilot" not in body
               ):
                   raise SystemExit("workspace resume payload is invalid")
-              entries[(pull_request, marker)] = body
+              entries.add(issue)
 
-          repository = os.environ["TRUSTED_REPOSITORY"]
-          for (pull_request, marker), body in sorted(entries.items()):
-              comments = json.loads(
-                  subprocess.run(
-                      f"gh api repos/{{repository}}/issues/{{pull_request}}/comments --paginate".split(),
-                      check=True,
-                      capture_output=True,
-                      text=True,
-                  ).stdout
-              )
-              if any(
-                  isinstance(comment, dict)
-                  and marker in str(comment.get("body", ""))
-                  for comment in comments
-              ):
-                  continue
-              subprocess.run(
-                  f"gh pr comment {{pull_request}} --repo {{repository}} --body-file -".split(),
+          package = os.environ["OPTIMIZER_PACKAGE"]
+          environment = dict(os.environ)
+          for issue in sorted(entries):
+              result = subprocess.run(
+                  [
+                      "uv",
+                      "run",
+                      "--no-project",
+                      "--no-config",
+                      "--no-env-file",
+                      "--with",
+                      package,
+                      "foundry-opt",
+                      "workspace",
+                      "assign",
+                      "--issue",
+                      str(issue),
+                      "--json",
+                  ],
                   check=True,
-                  input=body,
+                  capture_output=True,
                   text=True,
+                  env=environment,
               )
+              if result.stdout:
+                  print(result.stdout, end="")
 """
 
 

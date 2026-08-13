@@ -2379,9 +2379,16 @@ def build_production_workspace_operations_service() -> (
     from foundry_opt.orchestration.workspace_production import (
         build_production_workspace_service,
     )
+    from foundry_opt.orchestration.workspace_operations_production import (
+        build_production_workspace_operations_bindings,
+    )
 
+    workspace_service = build_production_workspace_service()
     return WorkspaceOperationsService(
-        workspace_service=build_production_workspace_service()
+        **build_production_workspace_operations_bindings(
+            Path.cwd(),
+            workspace_service=workspace_service,
+        )
     )
 
 

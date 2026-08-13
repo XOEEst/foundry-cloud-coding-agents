@@ -87,6 +87,9 @@ from foundry_opt.orchestration.workspace_projection import (
     GhWorkspaceIssueProjector,
     WorkspaceIssueProjector,
 )
+from foundry_opt.orchestration.workspace_execution_production import (
+    build_production_workspace_service_bindings,
+)
 from foundry_opt.orchestration.workspace_verifier import (
     WorkspaceVerificationResult,
     WorkspaceVerifier,
@@ -281,7 +284,11 @@ def build_production_workspace(
 
 
 def build_production_workspace_service() -> ProductionWorkspaceService:
-    return ProductionWorkspaceService()
+    return ProductionWorkspaceService(
+        **build_production_workspace_service_bindings(
+            Path.cwd(),
+        )
+    )
 
 
 class ProductionWorkspaceService:

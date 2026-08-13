@@ -26,6 +26,18 @@ from foundry_opt.orchestration.workspace_verification import (
     WorkspaceVerifyResult,
     WorkspaceVerifyStatus,
 )
+from foundry_opt.orchestration.workspace_operations_executor import (
+    WorkspaceOperationsResult,
+    WorkspaceOperationsStatus,
+    WorkspaceResumeRequest,
+    WorkspaceVerificationRequest,
+)
+from foundry_opt.orchestration.workspace_verification import (
+    WorkspaceEvidenceLink,
+    WorkspaceMetricVerification,
+    WorkspaceVerifyResult,
+    WorkspaceVerifyStatus,
+)
 
 
 runner = CliRunner()

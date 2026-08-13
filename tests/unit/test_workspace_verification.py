@@ -9,6 +9,8 @@ from foundry_opt.evaluation import MetricDirection, MetricPolicy
 from foundry_opt.orchestration.workspace import WorkspacePhase
 from foundry_opt.orchestration.workspace_store import (
     CandidateSummary,
+    WorkspaceExperimentRecord,
+    WorkspaceLineage,
     WorkspaceSnapshot,
 )
 from foundry_opt.orchestration.workspace_verification import (
@@ -86,6 +88,39 @@ def _snapshot() -> WorkspaceSnapshot:
             f"candidate-2:bundle:{'2' * 64}",
             f"candidate-2:evidence:{'3' * 64}",
             f"candidate-2:tree:{'b' * 40}",
+        ),
+        experiments=(
+            WorkspaceExperimentRecord(
+                candidate_id="candidate-2",
+                mutation_class="system_instructions",
+                patch_sha256=patch_sha256,
+                bundle_sha256="2" * 64,
+                evidence_sha256="3" * 64,
+                idempotency_key="4" * 64,
+                operation_sha256="5" * 64,
+                status="completed",
+                changed_paths=("agent.py",),
+                validation=("pytest: passed",),
+                expected_tree="b" * 40,
+                executor="direct_oidc",
+                draft_id="draft-2",
+                evaluation_id="evaluation-2",
+                run_id="run-2",
+                metrics={"quality": 0.9, "safety": 1.0},
+                guardrails={"safety": "pass"},
+            ),
+        ),
+        lineage=WorkspaceLineage(
+            spec_sha256="6" * 64,
+            base_commit="7" * 40,
+            patch_sha256=patch_sha256,
+            evidence_sha256="3" * 64,
+            bundle_sha256="2" * 64,
+            expected_tree="b" * 40,
+            selected_candidate_id="candidate-2",
+            workspace_pull_request_number=104,
+            required_checks={"exact-candidate": "success"},
+            required_checks_provenance="trusted-selector:head:" + "a" * 40,
         ),
     )
 

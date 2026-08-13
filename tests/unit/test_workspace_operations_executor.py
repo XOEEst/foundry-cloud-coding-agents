@@ -54,6 +54,7 @@ from foundry_opt.orchestration.workspace_operations_executor import (
     WorkspaceReadyForHumanRequest,
     WorkspaceRetentionOutcome,
     WorkspaceRetentionStatus,
+    build_production_workspace_operations_service,
     render_workspace_completion_projection,
     render_workspace_ready_for_human_projection,
 )
@@ -1319,3 +1320,32 @@ def test_reconcile_duplicate_completed_deployment_skips_re_evaluation(
     assert not evaluator.calls
     assert not finalizer.complete_calls
     assert not finalizer.ready_calls
+
+
+def test_build_production_workspace_operations_service_uses_real_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    monkeypatch.chdir(repository_root)
+
+    service = build_production_workspace_operations_service()
+
+    for seam in (
+        service._baseline_store,
+        service._baseline_planner,
+        service._baseline_executor,
+        service._baseline_completion,
+        service._candidate_store,
+        service._candidate_planner,
+        service._candidate_executor,
+        service._candidate_selection,
+        service._deployment_loader,
+        service._deployment_executor,
+        service._deployment_verifier,
+        service._retention_evaluator,
+        service._finalizer,
+    ):
+        name = type(seam).__name__
+        assert "Empty" not in name
+        assert "Noop" not in name
+        assert "Unavailable" not in name

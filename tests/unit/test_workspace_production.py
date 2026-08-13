@@ -33,6 +33,7 @@ from foundry_opt.orchestration.workspace_github import GhWorkspacePullRequests
 from foundry_opt.orchestration.workspace_production import (
     ProductionWorkspaceError,
     ProductionWorkspaceService,
+    build_production_workspace_service,
 )
 from foundry_opt.preflight.interfaces import CommandResult
 
@@ -77,6 +78,19 @@ def test_production_builder_uses_git_state_and_gh_pull_requests(
     assert isinstance(workspace, OptimizationWorkspace)
     assert isinstance(workspace._store, GitWorkspaceStore)
     assert isinstance(workspace._pull_requests, GhWorkspacePullRequests)
+
+
+def test_build_production_workspace_service_uses_real_baseline_and_experiment_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    monkeypatch.chdir(repository_root)
+
+    service = build_production_workspace_service()
+
+    assert isinstance(service, ProductionWorkspaceService)
+    assert service._experiment_runner is not None
+    assert service._baseline_request_builder is not None
 
 
 def test_issue_created_plans_baseline_before_candidate_assignment(
