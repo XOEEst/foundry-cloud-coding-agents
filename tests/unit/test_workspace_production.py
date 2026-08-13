@@ -537,6 +537,78 @@ def test_copilot_experiment_writes_revision_bound_proxy_envelope(
     }
 
 
+def test_trusted_experiment_records_manifest_before_execution(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class Recorded(RuntimeError):
+        pass
+
+    recorded: dict[str, Any] = {}
+    config = SimpleNamespace(
+        campaign=SimpleNamespace(max_changed_candidates=2),
+        targets={"support-agent": SimpleNamespace()},
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "load_config",
+        lambda path: config,
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "_trusted_copilot_repository_context",
+        lambda: None,
+    )
+
+    class Operations:
+        def record_candidate_manifest(self, issue_number, payload):
+            recorded["issue"] = issue_number
+            recorded["payload"] = payload
+            raise Recorded
+
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceOperationStore",
+        lambda root: Operations(),
+    )
+    service = ProductionWorkspaceService(
+        commands=FakeCommands({}),
+        experiment_runner=object(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_repository_context",
+        lambda root: SimpleNamespace(
+            repository="octo-org/optimizer",
+            default_branch="main",
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_existing_workspace_pull_request",
+        lambda root, repository, issue: (104, "b" * 40),
+    )
+    payload = {
+        "schema_version": 3,
+        "issue_number": 31,
+        "target": "support-agent",
+        "base_commit": "b" * 40,
+        "candidate": {
+            "candidate_id": "candidate-1",
+            "mutation_class": "system_instructions",
+            "summary": "Improve policy coverage.",
+            "patch_base64": base64.b64encode(
+                b"diff --git a/agent.py b/agent.py\n"
+            ).decode("ascii"),
+        },
+    }
+
+    with pytest.raises(Recorded):
+        service.execute_experiment(payload, repository_root=tmp_path)
+
+    assert recorded == {"issue": 31, "payload": payload}
+
+
 def _trusted_baseline() -> WorkspaceBaselineRecord:
     return WorkspaceBaselineRecord(
         status="completed",

@@ -113,6 +113,9 @@ from foundry_opt.orchestration.workspace_operations import (
     TrustedWorkspaceOperationContext,
     normalize_workspace_operation,
 )
+from foundry_opt.orchestration.workspace_operation_store import (
+    GitWorkspaceOperationStore,
+)
 from foundry_opt.preflight.interfaces import CommandRunner
 from foundry_opt.security import reject_secret_content
 
@@ -926,6 +929,10 @@ class ProductionWorkspaceService:
                 manifest=manifest,
                 config=config,
             )
+        GitWorkspaceOperationStore(root).record_candidate_manifest(
+            manifest.issue_number,
+            payload,
+        )
         request_builder = (
             self._experiment_request_builder
             or GitWorkspaceCandidatePreparer(
