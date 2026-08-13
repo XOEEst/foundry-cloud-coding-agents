@@ -44,3 +44,21 @@ def test_workspace_execution_uses_persisted_specification_base(
     )
 
     assert _workspace_spec_base(SimpleNamespace(), 31) == "b" * 40
+
+
+def test_workspace_execution_uses_completed_audit_specification_base(
+    monkeypatch,
+) -> None:
+    snapshot = SimpleNamespace(
+        specification=SimpleNamespace(base_commit="c" * 40),
+    )
+    monkeypatch.setattr(
+        production,
+        "GitWorkspaceStore",
+        lambda root: SimpleNamespace(
+            load=lambda issue: None,
+            load_audit=lambda issue: snapshot,
+        ),
+    )
+
+    assert _workspace_spec_base(SimpleNamespace(), 31) == "c" * 40

@@ -656,7 +656,10 @@ def _trusted_execution_inputs(
 
 
 def _workspace_spec_base(root: Path, issue_number: int) -> str:
-    snapshot = GitWorkspaceStore(root).load(issue_number)
+    store = GitWorkspaceStore(root)
+    snapshot = store.load(issue_number)
+    if snapshot is None:
+        snapshot = store.load_audit(issue_number)
     if snapshot is None or snapshot.specification is None:
         raise ValueError("workspace specification is unavailable")
     return snapshot.specification.base_commit

@@ -887,6 +887,8 @@ class ProductionWorkspaceRetentionEvaluator(WorkspaceRetentionEvaluator):
             ),
         )
         snapshot = self._store.load(target.issue_number)
+        if snapshot is None:
+            snapshot = self._store.load_audit(target.issue_number)
         if snapshot is None or snapshot.baseline is None:
             raise ValueError("workspace baseline is unavailable")
         selected = next(
