@@ -606,6 +606,8 @@ def _workspace_workflow(request: OnboardingRequest) -> str:
 on:
   issues:
     types: [opened, edited, reopened, closed]
+  issue_comment:
+    types: [created]
   pull_request_target:
     types: [opened, synchronize, reopened, edited, ready_for_review, closed]
   schedule:
@@ -746,6 +748,9 @@ jobs:
       (github.event_name == 'issues' &&
       (github.event.action != 'opened' ||
       startsWith(github.event.issue.title, '[Optimize] '))) ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == 'Copilot') ||
       (github.event_name == 'pull_request_target' &&
       github.event.pull_request.base.ref ==
       github.event.repository.default_branch &&
@@ -794,6 +799,19 @@ jobs:
           if event_name == "issues":
               issue = event.get("issue", {{}}).get("number")
               pull_request = ""
+          elif event_name == "issue_comment":
+              issue_data = event.get("issue", {{}})
+              body = issue_data.get("body") or ""
+              matches = re.findall(
+                  r"foundry-opt:workspace-pr:issue-([1-9][0-9]*):v1",
+                  body,
+              )
+              if len(matches) != 1:
+                  raise SystemExit(
+                      "workspace pull request marker is missing or ambiguous"
+                  )
+              issue = int(matches[0])
+              pull_request = str(issue_data.get("number") or "")
           elif event_name == "pull_request_target":
               pull_request_data = event.get("pull_request", {{}})
               body = pull_request_data.get("body") or ""
@@ -842,7 +860,10 @@ jobs:
             foundry-opt workspace
           )
           head_sha="$TRUSTED_HEAD_SHA"
-          if [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ]; then
+          if (
+            [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] ||
+            [ "$TRUSTED_EVENT_NAME" = "issue_comment" ]
+          ); then
             owner="${{TRUSTED_REPOSITORY%%/*}}"
             branch="foundry-opt/workspace/issue-$ISSUE"
             head_sha="$(
@@ -917,7 +938,10 @@ jobs:
                 --json
               exit 0
           fi
-          if [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ]; then
+          if (
+            [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] ||
+            [ "$TRUSTED_EVENT_NAME" = "issue_comment" ]
+          ); then
             "${{command[@]}}" advance --issue "$ISSUE" --json
           else
             args=(

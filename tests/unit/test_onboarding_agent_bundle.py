@@ -314,6 +314,7 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
 
     assert set(workflow[True]) == {
         "issues",
+        "issue_comment",
         "pull_request_target",
         "schedule",
         "workflow_dispatch",
@@ -489,6 +490,21 @@ def test_workspace_workflow_scans_candidate_envelopes_from_trusted_schedule() ->
     assert "foundry-opt/state/issue-" in text
     assert '"foundry-optimization-workspace.yml"' in text
     assert 'f"issue={issue}"' in text
+
+
+def test_workspace_workflow_imports_after_copilot_completion_comment() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-optimization-workspace.yml")
+    ]
+
+    assert "issue_comment:" in text
+    assert "github.event.comment.user.login == 'Copilot'" in text
+    assert 'event_name == "issue_comment"' in text
+    assert '[ "$TRUSTED_EVENT_NAME" = "issue_comment" ]' in text
 
 
 def test_bundle_preserves_customer_deployment_workflow() -> None:
