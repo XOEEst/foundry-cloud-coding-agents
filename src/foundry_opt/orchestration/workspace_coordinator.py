@@ -27,6 +27,9 @@ from foundry_opt.orchestration.workspace import (
     WorkspaceSelectionDecision,
     WorkspaceSelectionRequest,
 )
+from foundry_opt.orchestration.workspace_attribution import (
+    WorkspaceCandidateProvenance,
+)
 from foundry_opt.orchestration.workspace_runtime import WorkspaceStore
 from foundry_opt.orchestration.workspace_github import (
     workspace_pull_request_base_marker,
@@ -53,6 +56,10 @@ _COMMIT_ENVIRONMENT = {
     "GIT_COMMITTER_EMAIL": "foundry-opt@example.invalid",
     "GIT_COMMITTER_NAME": "Foundry Optimizer Workspace",
 }
+_COPILOT_COAUTHOR = (
+    "Co-authored-by: GitHub Copilot "
+    "<198982749+Copilot@users.noreply.github.com>"
+)
 
 
 class TrustedWorkspaceSelector(Protocol):
@@ -91,6 +98,7 @@ class WorkspaceExactBranchPublisher(Protocol):
         repository_root: Path,
         pull_request: WorkspacePullRequest,
         candidate: WorkspaceCandidate,
+        provenance: WorkspaceCandidateProvenance | None = None,
     ) -> WorkspaceExactPatchResult: ...
 
 
@@ -111,8 +119,14 @@ class GitWorkspaceExactBranchPublisher:
         repository_root: Path,
         pull_request: WorkspacePullRequest,
         candidate: WorkspaceCandidate,
+        provenance: WorkspaceCandidateProvenance | None = None,
     ) -> WorkspaceExactPatchResult:
         root = repository_root.resolve(strict=True)
+        message = self._commit_message(
+            pull_request,
+            candidate,
+            provenance,
+        )
         branch_ref = f"refs/heads/{pull_request.branch}"
         remote_head = self._remote_head(root, branch_ref)
         if remote_head is None:
@@ -122,6 +136,7 @@ class GitWorkspaceExactBranchPublisher:
             remote_head,
             pull_request,
             candidate,
+            message,
         )
         if existing is not None:
             return existing
@@ -193,22 +208,12 @@ class GitWorkspaceExactBranchPublisher:
             tree = self._run(("git", "write-tree"), worktree).stdout.strip()
             if tree != candidate.expected_tree:
                 raise RuntimeError("workspace exact tree does not match")
-            commit = self._run(
-                (
-                    "git",
-                    "commit-tree",
-                    tree,
-                    "-p",
-                    pull_request.base_commit,
-                    "-m",
-                    (
-                        "Apply selected optimization candidate "
-                        f"for issue-{pull_request.issue_number}"
-                    ),
-                ),
+            commit = self._exact_commit(
                 worktree,
-                environment=_COMMIT_ENVIRONMENT,
-            ).stdout.strip()
+                tree,
+                pull_request.base_commit,
+                message,
+            )
             self._run(("git", "reset", "--hard", commit), worktree)
             verified_tree = self._run(
                 ("git", "rev-parse", "--verify", "HEAD^{tree}"),
@@ -257,6 +262,7 @@ class GitWorkspaceExactBranchPublisher:
         commit: str,
         pull_request: WorkspacePullRequest,
         candidate: WorkspaceCandidate,
+        message: str,
     ) -> WorkspaceExactPatchResult | None:
         try:
             self._run(
@@ -296,11 +302,88 @@ class GitWorkspaceExactBranchPublisher:
             or len(changed_paths) != len(candidate.changed_paths)
         ):
             return None
+        try:
+            expected_commit = self._exact_commit(
+                root,
+                tree,
+                pull_request.base_commit,
+                message,
+            )
+        except CommandError:
+            return None
+        if commit != expected_commit:
+            return None
         return WorkspaceExactPatchResult(
             commit_sha=commit,
             tree_sha=tree,
             changed_paths=changed_paths,
         )
+
+    def _commit_message(
+        self,
+        pull_request: WorkspacePullRequest,
+        candidate: WorkspaceCandidate,
+        provenance: WorkspaceCandidateProvenance | None,
+    ) -> str:
+        subject = (
+            "Apply selected optimization candidate "
+            f"for issue-{pull_request.issue_number}"
+        )
+        if provenance is None:
+            return subject
+        if (
+            type(provenance) is not WorkspaceCandidateProvenance
+            or pull_request.number is None
+            or provenance.workspace_pr_number != pull_request.number
+        ):
+            raise ValueError("workspace candidate provenance is invalid")
+        return "\n".join(
+            (
+                subject,
+                "",
+                (
+                    "Selected candidate ID: "
+                    f"{candidate.experiment.candidate_id}"
+                ),
+                (
+                    "Copilot source commit SHA: "
+                    f"{provenance.candidate_source_commit_sha}"
+                ),
+                (
+                    "Copilot source commit URL: "
+                    f"{provenance.candidate_source_commit_url}"
+                ),
+                (
+                    "Copilot acknowledgement URL: "
+                    f"{provenance.acknowledgement_comment_url}"
+                ),
+                f"Provenance SHA-256: {provenance.identity_sha256}",
+                "",
+                _COPILOT_COAUTHOR,
+            )
+        )
+
+    def _exact_commit(
+        self,
+        root: Path,
+        tree: str,
+        parent: str,
+        message: str,
+    ) -> str:
+        return self._run(
+            (
+                "git",
+                "commit-tree",
+                tree,
+                "-p",
+                parent,
+                "-F",
+                "-",
+            ),
+            root,
+            input_bytes=f"{message}\n".encode("utf-8"),
+            environment=_COMMIT_ENVIRONMENT,
+        ).stdout.strip()
 
     def _remote_head(self, root: Path, branch_ref: str) -> str | None:
         result = self._run(
@@ -581,6 +664,11 @@ class WorkspaceCandidateCoordinator:
             or not set(decision.eligible_candidate_ids) <= set(by_id)
         ):
             raise ValueError("workspace selector changed candidate binding")
+        selected_experiment_record = next(
+            item
+            for item in snapshot.experiments
+            if item.candidate_id == decision.selected_candidate_id
+        )
         if snapshot.phase is WorkspacePhase.AWAITING_SELECTION:
             existing_lineage = snapshot.lineage
             if existing_lineage is None:
@@ -612,6 +700,8 @@ class WorkspaceCandidateCoordinator:
                 != existing_lineage.bundle_sha256
                 or dict(decision.required_checks)
                 != dict(existing_lineage.required_checks)
+                or selected_experiment_record.provenance
+                != existing_lineage.candidate_provenance
             ):
                 raise ValueError(
                     "workspace committed selection lineage changed"
@@ -620,15 +710,11 @@ class WorkspaceCandidateCoordinator:
         selected_experiment = experiment_by_id[
             decision.selected_candidate_id
         ]
-        selected_experiment_record = next(
-            item
-            for item in snapshot.experiments
-            if item.candidate_id == decision.selected_candidate_id
-        )
         exact = self._exact_publisher.publish(
             request.repository_root,
             pull_request,
             selected,
+            selected_experiment_record.provenance,
         )
         if (
             exact.tree_sha != selected.expected_tree

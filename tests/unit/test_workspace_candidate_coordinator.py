@@ -261,8 +261,16 @@ class RecordingExactPublisher:
         self.tree = tree
         self.calls = []
 
-    def publish(self, repository_root, pull_request, candidate):
-        self.calls.append((repository_root, pull_request, candidate))
+    def publish(
+        self,
+        repository_root,
+        pull_request,
+        candidate,
+        provenance=None,
+    ):
+        self.calls.append(
+            (repository_root, pull_request, candidate, provenance)
+        )
         return WorkspaceExactPatchResult(
             commit_sha="c" * 40,
             tree_sha=self.tree,
@@ -412,6 +420,7 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     assert result.report is not None
     assert result.report.candidate_id == "candidate-2"
     assert result.report.candidate_provenance == provenance
+    assert publisher.calls[0][3] == provenance
     assert snapshot.baseline is not None
     assert result.report.baseline_metrics == snapshot.baseline.metrics
     assert result.report.sample_count == snapshot.baseline.sample_count
