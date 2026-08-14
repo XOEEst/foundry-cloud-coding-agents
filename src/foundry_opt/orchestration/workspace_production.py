@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 import hashlib
 import json
 import os
@@ -14,6 +15,10 @@ from foundry_opt.adapters.commands import (
     SubprocessCommandRunner,
 )
 from foundry_opt.adapters.github import github_repository_from_remote_url
+from foundry_opt.adapters.github_credentials import (
+    GitHubCredentialProvider,
+    WorkspacePullRequestBootstrapCredentialProvider,
+)
 from foundry_opt.config import load_config
 from foundry_opt.config.models import (
     MetricDirection as ConfigMetricDirection,
@@ -302,6 +307,9 @@ def build_production_workspace(
     commands: CommandRunner | None = None,
     candidate_count: int | None = None,
     selector: TrustedWorkspaceSelector | None = None,
+    workspace_pr_bootstrap_credentials: (
+        GitHubCredentialProvider | None
+    ) = None,
 ) -> OptimizationWorkspace:
     runner = commands or SubprocessCommandRunner()
     store = GitWorkspaceStore(repository_root)
@@ -316,6 +324,7 @@ def build_production_workspace(
             runner,
             repository=repository,
             base_branch=base_branch,
+            bootstrap_credentials=workspace_pr_bootstrap_credentials,
         )
     candidate_coordinator = None
     configured = (
@@ -349,8 +358,20 @@ def build_production_workspace(
 def build_production_workspace_service(
     *,
     actions_execution: bool = False,
+    workspace_pr_bootstrap_token: str | None = None,
 ) -> ProductionWorkspaceService:
+    workspace_factory: WorkspaceFactory = build_production_workspace
+    if workspace_pr_bootstrap_token:
+        workspace_factory = partial(
+            build_production_workspace,
+            workspace_pr_bootstrap_credentials=(
+                WorkspacePullRequestBootstrapCredentialProvider(
+                    workspace_pr_bootstrap_token
+                )
+            ),
+        )
     return ProductionWorkspaceService(
+        workspace_factory=workspace_factory,
         **build_production_workspace_service_bindings(
             Path.cwd(),
             actions_execution=actions_execution,

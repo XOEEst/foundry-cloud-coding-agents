@@ -7,11 +7,16 @@ from typing import Any
 
 import pytest
 
+from foundry_opt.adapters.commands import CommandExitError
+from foundry_opt.adapters.github_credentials import (
+    WorkspacePullRequestBootstrapCredentialProvider,
+)
 from foundry_opt.orchestration import (
     InMemoryWorkspaceStore,
     OptimizationWorkspace,
     WorkspaceIssue,
     WorkspacePhase,
+    WorkspacePullRequest,
     WorkspaceRequest,
     WorkspaceTrigger,
     WorkspaceUpdate,
@@ -220,6 +225,137 @@ def test_issue_creation_creates_one_draft_workspace_pull_request(
         invocation[:2] == ("gh", "issue")
         for invocation in commands.invocations
     )
+    create_call = next(
+        call
+        for call in commands.calls
+        if call["arguments"][:3] == ("gh", "pr", "create")
+    )
+    assert create_call["environment"] is None
+    assert all(
+        call["environment"] != {"GH_TOKEN": "bootstrap-token"}
+        for call in commands.calls
+    )
+
+
+def test_pr_creation_retries_only_policy_denial_with_bootstrap_token(
+    tmp_path: Path,
+) -> None:
+    command = (
+        "gh",
+        "pr",
+        "create",
+        "--repo",
+        _REPOSITORY,
+        "--draft",
+        "--base",
+        _BASE_BRANCH,
+        "--head",
+        _BRANCH,
+        "--title",
+        "[Optimize] #31 workspace - draft, not yet selectable",
+        "--body-file",
+        "-",
+    )
+    commands = FakeCommands(
+        {
+            command: [
+                CommandExitError(
+                    command,
+                    exit_code=1,
+                    stdout="",
+                    stderr=(
+                        "HTTP 409: The organization does not allow GitHub "
+                        "Actions to create or approve pull requests"
+                    ),
+                ),
+                f"https://github.com/{_REPOSITORY}/pull/104\n",
+            ]
+        }
+    )
+    adapter = GhWorkspacePullRequests(
+        commands,
+        repository=_REPOSITORY,
+        base_branch=_BASE_BRANCH,
+        bootstrap_credentials=(
+            WorkspacePullRequestBootstrapCredentialProvider(
+                "bootstrap-token"
+            )
+        ),
+    )
+
+    number = adapter._create_pull_request(
+        tmp_path,
+        WorkspacePullRequest(
+            number=None,
+            issue_number=_ISSUE_NUMBER,
+            branch=_BRANCH,
+            title="[Optimize] #31 workspace - draft, not yet selectable",
+            draft=True,
+            reuse_existing=True,
+            base_commit=_BASE_COMMIT,
+        ),
+    )
+
+    assert number == 104
+    assert [call["environment"] for call in commands.calls] == [
+        None,
+        {"GH_TOKEN": "bootstrap-token"},
+    ]
+
+
+def test_pr_creation_does_not_fallback_for_other_failures(
+    tmp_path: Path,
+) -> None:
+    command = (
+        "gh",
+        "pr",
+        "create",
+        "--repo",
+        _REPOSITORY,
+        "--draft",
+        "--base",
+        _BASE_BRANCH,
+        "--head",
+        _BRANCH,
+        "--title",
+        "[Optimize] #31 workspace - draft, not yet selectable",
+        "--body-file",
+        "-",
+    )
+    failure = CommandExitError(
+        command,
+        exit_code=1,
+        stdout="",
+        stderr="GraphQL: Validation failed",
+    )
+    commands = FakeCommands({command: failure})
+    adapter = GhWorkspacePullRequests(
+        commands,
+        repository=_REPOSITORY,
+        base_branch=_BASE_BRANCH,
+        bootstrap_credentials=(
+            WorkspacePullRequestBootstrapCredentialProvider(
+                "bootstrap-token"
+            )
+        ),
+    )
+
+    with pytest.raises(CommandExitError) as raised:
+        adapter._create_pull_request(
+            tmp_path,
+            WorkspacePullRequest(
+                number=None,
+                issue_number=_ISSUE_NUMBER,
+                branch=_BRANCH,
+                title="[Optimize] #31 workspace - draft, not yet selectable",
+                draft=True,
+                reuse_existing=True,
+                base_commit=_BASE_COMMIT,
+            ),
+        )
+
+    assert raised.value is failure
+    assert [call["environment"] for call in commands.calls] == [None]
 
 
 def test_continuation_updates_and_reuses_the_same_workspace_pr(

@@ -90,10 +90,20 @@ def _repository_context(
         "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
         "user-to-server token; an installation token is not supported. "
         "This credential is for Copilot invocation and verified assignment-"
-        "comment cleanup only.\n"
+        "comment cleanup, plus workspace pull-request bootstrap only when "
+        "organization policy blocks Actions from creating pull requests.\n"
         "- Durable repository operations use Actions `github.token` and "
-        "therefore appear as `github-actions[bot]`; the assignment credential "
-        "is never their `GH_TOKEN`.\n"
+        "therefore appear as `github-actions[bot]`. Workspace pull-request "
+        "creation first uses `github.token`; only the explicit organization-"
+        "policy denial retries that one mutation with the eligible-user "
+        "credential. The branch push and every other repository mutation "
+        "remain on the normal Actions identity.\n"
+        "- Actor ledger: a fallback-created workspace pull request is "
+        "attributed to the eligible user until the Foundry-owned App "
+        "migration; ordinary issue comments, status, evidence, checks, "
+        "closure, and other optimizer writes remain `github-actions[bot]`. "
+        "Only transient assignment-comment cleanup uses the same narrow "
+        "eligible-user adapter.\n"
         "- The transient assignment comment is removed only after verified "
         "provenance capture. Copilot source-commit and acknowledgement-comment "
         "links remain durable public evidence.\n"
@@ -148,10 +158,18 @@ def _previous_repository_context(
         "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
         "user-to-server token; an installation token is not supported. "
         "This credential is for Copilot invocation and verified assignment-"
-        "comment cleanup only.\n"
+        "comment cleanup, plus workspace pull-request bootstrap only when "
+        "organization policy blocks Actions from creating pull requests.\n"
         "- Durable repository operations use Actions `github.token` and "
-        "therefore appear as `github-actions[bot]`; the assignment credential "
-        "is never their `GH_TOKEN`.\n"
+        "therefore appear as `github-actions[bot]`. Workspace pull-request "
+        "creation first uses `github.token`; only the explicit organization-"
+        "policy denial retries that one mutation with the eligible-user "
+        "credential. The branch push and every other repository mutation "
+        "remain on the normal Actions identity.\n"
+        "- Actor ledger: a fallback-created workspace pull request is "
+        "attributed to the eligible user until the Foundry-owned App "
+        "migration; all other optimizer writes remain "
+        "`github-actions[bot]`.\n"
         "- The transient assignment comment is removed only after verified "
         "provenance capture. Copilot source-commit and acknowledgement-comment "
         "links remain durable public evidence.\n"
@@ -657,8 +675,9 @@ on:
         default: none
         options: [none, schedule]
 
-# GitHub permissions apply to github.token. Durable writes appear as
-# github-actions[bot]; COPILOT_ASSIGNMENT_TOKEN is never general GH_TOKEN.
+# GitHub permissions apply to github.token. Ordinary durable writes appear as
+# github-actions[bot]. The eligible-user token is limited to Copilot assignment
+# cleanup and the explicit organization-policy workspace PR bootstrap fallback.
 permissions:
   actions: write
   contents: write
@@ -880,6 +899,8 @@ jobs:
       - name: Ingest trusted event or retry the workspace
         id: ingest
         env:
+          FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN: >-
+            ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
           GH_TOKEN: ${{{{ github.token }}}}
           ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
@@ -900,6 +921,8 @@ jobs:
             --with "$OPTIMIZER_PACKAGE"
             foundry-opt workspace
           )
+          workspace_pr_bootstrap_token="$FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"
+          unset FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN
           head_sha="$TRUSTED_HEAD_SHA"
           pull_request="$TRUSTED_PULL_REQUEST_NUMBER"
           if (
@@ -1021,7 +1044,8 @@ jobs:
             if [ "$TRUSTED_EVENT_NAME" = "issues" ]; then
               args+=(--base-commit "$(git rev-parse HEAD)")
             fi
-            "${{command[@]}}" "${{args[@]}}"
+            FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN="$workspace_pr_bootstrap_token" \
+              "${{command[@]}}" "${{args[@]}}"
           fi
       - name: Remove transient Copilot assignment marker after verified provenance capture
         if: steps.ingest.outputs.cleanup_pull_request != ''

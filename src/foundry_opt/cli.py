@@ -153,13 +153,18 @@ def build_auth_probe():
     return build_production_auth_probe()
 
 
-def build_workspace_service():
+def build_workspace_service(
+    *,
+    workspace_pr_bootstrap_token: str | None = None,
+):
     """Return the production single-workspace service."""
     from foundry_opt.orchestration.workspace_production import (
         build_production_workspace_service,
     )
 
-    return build_production_workspace_service()
+    return build_production_workspace_service(
+        workspace_pr_bootstrap_token=workspace_pr_bootstrap_token,
+    )
 
 
 def build_workspace_assignment_cleaner(
@@ -651,13 +656,19 @@ def workspace_intake(
         TrustedWorkspaceEventContext,
     )
 
+    workspace_pr_bootstrap_token = os.environ.pop(
+        "FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN",
+        None,
+    )
     try:
         if event_path.stat().st_size > 2_000_000:
             raise ValueError("workspace event payload is too large")
         payload = json.loads(event_path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("workspace event payload must be an object")
-        result = build_workspace_service().ingest(
+        result = build_workspace_service(
+            workspace_pr_bootstrap_token=workspace_pr_bootstrap_token,
+        ).ingest(
             payload,
             TrustedWorkspaceEventContext(
                 event_name=event_name,

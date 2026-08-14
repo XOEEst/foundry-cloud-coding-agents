@@ -58,7 +58,10 @@ COPILOT_ASSIGNMENT_SECRET_REQUIREMENT = GitHubActionsSecretRequirement(
         "pull requests: read/write",
     ),
     automatic_configuration_supported=False,
-    purpose="Copilot invocation and verified assignment-comment cleanup only",
+    purpose=(
+        "Copilot invocation, verified assignment-comment cleanup, and "
+        "organization-policy workspace pull-request bootstrap only"
+    ),
     prohibited_uses=(
         "general GH_TOKEN",
         "durable repository writes",

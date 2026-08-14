@@ -300,7 +300,9 @@ def test_bundle_copies_skill_snapshot_and_workspace_context() -> None:
     assert "same workspace pull request" in context
     assert "secondary optimization" in context
     assert "specialist pull requests" not in context
-    assert "invocation and verified assignment-comment cleanup only" in context
+    assert "workspace pull-request bootstrap only" in context
+    assert "Actor ledger" in context
+    assert "attributed to the eligible user" in context
     assert "github-actions[bot]" in context
     assert "verified provenance capture" in context
     assert "durable public evidence" in context
@@ -344,6 +346,20 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
     )
     assert ingest["env"]["GH_TOKEN"] == "${{ github.token }}"
     assert "COPILOT_ASSIGNMENT_TOKEN" not in ingest["env"]
+    assert ingest["env"]["FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"] == (
+        "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    )
+    assert (
+        'unset FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN'
+        in ingest["run"]
+    )
+    assert (
+        'FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN="$workspace_pr_bootstrap_token"'
+        in ingest["run"]
+    )
+    assert ingest["run"].index(
+        "unset FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"
+    ) < ingest["run"].index("gh api")
     cleanup = next(
         step
         for step in workflow["jobs"]["advance"]["steps"]
@@ -547,6 +563,9 @@ def test_workspace_workflow_imports_candidate_envelope_from_exact_pr_head() -> N
     ]
     assert ingest["id"] == "ingest"
     assert "COPILOT_ASSIGNMENT_TOKEN" not in ingest.get("env", {})
+    assert ingest["env"]["FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"] == (
+        "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    )
     assert cleanup["if"] == (
         "steps.ingest.outputs.cleanup_pull_request != ''"
     )

@@ -184,11 +184,16 @@ Grant only:
 GitHub App installation tokens are not supported for Copilot assignment.
 `foundry-opt init` cannot create Actions secrets. Never commit or emit this
 credential in workflow output, durable state, comments, issue bodies, or logs.
-It is step-scoped to Copilot invocation and verified assignment-comment
-cleanup and is never the general `GH_TOKEN`. Durable repository writes use
-Actions `github.token`, appear as `github-actions[bot]`, and retain the Copilot
-source-commit and acknowledgement-comment links as public evidence after the
-transient assignment comment is removed.
+It is step-scoped to Copilot invocation, verified assignment-comment cleanup,
+and workspace pull-request bootstrap only when organization policy blocks
+Actions from creating pull requests. The bootstrap adapter attempts
+`github.token` first and retries only the explicit policy denial; branch push
+and all other durable repository writes remain on `github.token`. A
+fallback-created workspace pull request is attributed to the eligible user
+until the Foundry-owned App migration. Other writes appear as
+`github-actions[bot]` and retain the Copilot source-commit and
+acknowledgement-comment links as public evidence after the transient assignment
+comment is removed.
 
 ## Future GitHub App migration
 

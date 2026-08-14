@@ -11,13 +11,21 @@ from foundry_opt.preflight.models import CheckResult, CheckStatus, PreflightRequ
 
 _ASSIGNMENT_SECRET = "COPILOT_ASSIGNMENT_TOKEN"
 _ASSIGNMENT_EXPRESSION = "secrets.COPILOT_ASSIGNMENT_TOKEN"
-_ALLOWED_STEP_NAMES = frozenset(
-    {
-        "Remove transient Copilot assignment marker after verified "
-        "provenance capture",
-        "Resume same workspace pull request when trusted state needs Copilot",
-    }
+_WORKSPACE_PR_BOOTSTRAP_ENVIRONMENT = (
+    "FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"
 )
+_ALLOWED_STEP_ENVIRONMENTS = {
+    (
+        "Remove transient Copilot assignment marker after verified "
+        "provenance capture"
+    ): _ASSIGNMENT_SECRET,
+    (
+        "Resume same workspace pull request when trusted state needs Copilot"
+    ): _ASSIGNMENT_SECRET,
+    (
+        "Ingest trusted event or retry the workspace"
+    ): _WORKSPACE_PR_BOOTSTRAP_ENVIRONMENT,
+}
 
 
 def assignment_credential_scope_violations(
@@ -60,8 +68,9 @@ def assert_assignment_credential_scope(
     if violations:
         raise ValueError(
             "COPILOT_ASSIGNMENT_TOKEN must be step-scoped to Copilot "
-            "invocation or verified assignment-comment cleanup and must "
-            f"never be general GH_TOKEN ({'; '.join(violations)})"
+            "invocation, verified assignment-comment cleanup, or the "
+            "workspace PR bootstrap fallback and must never be general "
+            f"GH_TOKEN ({'; '.join(violations)})"
         )
 
 
@@ -93,9 +102,9 @@ class AssignmentCredentialScopeCheck:
                 detail="Unsafe references: " + ", ".join(violations),
                 remediation=(
                     "Keep COPILOT_ASSIGNMENT_TOKEN only in the generated "
-                    "Copilot invocation and verified assignment-comment cleanup "
-                    "steps. Use github.token as GH_TOKEN for durable repository "
-                    "operations."
+                    "Copilot invocation, verified assignment-comment cleanup, "
+                    "and workspace PR bootstrap fallback environments. Use "
+                    "github.token as GH_TOKEN for durable repository operations."
                 ),
             )
         return CheckResult(
@@ -138,7 +147,6 @@ def _allowed_assignment_reference(
         or steps != "steps"
         or not isinstance(step_index, int)
         or env != "env"
-        or name != _ASSIGNMENT_SECRET
         or not isinstance(value, str)
         or _ASSIGNMENT_EXPRESSION not in value
     ):
@@ -148,10 +156,10 @@ def _allowed_assignment_reference(
     if not isinstance(step_items, list) or step_index >= len(step_items):
         return False
     step = step_items[step_index]
-    return (
-        isinstance(step, Mapping)
-        and step.get("name") in _ALLOWED_STEP_NAMES
-    )
+    if not isinstance(step, Mapping):
+        return False
+    expected_environment = _ALLOWED_STEP_ENVIRONMENTS.get(step.get("name"))
+    return name == expected_environment
 
 
 __all__ = [

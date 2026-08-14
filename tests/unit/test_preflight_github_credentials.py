@@ -31,6 +31,11 @@ jobs:
         env:
           COPILOT_ASSIGNMENT_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}
         run: foundry-opt workspace cleanup-assignment --issue 1
+      - name: Ingest trusted event or retry the workspace
+        env:
+          FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: foundry-opt workspace intake --issue 1
 """
 
     workflows = {Path(".github/workflows/safe.yml"): workflow}
@@ -64,3 +69,23 @@ jobs:
     assert "GH_TOKEN" in (result.detail or "")
     assert "secret value" not in str(result).casefold()
     assert "github.token as GH_TOKEN" in (result.remediation or "")
+
+
+def test_assignment_secret_bootstrap_alias_fails_outside_intake() -> None:
+    workflow = """
+name: unsafe
+jobs:
+  write:
+    steps:
+      - name: Update issue
+        env:
+          FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}
+        run: gh issue edit 1
+"""
+
+    violations = assignment_credential_scope_violations(
+        {Path(".github/workflows/unsafe.yml"): workflow}
+    )
+
+    assert violations
+    assert "FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN" in violations[0]

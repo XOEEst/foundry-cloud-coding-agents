@@ -972,6 +972,11 @@ def test_workspace_intake_normalizes_trusted_event_through_service(
     tmp_path: Path,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN",
+        "bootstrap-token",
+    )
+    monkeypatch.setenv("GH_TOKEN", "actions-token")
     event_path = tmp_path / "event.json"
     event_path.write_text(
         json.dumps(
@@ -1015,11 +1020,16 @@ def test_workspace_intake_normalizes_trusted_event_through_service(
             assert repository_root == tmp_path
             return IntakeResult()
 
-    monkeypatch.setattr(
-        cli,
-        "build_workspace_service",
-        lambda: Service(),
-    )
+    def build_service(*, workspace_pr_bootstrap_token):
+        assert workspace_pr_bootstrap_token == "bootstrap-token"
+        assert (
+            "FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"
+            not in __import__("os").environ
+        )
+        assert __import__("os").environ["GH_TOKEN"] == "actions-token"
+        return Service()
+
+    monkeypatch.setattr(cli, "build_workspace_service", build_service)
 
     completed = runner.invoke(
         app,
@@ -1046,3 +1056,4 @@ def test_workspace_intake_normalizes_trusted_event_through_service(
     assert json.loads(completed.stdout)["event"]["delivery_id"] == (
         "delivery-123"
     )
+    assert "bootstrap-token" not in completed.stdout

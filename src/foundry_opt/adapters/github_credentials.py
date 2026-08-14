@@ -37,8 +37,23 @@ class CopilotAssignmentCredentialProvider:
         return {"GH_TOKEN": self.token}
 
 
+@dataclass(frozen=True)
+class WorkspacePullRequestBootstrapCredentialProvider:
+    """Scope the user credential to the workspace PR creation fallback."""
+
+    token: str
+
+    def __post_init__(self) -> None:
+        if not self.token:
+            raise ValueError("Workspace pull request bootstrap token is required")
+
+    def command_environment(self) -> Mapping[str, str]:
+        return {"GH_TOKEN": self.token}
+
+
 __all__ = [
     "ActionsGitHubCredentialProvider",
     "CopilotAssignmentCredentialProvider",
     "GitHubCredentialProvider",
+    "WorkspacePullRequestBootstrapCredentialProvider",
 ]

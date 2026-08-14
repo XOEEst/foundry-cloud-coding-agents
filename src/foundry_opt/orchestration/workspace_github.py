@@ -7,8 +7,9 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from foundry_opt.adapters.commands import CommandError
+from foundry_opt.adapters.commands import CommandError, CommandExitError
 from foundry_opt.adapters.github import github_repository_from_remote_url
+from foundry_opt.adapters.github_credentials import GitHubCredentialProvider
 from foundry_opt.orchestration.workspace import WorkspacePullRequest
 from foundry_opt.preflight.interfaces import CommandRunner
 
@@ -30,6 +31,10 @@ _COMMIT_ENVIRONMENT = {
     "GIT_COMMITTER_EMAIL": "foundry-opt@example.invalid",
     "GIT_COMMITTER_NAME": "Foundry Optimizer Workspace",
 }
+_ACTIONS_PULL_REQUEST_POLICY_DENIAL = (
+    "the organization does not allow github actions to create or approve "
+    "pull requests"
+)
 
 
 class GitHubWorkspacePullRequestError(RuntimeError):
@@ -98,6 +103,7 @@ class GhWorkspacePullRequests:
         *,
         repository: str,
         base_branch: str,
+        bootstrap_credentials: GitHubCredentialProvider | None = None,
     ) -> None:
         if _REPOSITORY.fullmatch(repository) is None:
             raise ValueError("workspace repository is invalid")
@@ -111,6 +117,7 @@ class GhWorkspacePullRequests:
         self._commands = commands
         self._repository = repository
         self._base_branch = base_branch
+        self._bootstrap_credentials = bootstrap_credentials
 
     def synchronize(
         self,
@@ -379,30 +386,56 @@ class GhWorkspacePullRequests:
         repository_root: Path,
         pull_request: WorkspacePullRequest,
     ) -> int:
-        result = self._commands.run(
-            (
-                "gh",
-                "pr",
-                "create",
-                "--repo",
-                self._repository,
-                "--draft",
-                "--base",
-                self._base_branch,
-                "--head",
-                pull_request.branch,
-                "--title",
-                pull_request.title,
-                "--body-file",
-                "-",
-            ),
-            cwd=repository_root,
-            input_text=_workspace_pull_request_body(
-                pull_request.issue_number,
-                pull_request.base_commit,
-            ),
+        command = (
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            self._repository,
+            "--draft",
+            "--base",
+            self._base_branch,
+            "--head",
+            pull_request.branch,
+            "--title",
+            pull_request.title,
+            "--body-file",
+            "-",
         )
+        body = _workspace_pull_request_body(
+            pull_request.issue_number,
+            pull_request.base_commit,
+        )
+        try:
+            result = self._commands.run(
+                command,
+                cwd=repository_root,
+                input_text=body,
+            )
+        except CommandExitError as error:
+            credentials = self._bootstrap_credentials
+            if (
+                credentials is None
+                or not self._is_actions_pull_request_policy_denial(error)
+            ):
+                raise
+            environment = credentials.command_environment()
+            if not environment:
+                raise
+            result = self._commands.run(
+                command,
+                cwd=repository_root,
+                environment=environment,
+                input_text=body,
+            )
         return self._pull_request_number(result.stdout)
+
+    @staticmethod
+    def _is_actions_pull_request_policy_denial(
+        error: CommandExitError,
+    ) -> bool:
+        response = f"{error.stdout}\n{error.stderr}".casefold()
+        return _ACTIONS_PULL_REQUEST_POLICY_DENIAL in response
 
     def _json_list(
         self,

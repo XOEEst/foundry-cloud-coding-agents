@@ -286,7 +286,8 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
             ),
             automatic_configuration_supported=False,
             purpose=(
-                "Copilot invocation and verified assignment-comment cleanup only"
+                "Copilot invocation, verified assignment-comment cleanup, and "
+                "organization-policy workspace pull-request bootstrap only"
             ),
             prohibited_uses=(
                 "general GH_TOKEN",
@@ -402,9 +403,9 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         assignment_guidance
     )
     assert "installation token" in assignment_guidance
-    assert "invocation and verified assignment-comment cleanup only" in (
-        assignment_guidance
-    )
+    assert "workspace pull-request bootstrap only" in assignment_guidance
+    assert "organization policy blocks Actions" in assignment_guidance
+    assert "attributed to the eligible user" in assignment_guidance
     assert "github.token" in assignment_guidance
     assert "github-actions[bot]" in assignment_guidance
     assert "verified provenance capture" in assignment_guidance
