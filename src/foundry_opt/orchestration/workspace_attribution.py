@@ -282,7 +282,7 @@ class GhWorkspaceCandidateProvenanceResolver:
                     "gh",
                     "api",
                     (
-                        f"repos/{repository}/issues/comments?"
+                        f"repos/{repository}/issues/{pull_number}/comments?"
                         "per_page=100&sort=created&direction=desc"
                     ),
                 )

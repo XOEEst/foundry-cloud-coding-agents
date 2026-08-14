@@ -102,7 +102,7 @@ def _responses(
             "gh",
             "api",
             (
-                f"repos/{_REPOSITORY}/issues/comments?"
+                f"repos/{_REPOSITORY}/issues/104/comments?"
                 "per_page=100&sort=created&direction=desc"
             ),
         ): [
@@ -275,7 +275,7 @@ def test_scheduled_capture_rejects_comment_history_over_bound(
         "gh",
         "api",
         (
-            f"repos/{_REPOSITORY}/issues/comments?"
+            f"repos/{_REPOSITORY}/issues/104/comments?"
             "per_page=100&sort=created&direction=desc"
         ),
     )
