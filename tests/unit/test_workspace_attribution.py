@@ -7,6 +7,8 @@ import pytest
 from foundry_opt.orchestration import (
     WorkspaceCandidateImportEvent,
     WorkspaceCandidateProvenance,
+    parse_workspace_candidate_provenance,
+    workspace_candidate_provenance_document,
 )
 
 
@@ -55,6 +57,51 @@ def test_scheduled_import_provenance_is_valid() -> None:
     assert provenance.trusted_event_name is (
         WorkspaceCandidateImportEvent.SCHEDULE
     )
+
+
+def test_scheduled_import_allows_unavailable_acknowledgement() -> None:
+    provenance = _provenance(
+        trusted_event_name="schedule",
+        acknowledgement_comment_id=None,
+        acknowledgement_comment_url=None,
+    )
+
+    assert provenance.acknowledgement_comment_id is None
+    assert provenance.acknowledgement_comment_url is None
+    assert parse_workspace_candidate_provenance(
+        workspace_candidate_provenance_document(provenance)
+    ) == provenance
+
+
+@pytest.mark.parametrize(
+    ("comment_id", "comment_url"),
+    [
+        (501, None),
+        (
+            None,
+            "https://github.com/octo-org/optimizer/pull/"
+            "104#issuecomment-501",
+        ),
+    ],
+)
+def test_acknowledgement_identity_must_be_present_as_a_pair(
+    comment_id: int | None,
+    comment_url: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="acknowledgement.*together"):
+        _provenance(
+            trusted_event_name="schedule",
+            acknowledgement_comment_id=comment_id,
+            acknowledgement_comment_url=comment_url,
+        )
+
+
+def test_direct_import_requires_acknowledgement_pair() -> None:
+    with pytest.raises(ValueError, match="direct.*acknowledgement"):
+        _provenance(
+            acknowledgement_comment_id=None,
+            acknowledgement_comment_url=None,
+        )
 
 
 def test_copilot_app_login_is_normalized() -> None:
@@ -234,4 +281,21 @@ def test_canonical_serialization_and_identity_are_deterministic() -> None:
     assert first.identity_sha256 == hashlib.sha256(
         expected.encode("utf-8")
     ).hexdigest()
+    assert second.identity_sha256 == first.identity_sha256
+
+
+def test_nullable_acknowledgement_serialization_is_deterministic() -> None:
+    first = _provenance(
+        trusted_event_name="schedule",
+        acknowledgement_comment_id=None,
+        acknowledgement_comment_url=None,
+    )
+    second = replace(first)
+    document = workspace_candidate_provenance_document(first)
+
+    assert document["schema_version"] == 1
+    assert document["acknowledgement_comment_id"] is None
+    assert document["acknowledgement_comment_url"] is None
+    assert parse_workspace_candidate_provenance(document) == first
+    assert second.canonical_json == first.canonical_json
     assert second.identity_sha256 == first.identity_sha256

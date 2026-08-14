@@ -191,9 +191,11 @@ Actions from creating pull requests. The bootstrap adapter attempts
 and all other durable repository writes remain on `github.token`. A
 fallback-created workspace pull request is attributed to the eligible user
 until the Foundry-owned App migration. Other writes appear as
-`github-actions[bot]` and retain the Copilot source-commit and
-acknowledgement-comment links as public evidence after the transient assignment
-comment is removed.
+`github-actions[bot]` and always retain the Copilot source-commit link as
+public evidence after the transient assignment comment is removed. Ask Copilot
+to post the revision-bound acknowledgement marker; when GitHub publishes it,
+retain its link too. Trusted scheduled import can proceed from the verified
+Copilot commit if GitHub does not publish the acknowledgement comment.
 
 ## Future GitHub App migration
 

@@ -294,7 +294,6 @@ def test_attributed_commit_message_is_exact(tmp_path: Path) -> None:
         repository.candidate,
         provenance,
     )
-
     assert _message(repository.root, result.commit_sha) == (
         "Apply selected optimization candidate for issue-31\n"
         "\n"
@@ -305,6 +304,47 @@ def test_attributed_commit_message_is_exact(tmp_path: Path) -> None:
         "Copilot acknowledgement URL: "
         "https://github.com/octo-org/optimizer/pull/"
         "104#issuecomment-501\n"
+        f"Provenance SHA-256: {provenance.identity_sha256}\n"
+        "\n"
+        f"{_COAUTHOR}\n"
+    )
+
+
+def test_attributed_commit_omits_unavailable_acknowledgement_url(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    provenance = replace(
+        _provenance(),
+        trusted_event_name="schedule",
+        acknowledgement_comment_id=None,
+        acknowledgement_comment_url=None,
+    )
+    result = GitWorkspaceExactBranchPublisher(
+        SubprocessCommandRunner()
+    ).publish(
+        repository.root,
+        repository.pull_request,
+        repository.candidate,
+        provenance,
+    )
+    replay = GitWorkspaceExactBranchPublisher(
+        SubprocessCommandRunner()
+    ).publish(
+        repository.root,
+        repository.pull_request,
+        repository.candidate,
+        provenance,
+    )
+
+    assert replay.commit_sha == result.commit_sha
+    assert _message(repository.root, result.commit_sha) == (
+        "Apply selected optimization candidate for issue-31\n"
+        "\n"
+        "Selected candidate ID: candidate-2\n"
+        f"Copilot source commit SHA: {'9' * 40}\n"
+        "Copilot source commit URL: "
+        f"https://github.com/octo-org/optimizer/commit/{'9' * 40}\n"
         f"Provenance SHA-256: {provenance.identity_sha256}\n"
         "\n"
         f"{_COAUTHOR}\n"

@@ -170,11 +170,8 @@ def test_private_candidate_manifest_v4_requires_and_parses_provenance() -> None:
         candidate_source_commit_url=(
             "https://github.com/octo-org/optimizer/commit/" + "b" * 40
         ),
-        acknowledgement_comment_id=501,
-        acknowledgement_comment_url=(
-            "https://github.com/octo-org/optimizer/pull/"
-            "104#issuecomment-501"
-        ),
+        acknowledgement_comment_id=None,
+        acknowledgement_comment_url=None,
         assignment_marker_key="issue-31:assignment-a1:v1",
         workspace_pr_number=104,
         importer_workflow_run_id=9001,

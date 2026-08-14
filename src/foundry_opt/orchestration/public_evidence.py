@@ -401,11 +401,16 @@ def public_actor_ledger(
         copilot = "Copilot provenance unavailable."
         importer = "trusted import provenance unavailable"
     else:
-        copilot = (
-            "candidate investigation; "
-            f"[source commit]({provenance.candidate_source_commit_url}) and "
+        acknowledgement = (
             "[acknowledgement comment]"
             f"({provenance.acknowledgement_comment_url}) verified"
+            if provenance.acknowledgement_comment_url is not None
+            else "acknowledgement comment unavailable"
+        )
+        copilot = (
+            "candidate investigation; "
+            f"[source commit]({provenance.candidate_source_commit_url}) "
+            f"verified; {acknowledgement}"
         )
         importer = (
             f"[trusted import]({provenance.importer_workflow_run_url})"
@@ -453,7 +458,12 @@ def _candidate_attribution(report: OptimizationReport) -> str:
     acknowledgement = (
         f"[comment]({provenance.acknowledgement_comment_url})"
         if provenance is not None
-        else "Copilot provenance unavailable"
+        and provenance.acknowledgement_comment_url is not None
+        else (
+            "acknowledgement comment unavailable"
+            if provenance is not None
+            else "Copilot provenance unavailable"
+        )
     )
     rows = [
         (

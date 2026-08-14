@@ -596,6 +596,9 @@ def test_workspace_workflow_scans_candidate_envelopes_from_trusted_schedule() ->
     assert '"foundry-optimization-workspace.yml"' in text
     assert 'f"issue={issue}"' in text
     assert '"candidate_import_origin=schedule"' in text
+    assert 'export TRUSTED_ACK_COMMENT_ID=""' in text
+    assert 'echo "cleanup_pull_request=$pull_request"' in text
+    assert 'echo "cleanup_assignment_revision=$expected_revision"' in text
     assert 'workflows: ["CodeQL"]' in text
     assert "github.event.workflow_run.conclusion == 'success'" in text
 
@@ -630,6 +633,13 @@ def test_workspace_steward_posts_revision_bound_candidate_acknowledgement() -> N
     assert "<assignment-marker-key>" in text
     assert "<candidate-id>" in text
     assert "<git rev-parse HEAD>" in text
+    normalized = " ".join(text.split())
+    assert (
+        "trusted scheduled import can proceed from the verified Copilot "
+        "commit if GitHub does not publish "
+        "the acknowledgement comment"
+        in normalized
+    )
 
 
 def test_bundle_preserves_customer_deployment_workflow() -> None:

@@ -611,9 +611,11 @@ def test_trusted_experiment_records_manifest_before_execution(
     assert recorded == {"issue": 31, "payload": payload}
 
 
+@pytest.mark.parametrize("scheduled", [False, True])
 def test_trusted_candidate_import_persists_verified_provenance(
     monkeypatch,
     tmp_path: Path,
+    scheduled: bool,
 ) -> None:
     class Recorded(RuntimeError):
         pass
@@ -629,49 +631,62 @@ def test_trusted_candidate_import_persists_verified_provenance(
         "<!-- foundry-opt:workspace-candidate-ack:"
         f"issue-31:{marker_hash}:v1:candidate-1:{'c' * 40} -->"
     )
-    commands = FakeCommands(
-        {
-            ("gh", "api", "repos/octo-org/optimizer/pulls/104"): json.dumps(
-                {
-                    "number": 104,
-                    "state": "open",
-                    "head": {
-                        "sha": "c" * 40,
-                        "repo": {"full_name": "octo-org/optimizer"},
-                    },
-                }
-            ),
+    responses = {
+        ("gh", "api", "repos/octo-org/optimizer/pulls/104"): json.dumps(
+            {
+                "number": 104,
+                "state": "open",
+                "head": {
+                    "sha": "c" * 40,
+                    "repo": {"full_name": "octo-org/optimizer"},
+                },
+            }
+        ),
+        (
+            "gh",
+            "api",
+            "repos/octo-org/optimizer/commits/" + "c" * 40,
+        ): json.dumps(
+            {
+                "sha": "c" * 40,
+                "html_url": (
+                    "https://github.com/octo-org/optimizer/commit/"
+                    + "c" * 40
+                ),
+                "author": actor,
+            }
+        ),
+    }
+    if scheduled:
+        responses[
             (
                 "gh",
                 "api",
-                "repos/octo-org/optimizer/commits/" + "c" * 40,
-            ): json.dumps(
-                {
-                    "sha": "c" * 40,
-                    "html_url": (
-                        "https://github.com/octo-org/optimizer/commit/"
-                        + "c" * 40
-                    ),
-                    "author": actor,
-                }
-            ),
+                (
+                    "repos/octo-org/optimizer/issues/104/comments?"
+                    "per_page=100&sort=created&direction=desc"
+                ),
+            )
+        ] = json.dumps([])
+    else:
+        responses[
             (
                 "gh",
                 "api",
                 "repos/octo-org/optimizer/issues/comments/501",
-            ): json.dumps(
-                {
-                    "id": 501,
-                    "html_url": (
-                        "https://github.com/octo-org/optimizer/pull/"
-                        "104#issuecomment-501"
-                    ),
-                    "body": acknowledgement,
-                    "user": actor,
-                }
-            ),
-        }
-    )
+            )
+        ] = json.dumps(
+            {
+                "id": 501,
+                "html_url": (
+                    "https://github.com/octo-org/optimizer/pull/"
+                    "104#issuecomment-501"
+                ),
+                "body": acknowledgement,
+                "user": actor,
+            }
+        )
+    commands = FakeCommands(responses)
     monkeypatch.setattr(
         workspace_production,
         "load_config",
@@ -731,8 +746,8 @@ def test_trusted_candidate_import_persists_verified_provenance(
         candidate_source_commit_sha="c" * 40,
         expected_state_revision="a" * 40,
         importer_workflow_run_id=9001,
-        trusted_event_name="issue_comment",
-        acknowledgement_comment_id=501,
+        trusted_event_name=("schedule" if scheduled else "issue_comment"),
+        acknowledgement_comment_id=(None if scheduled else 501),
     )
 
     with pytest.raises(Recorded):
@@ -747,7 +762,12 @@ def test_trusted_candidate_import_persists_verified_provenance(
     assert persisted["provenance"]["candidate_source_commit_sha"] == (
         "c" * 40
     )
-    assert persisted["provenance"]["trusted_event_name"] == "issue_comment"
+    assert persisted["provenance"]["trusted_event_name"] == (
+        "schedule" if scheduled else "issue_comment"
+    )
+    assert persisted["provenance"]["acknowledgement_comment_id"] == (
+        None if scheduled else 501
+    )
 
 
 def _trusted_baseline() -> WorkspaceBaselineRecord:

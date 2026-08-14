@@ -283,6 +283,53 @@ def test_public_marker_binds_copilot_provenance_identity() -> None:
     assert "Copilot provenance unavailable" not in first.body
 
 
+def test_public_evidence_links_commit_when_acknowledgement_is_unavailable() -> None:
+    provenance = replace(
+        _provenance(),
+        trusted_event_name="schedule",
+        acknowledgement_comment_id=None,
+        acknowledgement_comment_url=None,
+    )
+    report = OptimizationReport(
+        issue_number=31,
+        candidate_id="candidate-1",
+        recommendation="Use the candidate.",
+        alternatives=(),
+        baseline_metrics={},
+        candidate_metrics={},
+        guardrails={},
+        thresholds={},
+        materiality={},
+        sample_count=0,
+        split="development",
+        foundry_operations=(),
+        changed_paths=(),
+        validation=(),
+        spec_sha256="1" * 64,
+        base_commit="2" * 40,
+        patch_sha256="3" * 64,
+        evidence_sha256="4" * 64,
+        bundle_sha256="5" * 64,
+        expected_tree="6" * 40,
+        candidate_provenance=provenance,
+    )
+
+    renderer = PublicEvidenceRenderer()
+    projection = renderer.render_issue(report)
+    acknowledged = renderer.render_issue(
+        replace(report, candidate_provenance=_provenance())
+    )
+    body = projection.body
+
+    assert (
+        "[source commit](https://github.com/octo-org/optimizer/commit/"
+        in body
+    )
+    assert "acknowledgement comment unavailable" in body
+    assert "Copilot provenance unavailable" not in body
+    assert projection.marker != acknowledged.marker
+
+
 def test_blocked_report_cannot_claim_a_mergeable_check() -> None:
     report = OptimizationReport(
         issue_number=31,

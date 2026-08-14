@@ -94,8 +94,8 @@ class WorkspaceCandidateProvenance:
     copilot_actor_login: str
     candidate_source_commit_sha: str
     candidate_source_commit_url: str
-    acknowledgement_comment_id: int
-    acknowledgement_comment_url: str
+    acknowledgement_comment_id: int | None
+    acknowledgement_comment_url: str | None
     assignment_marker_key: str
     workspace_pr_number: int
     importer_workflow_run_id: int
@@ -105,14 +105,24 @@ class WorkspaceCandidateProvenance:
     def __post_init__(self) -> None:
         for value, name in (
             (self.copilot_actor_id, "Copilot actor ID"),
-            (
-                self.acknowledgement_comment_id,
-                "acknowledgement comment ID",
-            ),
             (self.workspace_pr_number, "workspace PR number"),
             (self.importer_workflow_run_id, "importer workflow run ID"),
         ):
             _positive_integer(value, name)
+        acknowledgement_present = (
+            self.acknowledgement_comment_id is not None
+        )
+        if acknowledgement_present != (
+            self.acknowledgement_comment_url is not None
+        ):
+            raise ValueError(
+                "acknowledgement comment ID and URL must be present together"
+            )
+        if self.acknowledgement_comment_id is not None:
+            _positive_integer(
+                self.acknowledgement_comment_id,
+                "acknowledgement comment ID",
+            )
         login = self.copilot_actor_login
         if login == "app/copilot-swe-agent":
             login = _NORMALIZED_COPILOT_LOGIN
@@ -141,22 +151,37 @@ class WorkspaceCandidateProvenance:
                 "trusted event is not supported for candidate import"
             ) from error
         object.__setattr__(self, "trusted_event_name", event)
+        if (
+            event is WorkspaceCandidateImportEvent.ISSUE_COMMENT
+            and not acknowledgement_present
+        ):
+            raise ValueError(
+                "direct candidate import requires acknowledgement provenance"
+            )
 
         source_repository = _validate_source_commit_url(
             self.candidate_source_commit_url,
             self.candidate_source_commit_sha,
         )
-        acknowledgement_repository = _validate_acknowledgement_url(
-            self.acknowledgement_comment_url,
-            self.workspace_pr_number,
-            self.acknowledgement_comment_id,
+        acknowledgement_repository = (
+            _validate_acknowledgement_url(
+                self.acknowledgement_comment_url,
+                self.workspace_pr_number,
+                self.acknowledgement_comment_id,
+            )
+            if self.acknowledgement_comment_url is not None
+            and self.acknowledgement_comment_id is not None
+            else None
         )
         run_repository = _validate_workflow_run_url(
             self.importer_workflow_run_url,
             self.importer_workflow_run_id,
         )
         if (
-            acknowledgement_repository != source_repository
+            (
+                acknowledgement_repository is not None
+                and acknowledgement_repository != source_repository
+            )
             or run_repository != source_repository
         ):
             raise ValueError(
@@ -263,21 +288,32 @@ class GhWorkspaceCandidateProvenanceResolver:
             f"{assignment_marker_key}:{candidate_id}:"
             f"{context.candidate_source_commit_sha} -->"
         )
-        comments = (
-            (
-                self._object(
+        if (
+            context.trusted_event_name
+            is WorkspaceCandidateImportEvent.ISSUE_COMMENT
+        ):
+            assert context.acknowledgement_comment_id is not None
+            acknowledgement = self._object(
+                (
+                    "gh",
+                    "api",
                     (
-                        "gh",
-                        "api",
-                        (
-                            f"repos/{repository}/issues/comments/"
-                            f"{context.acknowledgement_comment_id}"
-                        ),
-                    )
-                ),
+                        f"repos/{repository}/issues/comments/"
+                        f"{context.acknowledgement_comment_id}"
+                    ),
+                )
             )
-            if context.acknowledgement_comment_id is not None
-            else self._comments(
+            if (
+                acknowledgement.get("id")
+                != context.acknowledgement_comment_id
+                or acknowledgement.get("body") != acknowledgement_marker
+                or not _same_actor(acknowledgement.get("user"), actor)
+            ):
+                raise ValueError(
+                    "trusted Copilot acknowledgement is invalid"
+                )
+        else:
+            comments = self._comments(
                 (
                     "gh",
                     "api",
@@ -287,33 +323,39 @@ class GhWorkspaceCandidateProvenanceResolver:
                     ),
                 )
             )
+            matches = [
+                item
+                for item in comments
+                if item.get("body") == acknowledgement_marker
+            ]
+            if len(matches) > 1:
+                raise ValueError(
+                    "trusted Copilot acknowledgement is ambiguous"
+                )
+            acknowledgement = matches[0] if matches else None
+            if (
+                acknowledgement is not None
+                and not _same_actor(acknowledgement.get("user"), actor)
+            ):
+                raise ValueError(
+                    "trusted Copilot acknowledgement actor is invalid"
+                )
+        comment_id = (
+            acknowledgement.get("id")
+            if acknowledgement is not None
+            else None
         )
-        matches = [
-            item
-            for item in comments
-            if item.get("body") == acknowledgement_marker
-            and (
-                context.acknowledgement_comment_id is None
-                or item.get("id")
-                == context.acknowledgement_comment_id
-            )
-            and _same_actor(item.get("user"), actor)
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                "trusted Copilot acknowledgement is missing or ambiguous"
-            )
-        acknowledgement = matches[0]
-        comment_id = acknowledgement.get("id")
-        comment_url = acknowledgement.get("html_url")
-        if (
+        comment_url = (
+            acknowledgement.get("html_url")
+            if acknowledgement is not None
+            else None
+        )
+        if acknowledgement is not None and (
             type(comment_id) is not int
             or comment_id < 1
             or not isinstance(comment_url, str)
         ):
-            raise ValueError(
-                "trusted Copilot acknowledgement is invalid"
-            )
+            raise ValueError("trusted Copilot acknowledgement is invalid")
 
         return WorkspaceCandidateProvenance(
             copilot_actor_id=actor["id"],

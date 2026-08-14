@@ -187,6 +187,132 @@ def test_scheduled_capture_recovers_the_exact_acknowledgement(
     assert provenance.acknowledgement_comment_id == 501
 
 
+def test_scheduled_capture_accepts_missing_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    responses = _responses()
+    endpoint = (
+        "gh",
+        "api",
+        (
+            f"repos/{_REPOSITORY}/issues/104/comments?"
+            "per_page=100&sort=created&direction=desc"
+        ),
+    )
+    responses[endpoint] = []
+
+    provenance = _resolve(
+        tmp_path,
+        context=_context(
+            trusted_event_name="schedule",
+            acknowledgement_comment_id=None,
+        ),
+        responses=responses,
+    )
+
+    assert provenance.acknowledgement_comment_id is None
+    assert provenance.acknowledgement_comment_url is None
+    assert provenance.candidate_source_commit_sha == _SOURCE_SHA
+
+
+def test_scheduled_capture_rejects_multiple_acknowledgements(
+    tmp_path: Path,
+) -> None:
+    responses = _responses()
+    endpoint = (
+        "gh",
+        "api",
+        (
+            f"repos/{_REPOSITORY}/issues/104/comments?"
+            "per_page=100&sort=created&direction=desc"
+        ),
+    )
+    first = responses[endpoint][0]
+    responses[endpoint] = [
+        first,
+        {
+            **first,
+            "id": 502,
+            "html_url": (
+                f"https://github.com/{_REPOSITORY}/pull/"
+                "104#issuecomment-502"
+            ),
+        },
+    ]
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        _resolve(
+            tmp_path,
+            context=_context(
+                trusted_event_name="schedule",
+                acknowledgement_comment_id=None,
+            ),
+            responses=responses,
+        )
+
+
+def test_scheduled_capture_rejects_spoofed_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    responses = _responses()
+    endpoint = (
+        "gh",
+        "api",
+        (
+            f"repos/{_REPOSITORY}/issues/104/comments?"
+            "per_page=100&sort=created&direction=desc"
+        ),
+    )
+    responses[endpoint][0]["user"] = {
+        "id": 7,
+        "login": "Copilot",
+        "type": "Bot",
+    }
+
+    with pytest.raises(ValueError, match="acknowledgement actor"):
+        _resolve(
+            tmp_path,
+            context=_context(
+                trusted_event_name="schedule",
+                acknowledgement_comment_id=None,
+            ),
+            responses=responses,
+        )
+
+
+def test_scheduled_capture_rejects_foreign_acknowledgement_url(
+    tmp_path: Path,
+) -> None:
+    responses = _responses()
+    endpoint = (
+        "gh",
+        "api",
+        (
+            f"repos/{_REPOSITORY}/issues/104/comments?"
+            "per_page=100&sort=created&direction=desc"
+        ),
+    )
+    responses[endpoint][0]["html_url"] = (
+        "https://github.com/other/repository/pull/"
+        "104#issuecomment-501"
+    )
+
+    with pytest.raises(ValueError, match="same repository"):
+        _resolve(
+            tmp_path,
+            context=_context(
+                trusted_event_name="schedule",
+                acknowledgement_comment_id=None,
+            ),
+            responses=responses,
+        )
+
+
+def test_direct_context_requires_acknowledgement_comment_id() -> None:
+    with pytest.raises(ValueError, match="direct.*comment ID"):
+        _context(acknowledgement_comment_id=None)
+
+
 @pytest.mark.parametrize(
     ("responses", "message"),
     [

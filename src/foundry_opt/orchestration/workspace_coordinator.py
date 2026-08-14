@@ -337,31 +337,37 @@ class GitWorkspaceExactBranchPublisher:
             or provenance.workspace_pr_number != pull_request.number
         ):
             raise ValueError("workspace candidate provenance is invalid")
-        return "\n".join(
+        details = [
+            subject,
+            "",
             (
-                subject,
-                "",
-                (
-                    "Selected candidate ID: "
-                    f"{candidate.experiment.candidate_id}"
-                ),
-                (
-                    "Copilot source commit SHA: "
-                    f"{provenance.candidate_source_commit_sha}"
-                ),
-                (
-                    "Copilot source commit URL: "
-                    f"{provenance.candidate_source_commit_url}"
-                ),
+                "Selected candidate ID: "
+                f"{candidate.experiment.candidate_id}"
+            ),
+            (
+                "Copilot source commit SHA: "
+                f"{provenance.candidate_source_commit_sha}"
+            ),
+            (
+                "Copilot source commit URL: "
+                f"{provenance.candidate_source_commit_url}"
+            ),
+        ]
+        if provenance.acknowledgement_comment_url is not None:
+            details.append(
                 (
                     "Copilot acknowledgement URL: "
                     f"{provenance.acknowledgement_comment_url}"
-                ),
+                )
+            )
+        details.extend(
+            (
                 f"Provenance SHA-256: {provenance.identity_sha256}",
                 "",
                 _COPILOT_COAUTHOR,
             )
         )
+        return "\n".join(details)
 
     def _exact_commit(
         self,

@@ -149,11 +149,8 @@ def test_compact_v5_reconstructs_provenance_and_reads_v4_records() -> None:
         candidate_source_commit_url=(
             "https://github.com/octo-org/optimizer/commit/" + "9" * 40
         ),
-        acknowledgement_comment_id=501,
-        acknowledgement_comment_url=(
-            "https://github.com/octo-org/optimizer/pull/"
-            "104#issuecomment-501"
-        ),
+        acknowledgement_comment_id=None,
+        acknowledgement_comment_url=None,
         assignment_marker_key="issue-31:assignment-a1:v1",
         workspace_pr_number=104,
         importer_workflow_run_id=9001,

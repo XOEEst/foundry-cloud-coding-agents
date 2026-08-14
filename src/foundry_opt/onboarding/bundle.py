@@ -559,7 +559,9 @@ redacted experiment results, and command as authoritative:
    request with exactly
    `<!-- foundry-opt:workspace-candidate-ack:<assignment-marker-key>:<candidate-id>:<git rev-parse HEAD> -->`,
    using the assignment marker key from the comment that assigned this
-   session, and stop. If it says
+   session. Ask GitHub to publish that marker, but trusted scheduled import can
+   proceed from the verified Copilot commit if GitHub does not publish the
+   acknowledgement comment. Then stop. If it says
    `await_trusted_actions_result`, stop directly. Trusted Actions imports and
    evaluates the proposal, then a revision-bound continuation requests the
    next slot.
