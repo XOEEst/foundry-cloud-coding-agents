@@ -22,6 +22,7 @@ from foundry_opt.orchestration import (
     InMemoryWorkspaceStore,
     OptimizationWorkspace,
     WorkspaceCandidate,
+    WorkspaceCandidateProvenance,
     WorkspaceCandidateCoordinator,
     WorkspaceBaselineRecord,
     WorkspaceExperimentRecord,
@@ -98,6 +99,7 @@ def _record(
     candidate: WorkspaceCandidate,
     *,
     status: str = "completed",
+    provenance: WorkspaceCandidateProvenance | None = None,
 ) -> WorkspaceExperimentRecord:
     result = candidate.experiment_result
     return WorkspaceExperimentRecord(
@@ -116,6 +118,7 @@ def _record(
         changed_paths=candidate.changed_paths,
         validation=candidate.validation,
         expected_tree=candidate.expected_tree,
+        provenance=provenance,
         executor=result.executor if status == "completed" else None,
         draft_id=result.draft_id if status == "completed" else None,
         evaluation_id=(
@@ -132,6 +135,9 @@ def _seed_records(
     candidates: tuple[WorkspaceCandidate, ...],
     *,
     pending: str | None = None,
+    provenance_by_candidate: (
+        dict[str, WorkspaceCandidateProvenance] | None
+    ) = None,
 ) -> None:
     snapshot = store.load(31)
     assert snapshot is not None
@@ -142,6 +148,9 @@ def _seed_records(
                 "pending"
                 if candidate.experiment.candidate_id == pending
                 else "completed"
+            ),
+            provenance=(provenance_by_candidate or {}).get(
+                candidate.experiment.candidate_id
             ),
         )
         for candidate in candidates
@@ -325,7 +334,31 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
             workspace_pull_request=_pull_request(),
         )
     )
-    _seed_records(store, (_candidate(1), _candidate(2)))
+    provenance = WorkspaceCandidateProvenance(
+        copilot_actor_id=198982749,
+        copilot_actor_login="Copilot",
+        candidate_source_commit_sha="9" * 40,
+        candidate_source_commit_url=(
+            "https://github.com/octo-org/optimizer/commit/" + "9" * 40
+        ),
+        acknowledgement_comment_id=501,
+        acknowledgement_comment_url=(
+            "https://github.com/octo-org/optimizer/pull/"
+            "104#issuecomment-501"
+        ),
+        assignment_marker_key="issue-31:assignment-a1:v1",
+        workspace_pr_number=104,
+        importer_workflow_run_id=9001,
+        importer_workflow_run_url=(
+            "https://github.com/octo-org/optimizer/actions/runs/9001"
+        ),
+        trusted_event_name="issue_comment",
+    )
+    _seed_records(
+        store,
+        (_candidate(1), _candidate(2)),
+        provenance_by_candidate={"candidate-2": provenance},
+    )
 
     result = workspace.advance(
         WorkspaceRequest(
@@ -377,6 +410,7 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     )
     assert result.report is not None
     assert result.report.candidate_id == "candidate-2"
+    assert result.report.candidate_provenance == provenance
     assert snapshot.baseline is not None
     assert result.report.baseline_metrics == snapshot.baseline.metrics
     assert result.report.sample_count == snapshot.baseline.sample_count
@@ -416,6 +450,7 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
     assert snapshot.lineage.required_checks_provenance == (
         f"trusted-selector:head:{'c' * 40}"
     )
+    assert snapshot.lineage.candidate_provenance == provenance
     document = result.to_dict()
     assert document["next_action"]["kind"] == (
         "merge_workspace_pull_request"

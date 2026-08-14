@@ -275,7 +275,7 @@ def test_v3_conversion_is_canonical_one_way_and_idempotent(
             repository,
         )
     )
-    assert snapshot["schema_version"] == 4
+    assert snapshot["schema_version"] == 5
     assert snapshot["state"]["phase"] == "deployment"
     assert _remote_revision(repository, source_ref) == source_revision
 

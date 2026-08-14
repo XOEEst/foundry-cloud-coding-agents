@@ -162,7 +162,7 @@ class GitWorkspaceOperationStore:
 
 
 class WorkspaceExperimentRecordView:
-    """Read completed/pending experiment records from compact v4 state."""
+    """Read completed/pending experiment records from compact v5 state."""
 
     def __init__(self, repository_root: Path) -> None:
         self._git = GitWorkspaceStore(repository_root)

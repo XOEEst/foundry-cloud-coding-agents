@@ -26,7 +26,7 @@ def test_v3_migration_plan_is_read_only_and_preserves_legacy_paths() -> None:
         source_ref="refs/heads/foundry-opt/state/issue-31",
         source_revision="a" * 40,
         source_schema_version=3,
-        target_schema_version=4,
+        target_schema_version=5,
         legacy_paths=(
             "snapshot.json",
             "journal.jsonl",

@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 import hashlib
 import json
+import os
+from pathlib import Path
 import re
+from typing import Any
 from urllib.parse import urlsplit
+
+from foundry_opt.preflight.interfaces import CommandRunner
 
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_REPOSITORY = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
+    r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
+)
 _REPOSITORY_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _ASSIGNMENT_MARKER = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
@@ -19,6 +30,62 @@ _NORMALIZED_COPILOT_LOGIN = "copilot-swe-agent[bot]"
 class WorkspaceCandidateImportEvent(StrEnum):
     ISSUE_COMMENT = "issue_comment"
     SCHEDULE = "schedule"
+
+
+@dataclass(frozen=True)
+class TrustedWorkspaceCandidateImportContext:
+    repository: str
+    workspace_pr_number: int
+    candidate_source_commit_sha: str
+    expected_state_revision: str
+    importer_workflow_run_id: int
+    trusted_event_name: WorkspaceCandidateImportEvent
+    acknowledgement_comment_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.repository, str)
+            or _REPOSITORY.fullmatch(self.repository) is None
+        ):
+            raise ValueError("trusted import repository is invalid")
+        _positive_integer(
+            self.workspace_pr_number,
+            "workspace PR number",
+        )
+        _positive_integer(
+            self.importer_workflow_run_id,
+            "importer workflow run ID",
+        )
+        for value, name in (
+            (
+                self.candidate_source_commit_sha,
+                "candidate source commit SHA",
+            ),
+            (self.expected_state_revision, "expected state revision"),
+        ):
+            if not isinstance(value, str) or _COMMIT.fullmatch(value) is None:
+                raise ValueError(
+                    f"{name} must be 40 lowercase hex characters"
+                )
+        try:
+            event = WorkspaceCandidateImportEvent(self.trusted_event_name)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "trusted event is not supported for candidate import"
+            ) from error
+        if self.acknowledgement_comment_id is not None:
+            _positive_integer(
+                self.acknowledgement_comment_id,
+                "acknowledgement comment ID",
+            )
+        if (
+            event is WorkspaceCandidateImportEvent.ISSUE_COMMENT
+            and self.acknowledgement_comment_id is None
+        ):
+            raise ValueError(
+                "direct candidate import requires its comment ID"
+            )
+        object.__setattr__(self, "trusted_event_name", event)
 
 
 @dataclass(frozen=True)
@@ -104,30 +171,7 @@ class WorkspaceCandidateProvenance:
     @property
     def canonical_json(self) -> str:
         return json.dumps(
-            {
-                "acknowledgement_comment_id": (
-                    self.acknowledgement_comment_id
-                ),
-                "acknowledgement_comment_url": (
-                    self.acknowledgement_comment_url
-                ),
-                "assignment_marker_key": self.assignment_marker_key,
-                "candidate_source_commit_sha": (
-                    self.candidate_source_commit_sha
-                ),
-                "candidate_source_commit_url": (
-                    self.candidate_source_commit_url
-                ),
-                "copilot_actor_id": self.copilot_actor_id,
-                "copilot_actor_login": self.copilot_actor_login,
-                "importer_workflow_run_id": self.importer_workflow_run_id,
-                "importer_workflow_run_url": (
-                    self.importer_workflow_run_url
-                ),
-                "schema_version": 1,
-                "trusted_event_name": self.trusted_event_name.value,
-                "workspace_pr_number": self.workspace_pr_number,
-            },
+            workspace_candidate_provenance_document(self),
             ensure_ascii=True,
             allow_nan=False,
             separators=(",", ":"),
@@ -139,6 +183,344 @@ class WorkspaceCandidateProvenance:
         return hashlib.sha256(
             self.canonical_json.encode("utf-8")
         ).hexdigest()
+
+
+class GhWorkspaceCandidateProvenanceResolver:
+    """Resolve candidate attribution only from live trusted GitHub metadata."""
+
+    def __init__(
+        self,
+        commands: CommandRunner,
+        *,
+        repository_root: Path,
+        max_comments: int = 100,
+    ) -> None:
+        if type(max_comments) is not int or not 1 <= max_comments <= 100:
+            raise ValueError("candidate comment bound is invalid")
+        self._commands = commands
+        self._root = repository_root
+        self._max_comments = max_comments
+
+    def resolve(
+        self,
+        *,
+        issue_number: int,
+        candidate_id: str,
+        context: TrustedWorkspaceCandidateImportContext,
+    ) -> WorkspaceCandidateProvenance:
+        _positive_integer(issue_number, "workspace issue number")
+        if (
+            not isinstance(candidate_id, str)
+            or _IDENTIFIER.fullmatch(candidate_id) is None
+        ):
+            raise ValueError("workspace candidate ID is invalid")
+        repository = context.repository
+        pull_number = context.workspace_pr_number
+        pull = self._object(
+            ("gh", "api", f"repos/{repository}/pulls/{pull_number}")
+        )
+        head = pull.get("head")
+        head_repository = (
+            head.get("repo") if isinstance(head, Mapping) else None
+        )
+        if (
+            pull.get("number") != pull_number
+            or pull.get("state") != "open"
+            or not isinstance(head, Mapping)
+            or head.get("sha") != context.candidate_source_commit_sha
+            or not isinstance(head_repository, Mapping)
+            or head_repository.get("full_name") != repository
+        ):
+            raise ValueError(
+                "trusted candidate source does not match workspace PR head"
+            )
+
+        commit = self._object(
+            (
+                "gh",
+                "api",
+                (
+                    f"repos/{repository}/commits/"
+                    f"{context.candidate_source_commit_sha}"
+                ),
+            )
+        )
+        actor = commit.get("author")
+        if (
+            commit.get("sha") != context.candidate_source_commit_sha
+            or not isinstance(commit.get("html_url"), str)
+            or not _trusted_copilot_actor(actor)
+        ):
+            raise ValueError("trusted Copilot commit actor is invalid")
+        assert isinstance(actor, Mapping)
+
+        assignment_marker_key = workspace_assignment_marker_key(
+            issue_number,
+            context.expected_state_revision,
+        )
+        acknowledgement_marker = (
+            "<!-- foundry-opt:workspace-candidate-ack:"
+            f"{assignment_marker_key}:{candidate_id}:"
+            f"{context.candidate_source_commit_sha} -->"
+        )
+        comments = (
+            (
+                self._object(
+                    (
+                        "gh",
+                        "api",
+                        (
+                            f"repos/{repository}/issues/comments/"
+                            f"{context.acknowledgement_comment_id}"
+                        ),
+                    )
+                ),
+            )
+            if context.acknowledgement_comment_id is not None
+            else self._comments(
+                (
+                    "gh",
+                    "api",
+                    (
+                        f"repos/{repository}/issues/comments?"
+                        "per_page=100&sort=created&direction=desc"
+                    ),
+                )
+            )
+        )
+        matches = [
+            item
+            for item in comments
+            if item.get("body") == acknowledgement_marker
+            and (
+                context.acknowledgement_comment_id is None
+                or item.get("id")
+                == context.acknowledgement_comment_id
+            )
+            and _same_actor(item.get("user"), actor)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "trusted Copilot acknowledgement is missing or ambiguous"
+            )
+        acknowledgement = matches[0]
+        comment_id = acknowledgement.get("id")
+        comment_url = acknowledgement.get("html_url")
+        if (
+            type(comment_id) is not int
+            or comment_id < 1
+            or not isinstance(comment_url, str)
+        ):
+            raise ValueError(
+                "trusted Copilot acknowledgement is invalid"
+            )
+
+        return WorkspaceCandidateProvenance(
+            copilot_actor_id=actor["id"],
+            copilot_actor_login=actor["login"],
+            candidate_source_commit_sha=(
+                context.candidate_source_commit_sha
+            ),
+            candidate_source_commit_url=commit["html_url"],
+            acknowledgement_comment_id=comment_id,
+            acknowledgement_comment_url=comment_url,
+            assignment_marker_key=assignment_marker_key,
+            workspace_pr_number=pull_number,
+            importer_workflow_run_id=context.importer_workflow_run_id,
+            importer_workflow_run_url=(
+                f"https://github.com/{repository}/actions/runs/"
+                f"{context.importer_workflow_run_id}"
+            ),
+            trusted_event_name=context.trusted_event_name,
+        )
+
+    def _object(self, arguments: tuple[str, ...]) -> Mapping[str, Any]:
+        value = self._json(arguments)
+        if not isinstance(value, Mapping):
+            raise ValueError("trusted GitHub response is invalid")
+        return value
+
+    def _comments(
+        self,
+        arguments: tuple[str, ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        value = self._json(arguments)
+        if (
+            not isinstance(value, list)
+            or any(not isinstance(item, Mapping) for item in value)
+        ):
+            raise ValueError(
+                "trusted candidate comment history is invalid"
+            )
+        comments = tuple(value)
+        if len(comments) > self._max_comments:
+            raise ValueError(
+                "trusted candidate comment history exceeds its bound"
+            )
+        return comments
+
+    def _json(self, arguments: tuple[str, ...]) -> Any:
+        result = self._commands.run(arguments, cwd=self._root)
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError("trusted GitHub response is invalid") from error
+
+
+def workspace_assignment_marker_key(
+    issue_number: int,
+    assignment_revision: str,
+) -> str:
+    _positive_integer(issue_number, "workspace issue number")
+    if (
+        not isinstance(assignment_revision, str)
+        or not assignment_revision
+        or len(assignment_revision) > 256
+        or any(ord(character) < 32 for character in assignment_revision)
+    ):
+        raise ValueError("workspace assignment revision is invalid")
+    return (
+        f"issue-{issue_number}:"
+        f"{hashlib.sha256(assignment_revision.encode('utf-8')).hexdigest()[:16]}"
+        ":v1"
+    )
+
+
+def workspace_candidate_provenance_document(
+    provenance: WorkspaceCandidateProvenance,
+) -> dict[str, Any]:
+    if type(provenance) is not WorkspaceCandidateProvenance:
+        raise ValueError("workspace candidate provenance is invalid")
+    return {
+        "acknowledgement_comment_id": (
+            provenance.acknowledgement_comment_id
+        ),
+        "acknowledgement_comment_url": (
+            provenance.acknowledgement_comment_url
+        ),
+        "assignment_marker_key": provenance.assignment_marker_key,
+        "candidate_source_commit_sha": (
+            provenance.candidate_source_commit_sha
+        ),
+        "candidate_source_commit_url": (
+            provenance.candidate_source_commit_url
+        ),
+        "copilot_actor_id": provenance.copilot_actor_id,
+        "copilot_actor_login": provenance.copilot_actor_login,
+        "importer_workflow_run_id": provenance.importer_workflow_run_id,
+        "importer_workflow_run_url": (
+            provenance.importer_workflow_run_url
+        ),
+        "schema_version": 1,
+        "trusted_event_name": provenance.trusted_event_name.value,
+        "workspace_pr_number": provenance.workspace_pr_number,
+    }
+
+
+def parse_workspace_candidate_provenance(
+    value: Any,
+) -> WorkspaceCandidateProvenance:
+    if not isinstance(value, Mapping) or set(value) != {
+        "acknowledgement_comment_id",
+        "acknowledgement_comment_url",
+        "assignment_marker_key",
+        "candidate_source_commit_sha",
+        "candidate_source_commit_url",
+        "copilot_actor_id",
+        "copilot_actor_login",
+        "importer_workflow_run_id",
+        "importer_workflow_run_url",
+        "schema_version",
+        "trusted_event_name",
+        "workspace_pr_number",
+    }:
+        raise ValueError("workspace candidate provenance fields are invalid")
+    if value["schema_version"] != 1:
+        raise ValueError(
+            "workspace candidate provenance schema version is invalid"
+        )
+    try:
+        return WorkspaceCandidateProvenance(
+            copilot_actor_id=value["copilot_actor_id"],
+            copilot_actor_login=value["copilot_actor_login"],
+            candidate_source_commit_sha=value[
+                "candidate_source_commit_sha"
+            ],
+            candidate_source_commit_url=value[
+                "candidate_source_commit_url"
+            ],
+            acknowledgement_comment_id=value[
+                "acknowledgement_comment_id"
+            ],
+            acknowledgement_comment_url=value[
+                "acknowledgement_comment_url"
+            ],
+            assignment_marker_key=value["assignment_marker_key"],
+            workspace_pr_number=value["workspace_pr_number"],
+            importer_workflow_run_id=value["importer_workflow_run_id"],
+            importer_workflow_run_url=value["importer_workflow_run_url"],
+            trusted_event_name=value["trusted_event_name"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("workspace candidate provenance is invalid") from error
+
+
+def trusted_workspace_candidate_import_context_from_environment(
+    environ: Mapping[str, str] | None = None,
+) -> TrustedWorkspaceCandidateImportContext | None:
+    values = os.environ if environ is None else environ
+    origin = values.get("TRUSTED_CANDIDATE_IMPORT_ORIGIN", "")
+    if not origin:
+        return None
+    if values.get("GITHUB_ACTIONS") != "true":
+        raise ValueError(
+            "trusted candidate import requires GitHub Actions context"
+        )
+    try:
+        pull_request_number = int(
+            values.get("TRUSTED_PULL_REQUEST_NUMBER", "")
+        )
+        run_id = int(values.get("TRUSTED_RUN_ID", ""))
+        comment_value = values.get("TRUSTED_ACK_COMMENT_ID", "")
+        comment_id = int(comment_value) if comment_value else None
+    except ValueError as error:
+        raise ValueError(
+            "trusted candidate import numeric context is invalid"
+        ) from error
+    return TrustedWorkspaceCandidateImportContext(
+        repository=values.get("TRUSTED_REPOSITORY", ""),
+        workspace_pr_number=pull_request_number,
+        candidate_source_commit_sha=values.get(
+            "TRUSTED_HEAD_SHA",
+            "",
+        ),
+        expected_state_revision=values.get(
+            "TRUSTED_EXPECTED_REVISION",
+            "",
+        ),
+        importer_workflow_run_id=run_id,
+        trusted_event_name=origin,
+        acknowledgement_comment_id=comment_id,
+    )
+
+
+def _trusted_copilot_actor(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("login") in {"Copilot", _NORMALIZED_COPILOT_LOGIN}
+        and type(value.get("id")) is int
+        and value["id"] > 0
+        and value.get("type") == "Bot"
+    )
+
+
+def _same_actor(value: Any, expected: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("id") == expected.get("id")
+        and value.get("login") == expected.get("login")
+        and value.get("type") == "Bot"
+    )
 
 
 def _positive_integer(value: int, name: str) -> None:
@@ -217,6 +599,12 @@ def _validate_workflow_run_url(value: str, run_id: int) -> str:
 
 
 __all__ = [
+    "GhWorkspaceCandidateProvenanceResolver",
+    "TrustedWorkspaceCandidateImportContext",
     "WorkspaceCandidateImportEvent",
     "WorkspaceCandidateProvenance",
+    "parse_workspace_candidate_provenance",
+    "trusted_workspace_candidate_import_context_from_environment",
+    "workspace_assignment_marker_key",
+    "workspace_candidate_provenance_document",
 ]

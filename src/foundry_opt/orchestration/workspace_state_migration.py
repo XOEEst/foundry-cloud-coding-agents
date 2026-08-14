@@ -108,7 +108,7 @@ def workspace_state_v3_migration_plan(
         source_ref=_state_ref(issue_number),
         source_revision=source_revision,
         source_schema_version=3,
-        target_schema_version=4,
+        target_schema_version=5,
         legacy_paths=paths,
         read_only=True,
     )
@@ -155,7 +155,7 @@ def convert_workspace_state_v3(
         source_ref=plan.source_ref,
         source_revision=plan.source_revision,
         source_schema_version=3,
-        target_schema_version=4,
+        target_schema_version=5,
         transitions=transitions,
         canonical_bytes=_canonical_json(document),
     )
@@ -175,7 +175,7 @@ def validate_workspace_state_conversion_payload(
         payload.source_ref != _state_ref(payload.issue_number)
         or _COMMIT.fullmatch(payload.source_revision) is None
         or payload.source_schema_version != 3
-        or payload.target_schema_version != 4
+        or payload.target_schema_version != 5
         or not payload.transitions
         or any(
             type(item) is not WorkspaceUpdate
@@ -318,7 +318,7 @@ def _workspace_phase(phase: CampaignPhase) -> WorkspacePhase:
         CampaignPhase.DEPLOYMENT: WorkspacePhase.DEPLOYMENT,
         CampaignPhase.RETENTION: WorkspacePhase.RETENTION,
         CampaignPhase.COMPLETED: WorkspacePhase.COMPLETED,
-        # Compact v4 audits use one terminal phase; the journal preserves
+        # Compact v5 audits use one terminal phase; the journal preserves
         # the exact legacy event and reason that ended the campaign.
         CampaignPhase.BLOCKED: WorkspacePhase.COMPLETED,
         CampaignPhase.CANCELLED: WorkspacePhase.COMPLETED,
@@ -327,7 +327,7 @@ def _workspace_phase(phase: CampaignPhase) -> WorkspacePhase:
         return mapping[phase]
     except KeyError as error:
         raise WorkspaceStateConversionError(
-            f"workspace phase {phase.value} cannot be represented in v4"
+            f"workspace phase {phase.value} cannot be represented in v5"
         ) from error
 
 
@@ -395,7 +395,7 @@ def _merge_candidate_metadata(
     metrics = document.get("metrics", {})
     if type(metrics) is not dict:
         raise WorkspaceStateConversionError(
-            "candidate metrics cannot be represented in v4"
+            "candidate metrics cannot be represented in v5"
         )
     normalized_metrics: dict[str, float] = {}
     for name, value in metrics.items():
@@ -407,7 +407,7 @@ def _merge_candidate_metadata(
             or not isfinite(value)
         ):
             raise WorkspaceStateConversionError(
-                "candidate metrics cannot be represented in v4"
+                "candidate metrics cannot be represented in v5"
             )
         normalized_metrics[name] = float(value)
     normalized = {
@@ -538,7 +538,7 @@ def _selected_patch(
         reject_secret_content(patch_text)
     except (UnicodeDecodeError, ValueError) as error:
         raise WorkspaceStateConversionError(
-            "selected patch lineage violates v4 privacy"
+            "selected patch lineage violates v5 privacy"
         ) from error
     return patch
 
@@ -651,17 +651,17 @@ def _external_id(value: Any, field_name: str) -> str:
         normalized = value
     else:
         raise WorkspaceStateConversionError(
-            "external operation ID cannot be represented in v4"
+            "external operation ID cannot be represented in v5"
         )
     if _SAFE_EXTERNAL_ID.fullmatch(normalized) is None:
         raise WorkspaceStateConversionError(
-            "external operation ID cannot be represented in v4"
+            "external operation ID cannot be represented in v5"
         )
     try:
         reject_secret_content(normalized)
     except ValueError as error:
         raise WorkspaceStateConversionError(
-            "external operation ID violates v4 privacy"
+            "external operation ID violates v5 privacy"
         ) from error
     return normalized
 
@@ -679,7 +679,7 @@ def _conversion_document(
         "source_ref": source_ref,
         "source_revision": source_revision,
         "source_schema_version": 3,
-        "target_schema_version": 4,
+        "target_schema_version": 5,
         "transitions": [
             _transition_document(item) for item in transitions
         ],
@@ -688,7 +688,7 @@ def _conversion_document(
         reject_secret_content(document)
     except ValueError as error:
         raise WorkspaceStateConversionError(
-            "workspace conversion payload violates v4 privacy"
+            "workspace conversion payload violates v5 privacy"
         ) from error
     return document
 

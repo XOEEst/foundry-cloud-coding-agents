@@ -69,8 +69,14 @@ from foundry_opt.orchestration.workspace_assignment import (
     GhWorkspaceCopilotAssigner,
 )
 from foundry_opt.orchestration.workspace_attribution import (
+    GhWorkspaceCandidateProvenanceResolver,
+    TrustedWorkspaceCandidateImportContext,
     WorkspaceCandidateImportEvent,
     WorkspaceCandidateProvenance,
+    parse_workspace_candidate_provenance,
+    trusted_workspace_candidate_import_context_from_environment,
+    workspace_assignment_marker_key,
+    workspace_candidate_provenance_document,
 )
 from foundry_opt.orchestration.workspace_projection import (
     GhWorkspaceIssueProjector,
@@ -82,6 +88,7 @@ from foundry_opt.orchestration.workspace_manifest import (
     WorkspaceExperimentManifest,
     parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
+    workspace_candidate_manifest_document,
 )
 from foundry_opt.orchestration.workspace_operations import (
     NormalizedWorkspaceOperation,
@@ -549,9 +556,15 @@ __all__ = [
     "WorkspaceBaselineRequestBuilder",
     "WorkspaceSpecificationRecord",
     "WorkspaceIssueStatusProjectionIntent",
+    "GhWorkspaceCandidateProvenanceResolver",
+    "TrustedWorkspaceCandidateImportContext",
     "WorkspaceCandidate",
     "WorkspaceCandidateImportEvent",
     "WorkspaceCandidateProvenance",
+    "parse_workspace_candidate_provenance",
+    "trusted_workspace_candidate_import_context_from_environment",
+    "workspace_assignment_marker_key",
+    "workspace_candidate_provenance_document",
     "WorkspaceCandidateWorkContract",
     "WorkspaceCandidateProposal",
     "WorkspaceCandidateCoordinator",
@@ -624,6 +637,7 @@ __all__ = [
     "normalize_workspace_experiment_result",
     "parse_workspace_experiment_manifest",
     "parse_workspace_candidate_manifest",
+    "workspace_candidate_manifest_document",
     "candidate_pr_body",
     "candidate_pr_marker",
     "candidate_pull_request_event_from_payload",

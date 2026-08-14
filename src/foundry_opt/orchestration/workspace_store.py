@@ -9,6 +9,9 @@ from types import MappingProxyType
 from typing import Mapping
 
 from foundry_opt.orchestration.workspace import WorkspacePhase
+from foundry_opt.orchestration.workspace_attribution import (
+    WorkspaceCandidateProvenance,
+)
 
 
 @dataclass(frozen=True)
@@ -208,6 +211,7 @@ class WorkspaceLineage:
     workspace_pull_request_number: int
     required_checks: Mapping[str, str]
     required_checks_provenance: str
+    candidate_provenance: WorkspaceCandidateProvenance | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -267,6 +271,14 @@ class WorkspaceLineage:
             "required_checks",
             MappingProxyType(checks),
         )
+        if (
+            self.candidate_provenance is not None
+            and type(self.candidate_provenance)
+            is not WorkspaceCandidateProvenance
+        ):
+            raise ValueError(
+                "workspace lineage candidate provenance is invalid"
+            )
 
 
 @dataclass(frozen=True)
@@ -282,6 +294,7 @@ class WorkspaceExperimentRecord:
     changed_paths: tuple[str, ...]
     validation: tuple[str, ...]
     expected_tree: str
+    provenance: WorkspaceCandidateProvenance | None = None
     executor: str | None = None
     draft_id: str | None = None
     evaluation_id: str | None = None
@@ -387,6 +400,13 @@ class WorkspaceExperimentRecord:
             "guardrails",
             MappingProxyType(guardrails),
         )
+        if (
+            self.provenance is not None
+            and type(self.provenance) is not WorkspaceCandidateProvenance
+        ):
+            raise ValueError(
+                "workspace experiment provenance is invalid"
+            )
 
 
 @dataclass(frozen=True)
@@ -537,6 +557,21 @@ def _validate_lineage_update(update: WorkspaceUpdate) -> None:
         != lineage.selected_candidate_id
     ):
         raise ValueError("workspace lineage does not match state")
+    experiment = next(
+        (
+            item
+            for item in update.experiments
+            if item.candidate_id == lineage.selected_candidate_id
+        ),
+        None,
+    )
+    if lineage.candidate_provenance is not None and (
+        experiment is None
+        or experiment.provenance != lineage.candidate_provenance
+    ):
+        raise ValueError(
+            "workspace selected candidate provenance changed"
+        )
 
 
 def _validate_experiment_records(
@@ -568,6 +603,7 @@ def _validate_experiment_records(
             or current.changed_paths != prior.changed_paths
             or current.validation != prior.validation
             or current.expected_tree != prior.expected_tree
+            or current.provenance != prior.provenance
         ):
             raise ValueError("workspace experiment lineage changed")
 

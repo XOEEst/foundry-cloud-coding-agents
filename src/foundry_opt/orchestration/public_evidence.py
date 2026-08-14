@@ -10,6 +10,10 @@ import re
 from types import MappingProxyType
 from typing import Mapping
 
+from foundry_opt.orchestration.workspace_attribution import (
+    WorkspaceCandidateProvenance,
+)
+
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OBJECT = re.compile(r"^[0-9a-f]{40}$")
@@ -108,6 +112,7 @@ class OptimizationReport:
     materiality: Mapping[str, float] = field(default_factory=dict)
     required_checks: Mapping[str, str] = field(default_factory=dict)
     merge_gate: EvidenceMergeGate = EvidenceMergeGate.PENDING
+    candidate_provenance: WorkspaceCandidateProvenance | None = None
 
     def __post_init__(self) -> None:
         if type(self.issue_number) is not int or self.issue_number < 1:
@@ -171,6 +176,12 @@ class OptimizationReport:
                 raise ValueError(f"{name} must be a full Git object ID")
         if not isinstance(self.merge_gate, EvidenceMergeGate):
             raise ValueError("merge_gate must be an EvidenceMergeGate")
+        if (
+            self.candidate_provenance is not None
+            and type(self.candidate_provenance)
+            is not WorkspaceCandidateProvenance
+        ):
+            raise ValueError("candidate_provenance is invalid")
         if self.merge_gate is EvidenceMergeGate.ELIGIBLE and (
             not checks or any(status != "success" for status in checks.values())
         ):

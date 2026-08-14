@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping, Sequence
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -17,6 +18,7 @@ from foundry_opt.orchestration import (
     InMemoryWorkspaceStore,
     OptimizationWorkspace,
     TrustedWorkspaceEventContext,
+    TrustedWorkspaceCandidateImportContext,
     WorkspaceAdvanceRequest,
     WorkspaceBaselineRecord,
     WorkspaceBaselinePlan,
@@ -607,6 +609,145 @@ def test_trusted_experiment_records_manifest_before_execution(
         service.execute_experiment(payload, repository_root=tmp_path)
 
     assert recorded == {"issue": 31, "payload": payload}
+
+
+def test_trusted_candidate_import_persists_verified_provenance(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    class Recorded(RuntimeError):
+        pass
+
+    recorded: dict[str, Any] = {}
+    config = SimpleNamespace(
+        campaign=SimpleNamespace(max_changed_candidates=2),
+        targets={"support-agent": SimpleNamespace()},
+    )
+    actor = {"id": 198982749, "login": "Copilot", "type": "Bot"}
+    marker_hash = hashlib.sha256(("a" * 40).encode()).hexdigest()[:16]
+    acknowledgement = (
+        "<!-- foundry-opt:workspace-candidate-ack:"
+        f"issue-31:{marker_hash}:v1:candidate-1:{'c' * 40} -->"
+    )
+    commands = FakeCommands(
+        {
+            ("gh", "api", "repos/octo-org/optimizer/pulls/104"): json.dumps(
+                {
+                    "number": 104,
+                    "state": "open",
+                    "head": {
+                        "sha": "c" * 40,
+                        "repo": {"full_name": "octo-org/optimizer"},
+                    },
+                }
+            ),
+            (
+                "gh",
+                "api",
+                "repos/octo-org/optimizer/commits/" + "c" * 40,
+            ): json.dumps(
+                {
+                    "sha": "c" * 40,
+                    "html_url": (
+                        "https://github.com/octo-org/optimizer/commit/"
+                        + "c" * 40
+                    ),
+                    "author": actor,
+                }
+            ),
+            (
+                "gh",
+                "api",
+                "repos/octo-org/optimizer/issues/comments/501",
+            ): json.dumps(
+                {
+                    "id": 501,
+                    "html_url": (
+                        "https://github.com/octo-org/optimizer/pull/"
+                        "104#issuecomment-501"
+                    ),
+                    "body": acknowledgement,
+                    "user": actor,
+                }
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "load_config",
+        lambda path: config,
+    )
+    monkeypatch.setattr(
+        workspace_production,
+        "_trusted_copilot_repository_context",
+        lambda: None,
+    )
+
+    class Operations:
+        def record_candidate_manifest(self, issue_number, payload):
+            recorded["issue"] = issue_number
+            recorded["payload"] = payload
+            raise Recorded
+
+    monkeypatch.setattr(
+        workspace_production,
+        "GitWorkspaceOperationStore",
+        lambda root: Operations(),
+    )
+    service = ProductionWorkspaceService(
+        commands=commands,
+        experiment_runner=object(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_repository_context",
+        lambda root: SimpleNamespace(
+            repository="octo-org/optimizer",
+            default_branch="main",
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "_existing_workspace_pull_request",
+        lambda root, repository, issue: (104, "b" * 40),
+    )
+    payload = {
+        "schema_version": 3,
+        "issue_number": 31,
+        "target": "support-agent",
+        "base_commit": "b" * 40,
+        "candidate": {
+            "candidate_id": "candidate-1",
+            "mutation_class": "system_instructions",
+            "summary": "Improve policy coverage.",
+            "patch_base64": base64.b64encode(
+                b"diff --git a/agent.py b/agent.py\n"
+            ).decode("ascii"),
+        },
+    }
+    context = TrustedWorkspaceCandidateImportContext(
+        repository="octo-org/optimizer",
+        workspace_pr_number=104,
+        candidate_source_commit_sha="c" * 40,
+        expected_state_revision="a" * 40,
+        importer_workflow_run_id=9001,
+        trusted_event_name="issue_comment",
+        acknowledgement_comment_id=501,
+    )
+
+    with pytest.raises(Recorded):
+        service.execute_experiment(
+            payload,
+            repository_root=tmp_path,
+            candidate_import_context=context,
+        )
+
+    persisted = recorded["payload"]
+    assert persisted["schema_version"] == 4
+    assert persisted["provenance"]["candidate_source_commit_sha"] == (
+        "c" * 40
+    )
+    assert persisted["provenance"]["trusted_event_name"] == "issue_comment"
 
 
 def _trusted_baseline() -> WorkspaceBaselineRecord:

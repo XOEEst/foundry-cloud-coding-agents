@@ -507,6 +507,12 @@ def test_workspace_workflow_imports_candidate_envelope_from_exact_pr_head() -> N
     assert "Workspace candidate envelope is stale" in text
     assert '--candidate-manifest "$manifest_file"' in text
     assert 'branch="foundry-opt/workspace/issue-$ISSUE"' in text
+    assert 'export TRUSTED_HEAD_SHA="$head_sha"' in text
+    assert 'export TRUSTED_EXPECTED_REVISION="$expected_revision"' in text
+    assert (
+        'export TRUSTED_CANDIDATE_IMPORT_ORIGIN="$import_origin"'
+        in text
+    )
 
 
 def test_workspace_workflow_scans_candidate_envelopes_from_trusted_schedule() -> None:
@@ -525,6 +531,7 @@ def test_workspace_workflow_scans_candidate_envelopes_from_trusted_schedule() ->
     assert "foundry-opt/state/issue-" in text
     assert '"foundry-optimization-workspace.yml"' in text
     assert 'f"issue={issue}"' in text
+    assert '"candidate_import_origin=schedule"' in text
     assert 'workflows: ["CodeQL"]' in text
     assert "github.event.workflow_run.conclusion == 'success'" in text
 
@@ -542,6 +549,23 @@ def test_workspace_workflow_imports_after_copilot_completion_comment() -> None:
     assert "github.event.comment.user.login == 'Copilot'" in text
     assert 'event_name == "issue_comment"' in text
     assert '[ "$TRUSTED_EVENT_NAME" = "issue_comment" ]' in text
+    assert 'import_origin="issue_comment"' in text
+    assert "TRUSTED_ACK_COMMENT_ID" in text
+
+
+def test_workspace_steward_posts_revision_bound_candidate_acknowledgement() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/agents/foundry-optimization-steward.agent.md")
+    ]
+
+    assert "workspace-candidate-ack:" in text
+    assert "<assignment-marker-key>" in text
+    assert "<candidate-id>" in text
+    assert "<git rev-parse HEAD>" in text
 
 
 def test_bundle_preserves_customer_deployment_workflow() -> None:

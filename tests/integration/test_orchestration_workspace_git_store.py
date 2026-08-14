@@ -14,6 +14,7 @@ from foundry_opt.orchestration import (
     detect_workspace_state_v3,
     GitWorkspaceStore,
     WorkspaceCompletedError,
+    WorkspaceCandidateProvenance,
     WorkspaceBaselineRecord,
     WorkspaceConflictError,
     WorkspaceCorruptionError,
@@ -64,12 +65,32 @@ def _tree(repository: Path, revision: str) -> tuple[str, ...]:
     )
 
 
-def test_git_workspace_store_commits_and_loads_compact_v4_state(
+def test_git_workspace_store_commits_and_loads_compact_v5_provenance(
     tmp_path: Path,
 ) -> None:
     repository, _ = _repository(tmp_path)
     store = GitWorkspaceStore(repository)
     patch = b"diff --git a/agent.py b/agent.py\n"
+    provenance = WorkspaceCandidateProvenance(
+        copilot_actor_id=198982749,
+        copilot_actor_login="Copilot",
+        candidate_source_commit_sha="9" * 40,
+        candidate_source_commit_url=(
+            "https://github.com/octo-org/optimizer/commit/" + "9" * 40
+        ),
+        acknowledgement_comment_id=501,
+        acknowledgement_comment_url=(
+            "https://github.com/octo-org/optimizer/pull/"
+            "104#issuecomment-501"
+        ),
+        assignment_marker_key="issue-31:assignment-a1:v1",
+        workspace_pr_number=104,
+        importer_workflow_run_id=9001,
+        importer_workflow_run_url=(
+            "https://github.com/octo-org/optimizer/actions/runs/9001"
+        ),
+        trusted_event_name="schedule",
+    )
     lineage = WorkspaceLineage(
         spec_sha256="a" * 64,
         base_commit="b" * 40,
@@ -83,6 +104,7 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
         required_checks_provenance=(
             f"trusted-selector:head:{'f' * 40}"
         ),
+        candidate_provenance=provenance,
     )
     specification = WorkspaceSpecificationRecord(
         status="policy_approved",
@@ -153,6 +175,7 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
                     changed_paths=("agent.py",),
                     validation=("pytest: passed",),
                     expected_tree=lineage.expected_tree,
+                    provenance=provenance,
                     executor="direct_oidc",
                     draft_id="draft-1",
                     evaluation_id="evaluation-1",
@@ -168,6 +191,7 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
     )
 
     assert store.load(31) == second
+    assert store.load(31).experiments[0].provenance == provenance
     assert second.lineage == lineage
     assert _tree(repository, second.revision) == (
         "evidence/candidates.json",
@@ -199,6 +223,13 @@ def test_git_workspace_store_commits_and_loads_compact_v4_state(
     assert snapshot["state"]["experiments"][0]["metrics"] == {
         "policy_coverage": 0.5
     }
+    assert snapshot["schema_version"] == 5
+    assert snapshot["state"]["experiments"][0]["provenance"][
+        "candidate_source_commit_sha"
+    ] == "9" * 40
+    assert snapshot["state"]["lineage"]["candidate_provenance"][
+        "acknowledgement_comment_id"
+    ] == 501
     journal = _run(
         ("git", "show", f"{second.revision}:journal.jsonl"),
         repository,

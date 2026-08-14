@@ -1,9 +1,12 @@
 import pytest
+import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from foundry_opt.orchestration import (
     TrustedWorkspaceOperationContext,
+    WorkspaceCandidateProvenance,
     WorkspaceTrigger,
     normalize_workspace_operation,
 )
@@ -75,6 +78,78 @@ def test_operation_store_deletes_ref_through_validated_remote_url(
             ":refs/heads/foundry-opt/operations/issue-31",
         )
     ]
+
+
+def test_operation_store_roundtrip_and_replay_require_same_provenance(
+    tmp_path: Path,
+) -> None:
+    provenance = WorkspaceCandidateProvenance(
+        copilot_actor_id=198982749,
+        copilot_actor_login="Copilot",
+        candidate_source_commit_sha="9" * 40,
+        candidate_source_commit_url=(
+            "https://github.com/octo-org/optimizer/commit/" + "9" * 40
+        ),
+        acknowledgement_comment_id=501,
+        acknowledgement_comment_url=(
+            "https://github.com/octo-org/optimizer/pull/"
+            "104#issuecomment-501"
+        ),
+        assignment_marker_key="issue-31:assignment-a1:v1",
+        workspace_pr_number=104,
+        importer_workflow_run_id=9001,
+        importer_workflow_run_url=(
+            "https://github.com/octo-org/optimizer/actions/runs/9001"
+        ),
+        trusted_event_name="schedule",
+    )
+    payload = {
+        "base_commit": "b" * 40,
+        "candidate": {
+            "candidate_id": "candidate-1",
+            "mutation_class": "system_instructions",
+            "patch_base64": base64.b64encode(
+                b"diff --git a/agent.py b/agent.py\n"
+            ).decode("ascii"),
+            "summary": "Improve policy coverage.",
+        },
+        "issue_number": 31,
+        "provenance": json.loads(provenance.canonical_json),
+        "schema_version": 4,
+        "target": "support-agent",
+    }
+    files: dict[str, bytes] = {}
+
+    class FakeGit:
+        def _remote_revision(self, ref):
+            return "a" * 40 if files else None
+
+        def _write_commit(self, *, parent, files: dict[str, bytes], message):
+            del parent, message
+            globals_files.update(files)
+            return "a" * 40
+
+        def _push(self, **kwargs):
+            del kwargs
+
+    globals_files = files
+    store = object.__new__(operation_store.GitWorkspaceOperationStore)
+    store._root = tmp_path
+    store._remote = "origin"
+    store._git = FakeGit()
+    store._candidate_files = lambda issue: dict(files)
+
+    store.record_candidate_manifest(31, payload)
+
+    assert store.load_candidate_manifest(31, "candidate-1") == payload
+    store.record_candidate_manifest(31, payload)
+    changed = json.loads(json.dumps(payload))
+    changed["provenance"]["importer_workflow_run_id"] = 9002
+    changed["provenance"]["importer_workflow_run_url"] = (
+        "https://github.com/octo-org/optimizer/actions/runs/9002"
+    )
+    with pytest.raises(ValueError, match="manifest changed"):
+        store.record_candidate_manifest(31, changed)
 
 
 def test_trusted_workspace_operation_normalizes_completed_lineage() -> None:

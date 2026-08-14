@@ -85,6 +85,11 @@ from foundry_opt.orchestration.workspace_manifest import (
     WorkspaceCandidateManifest,
     parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
+    workspace_candidate_manifest_document,
+)
+from foundry_opt.orchestration.workspace_attribution import (
+    GhWorkspaceCandidateProvenanceResolver,
+    TrustedWorkspaceCandidateImportContext,
 )
 from foundry_opt.orchestration.workspace_policy import (
     ConfiguredWorkspaceSelector,
@@ -896,6 +901,9 @@ class ProductionWorkspaceService:
         payload: Mapping[str, Any],
         *,
         repository_root: Path,
+        candidate_import_context: (
+            TrustedWorkspaceCandidateImportContext | None
+        ) = None,
     ) -> WorkspaceExperimentExecutionResult:
         root = repository_root.expanduser().resolve()
         manifest = parse_workspace_candidate_manifest(payload)
@@ -916,6 +924,36 @@ class ProductionWorkspaceService:
             raise ProductionWorkspaceError(
                 "workspace candidate base does not match workspace PR"
             )
+        if candidate_import_context is not None:
+            if (
+                candidate_import_context.repository.casefold()
+                != context.repository.casefold()
+                or candidate_import_context.workspace_pr_number
+                != existing[0]
+            ):
+                raise ProductionWorkspaceError(
+                    "trusted candidate import context changed"
+                )
+            provenance = GhWorkspaceCandidateProvenanceResolver(
+                self._commands,
+                repository_root=root,
+            ).resolve(
+                issue_number=manifest.issue_number,
+                candidate_id=manifest.candidate.candidate_id,
+                context=candidate_import_context,
+            )
+            if (
+                manifest.provenance is not None
+                and manifest.provenance != provenance
+            ):
+                raise ProductionWorkspaceError(
+                    "workspace candidate provenance changed"
+                )
+            payload = workspace_candidate_manifest_document(
+                manifest,
+                provenance,
+            )
+            manifest = parse_workspace_candidate_manifest(payload)
         if (
             self._experiment_runner is None
         ):
@@ -950,6 +988,7 @@ class ProductionWorkspaceService:
             target=manifest.target,
             base_commit=manifest.base_commit,
             proposal=manifest.candidate,
+            provenance=manifest.provenance,
         )
 
     def _write_candidate_proxy_envelope(

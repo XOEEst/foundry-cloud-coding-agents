@@ -520,7 +520,11 @@ redacted experiment results, and command as authoritative:
 7. Remove the disposable worktree and manifest after successful submission.
    If the result says `proxy_import_required`, add only
    `.foundry-optimizer/workspace-candidate.json`, commit it on the existing
-   workspace PR branch, push that branch, and stop. If it says
+   workspace PR branch, push that branch, then comment on that same pull
+   request with exactly
+   `<!-- foundry-opt:workspace-candidate-ack:<assignment-marker-key>:<candidate-id>:<git rev-parse HEAD> -->`,
+   using the assignment marker key from the comment that assigned this
+   session, and stop. If it says
    `await_trusted_actions_result`, stop directly. Trusted Actions imports and
    evaluates the proposal, then a revision-bound continuation requests the
    next slot.
@@ -629,6 +633,12 @@ on:
         description: Optimization issue number to retry
         required: true
         type: number
+      candidate_import_origin:
+        description: Trusted scanner-proxy origin
+        required: false
+        type: choice
+        default: none
+        options: [none, schedule]
 
 permissions:
   actions: write
@@ -752,6 +762,8 @@ jobs:
                       os.environ["TRUSTED_DEFAULT_BRANCH"],
                       "-f",
                       f"issue={{issue}}",
+                      "-f",
+                      "candidate_import_origin=schedule",
                   ],
                   check=True,
               )
@@ -786,6 +798,8 @@ jobs:
         id: workspace
         env:
           DISPATCH_ISSUE: ${{{{ inputs.issue }}}}
+          DISPATCH_IMPORT_ORIGIN: >-
+            ${{{{ inputs.candidate_import_origin }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
@@ -851,6 +865,9 @@ jobs:
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
           TRUSTED_HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}
+          TRUSTED_ACK_COMMENT_ID: ${{{{ github.event.comment.id }}}}
+          TRUSTED_DISPATCH_IMPORT_ORIGIN: >-
+            ${{{{ inputs.candidate_import_origin }}}}
           TRUSTED_PULL_REQUEST_NUMBER: >-
             ${{{{ steps.workspace.outputs.pull_request }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
@@ -864,24 +881,37 @@ jobs:
             foundry-opt workspace
           )
           head_sha="$TRUSTED_HEAD_SHA"
+          pull_request="$TRUSTED_PULL_REQUEST_NUMBER"
           if (
             [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] ||
             [ "$TRUSTED_EVENT_NAME" = "issue_comment" ]
           ); then
             owner="${{TRUSTED_REPOSITORY%%/*}}"
             branch="foundry-opt/workspace/issue-$ISSUE"
-            head_sha="$(
+            pull_data="$(
               gh api --method GET \
                 "repos/$TRUSTED_REPOSITORY/pulls" \
                 -f state=open \
                 -f head="$owner:$branch" \
-                --jq 'if length == 1 then .[0].head.sha else "" end'
+                --jq 'if length == 1 then "\\(.[0].number) \\(.[0].head.sha)" else "" end'
             )"
+            read -r pull_request head_sha <<< "$pull_data"
+          fi
+          import_origin=""
+          if [ "$TRUSTED_EVENT_NAME" = "issue_comment" ]; then
+            import_origin="issue_comment"
+          elif (
+            [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] &&
+            [ "$TRUSTED_DISPATCH_IMPORT_ORIGIN" = "schedule" ]
+          ); then
+            import_origin="schedule"
           fi
           envelope_path=".foundry-optimizer/workspace-candidate.json"
           envelope_file="$RUNNER_TEMP/workspace-candidate-envelope.json"
           manifest_file="$RUNNER_TEMP/workspace-candidate-manifest.json"
           if (
+            [ -n "$import_origin" ] &&
+            [[ "$pull_request" =~ ^[1-9][0-9]*$ ]] &&
             [[ "$head_sha" =~ ^[0-9a-f]{{40}}$ ]] &&
             git fetch --no-tags origin "$head_sha" &&
             git cat-file -e "$head_sha:$envelope_path" 2>/dev/null
@@ -935,6 +965,13 @@ jobs:
               if [ "$current_revision" != "$expected_revision" ]; then
                 echo "Workspace candidate envelope is stale" >&2
                 exit 1
+              fi
+              export TRUSTED_CANDIDATE_IMPORT_ORIGIN="$import_origin"
+              export TRUSTED_PULL_REQUEST_NUMBER="$pull_request"
+              export TRUSTED_HEAD_SHA="$head_sha"
+              export TRUSTED_EXPECTED_REVISION="$expected_revision"
+              if [ "$import_origin" != "issue_comment" ]; then
+                export TRUSTED_ACK_COMMENT_ID=""
               fi
               "${{command[@]}}" experiment \
                 --issue "$ISSUE" \

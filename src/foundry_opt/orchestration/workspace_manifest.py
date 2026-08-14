@@ -9,6 +9,11 @@ from typing import Any
 from foundry_opt.orchestration.workspace import (
     WorkspaceCandidateProposal,
 )
+from foundry_opt.orchestration.workspace_attribution import (
+    WorkspaceCandidateProvenance,
+    parse_workspace_candidate_provenance,
+    workspace_candidate_provenance_document,
+)
 from foundry_opt.security import reject_secret_content
 
 
@@ -31,6 +36,7 @@ class WorkspaceCandidateManifest:
     target: str
     base_commit: str
     candidate: WorkspaceCandidateProposal
+    provenance: WorkspaceCandidateProvenance | None = None
 
 
 def parse_workspace_experiment_manifest(
@@ -76,26 +82,76 @@ def parse_workspace_candidate_manifest(
     payload: Mapping[str, Any],
 ) -> WorkspaceCandidateManifest:
     reject_secret_content(payload)
-    _exact_keys(
-        payload,
-        {
-            "base_commit",
-            "candidate",
-            "issue_number",
-            "schema_version",
-            "target",
-        },
-        "workspace candidate manifest",
-    )
+    schema_version = payload.get("schema_version")
+    if schema_version == 3:
+        _exact_keys(
+            payload,
+            {
+                "base_commit",
+                "candidate",
+                "issue_number",
+                "schema_version",
+                "target",
+            },
+            "workspace candidate manifest",
+        )
+        provenance = None
+    elif schema_version == 4:
+        _exact_keys(
+            payload,
+            {
+                "base_commit",
+                "candidate",
+                "issue_number",
+                "provenance",
+                "schema_version",
+                "target",
+            },
+            "workspace candidate manifest",
+        )
+        provenance = parse_workspace_candidate_provenance(
+            payload["provenance"]
+        )
+    else:
+        raise ValueError("workspace manifest schema version is invalid")
     issue_number, target, base_commit = _header(
-        payload, schema_version=3
+        payload, schema_version=schema_version
     )
     return WorkspaceCandidateManifest(
         issue_number=issue_number,
         target=target,
         base_commit=base_commit,
         candidate=_candidate(payload["candidate"]),
+        provenance=provenance,
     )
+
+
+def workspace_candidate_manifest_document(
+    manifest: WorkspaceCandidateManifest,
+    provenance: WorkspaceCandidateProvenance,
+) -> dict[str, Any]:
+    if type(manifest) is not WorkspaceCandidateManifest:
+        raise ValueError("workspace candidate manifest is invalid")
+    if (
+        manifest.provenance is not None
+        and manifest.provenance != provenance
+    ):
+        raise ValueError("workspace candidate provenance changed")
+    return {
+        "base_commit": manifest.base_commit,
+        "candidate": {
+            "candidate_id": manifest.candidate.candidate_id,
+            "mutation_class": manifest.candidate.mutation_class,
+            "patch_base64": base64.b64encode(
+                manifest.candidate.exact_patch
+            ).decode("ascii"),
+            "summary": manifest.candidate.summary,
+        },
+        "issue_number": manifest.issue_number,
+        "provenance": workspace_candidate_provenance_document(provenance),
+        "schema_version": 4,
+        "target": manifest.target,
+    }
 
 
 def _header(
@@ -168,4 +224,5 @@ __all__ = [
     "WorkspaceExperimentManifest",
     "parse_workspace_candidate_manifest",
     "parse_workspace_experiment_manifest",
+    "workspace_candidate_manifest_document",
 ]

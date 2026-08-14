@@ -33,6 +33,9 @@ from foundry_opt.orchestration.workspace_store import (
     WorkspaceExperimentRecord,
     WorkspaceUpdate,
 )
+from foundry_opt.orchestration.workspace_attribution import (
+    WorkspaceCandidateProvenance,
+)
 from foundry_opt.security import reject_secret_content
 
 
@@ -470,6 +473,7 @@ class WorkspaceExperimentExecutor:
         target: str,
         base_commit: str,
         proposal: WorkspaceCandidateProposal,
+        provenance: WorkspaceCandidateProvenance | None = None,
     ) -> WorkspaceExperimentExecutionResult:
         snapshot = self._store.load(issue_number)
         if self._runner is None or self._request_builder is None:
@@ -496,7 +500,7 @@ class WorkspaceExperimentExecutor:
         pending_recorded = False
         if existing is not None:
             request = _request_from_record(issue_number, existing)
-            _validate_proposal_record(proposal, existing)
+            _validate_proposal_record(proposal, existing, provenance)
             if existing.status == "completed":
                 return _execution_result(
                     issue_number,
@@ -528,6 +532,7 @@ class WorkspaceExperimentExecutor:
                 changed_paths=preparation.changed_paths,
                 validation=preparation.validation,
                 expected_tree=preparation.expected_tree,
+                provenance=provenance,
             )
             snapshot = self._store.commit(
                 expected_revision=snapshot.revision,
@@ -719,6 +724,7 @@ def _completed_record(
         changed_paths=pending.changed_paths,
         validation=pending.validation,
         expected_tree=pending.expected_tree,
+        provenance=pending.provenance,
         executor=result.executor,
         draft_id=result.draft_id,
         evaluation_id=result.evaluation_id,
@@ -744,11 +750,13 @@ def _validate_preparation(
 def _validate_proposal_record(
     proposal: WorkspaceCandidateProposal,
     record: WorkspaceExperimentRecord,
+    provenance: WorkspaceCandidateProvenance | None,
 ) -> None:
     if (
         record.candidate_id != proposal.candidate_id
         or record.patch_sha256 != proposal.patch_sha256
         or record.mutation_class != proposal.mutation_class
+        or record.provenance != provenance
     ):
         raise ValueError("workspace experiment proposal binding changed")
 

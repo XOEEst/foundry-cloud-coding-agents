@@ -19,6 +19,10 @@ from foundry_opt.orchestration.git_transport import (
     resolve_safe_push_remote,
 )
 from foundry_opt.orchestration.workspace import WorkspacePhase
+from foundry_opt.orchestration.workspace_attribution import (
+    parse_workspace_candidate_provenance,
+    workspace_candidate_provenance_document,
+)
 from foundry_opt.orchestration.workspace_state_migration import (
     WorkspaceStateConversionPayload,
     WorkspaceStateMigrationPlan,
@@ -38,7 +42,8 @@ from foundry_opt.orchestration.workspace_store import (
 from foundry_opt.security import reject_secret_content
 
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
+_READABLE_SCHEMA_VERSIONS = frozenset({4, 5})
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$")
@@ -82,7 +87,7 @@ class WorkspaceMigrationRequiredError(WorkspaceStoreError):
 
 
 class GitWorkspaceStore:
-    """Compact v4 workspace state stored on private Git refs."""
+    """Compact v5 workspace state stored on private Git refs."""
 
     def __init__(
         self,
@@ -412,7 +417,7 @@ class GitWorkspaceStore:
             parent=payload.source_revision,
             files=files,
             message=(
-                f"Convert workspace state v3 to v4 for "
+                f"Convert workspace state v3 to v5 for "
                 f"issue-{payload.issue_number}"
             ),
         )
@@ -572,6 +577,9 @@ class GitWorkspaceStore:
             raise WorkspaceCorruptionError(
                 "workspace phase is invalid"
             ) from error
+        experiments = _experiments_from_document(
+            state_document["experiments"]
+        )
         lineage = _lineage_from_document(state_document["lineage"])
         if lineage is not None:
             _validate_lineage_state(
@@ -582,6 +590,11 @@ class GitWorkspaceStore:
                     state_document["workspace_pull_request_number"]
                 ),
                 error_type=WorkspaceCorruptionError,
+            )
+            _validate_lineage_provenance(
+                lineage,
+                experiments,
+                WorkspaceCorruptionError,
             )
         return (
             WorkspaceSnapshot(
@@ -596,9 +609,7 @@ class GitWorkspaceStore:
                 external_operation_ids=tuple(
                     state_document["external_operation_ids"]
                 ),
-                experiments=_experiments_from_document(
-                    state_document["experiments"]
-                ),
+                experiments=experiments,
                 lineage=lineage,
                 specification=_specification_from_document(
                     state_document["specification"]
@@ -1008,6 +1019,11 @@ def _validate_update(update: WorkspaceUpdate) -> None:
             ),
             error_type=WorkspacePrivacyError,
         )
+        _validate_lineage_provenance(
+            update.lineage,
+            update.experiments,
+            WorkspacePrivacyError,
+        )
     _validate_privacy(
         {
             "semantic_event": update.semantic_event,
@@ -1357,6 +1373,11 @@ def _experiment_to_document(
         "mutation_class": record.mutation_class,
         "operation_sha256": record.operation_sha256,
         "patch_sha256": record.patch_sha256,
+        "provenance": (
+            workspace_candidate_provenance_document(record.provenance)
+            if record.provenance is not None
+            else None
+        ),
         "run_id": record.run_id,
         "status": record.status,
         "validation": list(record.validation),
@@ -1385,6 +1406,13 @@ def _experiments_from_document(
                 changed_paths=tuple(item["changed_paths"]),
                 validation=tuple(item["validation"]),
                 expected_tree=item["expected_tree"],
+                provenance=(
+                    parse_workspace_candidate_provenance(
+                        item["provenance"]
+                    )
+                    if item.get("provenance") is not None
+                    else None
+                ),
                 executor=item["executor"],
                 draft_id=item["draft_id"],
                 evaluation_id=item["evaluation_id"],
@@ -1404,9 +1432,7 @@ def _experiments_from_document(
 
 
 def _experiment_document(value: Any) -> bool:
-    _exact_keys(
-        value,
-        {
+    legacy_keys = {
             "bundle_sha256",
             "candidate_id",
             "changed_paths",
@@ -1424,9 +1450,12 @@ def _experiment_document(value: Any) -> bool:
             "status",
             "validation",
             "expected_tree",
-        },
-        "workspace experiment",
-    )
+    }
+    keys = set(value) if isinstance(value, Mapping) else set()
+    if keys not in {frozenset(legacy_keys), frozenset((*legacy_keys, "provenance"))}:
+        raise WorkspaceCorruptionError(
+            "workspace experiment fields are invalid"
+        )
     return True
 
 
@@ -1467,6 +1496,7 @@ def _validate_experiment_transition(
             or item.changed_paths != prior.changed_paths
             or item.validation != prior.validation
             or item.expected_tree != prior.expected_tree
+            or item.provenance != prior.provenance
         ):
             raise error_type("workspace experiment lineage changed")
 
@@ -1510,6 +1540,13 @@ def _lineage_to_document(
         "required_checks_provenance": (
             lineage.required_checks_provenance
         ),
+        "candidate_provenance": (
+            workspace_candidate_provenance_document(
+                lineage.candidate_provenance
+            )
+            if lineage.candidate_provenance is not None
+            else None
+        ),
         "selected_candidate_id": lineage.selected_candidate_id,
         "spec_sha256": lineage.spec_sha256,
         "workspace_pull_request_number": (
@@ -1521,9 +1558,7 @@ def _lineage_to_document(
 def _lineage_from_document(value: Any) -> WorkspaceLineage | None:
     if value is None:
         return None
-    _exact_keys(
-        value,
-        {
+    legacy_keys = {
             "base_commit",
             "bundle_sha256",
             "evidence_sha256",
@@ -1534,9 +1569,15 @@ def _lineage_from_document(value: Any) -> WorkspaceLineage | None:
             "selected_candidate_id",
             "spec_sha256",
             "workspace_pull_request_number",
-        },
-        "workspace lineage",
-    )
+    }
+    keys = set(value) if isinstance(value, Mapping) else set()
+    if keys not in {
+        frozenset(legacy_keys),
+        frozenset((*legacy_keys, "candidate_provenance")),
+    }:
+        raise WorkspaceCorruptionError(
+            "workspace lineage fields are invalid"
+        )
     try:
         return WorkspaceLineage(
             spec_sha256=value["spec_sha256"],
@@ -1552,6 +1593,13 @@ def _lineage_from_document(value: Any) -> WorkspaceLineage | None:
             required_checks=value["required_checks"],
             required_checks_provenance=(
                 value["required_checks_provenance"]
+            ),
+            candidate_provenance=(
+                parse_workspace_candidate_provenance(
+                    value["candidate_provenance"]
+                )
+                if value.get("candidate_provenance") is not None
+                else None
             ),
         )
     except (TypeError, ValueError) as error:
@@ -1580,6 +1628,28 @@ def _validate_lineage_state(
         != lineage.selected_candidate_id
     ):
         raise error_type("workspace lineage does not match state")
+
+
+def _validate_lineage_provenance(
+    lineage: WorkspaceLineage,
+    experiments: tuple[WorkspaceExperimentRecord, ...],
+    error_type: type[WorkspaceCorruptionError],
+) -> None:
+    selected = next(
+        (
+            item
+            for item in experiments
+            if item.candidate_id == lineage.selected_candidate_id
+        ),
+        None,
+    )
+    if lineage.candidate_provenance is not None and (
+        selected is None
+        or selected.provenance != lineage.candidate_provenance
+    ):
+        raise error_type(
+            "workspace selected candidate provenance changed"
+        )
 
 
 def _validate_journal_entry(
@@ -1685,7 +1755,10 @@ def _exact_keys(value: Any, expected: set[str], description: str) -> None:
 
 
 def _version(value: Any, description: str) -> None:
-    if type(value) is not int or value != _SCHEMA_VERSION:
+    if (
+        type(value) is not int
+        or value not in _READABLE_SCHEMA_VERSIONS
+    ):
         raise WorkspaceCorruptionError(
             f"unsupported {description} schema_version"
         )

@@ -678,10 +678,25 @@ def workspace_experiment(
             raise ValueError(
                 "workspace candidate manifest issue does not match --issue"
             )
-        result = build_workspace_service().execute_experiment(
-            payload,
-            repository_root=Path.cwd(),
+        from foundry_opt.orchestration.workspace_attribution import (
+            trusted_workspace_candidate_import_context_from_environment,
         )
+
+        service = build_workspace_service()
+        import_context = (
+            trusted_workspace_candidate_import_context_from_environment()
+        )
+        if import_context is None:
+            result = service.execute_experiment(
+                payload,
+                repository_root=Path.cwd(),
+            )
+        else:
+            result = service.execute_experiment(
+                payload,
+                repository_root=Path.cwd(),
+                candidate_import_context=import_context,
+            )
     except (
         ConfigLoadError,
         json.JSONDecodeError,

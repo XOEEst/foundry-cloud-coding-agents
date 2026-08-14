@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import hashlib
 import json
 from pathlib import Path
 import re
 from typing import Any
 
 from foundry_opt.preflight.interfaces import CommandRunner
+from foundry_opt.orchestration.workspace_attribution import (
+    workspace_assignment_marker_key,
+)
 
 
 _REPOSITORY = re.compile(
@@ -66,11 +68,13 @@ class GhWorkspaceCopilotAssigner:
             raise RuntimeError(
                 "workspace assignment author is invalid"
             )
+        marker_key = workspace_assignment_marker_key(
+            issue_number,
+            assignment_key,
+        )
         marker = (
             "<!-- foundry-opt:workspace-copilot-assignment:"
-            f"issue-{issue_number}:"
-            f"{hashlib.sha256(assignment_key.encode('utf-8')).hexdigest()[:16]}"
-            ":v1 -->"
+            f"{marker_key} -->"
         )
         pages = self._api(
             (

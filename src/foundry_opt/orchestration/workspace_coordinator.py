@@ -620,6 +620,11 @@ class WorkspaceCandidateCoordinator:
         selected_experiment = experiment_by_id[
             decision.selected_candidate_id
         ]
+        selected_experiment_record = next(
+            item
+            for item in snapshot.experiments
+            if item.candidate_id == decision.selected_candidate_id
+        )
         exact = self._exact_publisher.publish(
             request.repository_root,
             pull_request,
@@ -689,6 +694,7 @@ class WorkspaceCandidateCoordinator:
             required_checks_provenance=(
                 f"trusted-selector:head:{exact.commit_sha}"
             ),
+            candidate_provenance=selected_experiment_record.provenance,
         )
         committed = (
             self._store.commit(
@@ -901,6 +907,7 @@ class WorkspaceCandidateCoordinator:
             expected_tree=lineage.expected_tree,
             required_checks=lineage.required_checks,
             merge_gate=EvidenceMergeGate.ELIGIBLE,
+            candidate_provenance=lineage.candidate_provenance,
         )
 
 

@@ -1,11 +1,13 @@
 import base64
 import hashlib
+import json
 
 import pytest
 
 from foundry_opt.orchestration import (
     parse_workspace_candidate_manifest,
     parse_workspace_experiment_manifest,
+    WorkspaceCandidateProvenance,
     WorkspaceCandidateWorkContract,
     WorkspaceNextAction,
     WorkspaceNextActionKind,
@@ -157,3 +159,39 @@ def test_single_candidate_manifest_uses_same_proposal_contract() -> None:
     manifest = parse_workspace_candidate_manifest(payload)
 
     assert manifest.candidate.candidate_id == "candidate-1"
+    assert manifest.provenance is None
+
+
+def test_private_candidate_manifest_v4_requires_and_parses_provenance() -> None:
+    provenance = WorkspaceCandidateProvenance(
+        copilot_actor_id=198982749,
+        copilot_actor_login="Copilot",
+        candidate_source_commit_sha="b" * 40,
+        candidate_source_commit_url=(
+            "https://github.com/octo-org/optimizer/commit/" + "b" * 40
+        ),
+        acknowledgement_comment_id=501,
+        acknowledgement_comment_url=(
+            "https://github.com/octo-org/optimizer/pull/"
+            "104#issuecomment-501"
+        ),
+        assignment_marker_key="issue-31:assignment-a1:v1",
+        workspace_pr_number=104,
+        importer_workflow_run_id=9001,
+        importer_workflow_run_url=(
+            "https://github.com/octo-org/optimizer/actions/runs/9001"
+        ),
+        trusted_event_name="schedule",
+    )
+    payload = {
+        "schema_version": 4,
+        "issue_number": 31,
+        "target": "support-agent",
+        "base_commit": "a" * 40,
+        "candidate": _candidate(),
+        "provenance": json.loads(provenance.canonical_json),
+    }
+
+    manifest = parse_workspace_candidate_manifest(payload)
+
+    assert manifest.provenance == provenance
