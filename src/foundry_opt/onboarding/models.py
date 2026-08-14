@@ -51,8 +51,6 @@ COPILOT_ASSIGNMENT_SECRET_REQUIREMENT = GitHubActionsSecretRequirement(
     ),
     repository_permissions=(
         "metadata: read",
-        "actions: read/write",
-        "contents: read/write",
         "issues: read/write",
         "pull requests: read/write",
     ),

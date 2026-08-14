@@ -48,24 +48,26 @@ unneeded.
 Before merging or running the generated workflows, manually create the
 repository Actions secret `COPILOT_ASSIGNMENT_TOKEN`. `foundry-opt init`
 cannot create Actions secrets. The value must be a user-to-server credential
-for a user who can use Copilot cloud agent and assign the generated custom
-agents; GitHub Actions `github.token` and GitHub App installation tokens are
-not supported for this assignment API.
+for a user who can use Copilot cloud agent and summon it on the existing
+workspace pull request; GitHub Actions `github.token` and GitHub App
+installation tokens are not supported for this invocation. This credential is
+for Copilot invocation only.
 
 Prefer a fine-grained personal access token scoped only to the target
 repository, or use a GitHub App user-to-server token or OAuth app token.
 GitHub documents these minimum fine-grained repository permissions for
-assigning Copilot:
+posting the invocation on the existing workspace pull request:
 
 - Metadata: read
-- Actions, Contents, Issues, and Pull requests: read/write
+- Issues and Pull requests: read/write
 
 Store the credential only as the Actions secret. Never commit it, put it in a
 workflow variable, print it, or persist it in issue content or optimizer
-state. Issue intake and scheduled/manual reconciliation fail before checkout
-with a non-secret error when the secret is absent. Generated workflows retain
-`github.token` for ordinary GitHub transport and use the dedicated credential
-only for the remove/reassign calls that create Copilot sessions.
+state. Generated workflows use `github.token` for durable repository
+operations, which therefore appear as `github-actions[bot]`. Only the narrow
+workspace assignment subprocess receives `COPILOT_ASSIGNMENT_TOKEN`; its
+private invocation adapter uses that credential to summon Copilot on the
+existing workspace pull request.
 
 ### 2. Create one optimization issue
 

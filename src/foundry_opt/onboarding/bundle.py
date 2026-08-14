@@ -88,7 +88,11 @@ def _repository_context(
         "`AZURE_CLIENT_ID`; Copilot performs no Foundry network operations.\n"
         "- Copilot session assignment uses the repository Actions secret "
         "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
-        "user-to-server token; an installation token is not supported.\n"
+        "user-to-server token; an installation token is not supported. "
+        "This credential is for Copilot invocation only.\n"
+        "- Durable repository operations use Actions `github.token` and "
+        "therefore appear as `github-actions[bot]`; the assignment credential "
+        "is never their `GH_TOKEN`.\n"
         "- foundry-opt init cannot create Actions secrets; configure the "
         "assignment secret manually and never commit its value.\n"
         "- Create the generated `[Optimize]` issue to start one persistent "
@@ -129,7 +133,11 @@ def _previous_repository_context(
         "operations.\n"
         "- Copilot session assignment uses the repository Actions secret "
         "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
-        "user-to-server token; an installation token is not supported.\n"
+        "user-to-server token; an installation token is not supported. "
+        "This credential is for Copilot invocation only.\n"
+        "- Durable repository operations use Actions `github.token` and "
+        "therefore appear as `github-actions[bot]`; the assignment credential "
+        "is never their `GH_TOKEN`.\n"
         "- foundry-opt init cannot create Actions secrets; configure the "
         "assignment secret manually and never commit its value.\n"
         "- Create the generated `[Optimize]` issue to start; workflow "
@@ -769,15 +777,6 @@ jobs:
       GH_TOKEN: ${{{{ github.token }}}}
       OPTIMIZER_PACKAGE: {install}
     steps:
-      - name: Require Copilot assignment token
-        env:
-          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
-        shell: bash
-        run: |
-          if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then
-            echo "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN" >&2
-            exit 1
-          fi
       - uses: {_CHECKOUT_ACTION} # v7.0.1
         with:
           fetch-depth: 0
@@ -847,8 +846,7 @@ jobs:
               output.write(f"pull_request={{pull_request}}\\n")
       - name: Ingest trusted event or retry the workspace
         env:
-          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
-          GH_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          GH_TOKEN: ${{{{ github.token }}}}
           ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
@@ -1040,15 +1038,6 @@ jobs:
       FOUNDRY_OPT_DEPLOYMENT_GH_TOKEN: ${{{{ github.token }}}}
       OPTIMIZER_PACKAGE: {install}
     steps:
-      - name: Require Copilot assignment token
-        env:
-          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
-        shell: bash
-        run: |
-          if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then
-            echo "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN" >&2
-            exit 1
-          fi
       - uses: {_CHECKOUT_ACTION} # v7.0.1
         with:
           fetch-depth: 0
@@ -1064,7 +1053,7 @@ jobs:
       - uses: {_SETUP_UV_ACTION} # v9.0.0
       - name: Execute trusted workspace operations
         env:
-          GH_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          GH_TOKEN: ${{{{ github.token }}}}
           REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
           TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
@@ -1132,7 +1121,7 @@ jobs:
           github.event_name == 'workflow_run' ||
           inputs.deployment_run_id != ''
         env:
-          GH_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          GH_TOKEN: ${{{{ github.token }}}}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
           TRUSTED_WORKFLOW_RUN_ID: >-
@@ -1179,6 +1168,7 @@ jobs:
           printf '%s\\n' "$result_json" >> "$WORKSPACE_RESUME_FILE"
       - name: Publish trusted exact verification check and ready finalized workspace pull request
         env:
+          GH_TOKEN: ${{{{ github.token }}}}
           OPTIMIZER_PACKAGE: {install}
           TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
           WORKSPACE_RESUME_FILE: >-
@@ -1434,7 +1424,7 @@ jobs:
       - name: Resume same workspace pull request when trusted state needs Copilot
         env:
           COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
-          GH_TOKEN: ""
+          GH_TOKEN: ${{{{ github.token }}}}
           OPTIMIZER_PACKAGE: {install}
           WORKSPACE_RESUME_FILE: >-
             ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
@@ -1477,7 +1467,6 @@ jobs:
 
           package = os.environ["OPTIMIZER_PACKAGE"]
           environment = dict(os.environ)
-          environment["GH_TOKEN"] = environment["COPILOT_ASSIGNMENT_TOKEN"]
           for issue in sorted(entries):
               result = subprocess.run(
                   [

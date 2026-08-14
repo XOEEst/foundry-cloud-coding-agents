@@ -2,9 +2,9 @@
   ".github/ISSUE_TEMPLATE/foundry-optimization.yml": "02d4571290388b076b589a74ba62f04697e4825203450fa691463812b156a05f",
   ".github/agents/foundry-optimization-steward.agent.md": "14d12be6cd1f9e64157bc41948ee7b4a4d843b5bf2dc4ccc6f6d600c1a264a40",
   ".github/skills/foundry-agent-optimizer/ADAPTER_MAPPING.md": "f460566a9c86ec2e12685ca7f1a0a211a7ae5a8530eb19f29f99b3c5ab2b34a2",
-  ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md": "a569f7663154613b46f1f25e05649cdfee1fbaf78888c9dd55ce92e02aff5a25",
+  ".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md": "d3b118d8f601409ba413242c05f36f9cc3ccd6e8f4e6c39f2e81dfcef84365d1",
   ".github/skills/foundry-agent-optimizer/SKILL.md": "90eed6d6691037a784bf84432398977c2098186bc6f2fd095a6a3fdb98e9b603",
   ".github/workflows/foundry-exact-candidate-check.yml": "1b40b038a2da5f8f8b914141f001fe37bcb839f81be747c947ba5a1835bc4293",
-  ".github/workflows/foundry-optimization-operations.yml": "38b807491e799a3ebb86357396dac072a37aa40903085eda47b7247b93dcf3a0",
-  ".github/workflows/foundry-optimization-workspace.yml": "7c41493d812e697158073e6d64a5455ab0a1a5ae0e79c642e666335def9c0de6"
+  ".github/workflows/foundry-optimization-operations.yml": "da92b22b46ce6b4adb88abef7761446b61f7dfb58c75c4acfd0148453cea86d3",
+  ".github/workflows/foundry-optimization-workspace.yml": "3ad46b5bb06fe095cbf77bca98ca9599a5f1a057252791019a354f018c28bff7"
 }

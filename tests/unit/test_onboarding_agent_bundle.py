@@ -300,6 +300,8 @@ def test_bundle_copies_skill_snapshot_and_workspace_context() -> None:
     assert "same workspace pull request" in context
     assert "secondary optimization" in context
     assert "specialist pull requests" not in context
+    assert "invocation only" in context
+    assert "github-actions[bot]" in context
 
 
 def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
@@ -326,11 +328,16 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         "issues": "write",
         "pull-requests": "write",
     }
-    assert "COPILOT_ASSIGNMENT_TOKEN" in text
-    assert (
-        "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
-        in text
+    assert "COPILOT_ASSIGNMENT_TOKEN" not in text
+    assert "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}" not in text
+    assert text.count("GH_TOKEN: ${{ github.token }}") >= 2
+    ingest = next(
+        step
+        for step in workflow["jobs"]["advance"]["steps"]
+        if step.get("name") == "Ingest trusted event or retry the workspace"
     )
+    assert ingest["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "COPILOT_ASSIGNMENT_TOKEN" not in ingest["env"]
     assert '"${command[@]}" advance --issue "$ISSUE" --json' in text
     assert "intake" in text
     assert '--event-path "$TRUSTED_EVENT_PATH"' in text
@@ -399,9 +406,18 @@ def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
     assert "gh pr comment" not in text
     assert "@copilot" not in text
     assert "head -25" in text
-    assert text.count(
-        "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
-    ) == 2
+    assert "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}" not in text
+    operate_steps = {
+        step.get("name"): step
+        for step in workflow["jobs"]["operate"]["steps"]
+    }
+    for name in (
+        "Execute trusted workspace operations",
+        "Reconcile authenticated deployment result",
+        "Publish trusted exact verification check and ready finalized workspace pull request",
+    ):
+        assert operate_steps[name]["env"]["GH_TOKEN"] == "${{ github.token }}"
+        assert "COPILOT_ASSIGNMENT_TOKEN" not in operate_steps[name]["env"]
     assert (
         'if [ "$TRUSTED_EVENT_NAME" = "push" ] &&'
         in text
@@ -428,6 +444,7 @@ def test_operations_workflow_resumes_same_workspace_pull_request_without_creatin
     text = files[
         Path(".github/workflows/foundry-optimization-operations.yml")
     ]
+    workflow = yaml.safe_load(text)
 
     assert "Resume same workspace pull request when trusted state needs Copilot" in text
     assert text.index(
@@ -444,7 +461,7 @@ def test_operations_workflow_resumes_same_workspace_pull_request_without_creatin
     assert "assign" in text
     assert "gh pr comment" not in text
     assert "COPILOT_ASSIGNMENT_TOKEN" in text
-    assert 'GH_TOKEN: ""' in text
+    assert "GH_TOKEN: ${{ github.token }}" in text
     assert "FOUNDRY_OPT_DEPLOYMENT_GH_TOKEN: ${{ github.token }}" in text
     assert "deployment_run_id:" in text
     assert "inputs.deployment_run_id != ''" in text
@@ -455,7 +472,17 @@ def test_operations_workflow_resumes_same_workspace_pull_request_without_creatin
     assert (
         'environment["GH_TOKEN"] = '
         'environment["COPILOT_ASSIGNMENT_TOKEN"]'
-    ) in text
+    ) not in text
+    resume_step = next(
+        step
+        for step in workflow["jobs"]["operate"]["steps"]
+        if step.get("name")
+        == "Resume same workspace pull request when trusted state needs Copilot"
+    )
+    assert resume_step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert resume_step["env"]["COPILOT_ASSIGNMENT_TOKEN"] == (
+        "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    )
     assert 'print(result.stderr, end="", file=sys.stderr)' in text
     assert "raise SystemExit(result.returncode)" in text
     assert "gh pr create" not in text

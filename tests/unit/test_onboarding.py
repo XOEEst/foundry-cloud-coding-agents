@@ -281,8 +281,6 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
             ),
             repository_permissions=(
                 "metadata: read",
-                "actions: read/write",
-                "contents: read/write",
                 "issues: read/write",
                 "pull requests: read/write",
             ),
@@ -392,6 +390,9 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         assignment_guidance
     )
     assert "installation token" in assignment_guidance
+    assert "invocation only" in assignment_guidance
+    assert "github.token" in assignment_guidance
+    assert "github-actions[bot]" in assignment_guidance
     assert "Do not commit" in assignment_guidance
 
 

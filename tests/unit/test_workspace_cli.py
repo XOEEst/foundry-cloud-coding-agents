@@ -161,6 +161,7 @@ def test_workspace_assign_uses_secret_without_emitting_it(
         "COPILOT_ASSIGNMENT_TOKEN",
         "assignment-token",
     )
+    monkeypatch.setenv("GH_TOKEN", "actions-token")
 
     class Result:
         def to_dict(self):
@@ -184,6 +185,7 @@ def test_workspace_assign_uses_secret_without_emitting_it(
             assert issue_number == 31
             assert assignment_token == "assignment-token"
             assert "COPILOT_ASSIGNMENT_TOKEN" not in __import__("os").environ
+            assert __import__("os").environ["GH_TOKEN"] == "actions-token"
             return Result()
 
     monkeypatch.setattr(cli, "build_workspace_service", lambda: Service())

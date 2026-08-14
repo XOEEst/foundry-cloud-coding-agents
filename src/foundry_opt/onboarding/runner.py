@@ -44,10 +44,11 @@ _COPILOT_ASSIGNMENT_GUIDANCE = (
     "user-to-server credential for an eligible Copilot user, not an "
     "installation token: preferably a fine-grained personal access token "
     "scoped only to this repository, or a GitHub App user-to-server token "
-    "or OAuth app token. Grant the documented minimum of metadata read plus "
-    "actions, contents, issues, and pull requests read/write, including "
-    "permission to assign Copilot and the selected custom agents. Do not "
-    "commit the token."
+    "or OAuth app token. This credential is for Copilot invocation only. "
+    "Grant the documented minimum permissions needed to invoke Copilot on "
+    "the existing workspace pull request. Durable repository operations use "
+    "github.token and appear as github-actions[bot]; they never use this "
+    "credential as GH_TOKEN. Do not commit the token."
 )
 
 
