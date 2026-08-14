@@ -68,6 +68,10 @@ from foundry_opt.orchestration.workspace_intake import (
 from foundry_opt.orchestration.workspace_assignment import (
     GhWorkspaceCopilotAssigner,
 )
+from foundry_opt.orchestration.workspace_attribution import (
+    WorkspaceCandidateImportEvent,
+    WorkspaceCandidateProvenance,
+)
 from foundry_opt.orchestration.workspace_projection import (
     GhWorkspaceIssueProjector,
     WorkspaceIssueProjectionResult,
@@ -546,6 +550,8 @@ __all__ = [
     "WorkspaceSpecificationRecord",
     "WorkspaceIssueStatusProjectionIntent",
     "WorkspaceCandidate",
+    "WorkspaceCandidateImportEvent",
+    "WorkspaceCandidateProvenance",
     "WorkspaceCandidateWorkContract",
     "WorkspaceCandidateProposal",
     "WorkspaceCandidateCoordinator",
