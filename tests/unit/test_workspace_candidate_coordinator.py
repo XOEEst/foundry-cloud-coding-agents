@@ -37,6 +37,7 @@ from foundry_opt.orchestration import (
     WorkspaceSelectionDecision,
     WorkspaceTrigger,
     WorkspaceUpdate,
+    workspace_candidate_provenance_document,
 )
 from foundry_opt.adapters.commands import SubprocessCommandRunner
 from foundry_opt.orchestration.public_evidence import PullRequestProjection
@@ -456,6 +457,9 @@ def test_candidate_completion_evaluates_exact_count_and_finalizes_same_pr(
         "merge_workspace_pull_request"
     )
     assert document["report"]["candidate_id"] == "candidate-2"
+    assert document["report"]["candidate_provenance"] == (
+        workspace_candidate_provenance_document(provenance)
+    )
     assert document["workspace_pull_request"]["number"] == 104
     assert publisher.calls[0][2].experiment.candidate_id == "candidate-2"
     assert len(finalizer.calls) == 1

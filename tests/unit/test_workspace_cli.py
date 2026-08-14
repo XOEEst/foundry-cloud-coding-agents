@@ -200,6 +200,72 @@ def test_workspace_assign_uses_secret_without_emitting_it(
     assert "assignment-token" not in completed.stdout
 
 
+def test_workspace_cleanup_assignment_uses_private_token_only(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "COPILOT_ASSIGNMENT_TOKEN",
+        "assignment-token",
+    )
+    monkeypatch.setenv("GH_TOKEN", "actions-token")
+
+    class Cleaner:
+        def cleanup(
+            self,
+            *,
+            issue_number,
+            pull_request_number,
+            assignment_marker_key,
+        ):
+            assert issue_number == 31
+            assert pull_request_number == 104
+            assert assignment_marker_key.startswith("issue-31:")
+            assert assignment_marker_key.endswith(":v1")
+            assert "COPILOT_ASSIGNMENT_TOKEN" not in __import__("os").environ
+            assert __import__("os").environ["GH_TOKEN"] == "actions-token"
+            return True
+
+    def build_cleaner(
+        *,
+        repository_root,
+        repository,
+        assignment_token,
+    ):
+        assert repository_root == tmp_path
+        assert repository == "octo-org/optimizer"
+        assert assignment_token == "assignment-token"
+        return Cleaner()
+
+    monkeypatch.setattr(
+        cli,
+        "build_workspace_assignment_cleaner",
+        build_cleaner,
+    )
+
+    completed = runner.invoke(
+        app,
+        [
+            "workspace",
+            "cleanup-assignment",
+            "--issue",
+            "31",
+            "--pull-request",
+            "104",
+            "--assignment-revision",
+            "a" * 40,
+            "--repository",
+            "octo-org/optimizer",
+            "--json",
+        ],
+    )
+
+    assert completed.exit_code == 0
+    assert json.loads(completed.stdout)["status"] == "deleted"
+    assert "assignment-token" not in completed.stdout
+
+
 def test_workspace_experiments_complete_ingests_manifest(
     monkeypatch,
     tmp_path: Path,

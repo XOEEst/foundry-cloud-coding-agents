@@ -17,6 +17,9 @@ from foundry_opt.orchestration.public_evidence import (
     FoundryOperation,
     OptimizationReport,
 )
+from foundry_opt.orchestration.workspace_attribution import (
+    workspace_candidate_provenance_document,
+)
 
 if TYPE_CHECKING:
     from foundry_opt.orchestration.candidate_search import (
@@ -1049,6 +1052,13 @@ def _report_to_dict(report: OptimizationReport) -> dict[str, Any]:
         "baseline_metrics": dict(report.baseline_metrics),
         "bundle_sha256": report.bundle_sha256,
         "candidate_id": report.candidate_id,
+        "candidate_provenance": (
+            workspace_candidate_provenance_document(
+                report.candidate_provenance
+            )
+            if report.candidate_provenance is not None
+            else None
+        ),
         "candidate_metrics": dict(report.candidate_metrics),
         "changed_paths": list(report.changed_paths),
         "evidence_sha256": report.evidence_sha256,

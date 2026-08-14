@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from foundry_opt.orchestration.public_evidence import (
     OptimizationReport,
     PublicEvidenceRenderer,
+    public_actor_ledger,
 )
 from foundry_opt.orchestration.workspace import (
     WorkspaceIssueStatusProjectionIntent,
@@ -80,7 +81,7 @@ class GhWorkspaceIssueProjector:
         status_changed = self._upsert_status(
             comments,
             intent,
-            _status_body(intent),
+            _status_body(intent, report),
         )
         created: list[str] = []
         for name, marker, body in _milestones(
@@ -339,7 +340,10 @@ def _milestone_marker(issue_number: int, name: str) -> str:
     )
 
 
-def _status_body(intent: WorkspaceIssueStatusProjectionIntent) -> str:
+def _status_body(
+    intent: WorkspaceIssueStatusProjectionIntent,
+    report: OptimizationReport | None,
+) -> str:
     next_status = {
         WorkspacePhase.SPECIFICATION: (
             "Copilot candidate preparation is ready."
@@ -369,6 +373,12 @@ def _status_body(intent: WorkspaceIssueStatusProjectionIntent) -> str:
                 f"#{intent.workspace_pull_request_number}"
             ),
             f"- Status: {next_status}",
+            "",
+            "## Who did what",
+            "",
+            public_actor_ledger(
+                report.candidate_provenance if report is not None else None
+            ),
         )
     )
 
@@ -407,6 +417,10 @@ def _milestones(
                         f"#{intent.workspace_pull_request_number} was "
                         f"established at approved base `{base_commit}`."
                     ),
+                    "",
+                    "## Who did what",
+                    "",
+                    public_actor_ledger(None),
                 )
             ),
         )
@@ -430,6 +444,10 @@ def _milestones(
                             "evaluation in the same workspace PR "
                             f"#{intent.workspace_pull_request_number}."
                         ),
+                        "",
+                        "## Who did what",
+                        "",
+                        public_actor_ledger(None),
                     )
                 ),
             )

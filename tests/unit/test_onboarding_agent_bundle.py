@@ -328,7 +328,7 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         "issues": "write",
         "pull-requests": "write",
     }
-    assert "COPILOT_ASSIGNMENT_TOKEN" not in text
+    assert text.count("COPILOT_ASSIGNMENT_TOKEN") == 2
     assert "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}" not in text
     assert text.count("GH_TOKEN: ${{ github.token }}") >= 2
     ingest = next(
@@ -338,6 +338,19 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
     )
     assert ingest["env"]["GH_TOKEN"] == "${{ github.token }}"
     assert "COPILOT_ASSIGNMENT_TOKEN" not in ingest["env"]
+    cleanup = next(
+        step
+        for step in workflow["jobs"]["advance"]["steps"]
+        if step.get("name")
+        == "Remove transient Copilot assignment marker"
+    )
+    assert set(cleanup["env"]) == {
+        "ASSIGNMENT_REVISION",
+        "COPILOT_ASSIGNMENT_TOKEN",
+        "ISSUE",
+        "PULL_REQUEST",
+        "TRUSTED_REPOSITORY",
+    }
     assert '"${command[@]}" advance --issue "$ISSUE" --json' in text
     assert "intake" in text
     assert '--event-path "$TRUSTED_EVENT_PATH"' in text
@@ -513,6 +526,26 @@ def test_workspace_workflow_imports_candidate_envelope_from_exact_pr_head() -> N
         'export TRUSTED_CANDIDATE_IMPORT_ORIGIN="$import_origin"'
         in text
     )
+    workflow = yaml.safe_load(text)
+    steps = {
+        step.get("name"): step
+        for step in workflow["jobs"]["advance"]["steps"]
+    }
+    ingest = steps["Ingest trusted event or retry the workspace"]
+    cleanup = steps["Remove transient Copilot assignment marker"]
+    assert ingest["id"] == "ingest"
+    assert "COPILOT_ASSIGNMENT_TOKEN" not in ingest.get("env", {})
+    assert cleanup["if"] == (
+        "steps.ingest.outputs.cleanup_pull_request != ''"
+    )
+    assert cleanup["env"]["COPILOT_ASSIGNMENT_TOKEN"] == (
+        "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    )
+    assert "cleanup-assignment" in cleanup["run"]
+    assert "--assignment-revision" in cleanup["run"]
+    assert "cleanup_pull_request=" in text
+    assert "cleanup_assignment_revision=" in text
+    assert "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}" not in text
 
 
 def test_workspace_workflow_scans_candidate_envelopes_from_trusted_schedule() -> None:

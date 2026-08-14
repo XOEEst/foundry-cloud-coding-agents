@@ -28,6 +28,10 @@ from foundry_opt.orchestration.workspace import (
     WorkspaceResult,
     WorkspaceTrigger,
 )
+from foundry_opt.orchestration.public_evidence import public_actor_ledger
+from foundry_opt.orchestration.workspace_attribution import (
+    WorkspaceCandidateProvenance,
+)
 from foundry_opt.orchestration.workspace_production import (
     WorkspaceAdvanceRequest,
 )
@@ -384,6 +388,7 @@ class WorkspaceDeploymentTarget:
     workflow_path: Path
     workflow_ref: str
     workflow_trigger: DeploymentTrigger
+    candidate_provenance: WorkspaceCandidateProvenance | None = None
     cleanup_refs: tuple[str, ...] = ()
     cleanup_drafts: tuple[str, ...] = ()
     cleanup_artifacts: tuple[str, ...] = ()
@@ -435,6 +440,12 @@ class WorkspaceDeploymentTarget:
             raise ValueError("deployment workflow ref is invalid")
         if not isinstance(self.workflow_trigger, DeploymentTrigger):
             raise ValueError("deployment workflow trigger is invalid")
+        if (
+            self.candidate_provenance is not None
+            and type(self.candidate_provenance)
+            is not WorkspaceCandidateProvenance
+        ):
+            raise ValueError("workspace candidate provenance is invalid")
         object.__setattr__(
             self,
             "cleanup_refs",
@@ -867,16 +878,25 @@ def workspace_final_issue_marker(
     issue_number: int,
     candidate_id: str,
     disposition: str,
+    provenance_identity_sha256: str | None = None,
 ) -> str:
     _positive_integer(issue_number, "workspace issue number")
     _identifier(candidate_id, "workspace candidate")
     _identifier(disposition, "workspace disposition")
+    if provenance_identity_sha256 is not None:
+        _sha256(
+            provenance_identity_sha256,
+            "workspace provenance identity",
+        )
     digest = hashlib.sha256(
         json.dumps(
             {
                 "candidate_id": candidate_id,
                 "disposition": disposition,
                 "issue_number": issue_number,
+                "provenance_identity_sha256": (
+                    provenance_identity_sha256
+                ),
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -898,6 +918,11 @@ def render_workspace_completion_projection(
         issue_number=target.issue_number,
         candidate_id=target.candidate_id,
         disposition="retained_improvement",
+        provenance_identity_sha256=(
+            target.candidate_provenance.identity_sha256
+            if target.candidate_provenance is not None
+            else None
+        ),
     )
     body = "\n".join(
         (
@@ -913,6 +938,14 @@ def render_workspace_completion_projection(
             f"- Deployment portal: {artifact.portal_url}",
             f"- Trusted workflow run: {artifact.run_url}",
             "",
+            "## Who did what",
+            "",
+            public_actor_ledger(
+                target.candidate_provenance,
+                deployment_run_url=artifact.run_url,
+                final=True,
+            ),
+            "",
             "## Exact lineage",
             "",
             f"- Spec SHA-256: `{target.spec_sha256}`",
@@ -921,6 +954,12 @@ def render_workspace_completion_projection(
             f"- Evidence SHA-256: `{target.evidence_sha256}`",
             f"- Merge commit: `{target.merge_commit}`",
             f"- Tree SHA: `{target.tree_sha}`",
+            (
+                "- Copilot provenance SHA-256: "
+                f"`{target.candidate_provenance.identity_sha256}`"
+                if target.candidate_provenance is not None
+                else "- Copilot provenance unavailable"
+            ),
             "",
             "## Held-out evaluation",
             "",
@@ -950,6 +989,11 @@ def render_workspace_ready_for_human_projection(
         issue_number=target.issue_number,
         candidate_id=target.candidate_id,
         disposition="ready_for_human",
+        provenance_identity_sha256=(
+            target.candidate_provenance.identity_sha256
+            if target.candidate_provenance is not None
+            else None
+        ),
     )
     body = "\n".join(
         (
@@ -965,6 +1009,14 @@ def render_workspace_ready_for_human_projection(
             f"- Regression reason: `{retention.reason}`",
             f"- Trusted workflow run: {artifact.run_url}",
             "",
+            "## Who did what",
+            "",
+            public_actor_ledger(
+                target.candidate_provenance,
+                deployment_run_url=artifact.run_url,
+                final=True,
+            ),
+            "",
             "## Exact lineage",
             "",
             f"- Spec SHA-256: `{target.spec_sha256}`",
@@ -973,6 +1025,12 @@ def render_workspace_ready_for_human_projection(
             f"- Evidence SHA-256: `{target.evidence_sha256}`",
             f"- Merge commit: `{target.merge_commit}`",
             f"- Tree SHA: `{target.tree_sha}`",
+            (
+                "- Copilot provenance SHA-256: "
+                f"`{target.candidate_provenance.identity_sha256}`"
+                if target.candidate_provenance is not None
+                else "- Copilot provenance unavailable"
+            ),
             "",
             "## Held-out evaluation",
             "",

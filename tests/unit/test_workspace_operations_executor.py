@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,9 @@ from foundry_opt.orchestration.workspace import (
     WorkspacePhase,
     WorkspaceResult,
     WorkspaceTrigger,
+)
+from foundry_opt.orchestration.workspace_attribution import (
+    WorkspaceCandidateProvenance,
 )
 from foundry_opt.orchestration.workspace_operations_executor import (
     PendingWorkspaceBaselineExecution,
@@ -303,6 +307,7 @@ def _candidate_plan(
 def _deployment_target(
     *,
     phase: WorkspacePhase = WorkspacePhase.DEPLOYMENT,
+    candidate_provenance: WorkspaceCandidateProvenance | None = None,
 ) -> WorkspaceDeploymentTarget:
     return WorkspaceDeploymentTarget(
         issue_number=31,
@@ -321,6 +326,7 @@ def _deployment_target(
         workflow_path=Path(".github/workflows/deploy-foundry-agent.yml"),
         workflow_ref="refs/heads/main",
         workflow_trigger=DeploymentTrigger.MERGE,
+        candidate_provenance=candidate_provenance,
         cleanup_refs=("refs/heads/foundry-opt/operations/31",),
         cleanup_drafts=("draft-candidate-2",),
         cleanup_artifacts=(".foundry-optimizer/operations/31.json",),
@@ -1201,7 +1207,27 @@ def test_reconcile_requires_exact_deployment_lineage(
 def test_reconcile_retained_improvement_finalizes_and_cleans_up(
     tmp_path: Path,
 ) -> None:
-    target = _deployment_target()
+    provenance = WorkspaceCandidateProvenance(
+        copilot_actor_id=198982749,
+        copilot_actor_login="Copilot",
+        candidate_source_commit_sha="c" * 40,
+        candidate_source_commit_url=(
+            "https://github.com/octo-org/optimizer/commit/" + "c" * 40
+        ),
+        acknowledgement_comment_id=501,
+        acknowledgement_comment_url=(
+            "https://github.com/octo-org/optimizer/pull/"
+            "104#issuecomment-501"
+        ),
+        assignment_marker_key="issue-31:assignment-a1:v1",
+        workspace_pr_number=104,
+        importer_workflow_run_id=9001,
+        importer_workflow_run_url=(
+            "https://github.com/octo-org/optimizer/actions/runs/9001"
+        ),
+        trusted_event_name="issue_comment",
+    )
+    target = _deployment_target(candidate_provenance=provenance)
     workspace = RecordingWorkspaceService(
         [
             _workspace_result(WorkspacePhase.RETENTION, recorded=True),
@@ -1251,6 +1277,22 @@ def test_reconcile_retained_improvement_finalizes_and_cleans_up(
     assert len(verifier.calls) == 1
     assert len(finalizer.complete_calls) == 1
     assert not finalizer.ready_calls
+    projection = result.finalization.projection
+    assert projection is not None
+    assert "## Who did what" in projection.body
+    assert provenance.candidate_source_commit_url in projection.body
+    assert provenance.acknowledgement_comment_url in projection.body
+    assert provenance.importer_workflow_run_url in projection.body
+    assert provenance.identity_sha256 in projection.body
+    assert "deployment run" in projection.body
+    assert "merge was the only requested human action" in projection.body
+    legacy_projection = render_workspace_completion_projection(
+        replace(
+            finalizer.complete_calls[0],
+            target=replace(target, candidate_provenance=None),
+        )
+    )
+    assert legacy_projection.marker != projection.marker
 
 
 def test_reconcile_regression_leaves_issue_open_ready_for_human(
@@ -1289,6 +1331,10 @@ def test_reconcile_regression_leaves_issue_open_ready_for_human(
     assert workspace.requests[0].trigger.value == "deployment_completed"
     assert not finalizer.complete_calls
     assert len(finalizer.ready_calls) == 1
+    projection = result.finalization.projection
+    assert projection is not None
+    assert "## Who did what" in projection.body
+    assert "Copilot provenance unavailable" in projection.body
 
 
 def test_reconcile_duplicate_completed_deployment_retries_finalization(

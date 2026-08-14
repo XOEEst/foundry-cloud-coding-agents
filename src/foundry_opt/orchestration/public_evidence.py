@@ -294,14 +294,18 @@ class PublicEvidenceRenderer:
         return "\n".join(
             (
                 public_evidence_marker(report),
-                "## Copilot recommendation",
+                "## Who did what",
+                "",
+                public_actor_ledger(report.candidate_provenance),
+                "",
+                "## Copilot investigation",
+                "",
+                _candidate_attribution(report),
+                "",
+                "## Optimizer recommendation",
                 "",
                 _safe_prose(report.recommendation)
                 or "No recommendation was recorded.",
-                "",
-                "## Alternatives tested",
-                "",
-                _alternatives(report.alternatives),
                 "",
                 "## Evaluation improvement",
                 "",
@@ -338,6 +342,12 @@ class PublicEvidenceRenderer:
                 f"- Evidence SHA-256: `{report.evidence_sha256}`",
                 f"- Bundle SHA-256: `{report.bundle_sha256}`",
                 f"- Expected tree: `{report.expected_tree}`",
+                (
+                    "- Copilot provenance SHA-256: "
+                    f"`{report.candidate_provenance.identity_sha256}`"
+                    if report.candidate_provenance is not None
+                    else "- Copilot provenance unavailable"
+                ),
                 "",
                 "## Merge gate",
                 "",
@@ -360,6 +370,11 @@ def public_evidence_marker(report: OptimizationReport) -> str:
         "issue_number": report.issue_number,
         "merge_gate": report.merge_gate.value,
         "patch_sha256": report.patch_sha256,
+        "provenance_identity_sha256": (
+            report.candidate_provenance.identity_sha256
+            if report.candidate_provenance is not None
+            else None
+        ),
         "required_checks": dict(report.required_checks),
         "spec_sha256": report.spec_sha256,
     }
@@ -376,37 +391,108 @@ def public_evidence_marker(report: OptimizationReport) -> str:
     )
 
 
-def _alternatives(
-    alternatives: tuple[AlternativeResult | str, ...],
+def public_actor_ledger(
+    provenance: WorkspaceCandidateProvenance | None,
+    *,
+    deployment_run_url: str | None = None,
+    final: bool = False,
 ) -> str:
-    if not alternatives:
-        return "No alternatives were recorded."
-    if all(isinstance(item, AlternativeResult) for item in alternatives):
-        rows = [
-            "Candidate | Outcome | Rejection reason",
-            "--- | --- | ---",
-        ]
-        for item in alternatives:
-            assert isinstance(item, AlternativeResult)
-            rows.append(
-                f"{_safe_inline(item.candidate_id)} | "
-                f"{_safe_inline(item.outcome)} | "
-                + (
-                    _safe_inline(item.rejection_reason)
-                    if item.rejection_reason
-                    else "—"
-                )
-            )
-        return "\n".join(rows)
-    return "\n".join(
-        "- "
-        + (
-            _safe_prose(item)
-            if isinstance(item, str)
-            else _safe_inline(item.candidate_id)
+    if provenance is None:
+        copilot = "Copilot provenance unavailable."
+        importer = "trusted import provenance unavailable"
+    else:
+        copilot = (
+            "candidate investigation; "
+            f"[source commit]({provenance.candidate_source_commit_url}) and "
+            "[acknowledgement comment]"
+            f"({provenance.acknowledgement_comment_url}) verified"
         )
-        for item in alternatives
+        importer = (
+            f"[trusted import]({provenance.importer_workflow_run_url})"
+        )
+    human_action = (
+        "created the request; merge was the only requested human action. "
+        "No login identity is inferred."
+        if final
+        else (
+            "created the request; merge remains the only requested human "
+            "action once trusted evidence is eligible. No login identity "
+            "is inferred."
+        )
     )
+    optimizer = (
+        f"{importer}; evaluation, selection, exact verification, deployment "
+        "reconciliation, and public evidence/closure handling"
+    )
+    if deployment_run_url is not None:
+        optimizer += f"; [deployment run]({deployment_run_url})"
+    else:
+        optimizer += (
+            "; existing Foundry run links are retained in candidate evidence"
+        )
+    return "\n".join(
+        (
+            f"- **Human** — {human_action}",
+            f"- **GitHub Copilot** — {copilot}",
+            (
+                "- **Foundry Optimizer (`github-actions[bot]` interim)** — "
+                f"{optimizer}."
+            ),
+        )
+    )
+
+
+def _candidate_attribution(report: OptimizationReport) -> str:
+    provenance = report.candidate_provenance
+    commit = (
+        f"[`{provenance.candidate_source_commit_sha[:12]}`]"
+        f"({provenance.candidate_source_commit_url})"
+        if provenance is not None
+        else "Copilot provenance unavailable"
+    )
+    acknowledgement = (
+        f"[comment]({provenance.acknowledgement_comment_url})"
+        if provenance is not None
+        else "Copilot provenance unavailable"
+    )
+    rows = [
+        (
+            "Candidate | Copilot commit | Copilot acknowledgement | "
+            "Evaluation outcome / rejection reason"
+        ),
+        "--- | --- | --- | ---",
+    ]
+    alternatives = report.alternatives or (
+        AlternativeResult(
+            candidate_id=report.candidate_id,
+            outcome="selected",
+        ),
+    )
+    for item in alternatives:
+        if isinstance(item, AlternativeResult):
+            candidate_id = item.candidate_id
+            outcome = item.outcome + (
+                f": {item.rejection_reason}"
+                if item.rejection_reason
+                else ""
+            )
+        else:
+            parsed_id, separator, detail = item.partition(":")
+            candidate_id = (
+                parsed_id.strip()
+                if separator
+                and _IDENTIFIER.fullmatch(parsed_id.strip()) is not None
+                else report.candidate_id
+            )
+            outcome = detail.strip() if separator and detail.strip() else item
+        selected_provenance = candidate_id == report.candidate_id
+        rows.append(
+            f"{_safe_inline(candidate_id)} | "
+            f"{commit if selected_provenance else '—'} | "
+            f"{acknowledgement if selected_provenance else '—'} | "
+            f"{_safe_inline(outcome)}"
+        )
+    return "\n".join(rows)
 
 
 def _metric_table(report: OptimizationReport) -> str:

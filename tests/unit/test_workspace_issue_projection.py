@@ -8,6 +8,7 @@ from foundry_opt.orchestration import (
     EvidenceMergeGate,
     OptimizationReport,
     PublicEvidenceRenderer,
+    WorkspaceCandidateProvenance,
     WorkspaceIssueStatusProjectionIntent,
     WorkspacePhase,
 )
@@ -125,6 +126,26 @@ def _report() -> OptimizationReport:
         expected_tree="6" * 40,
         required_checks={"tests": "success"},
         merge_gate=EvidenceMergeGate.ELIGIBLE,
+        candidate_provenance=WorkspaceCandidateProvenance(
+            copilot_actor_id=198982749,
+            copilot_actor_login="Copilot",
+            candidate_source_commit_sha="a" * 40,
+            candidate_source_commit_url=(
+                "https://github.com/octo-org/optimizer/commit/" + "a" * 40
+            ),
+            acknowledgement_comment_id=501,
+            acknowledgement_comment_url=(
+                "https://github.com/octo-org/optimizer/pull/"
+                "104#issuecomment-501"
+            ),
+            assignment_marker_key="issue-31:assignment-a1:v1",
+            workspace_pr_number=104,
+            importer_workflow_run_id=9001,
+            importer_workflow_run_url=(
+                "https://github.com/octo-org/optimizer/actions/runs/9001"
+            ),
+            trusted_event_name="issue_comment",
+        ),
     )
 
 
@@ -167,6 +188,8 @@ def test_issue_projection_updates_status_and_appends_milestones_once(
         for body in bodies
     ) == 1
     assert "Phase: `evaluating`" in bodies[0]
+    assert "## Who did what" in bodies[0]
+    assert "Copilot provenance unavailable" in bodies[0]
     assert [method for method, _ in commands.writes].count("PATCH") == 1
 
     with pytest.raises(RuntimeError, match="immutable milestone changed"):
@@ -270,3 +293,13 @@ def test_candidate_ready_evidence_is_identical_on_issue_and_pr(
     assert issue.marker in pull_request.body
     assert "quality | 0.5 | 0.9 | +0.4" in issue.body
     assert "quality | 0.5 | 0.9 | +0.4" in pull_request.body
+    assert "## Who did what" in issue.body
+    assert "## Copilot investigation" in issue.body
+    assert "actions/runs/9001" in issue.body
+    status = next(
+        item["body"]
+        for item in commands.comments
+        if "workspace-status:issue-31:v1" in item["body"]
+    )
+    assert "source commit" in status
+    assert "Copilot provenance unavailable" not in status

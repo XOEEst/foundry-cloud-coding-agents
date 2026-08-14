@@ -748,6 +748,9 @@ class GitWorkspaceDeploymentLoader(WorkspaceDeploymentStateLoader):
             workflow_path=workflow.path,
             workflow_ref=f"refs/heads/{_default_branch(self._commands, self._root)}",
             workflow_trigger=DeploymentTrigger(workflow.trigger.value),
+            candidate_provenance=(
+                snapshot.lineage.candidate_provenance
+            ),
             cleanup_refs=cleanup_refs,
             cleanup_drafts=cleanup_drafts,
             cleanup_artifacts=cleanup_artifacts,

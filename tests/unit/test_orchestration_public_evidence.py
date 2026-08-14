@@ -8,7 +8,36 @@ from foundry_opt.orchestration import (
     FoundryOperation,
     OptimizationReport,
     PublicEvidenceRenderer,
+    WorkspaceCandidateProvenance,
 )
+
+
+def _provenance(
+    *,
+    commit_sha: str = "a" * 40,
+    run_id: int = 9001,
+) -> WorkspaceCandidateProvenance:
+    return WorkspaceCandidateProvenance(
+        copilot_actor_id=198982749,
+        copilot_actor_login="Copilot",
+        candidate_source_commit_sha=commit_sha,
+        candidate_source_commit_url=(
+            "https://github.com/octo-org/optimizer/commit/" + commit_sha
+        ),
+        acknowledgement_comment_id=501,
+        acknowledgement_comment_url=(
+            "https://github.com/octo-org/optimizer/pull/"
+            "104#issuecomment-501"
+        ),
+        assignment_marker_key="issue-31:assignment-a1:v1",
+        workspace_pr_number=104,
+        importer_workflow_run_id=run_id,
+        importer_workflow_run_url=(
+            "https://github.com/octo-org/optimizer/actions/runs/"
+            f"{run_id}"
+        ),
+        trusted_event_name="issue_comment",
+    )
 
 
 def test_final_pr_projection_makes_the_user_decision_obvious() -> None:
@@ -60,6 +89,7 @@ def test_final_pr_projection_makes_the_user_decision_obvious() -> None:
             "tests": "success",
         },
         merge_gate=EvidenceMergeGate.ELIGIBLE,
+        candidate_provenance=_provenance(),
     )
 
     renderer = PublicEvidenceRenderer()
@@ -69,8 +99,9 @@ def test_final_pr_projection_makes_the_user_decision_obvious() -> None:
     assert projection.title == "[Optimize] #31 selected candidate"
     assert projection.draft is False
     for heading in (
-        "## Copilot recommendation",
-        "## Alternatives tested",
+        "## Who did what",
+        "## Copilot investigation",
+        "## Optimizer recommendation",
         "## Evaluation improvement",
         "## Evaluation policy",
         "## Guardrails",
@@ -92,9 +123,26 @@ def test_final_pr_projection_makes_the_user_decision_obvious() -> None:
     assert "2026-08-12T18:00:00Z" in projection.body
     assert "2026-08-12T18:02:00Z" in projection.body
     assert (
-        "candidate-1 | rejected | less effective coverage improvement"
+        "candidate-1 | — | — | rejected: "
+        "less effective coverage improvement"
         in projection.body
     )
+    assert "[source commit](https://github.com/octo-org/optimizer/commit/" in (
+        projection.body
+    )
+    assert (
+        "[acknowledgement comment]"
+        "(https://github.com/octo-org/optimizer/pull/"
+        "104#issuecomment-501)"
+    ) in projection.body
+    assert (
+        "[trusted import]"
+        "(https://github.com/octo-org/optimizer/actions/runs/9001)"
+    ) in projection.body
+    assert "Foundry Optimizer (`github-actions[bot]` interim)" in projection.body
+    assert "merge remains the only requested human action" in projection.body
+    assert _provenance().identity_sha256 in projection.body
+    assert "## Copilot recommendation" not in projection.body
     assert "Merge this PR to select and deploy `candidate-2`." in projection.body
     assert "<!-- foundry-opt:public-evidence:v1:issue-31:" in projection.body
     assert check.name == "Foundry exact candidate check"
@@ -175,7 +223,7 @@ def test_issue_projection_preserves_evidence_and_derives_merge_gate() -> None:
     )
 
     assert "No aggregate metrics were reported." in pending.body
-    assert "No alternatives were recorded." in pending.body
+    assert "Copilot provenance unavailable" in pending.body
     assert "No Foundry operations were recorded." in pending.body
     assert "No changed paths were recorded." in pending.body
     assert "No validation results were recorded." in pending.body
@@ -189,9 +237,50 @@ def test_issue_projection_preserves_evidence_and_derives_merge_gate() -> None:
     )
     assert deployed.marker in deployed.body
     assert deployed.marker != pending.marker
-    assert "## Copilot recommendation" in deployed.body
+    assert "## Optimizer recommendation" in deployed.body
     assert "## Deployment milestone" in deployed.body
     assert "already selected and deployed" in deployed.body
+
+
+def test_public_marker_binds_copilot_provenance_identity() -> None:
+    report = OptimizationReport(
+        issue_number=31,
+        candidate_id="candidate-1",
+        recommendation="Use the candidate.",
+        alternatives=(),
+        baseline_metrics={},
+        candidate_metrics={},
+        guardrails={},
+        thresholds={},
+        materiality={},
+        sample_count=0,
+        split="development",
+        foundry_operations=(),
+        changed_paths=(),
+        validation=(),
+        spec_sha256="1" * 64,
+        base_commit="2" * 40,
+        patch_sha256="3" * 64,
+        evidence_sha256="4" * 64,
+        bundle_sha256="5" * 64,
+        expected_tree="6" * 40,
+        candidate_provenance=_provenance(),
+    )
+
+    renderer = PublicEvidenceRenderer()
+    first = renderer.render_issue(report)
+    changed = renderer.render_issue(
+        replace(
+            report,
+            candidate_provenance=_provenance(
+                commit_sha="b" * 40,
+                run_id=9002,
+            ),
+        )
+    )
+
+    assert first.marker != changed.marker
+    assert "Copilot provenance unavailable" not in first.body
 
 
 def test_blocked_report_cannot_claim_a_mergeable_check() -> None:

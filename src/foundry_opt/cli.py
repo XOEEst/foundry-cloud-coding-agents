@@ -162,6 +162,26 @@ def build_workspace_service():
     return build_production_workspace_service()
 
 
+def build_workspace_assignment_cleaner(
+    *,
+    repository_root: Path,
+    repository: str,
+    assignment_token: str,
+):
+    """Return the isolated transient assignment cleanup adapter."""
+    from foundry_opt.adapters.commands import SubprocessCommandRunner
+    from foundry_opt.orchestration.workspace_assignment import (
+        GhWorkspaceAssignmentCleaner,
+    )
+
+    return GhWorkspaceAssignmentCleaner(
+        SubprocessCommandRunner(),
+        repository_root=repository_root,
+        repository=repository,
+        assignment_token=assignment_token,
+    )
+
+
 def build_workspace_operations_service():
     """Return the trusted v4 workspace operations service."""
     from foundry_opt.orchestration.workspace_operations_executor import (
@@ -506,6 +526,84 @@ def workspace_assign(
             f"Workspace PR "
             f"#{result.workspace_pull_request_number or 'unknown'}: "
             f"Copilot assignment {result.status}"
+        )
+
+
+@workspace_app.command("cleanup-assignment")
+def workspace_cleanup_assignment(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    pull_request_number: Annotated[
+        int,
+        typer.Option(
+            "--pull-request",
+            min=1,
+            help="Existing workspace pull request number.",
+        ),
+    ],
+    assignment_revision: Annotated[
+        str,
+        typer.Option(
+            "--assignment-revision",
+            help="Persisted assignment revision used by candidate provenance.",
+        ),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Remove the transient user assignment marker after trusted import."""
+    assignment_token = os.environ.pop(
+        "COPILOT_ASSIGNMENT_TOKEN",
+        None,
+    )
+    try:
+        if not assignment_token:
+            raise ValueError("Copilot assignment token is required")
+        from foundry_opt.orchestration.workspace_attribution import (
+            workspace_assignment_marker_key,
+        )
+
+        marker_key = workspace_assignment_marker_key(
+            issue_number,
+            assignment_revision,
+        )
+        deleted = build_workspace_assignment_cleaner(
+            repository_root=Path.cwd(),
+            repository=repository,
+            assignment_token=assignment_token,
+        ).cleanup(
+            issue_number=issue_number,
+            pull_request_number=pull_request_number,
+            assignment_marker_key=marker_key,
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    document = {
+        "deleted": deleted,
+        "issue_number": issue_number,
+        "pull_request_number": pull_request_number,
+        "status": "deleted" if deleted else "already_absent",
+    }
+    if json_output:
+        typer.echo(
+            json.dumps(
+                document,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            "Workspace assignment marker "
+            + ("deleted" if deleted else "already absent")
         )
 
 

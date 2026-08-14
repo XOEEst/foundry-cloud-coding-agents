@@ -66,6 +66,7 @@ from foundry_opt.orchestration.workspace_intake import (
     normalize_workspace_event,
 )
 from foundry_opt.orchestration.workspace_assignment import (
+    GhWorkspaceAssignmentCleaner,
     GhWorkspaceCopilotAssigner,
 )
 from foundry_opt.orchestration.workspace_attribution import (
@@ -556,6 +557,7 @@ __all__ = [
     "WorkspaceBaselineRequestBuilder",
     "WorkspaceSpecificationRecord",
     "WorkspaceIssueStatusProjectionIntent",
+    "GhWorkspaceAssignmentCleaner",
     "GhWorkspaceCandidateProvenanceResolver",
     "TrustedWorkspaceCandidateImportContext",
     "WorkspaceCandidate",

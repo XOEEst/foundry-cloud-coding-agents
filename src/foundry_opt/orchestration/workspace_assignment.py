@@ -16,6 +16,10 @@ _REPOSITORY = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/"
     r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"
 )
+_ASSIGNMENT_MARKER_KEY = re.compile(
+    r"^issue-([1-9][0-9]*):"
+    r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,100}:v1$"
+)
 _CUSTOM_AGENT = "foundry-optimization-steward"
 
 
@@ -167,6 +171,114 @@ class GhWorkspaceCopilotAssigner:
             ) from error
 
 
+class GhWorkspaceAssignmentCleaner:
+    """Delete only the authenticated user's exact assignment marker."""
+
+    def __init__(
+        self,
+        commands: CommandRunner,
+        *,
+        repository_root: Path,
+        repository: str,
+        assignment_token: str,
+    ) -> None:
+        if _REPOSITORY.fullmatch(repository) is None:
+            raise ValueError("workspace cleanup repository is invalid")
+        if not assignment_token:
+            raise ValueError("Copilot assignment token is required")
+        self._commands = commands
+        self._root = repository_root
+        self._repository = repository
+        self._assignment_environment = {"GH_TOKEN": assignment_token}
+
+    def cleanup(
+        self,
+        *,
+        issue_number: int,
+        pull_request_number: int,
+        assignment_marker_key: str,
+    ) -> bool:
+        _positive(issue_number, "workspace issue")
+        _positive(pull_request_number, "workspace pull request")
+        match = (
+            _ASSIGNMENT_MARKER_KEY.fullmatch(assignment_marker_key)
+            if isinstance(assignment_marker_key, str)
+            else None
+        )
+        if match is None or int(match.group(1)) != issue_number:
+            raise ValueError("workspace assignment marker key is invalid")
+        actor = self._api(("gh", "api", "user"))
+        if not _trusted_user(actor):
+            raise RuntimeError("workspace cleanup author is invalid")
+        endpoint = (
+            f"repos/{self._repository}/issues/{pull_request_number}"
+        )
+        pages = self._api(
+            (
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"{endpoint}/comments?per_page=100",
+            )
+        )
+        marker = (
+            "<!-- foundry-opt:workspace-copilot-assignment:"
+            f"{assignment_marker_key} -->"
+        )
+        matches = [
+            item
+            for item in _comments(pages)
+            if isinstance(item.get("body"), str)
+            and (
+                item["body"] == marker
+                or item["body"].startswith(f"{marker}\n")
+            )
+        ]
+        if not matches:
+            return False
+        if len(matches) != 1:
+            raise RuntimeError("workspace assignment cleanup is ambiguous")
+        comment = matches[0]
+        if not _same_user(comment.get("user"), actor):
+            raise RuntimeError(
+                "workspace assignment cleanup marker has a foreign author"
+            )
+        comment_id = comment.get("id")
+        if type(comment_id) is not int or comment_id < 1:
+            raise RuntimeError(
+                "workspace assignment cleanup comment is invalid"
+            )
+        self._commands.run(
+            (
+                "gh",
+                "api",
+                "--method",
+                "DELETE",
+                (
+                    f"repos/{self._repository}/issues/comments/"
+                    f"{comment_id}"
+                ),
+            ),
+            cwd=self._root,
+            environment=self._assignment_environment,
+        )
+        return True
+
+    def _api(self, arguments: tuple[str, ...]) -> Any:
+        result = self._commands.run(
+            arguments,
+            cwd=self._root,
+            environment=self._assignment_environment,
+        )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                "workspace assignment cleanup response is invalid"
+            ) from error
+
+
 def _positive(value: int, name: str) -> None:
     if type(value) is not int or value < 1:
         raise ValueError(f"{name} is invalid")
@@ -218,4 +330,7 @@ def _comments(value: Any) -> list[Mapping[str, Any]]:
     return comments
 
 
-__all__ = ["GhWorkspaceCopilotAssigner"]
+__all__ = [
+    "GhWorkspaceAssignmentCleaner",
+    "GhWorkspaceCopilotAssigner",
+]

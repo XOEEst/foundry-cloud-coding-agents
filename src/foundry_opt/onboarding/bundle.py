@@ -859,6 +859,7 @@ jobs:
               output.write(f"issue={{issue}}\\n")
               output.write(f"pull_request={{pull_request}}\\n")
       - name: Ingest trusted event or retry the workspace
+        id: ingest
         env:
           GH_TOKEN: ${{{{ github.token }}}}
           ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
@@ -977,6 +978,10 @@ jobs:
                 --issue "$ISSUE" \
                 --candidate-manifest "$manifest_file" \
                 --json
+              {{
+                echo "cleanup_pull_request=$pull_request"
+                echo "cleanup_assignment_revision=$expected_revision"
+              }} >> "$GITHUB_OUTPUT"
               exit 0
           fi
           if (
@@ -999,6 +1004,26 @@ jobs:
             fi
             "${{command[@]}}" "${{args[@]}}"
           fi
+      - name: Remove transient Copilot assignment marker
+        if: steps.ingest.outputs.cleanup_pull_request != ''
+        env:
+          ASSIGNMENT_REVISION: >-
+            ${{{{ steps.ingest.outputs.cleanup_assignment_revision }}}}
+          COPILOT_ASSIGNMENT_TOKEN: >-
+            ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
+          PULL_REQUEST: >-
+            ${{{{ steps.ingest.outputs.cleanup_pull_request }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+        run: >-
+          uv run --no-project --no-config --no-env-file
+          --with "$OPTIMIZER_PACKAGE"
+          foundry-opt workspace cleanup-assignment
+          --issue "$ISSUE"
+          --pull-request "$PULL_REQUEST"
+          --assignment-revision "$ASSIGNMENT_REVISION"
+          --repository "$TRUSTED_REPOSITORY"
+          --json
       - name: Dispatch trusted workspace operations
         env:
           DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}

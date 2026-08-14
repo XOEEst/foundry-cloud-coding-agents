@@ -3,7 +3,10 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from foundry_opt.orchestration.workspace_assignment import (
+    GhWorkspaceAssignmentCleaner,
     GhWorkspaceCopilotAssigner,
 )
 from foundry_opt.preflight.interfaces import CommandResult
@@ -210,3 +213,140 @@ def test_workspace_assignment_is_noop_while_already_assigned(
 
     assert assigned is False
     assert len(commands.calls) == 3
+
+
+def _assignment_comment(
+    *,
+    comment_id: int = 44,
+    user_id: int = 123,
+    login: str = "octocat",
+) -> dict[str, object]:
+    return {
+        "id": comment_id,
+        "body": (
+            "<!-- foundry-opt:workspace-copilot-assignment:"
+            "issue-31:assignment-a1:v1 -->\n"
+            "@copilot Continue this workspace."
+        ),
+        "user": {
+            "id": user_id,
+            "login": login,
+            "type": "User",
+        },
+    }
+
+
+def _cleaner(commands: Commands, tmp_path: Path) -> GhWorkspaceAssignmentCleaner:
+    return GhWorkspaceAssignmentCleaner(
+        commands,
+        repository_root=tmp_path,
+        repository="octo-org/optimizer",
+        assignment_token="assignment-token",
+    )
+
+
+def test_workspace_assignment_cleanup_deletes_exact_authenticated_marker(
+    tmp_path: Path,
+) -> None:
+    commands = Commands(
+        [
+            json.dumps(
+                {"id": 123, "login": "octocat", "type": "User"}
+            ),
+            json.dumps([[_assignment_comment()]]),
+            "",
+        ]
+    )
+
+    deleted = _cleaner(commands, tmp_path).cleanup(
+        issue_number=31,
+        pull_request_number=104,
+        assignment_marker_key="issue-31:assignment-a1:v1",
+    )
+
+    assert deleted is True
+    assert commands.calls[-1][0] == (
+        "gh",
+        "api",
+        "--method",
+        "DELETE",
+        "repos/octo-org/optimizer/issues/comments/44",
+    )
+    assert all(
+        environment == {"GH_TOKEN": "assignment-token"}
+        for _, environment, _ in commands.calls
+    )
+
+
+def test_workspace_assignment_cleanup_replay_already_absent(
+    tmp_path: Path,
+) -> None:
+    commands = Commands(
+        [
+            json.dumps(
+                {"id": 123, "login": "octocat", "type": "User"}
+            ),
+            json.dumps([[]]),
+        ]
+    )
+
+    deleted = _cleaner(commands, tmp_path).cleanup(
+        issue_number=31,
+        pull_request_number=104,
+        assignment_marker_key="issue-31:assignment-a1:v1",
+    )
+
+    assert deleted is False
+    assert len(commands.calls) == 2
+
+
+def test_workspace_assignment_cleanup_rejects_ambiguous_marker(
+    tmp_path: Path,
+) -> None:
+    commands = Commands(
+        [
+            json.dumps(
+                {"id": 123, "login": "octocat", "type": "User"}
+            ),
+            json.dumps(
+                [[
+                    _assignment_comment(comment_id=44),
+                    _assignment_comment(comment_id=45),
+                ]]
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        _cleaner(commands, tmp_path).cleanup(
+            issue_number=31,
+            pull_request_number=104,
+            assignment_marker_key="issue-31:assignment-a1:v1",
+        )
+
+
+def test_workspace_assignment_cleanup_rejects_foreign_author(
+    tmp_path: Path,
+) -> None:
+    commands = Commands(
+        [
+            json.dumps(
+                {"id": 123, "login": "octocat", "type": "User"}
+            ),
+            json.dumps(
+                [[
+                    _assignment_comment(
+                        user_id=456,
+                        login="someone-else",
+                    )
+                ]]
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="foreign author"):
+        _cleaner(commands, tmp_path).cleanup(
+            issue_number=31,
+            pull_request_number=104,
+            assignment_marker_key="issue-31:assignment-a1:v1",
+        )
