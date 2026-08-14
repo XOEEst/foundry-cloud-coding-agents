@@ -237,8 +237,22 @@ def test_issue_creation_creates_one_draft_workspace_pull_request(
     )
 
 
+@pytest.mark.parametrize(
+    "policy_denial",
+    [
+        (
+            "HTTP 409: The organization does not allow GitHub Actions "
+            "to create or approve pull requests"
+        ),
+        (
+            "GraphQL: GitHub Actions is not permitted to create or approve "
+            "pull requests. (createPullRequest)"
+        ),
+    ],
+)
 def test_pr_creation_retries_only_policy_denial_with_bootstrap_token(
     tmp_path: Path,
+    policy_denial: str,
 ) -> None:
     command = (
         "gh",
@@ -263,10 +277,7 @@ def test_pr_creation_retries_only_policy_denial_with_bootstrap_token(
                     command,
                     exit_code=1,
                     stdout="",
-                    stderr=(
-                        "HTTP 409: The organization does not allow GitHub "
-                        "Actions to create or approve pull requests"
-                    ),
+                    stderr=policy_denial,
                 ),
                 f"https://github.com/{_REPOSITORY}/pull/104\n",
             ]

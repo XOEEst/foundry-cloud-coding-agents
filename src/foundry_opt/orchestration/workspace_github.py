@@ -31,9 +31,12 @@ _COMMIT_ENVIRONMENT = {
     "GIT_COMMITTER_EMAIL": "foundry-opt@example.invalid",
     "GIT_COMMITTER_NAME": "Foundry Optimizer Workspace",
 }
-_ACTIONS_PULL_REQUEST_POLICY_DENIAL = (
-    "the organization does not allow github actions to create or approve "
-    "pull requests"
+_ACTIONS_PULL_REQUEST_POLICY_DENIALS = (
+    (
+        "the organization does not allow github actions to create or approve "
+        "pull requests"
+    ),
+    "github actions is not permitted to create or approve pull requests",
 )
 
 
@@ -435,7 +438,10 @@ class GhWorkspacePullRequests:
         error: CommandExitError,
     ) -> bool:
         response = f"{error.stdout}\n{error.stderr}".casefold()
-        return _ACTIONS_PULL_REQUEST_POLICY_DENIAL in response
+        return any(
+            message in response
+            for message in _ACTIONS_PULL_REQUEST_POLICY_DENIALS
+        )
 
     def _json_list(
         self,
