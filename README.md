@@ -51,7 +51,7 @@ cannot create Actions secrets. The value must be a user-to-server credential
 for a user who can use Copilot cloud agent and summon it on the existing
 workspace pull request; GitHub Actions `github.token` and GitHub App
 installation tokens are not supported for this invocation. This credential is
-for Copilot invocation only.
+for Copilot invocation and verified assignment-comment cleanup only.
 
 Prefer a fine-grained personal access token scoped only to the target
 repository, or use a GitHub App user-to-server token or OAuth app token.
@@ -67,7 +67,25 @@ state. Generated workflows use `github.token` for durable repository
 operations, which therefore appear as `github-actions[bot]`. Only the narrow
 workspace assignment subprocess receives `COPILOT_ASSIGNMENT_TOKEN`; its
 private invocation adapter uses that credential to summon Copilot on the
-existing workspace pull request.
+existing workspace pull request. It is never the general `GH_TOKEN`.
+
+After the trusted workflow verifies and captures candidate provenance, it
+removes the transient assignment comment with the same narrow credential.
+The Copilot source-commit and acknowledgement-comment links remain in the
+issue and workspace pull request as durable public evidence.
+
+The long-term target is a Foundry-owned, published, and secured
+`foundry-optimizer[bot]` GitHub App. Customers will only install the App on
+selected repositories. Foundry will issue short-lived installation tokens
+through a broker/workload-identity exchange; no App private key will be stored
+in a customer repository. This migration is not active yet and must not change
+candidate or lineage interfaces, the issue and single-workspace pull-request
+journey, or the human merge gate.
+
+`foundry-opt init` validates the generated workflow scope, and
+`foundry-opt preflight` scans repository workflow artifacts without reading
+secret values. Both reject using `COPILOT_ASSIGNMENT_TOKEN` as a generic
+`GH_TOKEN` or exposing it outside the narrow invocation and cleanup steps.
 
 ### 2. Create one optimization issue
 

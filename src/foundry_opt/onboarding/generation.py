@@ -16,6 +16,9 @@ from foundry_opt.onboarding.bundle import (
 from foundry_opt.onboarding.repository import (
     normalize_legacy_generated_content,
 )
+from foundry_opt.preflight.github_credentials import (
+    assert_assignment_credential_scope,
+)
 from foundry_opt.onboarding.models import (
     DeploymentWorkflowDiscovery,
     EvaluatorDiscovery,
@@ -114,6 +117,8 @@ jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
     environment: {json.dumps(request.environment_name)}
+    # Setup has no durable GitHub writes. Writer workflows use github.token
+    # and appear as github-actions[bot], never the assignment secret.
     permissions:
       contents: read
       id-token: write
@@ -315,6 +320,13 @@ def generate_change_contents(
             oidc_subject=oidc_subject,
             deployment_workflow_name=deployment_workflow_name,
         )
+    )
+    assert_assignment_credential_scope(
+        {
+            path: content
+            for path, content in contents.items()
+            if path.parent == Path(".github/workflows")
+        }
     )
     legacy_hashes = legacy_repository_agent_hashes(
         request,

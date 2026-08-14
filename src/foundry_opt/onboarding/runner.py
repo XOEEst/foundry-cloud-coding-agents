@@ -44,11 +44,14 @@ _COPILOT_ASSIGNMENT_GUIDANCE = (
     "user-to-server credential for an eligible Copilot user, not an "
     "installation token: preferably a fine-grained personal access token "
     "scoped only to this repository, or a GitHub App user-to-server token "
-    "or OAuth app token. This credential is for Copilot invocation only. "
+    "or OAuth app token. This credential is for Copilot invocation and "
+    "verified assignment-comment cleanup only. "
     "Grant the documented minimum permissions needed to invoke Copilot on "
     "the existing workspace pull request. Durable repository operations use "
     "github.token and appear as github-actions[bot]; they never use this "
-    "credential as GH_TOKEN. Do not commit the token."
+    "credential as GH_TOKEN. The transient assignment comment is removed only "
+    "after verified provenance capture; Copilot commit and acknowledgement "
+    "comment links remain durable public evidence. Do not commit the token."
 )
 
 

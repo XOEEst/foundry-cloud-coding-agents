@@ -357,6 +357,7 @@ def test_production_runner_assembles_checks_in_stable_order(
         "repository.github_remote",
         "repository.default_branch",
         "repository.worktree",
+        "credentials.copilot_assignment_scope",
         "credentials.azure",
         "github.permission",
         "foundry.access",

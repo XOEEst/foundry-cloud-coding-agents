@@ -10,6 +10,9 @@ from typing import Any
 
 from foundry_opt.adapters.commands import CommandError, SubprocessCommandRunner
 from foundry_opt.adapters.github import github_repository_from_remote_url
+from foundry_opt.adapters.github_credentials import (
+    ActionsGitHubCredentialProvider,
+)
 from foundry_opt.adapters.optimization_deployment import (
     GhWorkflowRunGateway,
     WorkflowRunQuery,
@@ -771,13 +774,12 @@ class ProductionWorkspaceDeploymentExecutor(
         deployment_token = os.environ.get(
             "FOUNDRY_OPT_DEPLOYMENT_GH_TOKEN"
         )
+        credentials = ActionsGitHubCredentialProvider(
+            deployment_token or None
+        )
         self._gateway = GhWorkflowRunGateway(
             self._commands,
-            dispatch_environment=(
-                {"GH_TOKEN": deployment_token}
-                if deployment_token
-                else None
-            ),
+            dispatch_environment=credentials.command_environment(),
         )
 
     def execute(

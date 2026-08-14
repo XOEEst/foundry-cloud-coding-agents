@@ -89,10 +89,23 @@ def _repository_context(
         "- Copilot session assignment uses the repository Actions secret "
         "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
         "user-to-server token; an installation token is not supported. "
-        "This credential is for Copilot invocation only.\n"
+        "This credential is for Copilot invocation and verified assignment-"
+        "comment cleanup only.\n"
         "- Durable repository operations use Actions `github.token` and "
         "therefore appear as `github-actions[bot]`; the assignment credential "
         "is never their `GH_TOKEN`.\n"
+        "- The transient assignment comment is removed only after verified "
+        "provenance capture. Copilot source-commit and acknowledgement-comment "
+        "links remain durable public evidence.\n"
+        "- Onboarding generation and preflight reject workflow artifacts that "
+        "use the assignment secret as generic `GH_TOKEN`, without inspecting "
+        "the secret value.\n"
+        "- Long term, Foundry will own, publish, and secure the "
+        "`foundry-optimizer[bot]` GitHub App. Customers will install it only "
+        "on selected repositories; short-lived installation tokens will come "
+        "from a Foundry broker/workload-identity exchange, with no private key "
+        "in the customer repository. That migration must not change candidate "
+        "or lineage interfaces or the human journey.\n"
         "- foundry-opt init cannot create Actions secrets; configure the "
         "assignment secret manually and never commit its value.\n"
         "- Create the generated `[Optimize]` issue to start one persistent "
@@ -134,10 +147,14 @@ def _previous_repository_context(
         "- Copilot session assignment uses the repository Actions secret "
         "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
         "user-to-server token; an installation token is not supported. "
-        "This credential is for Copilot invocation only.\n"
+        "This credential is for Copilot invocation and verified assignment-"
+        "comment cleanup only.\n"
         "- Durable repository operations use Actions `github.token` and "
         "therefore appear as `github-actions[bot]`; the assignment credential "
         "is never their `GH_TOKEN`.\n"
+        "- The transient assignment comment is removed only after verified "
+        "provenance capture. Copilot source-commit and acknowledgement-comment "
+        "links remain durable public evidence.\n"
         "- foundry-opt init cannot create Actions secrets; configure the "
         "assignment secret manually and never commit its value.\n"
         "- Create the generated `[Optimize]` issue to start; workflow "
@@ -640,6 +657,8 @@ on:
         default: none
         options: [none, schedule]
 
+# GitHub permissions apply to github.token. Durable writes appear as
+# github-actions[bot]; COPILOT_ASSIGNMENT_TOKEN is never general GH_TOKEN.
 permissions:
   actions: write
   contents: write
@@ -1004,7 +1023,7 @@ jobs:
             fi
             "${{command[@]}}" "${{args[@]}}"
           fi
-      - name: Remove transient Copilot assignment marker
+      - name: Remove transient Copilot assignment marker after verified provenance capture
         if: steps.ingest.outputs.cleanup_pull_request != ''
         env:
           ASSIGNMENT_REVISION: >-
@@ -1066,6 +1085,8 @@ on:
         required: false
         type: number
 
+# GitHub permissions apply to github.token. Durable writes appear as
+# github-actions[bot]; COPILOT_ASSIGNMENT_TOKEN is never general GH_TOKEN.
 permissions:
   actions: write
   checks: write
@@ -2008,6 +2029,8 @@ on:
     paths-ignore:
       - .foundry-optimizer/handoffs/**
 
+# GitHub permissions apply to github.token. This workflow is read-only and
+# COPILOT_ASSIGNMENT_TOKEN is never general GH_TOKEN.
 permissions:
   contents: read
   issues: read

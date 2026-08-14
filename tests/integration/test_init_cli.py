@@ -193,7 +193,9 @@ def test_init_cli_returns_zero_and_describes_draft_pr(
     assert "COPILOT_ASSIGNMENT_TOKEN" in result.stdout
     assert "foundry-opt init cannot create Actions secrets" in result.stdout
     assert "installation token" in result.stdout
-    assert "invocation only" in result.stdout
+    assert "invocation and verified assignment-comment cleanup only" in (
+        result.stdout
+    )
     assert "github-actions[bot]" in result.stdout
     assert "optimizer AZURE_CLIENT_ID" in result.stdout
     assert "Foundry operations workflow" in result.stdout

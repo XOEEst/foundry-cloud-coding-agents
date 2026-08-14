@@ -179,11 +179,26 @@ only to this repository.
 Grant only:
 
 - Metadata: read
-- Actions, Contents, Issues, and Pull requests: read/write
+- Issues and Pull requests: read/write
 
 GitHub App installation tokens are not supported for Copilot assignment.
 `foundry-opt init` cannot create Actions secrets. Never commit or emit this
 credential in workflow output, durable state, comments, issue bodies, or logs.
+It is step-scoped to Copilot invocation and verified assignment-comment
+cleanup and is never the general `GH_TOKEN`. Durable repository writes use
+Actions `github.token`, appear as `github-actions[bot]`, and retain the Copilot
+source-commit and acknowledgement-comment links as public evidence after the
+transient assignment comment is removed.
+
+## Future GitHub App migration
+
+The long-term durable writer is the Foundry-owned, published, and secured
+`foundry-optimizer[bot]` GitHub App. A customer installs it only on selected
+repositories. Short-lived installation tokens come from a Foundry
+broker/workload-identity exchange; no App private key is stored in the customer
+repository. Activating that adapter must not change candidate or lineage
+interfaces, the issue and single-workspace pull-request journey, or the human
+merge gate.
 
 ## Tenzing adaptation
 

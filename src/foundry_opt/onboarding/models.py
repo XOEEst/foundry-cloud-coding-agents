@@ -40,6 +40,9 @@ class GitHubActionsSecretRequirement:
     credential_types: tuple[str, ...]
     repository_permissions: tuple[str, ...]
     automatic_configuration_supported: bool
+    purpose: str
+    prohibited_uses: tuple[str, ...]
+    lifecycle: str
 
 
 COPILOT_ASSIGNMENT_SECRET_REQUIREMENT = GitHubActionsSecretRequirement(
@@ -55,6 +58,16 @@ COPILOT_ASSIGNMENT_SECRET_REQUIREMENT = GitHubActionsSecretRequirement(
         "pull requests: read/write",
     ),
     automatic_configuration_supported=False,
+    purpose="Copilot invocation and verified assignment-comment cleanup only",
+    prohibited_uses=(
+        "general GH_TOKEN",
+        "durable repository writes",
+    ),
+    lifecycle=(
+        "Remove the transient assignment comment only after verified "
+        "provenance capture; retain Copilot commit and acknowledgement-comment "
+        "links as durable public evidence."
+    ),
 )
 
 

@@ -285,6 +285,18 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
                 "pull requests: read/write",
             ),
             automatic_configuration_supported=False,
+            purpose=(
+                "Copilot invocation and verified assignment-comment cleanup only"
+            ),
+            prohibited_uses=(
+                "general GH_TOKEN",
+                "durable repository writes",
+            ),
+            lifecycle=(
+                "Remove the transient assignment comment only after verified "
+                "provenance capture; retain Copilot commit and "
+                "acknowledgement-comment links as durable public evidence."
+            ),
         ),
     )
 
@@ -390,9 +402,13 @@ def test_run_onboarding_generates_draft_change_set_with_assignment_secret_requir
         assignment_guidance
     )
     assert "installation token" in assignment_guidance
-    assert "invocation only" in assignment_guidance
+    assert "invocation and verified assignment-comment cleanup only" in (
+        assignment_guidance
+    )
     assert "github.token" in assignment_guidance
     assert "github-actions[bot]" in assignment_guidance
+    assert "verified provenance capture" in assignment_guidance
+    assert "durable public evidence" in assignment_guidance
     assert "Do not commit" in assignment_guidance
 
 

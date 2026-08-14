@@ -300,8 +300,14 @@ def test_bundle_copies_skill_snapshot_and_workspace_context() -> None:
     assert "same workspace pull request" in context
     assert "secondary optimization" in context
     assert "specialist pull requests" not in context
-    assert "invocation only" in context
+    assert "invocation and verified assignment-comment cleanup only" in context
     assert "github-actions[bot]" in context
+    assert "verified provenance capture" in context
+    assert "durable public evidence" in context
+    assert "foundry-optimizer[bot]" in context
+    assert "broker/workload-identity exchange" in context
+    assert "no private key" in context
+    assert "must not change candidate or lineage interfaces" in context
 
 
 def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
@@ -328,7 +334,7 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         "issues": "write",
         "pull-requests": "write",
     }
-    assert text.count("COPILOT_ASSIGNMENT_TOKEN") == 2
+    assert text.count("COPILOT_ASSIGNMENT_TOKEN") == 3
     assert "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}" not in text
     assert text.count("GH_TOKEN: ${{ github.token }}") >= 2
     ingest = next(
@@ -342,7 +348,10 @@ def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
         step
         for step in workflow["jobs"]["advance"]["steps"]
         if step.get("name")
-        == "Remove transient Copilot assignment marker"
+        == (
+            "Remove transient Copilot assignment marker after verified "
+            "provenance capture"
+        )
     )
     assert set(cleanup["env"]) == {
         "ASSIGNMENT_REVISION",
@@ -532,7 +541,10 @@ def test_workspace_workflow_imports_candidate_envelope_from_exact_pr_head() -> N
         for step in workflow["jobs"]["advance"]["steps"]
     }
     ingest = steps["Ingest trusted event or retry the workspace"]
-    cleanup = steps["Remove transient Copilot assignment marker"]
+    cleanup = steps[
+        "Remove transient Copilot assignment marker after verified "
+        "provenance capture"
+    ]
     assert ingest["id"] == "ingest"
     assert "COPILOT_ASSIGNMENT_TOKEN" not in ingest.get("env", {})
     assert cleanup["if"] == (

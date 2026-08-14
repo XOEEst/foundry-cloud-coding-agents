@@ -6,6 +6,9 @@ from pathlib import Path
 import re
 from typing import Any
 
+from foundry_opt.adapters.github_credentials import (
+    CopilotAssignmentCredentialProvider,
+)
 from foundry_opt.preflight.interfaces import CommandRunner
 from foundry_opt.orchestration.workspace_attribution import (
     workspace_assignment_marker_key,
@@ -36,12 +39,14 @@ class GhWorkspaceCopilotAssigner:
     ) -> None:
         if _REPOSITORY.fullmatch(repository) is None:
             raise ValueError("workspace assignment repository is invalid")
-        if not assignment_token:
-            raise ValueError("Copilot assignment token is required")
         self._commands = commands
         self._root = repository_root
         self._repository = repository
-        self._assignment_environment = {"GH_TOKEN": assignment_token}
+        self._assignment_environment = (
+            CopilotAssignmentCredentialProvider(
+                assignment_token
+            ).command_environment()
+        )
 
     def assign(
         self,
@@ -184,12 +189,14 @@ class GhWorkspaceAssignmentCleaner:
     ) -> None:
         if _REPOSITORY.fullmatch(repository) is None:
             raise ValueError("workspace cleanup repository is invalid")
-        if not assignment_token:
-            raise ValueError("Copilot assignment token is required")
         self._commands = commands
         self._root = repository_root
         self._repository = repository
-        self._assignment_environment = {"GH_TOKEN": assignment_token}
+        self._assignment_environment = (
+            CopilotAssignmentCredentialProvider(
+                assignment_token
+            ).command_environment()
+        )
 
     def cleanup(
         self,
