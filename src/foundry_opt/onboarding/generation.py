@@ -16,6 +16,9 @@ from foundry_opt.onboarding.bundle import (
 from foundry_opt.onboarding.repository import (
     normalize_legacy_generated_content,
 )
+from foundry_opt.preflight.github_credentials import (
+    assert_assignment_credential_scope,
+)
 from foundry_opt.onboarding.models import (
     DeploymentWorkflowDiscovery,
     EvaluatorDiscovery,
@@ -114,6 +117,8 @@ jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
     environment: {json.dumps(request.environment_name)}
+    # Setup has no durable GitHub writes. Writer workflows use github.token
+    # and appear as github-actions[bot], never the assignment secret.
     permissions:
       contents: read
       id-token: write
@@ -153,13 +158,21 @@ jobs:
         uses: {SETUP_UV_ACTION} # v9.0.0
       - name: Install pinned Foundry optimizer
         run: uv tool install {shell_quote(request.product_install)}
-      - name: Verify issue-only steward entry point
-        run: foundry-opt steward advance --help
+      - name: Verify single-workspace entry point
+        run: foundry-opt workspace advance --help
 """
     if export_proxy_marker:
-        workflow += """      - name: Export non-secret Foundry Copilot Git proxy marker
+        workflow += """      - name: Export non-secret Foundry Copilot repository context
+        env:
+          FOUNDRY_OPT_REPOSITORY: ${{ github.repository }}
+          FOUNDRY_OPT_REPOSITORY_ID: ${{ github.repository_id }}
+          FOUNDRY_OPT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         shell: bash
-        run: printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> "$GITHUB_ENV"
+        run: |
+          printf '%s\\n' 'FOUNDRY_OPT_COPILOT_GIT_PROXY=1' >> "$GITHUB_ENV"
+          printf '%s=%s\\n' FOUNDRY_OPT_REPOSITORY "$FOUNDRY_OPT_REPOSITORY" >> "$GITHUB_ENV"
+          printf '%s=%s\\n' FOUNDRY_OPT_REPOSITORY_ID "$FOUNDRY_OPT_REPOSITORY_ID" >> "$GITHUB_ENV"
+          printf '%s=%s\\n' FOUNDRY_OPT_DEFAULT_BRANCH "$FOUNDRY_OPT_DEFAULT_BRANCH" >> "$GITHUB_ENV"
 """
     return workflow
 
@@ -300,18 +313,25 @@ def generate_change_contents(
         Path(".github/foundry-optimizer.yaml"): config_text,
         Path(".github/workflows/copilot-setup-steps.yml"): workflow_text,
     }
+    deployment_workflow_name = workflow.name or workflow.path.as_posix()
     contents.update(
         generate_repository_agent_bundle(
             request,
             oidc_subject=oidc_subject,
-            deployment_workflow_name=(
-                workflow.name or workflow.path.as_posix()
-            ),
+            deployment_workflow_name=deployment_workflow_name,
         )
+    )
+    assert_assignment_credential_scope(
+        {
+            path: content
+            for path, content in contents.items()
+            if path.parent == Path(".github/workflows")
+        }
     )
     legacy_hashes = legacy_repository_agent_hashes(
         request,
         oidc_subject=oidc_subject,
+        deployment_workflow_name=deployment_workflow_name,
     )
     legacy_hashes[
         Path(".github/workflows/copilot-setup-steps.yml")
@@ -321,6 +341,7 @@ def generate_change_contents(
     legacy_contents = legacy_repository_agent_bundle(
         request,
         oidc_subject=oidc_subject,
+        deployment_workflow_name=deployment_workflow_name,
     )
     legacy_contents[
         Path(".github/workflows/copilot-setup-steps.yml")

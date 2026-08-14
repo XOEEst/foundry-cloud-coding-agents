@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Iterator
+from typing import Iterator, Mapping
 from urllib.parse import SplitResult, urlsplit
 from uuid import uuid4
 
@@ -45,6 +45,7 @@ def configured_remote_url(root: Path, remote: str) -> str | None:
         root,
         "git",
         "config",
+        "--local",
         "--get-all",
         f"remote.{remote}.url",
     )
@@ -64,16 +65,19 @@ def resolve_safe_push_remote(
     completed = _run(
         root,
         "git",
-        "remote",
-        "get-url",
-        "--push",
-        "--all",
-        remote,
+        "config",
+        "--local",
+        "--get-all",
+        f"remote.{remote}.pushurl",
     )
-    if completed.returncode != 0:
+    if completed.returncode not in {0, 1}:
         return None
-    push_urls = completed.stdout.decode("utf-8").splitlines()
-    if push_urls != [raw_url]:
+    push_urls = (
+        completed.stdout.decode("utf-8").splitlines()
+        if completed.returncode == 0
+        else []
+    )
+    if push_urls not in ([], [raw_url]):
         return None
     if not _supported_remote_url(raw_url):
         return None
@@ -91,18 +95,7 @@ def resolve_safe_fetch_remote(
     raw_url = configured_remote_url(root, remote)
     if raw_url is None:
         return None
-    completed = _run(
-        root,
-        "git",
-        "remote",
-        "get-url",
-        "--all",
-        remote,
-    )
-    if completed.returncode != 0:
-        return None
-    fetch_urls = completed.stdout.decode("utf-8").splitlines()
-    if fetch_urls != [raw_url] or not _supported_remote_url(raw_url):
+    if not _supported_remote_url(raw_url):
         return None
     return SafePushRemote(
         name=remote,
@@ -129,6 +122,49 @@ def remote_revision(
         )
 
 
+def list_remote_heads(
+    root: Path,
+    remote: SafePushRemote,
+    patterns: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    if not patterns:
+        raise ValueError("at least one remote head pattern is required")
+    with _isolated_git_transport(root, remote.url) as (
+        transport_git_dir,
+        environment,
+    ):
+        arguments = [
+            "git",
+            transport_git_dir,
+            "ls-remote",
+            "--heads",
+            remote.url,
+            *patterns,
+        ]
+        completed = _run(
+            root,
+            *arguments,
+            environment=environment,
+        )
+    if completed.returncode != 0:
+        raise GitTransportError("remote head inventory failed")
+    try:
+        lines = completed.stdout.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise GitTransportError(
+            "remote head inventory metadata is invalid"
+        ) from error
+    result: list[tuple[str, str]] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 2 or not fields[1].startswith("refs/heads/"):
+            raise GitTransportError(
+                "remote head inventory metadata is invalid"
+            )
+        result.append((fields[0], fields[1]))
+    return tuple(result)
+
+
 def compare_and_swap_push(
     root: Path,
     remote: SafePushRemote,
@@ -150,6 +186,50 @@ def compare_and_swap_push(
             destination_ref=destination_ref,
             expected_revision=expected_revision,
         )
+
+
+def atomic_compare_and_swap_delete(
+    root: Path,
+    remote: SafePushRemote,
+    *,
+    refs: Mapping[str, str | None],
+    guard_ref: str | None = None,
+    guard_revision: str | None = None,
+) -> int:
+    if not refs:
+        raise ValueError("at least one ref is required")
+    if (guard_ref is None) != (guard_revision is None):
+        raise ValueError(
+            "guard_ref and guard_revision must either both be set or both be absent"
+        )
+    with _isolated_git_transport(root, remote.url) as (
+        transport_git_dir,
+        environment,
+    ):
+        arguments = [
+            "git",
+            transport_git_dir,
+            "push",
+            "--atomic",
+        ]
+        if guard_ref is not None and guard_revision is not None:
+            arguments.append(
+                f"--force-with-lease={guard_ref}:{guard_revision}"
+            )
+        for ref, revision in sorted(refs.items()):
+            arguments.append(
+                f"--force-with-lease={ref}:{revision or ''}"
+            )
+        arguments.append(remote.url)
+        if guard_ref is not None and guard_revision is not None:
+            arguments.append(f"{guard_revision}:{guard_ref}")
+        arguments.extend(f":{ref}" for ref in sorted(refs))
+        completed = _run(
+            root,
+            *arguments,
+            environment=environment,
+        )
+    return completed.returncode
 
 
 def isolated_compare_and_swap_push(

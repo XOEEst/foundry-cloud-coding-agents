@@ -6,6 +6,11 @@ from typing import Annotated
 import typer
 
 from foundry_opt import __version__
+from foundry_opt.auth import (
+    AUTH_PROBE_SCOPE,
+    AuthProbeRequest,
+    AuthProbeResult,
+)
 from foundry_opt.config import OptimizerConfig, load_config
 from foundry_opt.config.loader import ConfigLoadError
 from foundry_opt.onboarding import (
@@ -26,6 +31,9 @@ from foundry_opt.preflight.runner import PreflightRunner
 from foundry_opt.orchestration.steward import (
     StewardAdvanceRequest,
     StewardAdvanceService,
+)
+from foundry_opt.orchestration.workspace_migration import (
+    WorkspaceLegacyCleanupPlan,
 )
 
 
@@ -49,6 +57,26 @@ steward_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(steward_app, name="steward")
+auth_app = typer.Typer(
+    help="Inspect product-side Azure OIDC readiness without exposing credentials.",
+    no_args_is_help=True,
+)
+app.add_typer(auth_app, name="auth")
+workspace_app = typer.Typer(
+    help="Advance the single durable optimization workspace.",
+    no_args_is_help=True,
+)
+app.add_typer(workspace_app, name="workspace")
+workspace_operations_app = typer.Typer(
+    help="Execute trusted v4 workspace operations.",
+    no_args_is_help=True,
+)
+workspace_app.add_typer(workspace_operations_app, name="operations")
+workspace_migration_app = typer.Typer(
+    help="Inventory, convert, clean up, and safely archive legacy workspace refs.",
+    no_args_is_help=True,
+)
+workspace_app.add_typer(workspace_migration_app, name="migration")
 
 
 def _version_callback(value: bool) -> None:
@@ -116,6 +144,1248 @@ def build_candidate_design_submission_service():
     )
 
     return build_production_candidate_design_submission_service()
+
+
+def build_auth_probe():
+    """Return the deterministic product-side OIDC probe."""
+    from foundry_opt.auth import build_production_auth_probe
+
+    return build_production_auth_probe()
+
+
+def build_workspace_service(
+    *,
+    workspace_pr_bootstrap_token: str | None = None,
+):
+    """Return the production single-workspace service."""
+    from foundry_opt.orchestration.workspace_production import (
+        build_production_workspace_service,
+    )
+
+    return build_production_workspace_service(
+        workspace_pr_bootstrap_token=workspace_pr_bootstrap_token,
+    )
+
+
+def build_workspace_assignment_cleaner(
+    *,
+    repository_root: Path,
+    repository: str,
+    assignment_token: str,
+):
+    """Return the isolated transient assignment cleanup adapter."""
+    from foundry_opt.adapters.commands import SubprocessCommandRunner
+    from foundry_opt.orchestration.workspace_assignment import (
+        GhWorkspaceAssignmentCleaner,
+    )
+
+    return GhWorkspaceAssignmentCleaner(
+        SubprocessCommandRunner(),
+        repository_root=repository_root,
+        repository=repository,
+        assignment_token=assignment_token,
+    )
+
+
+def build_workspace_operations_service():
+    """Return the trusted v4 workspace operations service."""
+    from foundry_opt.orchestration.workspace_operations_executor import (
+        build_production_workspace_operations_service,
+    )
+
+    return build_production_workspace_operations_service()
+
+
+def build_workspace_verification_service():
+    """Return the trusted workspace verification service."""
+    from foundry_opt.orchestration.workspace_verification import (
+        build_production_workspace_verification_service,
+    )
+
+    return build_production_workspace_verification_service()
+
+
+def build_workspace_migration_service():
+    """Return the production legacy workspace migration service."""
+    from foundry_opt.orchestration.workspace_migration import (
+        build_production_workspace_migration_service,
+    )
+
+    return build_production_workspace_migration_service(Path.cwd())
+
+
+def _workspace_failure(error: Exception) -> None:
+    typer.echo(
+        f"Workspace error: {redact(str(error))}",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+def _workspace_migration_output(result) -> None:
+    typer.echo(
+        json.dumps(
+            result.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def _workspace_migration_failure(error: Exception) -> None:
+    typer.echo(
+        json.dumps(
+            {
+                "error": redact(str(error)),
+                "status": "refused",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    raise typer.Exit(1)
+
+
+@workspace_migration_app.command("inventory")
+def workspace_migration_inventory() -> None:
+    """Inventory legacy v3 state and inbox refs without exposing contents."""
+    try:
+        result = build_workspace_migration_service().inventory()
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_migration_failure(error)
+    _workspace_migration_output(result)
+
+
+@workspace_migration_app.command("convert")
+def workspace_migration_convert(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    expected_source_revision: Annotated[
+        str,
+        typer.Option(
+            "--expected-source-revision",
+            help="Exact v3 state revision returned by inventory.",
+        ),
+    ],
+) -> None:
+    """Convert one verified closed v3 state ref to its compact v4 audit ref."""
+    try:
+        result = build_workspace_migration_service().convert(
+            issue_number,
+            expected_source_revision=expected_source_revision,
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_migration_failure(error)
+    _workspace_migration_output(result)
+
+
+@workspace_migration_app.command("archive")
+def workspace_migration_archive(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Delete only refs matching all exact planned revisions.",
+        ),
+    ] = False,
+    expected_state_revision: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-state-revision",
+            help="Planned state SHA, or 'absent'. Required with --apply.",
+        ),
+    ] = None,
+    expected_inbox_revision: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-inbox-revision",
+            help="Planned inbox SHA, or 'absent'. Required with --apply.",
+        ),
+    ] = None,
+    expected_audit_revision: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-audit-revision",
+            help="Planned audit SHA, or 'absent'. Required with --apply.",
+        ),
+    ] = None,
+    expected_migration_revision: Annotated[
+        str | None,
+        typer.Option(
+            "--expected-migration-revision",
+            help="Planned migration SHA, or 'absent'. Required with --apply.",
+        ),
+    ] = None,
+) -> None:
+    """Produce a dry-run archive plan, or apply its exact revisions."""
+    try:
+        if not apply:
+            if any(
+                value is not None
+                for value in (
+                    expected_state_revision,
+                    expected_inbox_revision,
+                    expected_audit_revision,
+                    expected_migration_revision,
+                )
+            ):
+                raise ValueError(
+                    "expected revisions require --apply"
+                )
+            result = build_workspace_migration_service().plan_archive(
+                issue_number
+            )
+        else:
+            missing = [
+                option
+                for option, value in (
+                    (
+                        "--expected-state-revision",
+                        expected_state_revision,
+                    ),
+                    (
+                        "--expected-inbox-revision",
+                        expected_inbox_revision,
+                    ),
+                    (
+                        "--expected-audit-revision",
+                        expected_audit_revision,
+                    ),
+                    (
+                        "--expected-migration-revision",
+                        expected_migration_revision,
+                    ),
+                )
+                if value is None
+            ]
+            if missing:
+                raise typer.BadParameter(
+                    f"{', '.join(missing)} required with --apply"
+                )
+            result = build_workspace_migration_service().apply_archive(
+                issue_number,
+                expected_revisions={
+                    "audit": _migration_revision(
+                        expected_audit_revision
+                    ),
+                    "inbox": _migration_revision(
+                        expected_inbox_revision
+                    ),
+                    "migration": _migration_revision(
+                        expected_migration_revision
+                    ),
+                    "state": _migration_revision(
+                        expected_state_revision
+                    ),
+                },
+            )
+    except typer.BadParameter:
+        raise
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_migration_failure(error)
+    _workspace_migration_output(result)
+
+
+@workspace_migration_app.command("cleanup-legacy")
+def workspace_migration_cleanup_legacy(
+    plan_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--plan-file",
+            dir_okay=False,
+            help="Write a dry-run plan or load an exact plan with --apply.",
+        ),
+    ] = None,
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Apply the exact cleanup plan loaded from --plan-file.",
+        ),
+    ] = False,
+) -> None:
+    """Plan or apply exact legacy ref cleanup without freeform arguments."""
+    try:
+        service = build_workspace_migration_service()
+        if apply:
+            if plan_file is None:
+                raise typer.BadParameter("--plan-file is required with --apply")
+            payload = json.loads(plan_file.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("workspace cleanup plan must be a JSON object")
+            result = service.apply_cleanup_legacy(
+                WorkspaceLegacyCleanupPlan.from_dict(payload)
+            )
+            _workspace_migration_output(result)
+            return
+        result = service.plan_cleanup_legacy()
+        if plan_file is not None:
+            plan_file.parent.mkdir(parents=True, exist_ok=True)
+            plan_file.write_text(
+                json.dumps(
+                    result.to_dict(),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+        _workspace_migration_output(result)
+    except typer.BadParameter:
+        raise
+    except (RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
+        _workspace_migration_failure(error)
+
+
+def _migration_revision(value: str | None) -> str | None:
+    if value == "absent":
+        return None
+    return value
+
+
+@workspace_app.command("advance")
+def workspace_advance(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Load and advance the issue's single production workspace."""
+    from foundry_opt.orchestration.workspace_production import (
+        WorkspaceAdvanceRequest,
+    )
+    try:
+        result = build_workspace_service().advance(
+            WorkspaceAdvanceRequest(
+                repository_root=Path.cwd(),
+                issue_number=issue_number,
+            )
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        pull_request = result.workspace_pull_request
+        next_action = (
+            result.next_action.kind.value
+            if result.next_action is not None
+            else "none"
+        )
+        typer.echo(
+            f"Workspace {result.phase.value}: "
+            f"PR #{pull_request.number if pull_request else 'unknown'}; "
+            f"next action {next_action}"
+        )
+
+
+@workspace_app.command("assign")
+def workspace_assign(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Assign Copilot only when v4 state requires candidate work."""
+    assignment_token = os.environ.pop(
+        "COPILOT_ASSIGNMENT_TOKEN",
+        None,
+    )
+    try:
+        result = build_workspace_service().assign_copilot(
+            repository_root=Path.cwd(),
+            issue_number=issue_number,
+            assignment_token=assignment_token,
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace PR "
+            f"#{result.workspace_pull_request_number or 'unknown'}: "
+            f"Copilot assignment {result.status}"
+        )
+
+
+@workspace_app.command("cleanup-assignment")
+def workspace_cleanup_assignment(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    pull_request_number: Annotated[
+        int,
+        typer.Option(
+            "--pull-request",
+            min=1,
+            help="Existing workspace pull request number.",
+        ),
+    ],
+    assignment_revision: Annotated[
+        str,
+        typer.Option(
+            "--assignment-revision",
+            help="Persisted assignment revision used by candidate provenance.",
+        ),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Remove the transient user assignment marker after trusted import."""
+    assignment_token = os.environ.pop(
+        "COPILOT_ASSIGNMENT_TOKEN",
+        None,
+    )
+    try:
+        if not assignment_token:
+            raise ValueError("Copilot assignment token is required")
+        from foundry_opt.orchestration.workspace_attribution import (
+            workspace_assignment_marker_key,
+        )
+
+        marker_key = workspace_assignment_marker_key(
+            issue_number,
+            assignment_revision,
+        )
+        deleted = build_workspace_assignment_cleaner(
+            repository_root=Path.cwd(),
+            repository=repository,
+            assignment_token=assignment_token,
+        ).cleanup(
+            issue_number=issue_number,
+            pull_request_number=pull_request_number,
+            assignment_marker_key=marker_key,
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    document = {
+        "deleted": deleted,
+        "issue_number": issue_number,
+        "pull_request_number": pull_request_number,
+        "status": "deleted" if deleted else "already_absent",
+    }
+    if json_output:
+        typer.echo(
+            json.dumps(
+                document,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            "Workspace assignment marker "
+            + ("deleted" if deleted else "already absent")
+        )
+
+
+@workspace_app.command("intake")
+def workspace_intake(
+    event_path: Annotated[
+        Path,
+        typer.Option(
+            "--event-path",
+            exists=True,
+            dir_okay=False,
+            help="Trusted GitHub event JSON path.",
+        ),
+    ],
+    event_name: Annotated[
+        str,
+        typer.Option("--event-name", help="Trusted GitHub event name."),
+    ],
+    delivery_id: Annotated[
+        str,
+        typer.Option("--delivery-id", help="Trusted delivery identifier."),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    base_commit: Annotated[
+        str | None,
+        typer.Option(
+            "--base-commit",
+            help="Trusted default-branch commit for an issue event.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Normalize one trusted issue or workspace PR event and advance."""
+    from foundry_opt.orchestration.workspace_intake import (
+        TrustedWorkspaceEventContext,
+    )
+
+    workspace_pr_bootstrap_token = os.environ.pop(
+        "FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN",
+        None,
+    )
+    try:
+        if event_path.stat().st_size > 2_000_000:
+            raise ValueError("workspace event payload is too large")
+        payload = json.loads(event_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("workspace event payload must be an object")
+        result = build_workspace_service(
+            workspace_pr_bootstrap_token=workspace_pr_bootstrap_token,
+        ).ingest(
+            payload,
+            TrustedWorkspaceEventContext(
+                event_name=event_name,
+                delivery_id=delivery_id,
+                repository=repository,
+                repository_id=repository_id,
+            ),
+            base_commit=base_commit,
+            repository_root=Path.cwd(),
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace event {result.event.delivery_id}: "
+            f"{result.workspace.phase.value}"
+        )
+
+
+@workspace_app.command("experiments-complete")
+def workspace_experiments_complete(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    manifest_path: Annotated[
+        Path,
+        typer.Option(
+            "--manifest",
+            exists=True,
+            dir_okay=False,
+            help="Privacy-safe prepared candidate manifest JSON.",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Reconcile prepared experiments into the same workspace PR."""
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("workspace manifest must be a JSON object")
+        if payload.get("issue_number") != issue_number:
+            raise ValueError(
+                "workspace manifest issue does not match --issue"
+            )
+        result = build_workspace_service().complete_experiments(
+            payload,
+            repository_root=Path.cwd(),
+        )
+    except (
+        ConfigLoadError,
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace {result.phase.value}: experiments reconciled"
+        )
+
+
+@workspace_app.command("experiment")
+def workspace_experiment(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    manifest_path: Annotated[
+        Path,
+        typer.Option(
+            "--candidate-manifest",
+            exists=True,
+            dir_okay=False,
+            help="Untrusted candidate proposal manifest JSON.",
+        ),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Execute or reconcile one trusted candidate experiment."""
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "workspace candidate manifest must be a JSON object"
+            )
+        if payload.get("issue_number") != issue_number:
+            raise ValueError(
+                "workspace candidate manifest issue does not match --issue"
+            )
+        from foundry_opt.orchestration.workspace_attribution import (
+            trusted_workspace_candidate_import_context_from_environment,
+        )
+
+        service = build_workspace_service()
+        import_context = (
+            trusted_workspace_candidate_import_context_from_environment()
+        )
+        if import_context is None:
+            result = service.execute_experiment(
+                payload,
+                repository_root=Path.cwd(),
+            )
+        else:
+            result = service.execute_experiment(
+                payload,
+                repository_root=Path.cwd(),
+                candidate_import_context=import_context,
+            )
+    except (
+        ConfigLoadError,
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace experiment {result.candidate_id}: "
+            f"{result.status}; next action {result.next_action}"
+        )
+
+
+@workspace_app.command("experiment-result")
+def workspace_experiment_result(
+    result_path: Annotated[
+        Path,
+        typer.Option(
+            "--result",
+            exists=True,
+            dir_okay=False,
+            help="Trusted Actions experiment result JSON.",
+        ),
+    ],
+    delivery_id: Annotated[
+        str,
+        typer.Option("--delivery-id", help="Trusted delivery identifier."),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Ingest a trusted Actions candidate experiment result."""
+    from foundry_opt.orchestration.workspace_experiments import (
+        TrustedWorkspaceExperimentResultContext,
+    )
+
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "workspace experiment result must be a JSON object"
+            )
+        result = build_workspace_service().ingest_experiment_result(
+            payload,
+            TrustedWorkspaceExperimentResultContext(
+                delivery_id=delivery_id,
+                repository=repository,
+                repository_id=repository_id,
+            ),
+            repository_root=Path.cwd(),
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace experiment {result.candidate_id}: "
+            f"{result.status}"
+        )
+
+
+@workspace_app.command("baseline")
+def workspace_baseline(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Execute or reconcile the trusted baseline experiment."""
+    try:
+        result = build_workspace_service().execute_baseline(
+            repository_root=Path.cwd(),
+            issue_number=issue_number,
+        )
+    except (
+        ConfigLoadError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace baseline {result.status}; "
+            f"next action {result.next_action}"
+        )
+
+
+@workspace_app.command("baseline-result")
+def workspace_baseline_result(
+    result_path: Annotated[
+        Path,
+        typer.Option(
+            "--result",
+            exists=True,
+            dir_okay=False,
+            help="Trusted Actions baseline result JSON.",
+        ),
+    ],
+    delivery_id: Annotated[
+        str,
+        typer.Option("--delivery-id", help="Trusted delivery identifier."),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Ingest a trusted Actions baseline experiment result."""
+    from foundry_opt.orchestration.workspace_experiments import (
+        TrustedWorkspaceExperimentResultContext,
+    )
+
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "workspace baseline result must be a JSON object"
+            )
+        result = build_workspace_service().ingest_baseline_result(
+            payload,
+            TrustedWorkspaceExperimentResultContext(
+                delivery_id=delivery_id,
+                repository=repository,
+                repository_id=repository_id,
+            ),
+            repository_root=Path.cwd(),
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(f"Workspace baseline {result.status}")
+
+
+@workspace_app.command("operation-complete")
+def workspace_operation_complete(
+    result_path: Annotated[
+        Path,
+        typer.Option(
+            "--result",
+            exists=True,
+            dir_okay=False,
+            help="Trusted deployment or retention result JSON.",
+        ),
+    ],
+    delivery_id: Annotated[
+        str,
+        typer.Option("--delivery-id", help="Trusted delivery identifier."),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Ingest a trusted completed deployment or retention operation."""
+    from foundry_opt.orchestration.workspace_operations import (
+        TrustedWorkspaceOperationContext,
+    )
+
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "workspace operation result must be a JSON object"
+            )
+        result = build_workspace_service().ingest_operation(
+            payload,
+            TrustedWorkspaceOperationContext(
+                delivery_id=delivery_id,
+                repository=repository,
+                repository_id=repository_id,
+            ),
+            repository_root=Path.cwd(),
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace operation {result.event.operation.operation_id}: "
+            f"{result.workspace.phase.value}"
+        )
+
+
+@workspace_app.command("verify")
+def workspace_verify(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    candidate_id: Annotated[
+        str,
+        typer.Option(
+            "--candidate",
+            help="Trusted selected candidate identifier.",
+        ),
+    ] = ...,
+    workspace_pull_request_number: Annotated[
+        int | None,
+        typer.Option(
+            "--pull-request",
+            min=1,
+            help="Expected workspace pull request number.",
+        ),
+    ] = None,
+    head_sha: Annotated[
+        str | None,
+        typer.Option(
+            "--head-sha",
+            help="Trusted workspace pull request head commit.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Verify trusted workspace candidate lineage and exact head tree."""
+    from foundry_opt.orchestration.workspace_verification import (
+        WorkspaceVerifyRequest,
+    )
+
+    try:
+        result = build_workspace_verification_service().verify(
+            WorkspaceVerifyRequest(
+                repository_root=Path.cwd(),
+                issue_number=issue_number,
+                candidate_id=candidate_id,
+                workspace_pull_request_number=(
+                    workspace_pull_request_number
+                ),
+                head_sha=head_sha,
+            )
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(result.summary_markdown)
+    raise typer.Exit(result.exit_code)
+
+
+@workspace_operations_app.command("execute")
+def workspace_operations_execute(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    event_name: Annotated[
+        str,
+        typer.Option(
+            "--event-name",
+            help="Trusted GitHub event name.",
+        ),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    state_ref: Annotated[
+        str | None,
+        typer.Option(
+            "--state-ref",
+            help="Trusted foundry-opt/state branch ref name when present.",
+        ),
+    ] = None,
+    workflow_run_id: Annotated[
+        int | None,
+        typer.Option(
+            "--workflow-run-id",
+            min=1,
+            help="Trusted workflow_run ID when present.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Execute trusted candidate or deployment v4 workspace operations."""
+    from foundry_opt.orchestration.workspace_operations_executor import (
+        TrustedWorkspaceExecutionContext,
+        WorkspaceOperationsExecuteRequest,
+    )
+
+    try:
+        result = build_workspace_operations_service().execute(
+            WorkspaceOperationsExecuteRequest(
+                repository_root=Path.cwd(),
+                issue_number=issue_number,
+                context=TrustedWorkspaceExecutionContext(
+                    event_name=event_name,
+                    repository=repository,
+                    repository_id=repository_id,
+                    state_ref=state_ref,
+                    workflow_run_id=workflow_run_id,
+                ),
+            )
+        )
+    except (RuntimeError, ValueError, OSError) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace operations {result.status.value}: "
+            f"issue #{result.issue_number}"
+        )
+
+
+@workspace_operations_app.command("reconcile")
+def workspace_operations_reconcile(
+    issue_number: Annotated[
+        int,
+        typer.Option("--issue", min=1, help="Optimization issue number."),
+    ],
+    result_path: Annotated[
+        Path,
+        typer.Option(
+            "--result",
+            exists=True,
+            dir_okay=False,
+            help="Trusted deployment result JSON.",
+        ),
+    ],
+    repository: Annotated[
+        str,
+        typer.Option("--repository", help="Trusted owner/repository."),
+    ],
+    repository_id: Annotated[
+        int,
+        typer.Option("--repository-id", min=1, help="Trusted repository ID."),
+    ],
+    run_id: Annotated[
+        int,
+        typer.Option("--run-id", min=1, help="Trusted workflow run ID."),
+    ],
+    artifact_name: Annotated[
+        str,
+        typer.Option(
+            "--artifact-name",
+            help="Trusted artifact name.",
+        ),
+    ] = "foundry-optimization-deployment-result",
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a stable JSON result."),
+    ] = False,
+) -> None:
+    """Reconcile a trusted deployment artifact into v4 workspace state."""
+    from foundry_opt.orchestration.workspace_operations_executor import (
+        TrustedWorkspaceArtifactContext,
+        WorkspaceOperationsReconcileRequest,
+    )
+
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "workspace deployment result must be a JSON object"
+            )
+        result = build_workspace_operations_service().reconcile(
+            WorkspaceOperationsReconcileRequest(
+                repository_root=Path.cwd(),
+                issue_number=issue_number,
+                payload=payload,
+                context=TrustedWorkspaceArtifactContext(
+                    repository=repository,
+                    repository_id=repository_id,
+                    run_id=run_id,
+                    artifact_name=artifact_name,
+                ),
+            )
+        )
+    except (
+        json.JSONDecodeError,
+        RuntimeError,
+        ValueError,
+        OSError,
+    ) as error:
+        _workspace_failure(error)
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(
+            f"Workspace operations {result.status.value}: "
+            f"issue #{result.issue_number}"
+        )
+
+
+def _render_auth_probe(result: AuthProbeResult) -> str:
+    tokens = ", ".join(
+        f"{item.resource}={'pass' if item.success else 'fail'}"
+        for item in result.token_acquisition
+    )
+    foundry = result.foundry_connectivity
+    lines = [
+        f"Environment: {result.environment_kind.value}",
+        (
+            "OIDC request variables present: "
+            f"{str(result.oidc_request_variables.present).lower()}"
+        ),
+        (
+            "Azure principal: "
+            f"{result.azure_principal.principal_type}; "
+            "configured client match="
+            f"{str(result.azure_principal.client_match).lower()}"
+        ),
+        f"Token acquisition: {tokens}",
+        (
+            "Foundry read-only connectivity: "
+            f"{str(foundry.read_only_access_success).lower()}"
+        ),
+        f"Refresh/reacquisition: {result.refresh_reacquisition.status}",
+        (
+            "Direct operations eligible: "
+            f"{str(result.direct_operations_eligible).lower()}"
+        ),
+    ]
+    if result.errors:
+        lines.append("Errors:")
+        lines.extend(
+            f"- [{redact(error.code)}] {redact(error.message)}"
+            for error in result.errors
+        )
+    return "\n".join(lines)
+
+
+@auth_app.command("probe")
+def auth_probe(
+    scope: Annotated[
+        str,
+        typer.Option(
+            "--scope",
+            help="Product auth scope to inspect.",
+        ),
+    ] = ...,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit a stable JSON result.",
+        ),
+    ] = False,
+) -> None:
+    """Probe product-side Azure OIDC readiness without printing tokens.
+
+    Exit status 1 means the probe is incomplete or not eligible.
+    """
+    if scope != AUTH_PROBE_SCOPE:
+        typer.echo(
+            "Authentication probe input error: unsupported scope.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    result = build_auth_probe().run(
+        AuthProbeRequest(
+            repository_root=Path.cwd(),
+            scope=scope,
+        )
+    )
+    if json_output:
+        typer.echo(
+            json.dumps(
+                result.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    else:
+        typer.echo(_render_auth_probe(result))
+    raise typer.Exit(result.exit_code)
 
 
 def _render_onboarding(result: OnboardingResult) -> str:

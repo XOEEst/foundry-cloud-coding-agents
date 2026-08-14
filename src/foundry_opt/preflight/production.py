@@ -13,6 +13,9 @@ from foundry_opt.adapters.github import GhGitHubGateway
 from foundry_opt.config import OptimizerConfig
 from foundry_opt.config.models import AuthenticationMode
 from foundry_opt.preflight.foundry_checks import FoundryAccessCheck
+from foundry_opt.preflight.github_credentials import (
+    AssignmentCredentialScopeCheck,
+)
 from foundry_opt.preflight.interfaces import (
     CommandRunner,
     EnvironmentReader,
@@ -255,6 +258,7 @@ def build_production_preflight_runner(
     )
     checks = (
         *runtime_checks,
+        AssignmentCredentialScopeCheck(),
         AzureCredentialsCheck(
             environment,
             authentication_mode=authentication_mode,

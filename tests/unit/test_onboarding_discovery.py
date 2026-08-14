@@ -1,5 +1,7 @@
 from collections.abc import Sequence
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -99,7 +101,7 @@ def test_discovery_finds_agents_checks_foundry_resources_and_workflows(
         "    steps:\n      - run: uv run pytest -q\n",
         encoding="utf-8",
     )
-    (workflows / "deploy.yml").write_text(
+    (workflows / "deploy-foundry-agent.yml").write_text(
         "name: Deploy Foundry agent\non:\n  push:\n    branches: [main]\n"
         "permissions:\n  contents: read\n  id-token: write\n"
         "jobs:\n  deploy:\n    environment: acceptance\n    steps:\n"
@@ -135,13 +137,83 @@ def test_discovery_finds_agents_checks_foundry_resources_and_workflows(
     assert result.foundry_agents[0].versions == ("4", "5")
     assert result.app_insights.connected is True
     assert result.deployment_workflows[0].path == Path(
-        ".github/workflows/deploy.yml"
+        ".github/workflows/deploy-foundry-agent.yml"
     )
     assert result.deployment_workflows[0].trigger == "merge"
     assert (
         result.deployment_workflows[0].deployment_identity_verified
         is True
     )
+
+
+def test_discovery_ignores_all_generated_optimizer_workflows(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "agent").mkdir()
+    (tmp_path / "agent/main.py").write_text(
+        "SYSTEM_INSTRUCTIONS = 'Help the user.'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\ntestpaths = ['tests']\n",
+        encoding="utf-8",
+    )
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    deployment = (
+        "name: Deploy customer agent\n"
+        "on:\n  workflow_dispatch:\n"
+        "permissions:\n  contents: read\n  id-token: write\n"
+        "jobs:\n  deploy:\n    environment: acceptance\n    steps:\n"
+        "      - uses: "
+        "azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43\n"
+        "        with:\n"
+        "          client-id: ${{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}\n"
+        "      - run: azd deploy\n"
+        "      - uses: actions/upload-artifact@"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "        with:\n"
+        "          name: foundry-optimization-deployment-result\n"
+        "          path: deployment-result.json\n"
+    )
+    (workflows / "customer-deploy.yml").write_text(
+        deployment,
+        encoding="utf-8",
+    )
+    generated_files: dict[str, str] = {}
+    for name in (
+        "copilot-setup-steps.yml",
+        "deploy-foundry-agent.yml",
+        "foundry-exact-candidate-check.yml",
+        "foundry-optimization-capability.yml",
+        "foundry-optimization-deployment-bridge.yml",
+        "foundry-optimization-handoff.yml",
+        "foundry-optimization-issue-intake.yml",
+        "foundry-optimization-operations.yml",
+        "foundry-optimization-reconcile.yml",
+        "foundry-optimization-workspace.yml",
+        "foundry-post-deployment-check.yml",
+    ):
+        path = workflows / name
+        path.write_text(deployment, encoding="utf-8")
+        generated_files[
+            path.relative_to(tmp_path).as_posix()
+        ] = hashlib.sha256(
+            path.read_text(encoding="utf-8").encode("utf-8")
+        ).hexdigest()
+    (tmp_path / ".github/foundry-optimizer.generated.json").write_text(
+        json.dumps({"files": generated_files}),
+        encoding="utf-8",
+    )
+
+    result = LocalOnboardingDiscovery(
+        FakeCommands(),
+        FakeFoundryInventory(),
+    ).discover(_request(tmp_path))
+
+    assert tuple(
+        workflow.path for workflow in result.deployment_workflows
+    ) == (Path(".github/workflows/customer-deploy.yml"),)
 
 
 def test_deployment_identity_must_be_on_the_deploying_job() -> None:

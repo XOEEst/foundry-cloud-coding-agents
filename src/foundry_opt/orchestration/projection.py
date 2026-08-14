@@ -117,91 +117,32 @@ class DashboardProjection:
             None,
         )
         if dashboard is not None:
-            self._project_dashboard(issue_number, dashboard)
+            self._project_dashboard(
+                issue_number,
+                dashboard,
+                tuple(
+                    record
+                    for record in records
+                    if record.kind in _DASHBOARD_KINDS
+                ),
+            )
         self._project_labels(issue_number, records)
 
     def _project_dashboard(
         self,
         issue_number: int,
         record: OutboxRecord,
+        records: tuple[OutboxRecord, ...],
     ) -> None:
-        _require_issue(record, issue_number)
-        expected = {
-            "disposition",
-            "issue_number",
-            "phase",
-            "status",
-        }
-        optional = {
-            "effect_id",
-            "reason",
-            "spec_classification",
-            "spec_sha256",
-        }
-        if record.kind == _CANDIDATE_SLATE_DASHBOARD:
-            expected.update(
-                {
-                    "baseline_metrics",
-                    "candidate_slate",
-                    "next_action",
-                    "spec_sha256",
-                }
-            )
-        if record.kind == _CANDIDATE_SELECTION_DASHBOARD:
-            expected.update(
-                {
-                    "merge_commit",
-                    "next_action",
-                    "selected_candidate_id",
-                    "spec_sha256",
-                }
-            )
-        if record.kind == _DEPLOYMENT_DASHBOARD:
-            expected.update(
-                {
-                    "candidate_id",
-                    "merge_commit",
-                    "next_action",
-                }
-            )
-        if record.kind == _DEPLOYMENT_READY_FOR_HUMAN:
-            expected.add("next_action")
-        if record.kind == _DEPLOYMENT_FINAL_DASHBOARD:
-            expected.update(
-                {
-                    "baseline_metrics",
-                    "bundle_sha256",
-                    "candidate_id",
-                    "deployed_metrics",
-                    "deployment_version",
-                    "draft_metrics",
-                    "evidence_sha256",
-                    "lineage_sha256",
-                    "merge_actor",
-                    "merge_commit",
-                    "metadata_sha256",
-                    "patch_sha256",
-                    "portal_url",
-                    "run_id",
-                    "run_url",
-                    "required_checks",
-                    "source_sha256",
-                    "spec_sha256",
-                    "tree_sha",
-                }
-            )
-        if (
-            not expected <= set(record.payload)
-            or set(record.payload) - expected - optional
-        ):
-            raise ProjectionError(
-                "dashboard projection payload is invalid"
-            )
+        for candidate in records:
+            _require_issue(candidate, issue_number)
+        # Historical milestones can use an earlier durable payload schema.
+        _validate_dashboard_payload(record)
         marker = _projection_marker(record.record_id)
         existing = self._gateway.find_dashboard(issue_number)
         if existing is not None and marker in existing.body:
             return
-        body = _dashboard_body(issue_number, record)
+        body = _dashboard_body(issue_number, record, records)
         if existing is None:
             self._gateway.create_dashboard(issue_number, body)
         else:
@@ -438,45 +379,193 @@ def _require_issue(record: OutboxRecord, issue_number: int) -> None:
         raise ProjectionError("projection issue does not match outbox")
 
 
+def _validate_dashboard_payload(record: OutboxRecord) -> None:
+    expected = {
+        "disposition",
+        "issue_number",
+        "phase",
+        "status",
+    }
+    optional = {
+        "effect_id",
+        "reason",
+        "spec_classification",
+        "spec_sha256",
+    }
+    if record.kind == _CANDIDATE_SLATE_DASHBOARD:
+        expected.update(
+            {
+                "baseline_metrics",
+                "candidate_slate",
+                "next_action",
+                "spec_sha256",
+            }
+        )
+    if record.kind == _CANDIDATE_SELECTION_DASHBOARD:
+        expected.update(
+            {
+                "merge_commit",
+                "next_action",
+                "selected_candidate_id",
+                "spec_sha256",
+            }
+        )
+    if record.kind == _DEPLOYMENT_DASHBOARD:
+        expected.update(
+            {
+                "candidate_id",
+                "merge_commit",
+                "next_action",
+            }
+        )
+    if record.kind == _DEPLOYMENT_READY_FOR_HUMAN:
+        expected.add("next_action")
+    if record.kind == _DEPLOYMENT_FINAL_DASHBOARD:
+        expected.update(
+            {
+                "baseline_metrics",
+                "bundle_sha256",
+                "candidate_id",
+                "deployed_metrics",
+                "deployment_version",
+                "draft_metrics",
+                "evidence_sha256",
+                "lineage_sha256",
+                "merge_actor",
+                "merge_commit",
+                "metadata_sha256",
+                "patch_sha256",
+                "portal_url",
+                "run_id",
+                "run_url",
+                "required_checks",
+                "source_sha256",
+                "spec_sha256",
+                "tree_sha",
+            }
+        )
+    if (
+        not expected <= set(record.payload)
+        or set(record.payload) - expected - optional
+    ):
+        raise ProjectionError("dashboard projection payload is invalid")
+
+
 def _dashboard_body(
     issue_number: int,
     record: OutboxRecord,
+    records: tuple[OutboxRecord, ...],
 ) -> str:
-    details = ""
-    if "spec_classification" in record.payload:
-        details += (
-            "- Specification classification: "
-            f"`{record.payload['spec_classification']}`\n"
+    slate = _latest_record(records, _CANDIDATE_SLATE_DASHBOARD)
+    selection = _latest_record(
+        records,
+        _CANDIDATE_SELECTION_DASHBOARD,
+    )
+    deployment = _latest_record(
+        records,
+        _DEPLOYMENT_DASHBOARD,
+        _DEPLOYMENT_READY_FOR_HUMAN,
+        _DEPLOYMENT_FINAL_DASHBOARD,
+    )
+    milestones = tuple(
+        candidate
+        for candidate in (slate, selection, deployment, record)
+        if candidate is not None
+    )
+    markers = "\n".join(
+        _projection_marker(candidate.record_id)
+        for index, candidate in enumerate(milestones)
+        if candidate.record_id
+        not in {
+            earlier.record_id
+            for earlier in milestones[:index]
+        }
+    )
+    details = _specification_details(records)
+    sections = ""
+    if slate is not None:
+        sections += _dashboard_section(
+            slate,
+            historical=selection is not None or deployment is not None,
         )
-    if "spec_sha256" in record.payload:
-        details += (
-            f"- Specification digest: `{record.payload['spec_sha256']}`\n"
+    for candidate in (selection, deployment):
+        if candidate is not None:
+            sections += _dashboard_section(candidate)
+    return (
+        f"{dashboard_marker(issue_number)}\n"
+        f"{markers}\n"
+        "## Foundry optimization dashboard\n\n"
+        f"- Generation: `{record.generation}`\n"
+        f"- Sequence: `{record.sequence}`\n"
+        f"- Phase: `{record.payload['phase']}`\n"
+        f"- Status: `{record.payload['status']}`\n"
+        f"- Disposition: `{record.payload['disposition']}`\n"
+        f"{details}"
+        f"{sections}"
+    )
+
+
+def _latest_record(
+    records: tuple[OutboxRecord, ...],
+    *kinds: str,
+) -> OutboxRecord | None:
+    return next(
+        (
+            record
+            for record in reversed(records)
+            if record.kind in kinds
+        ),
+        None,
+    )
+
+
+def _specification_details(
+    records: tuple[OutboxRecord, ...],
+) -> str:
+    lines: list[str] = []
+    fields = (
+        ("spec_classification", "Specification classification"),
+        ("spec_sha256", "Specification digest"),
+        ("reason", "Reason"),
+    )
+    for field, label in fields:
+        source = next(
+            (
+                record
+                for record in reversed(records)
+                if field in record.payload
+            ),
+            None,
         )
-    if "reason" in record.payload:
-        details += (
-            f"- Reason: `{record.payload['reason']}`\n"
-        )
-    slate = ""
+        if source is not None:
+            lines.append(f"- {label}: `{source.payload[field]}`")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _dashboard_section(
+    record: OutboxRecord,
+    *,
+    historical: bool = False,
+) -> str:
     if record.kind == _CANDIDATE_SLATE_DASHBOARD:
         baseline = record.payload["baseline_metrics"]
-        rows = record.payload["candidate_slate"]
         baseline_text = ", ".join(
             f"`{name}={_number(value)}`"
             for name, value in sorted(baseline.items())
-        )
+        ) or "none"
         table = [
             "| Rank | Candidate | Aggregates | Deltas | Guardrails | Evidence |",
             "| ---: | --- | --- | --- | --- | --- |",
         ]
-        for row in rows:
+        for row in record.payload["candidate_slate"]:
             metrics = ", ".join(
                 f"`{name}={_number(value)}`"
                 for name, value in sorted(row["metrics"].items())
-            )
+            ) or "—"
             deltas = ", ".join(
                 f"`{name}={_signed_number(value)}`"
                 for name, value in sorted(row["deltas"].items())
-            )
+            ) or "—"
             guardrails = ", ".join(
                 f"`{name}={outcome}`"
                 for name, outcome in sorted(row["guardrails"].items())
@@ -487,7 +576,23 @@ def _dashboard_body(
                 f"{metrics} | {deltas} | {guardrails} | "
                 f"[redacted evidence]({row['evidence_url']}) |"
             )
-        slate = "\n".join(
+        action = (
+            (
+                "### Historical selection evidence",
+                "",
+                "This pre-merge comparison is retained for audit history. "
+                "It is not a current merge instruction.",
+            )
+            if historical
+            else (
+                "### Next human action",
+                "",
+                "Merge exactly one eligible candidate PR. A comment, label, "
+                "or CLI command does not select a candidate. Deployment is "
+                "not dispatched in this phase.",
+            )
+        )
+        return "\n".join(
             (
                 "",
                 "### Candidate comparison",
@@ -496,16 +601,12 @@ def _dashboard_body(
                 "",
                 *table,
                 "",
-                "### Next human action",
-                "",
-                "Merge exactly one eligible candidate PR. A comment, label, "
-                "or CLI command does not select a candidate. Deployment is "
-                "not dispatched in this phase.",
+                *action,
                 "",
             )
         )
     if record.kind == _CANDIDATE_SELECTION_DASHBOARD:
-        slate = "\n".join(
+        return "\n".join(
             (
                 "",
                 "### Candidate selection",
@@ -519,7 +620,7 @@ def _dashboard_body(
             )
         )
     if record.kind == _DEPLOYMENT_DASHBOARD:
-        slate = "\n".join(
+        return "\n".join(
             (
                 "",
                 "### Deployment",
@@ -532,7 +633,7 @@ def _dashboard_body(
             )
         )
     if record.kind == _DEPLOYMENT_READY_FOR_HUMAN:
-        slate = "\n".join(
+        return "\n".join(
             (
                 "",
                 "### Deployment needs human attention",
@@ -544,25 +645,10 @@ def _dashboard_body(
             )
         )
     if record.kind == _DEPLOYMENT_FINAL_DASHBOARD:
-        baseline = ", ".join(
-            f"`{name}={_number(value)}`"
-            for name, value in sorted(
-                record.payload["baseline_metrics"].items()
-            )
-        )
-        draft = ", ".join(
-            f"`{name}={_number(value)}`"
-            for name, value in sorted(
-                record.payload["draft_metrics"].items()
-            )
-        )
-        deployed = ", ".join(
-            f"`{name}={_number(value)}`"
-            for name, value in sorted(
-                record.payload["deployed_metrics"].items()
-            )
-        )
-        slate = "\n".join(
+        baseline = _aggregate_text(record.payload["baseline_metrics"])
+        draft = _aggregate_text(record.payload["draft_metrics"])
+        deployed = _aggregate_text(record.payload["deployed_metrics"])
+        return "\n".join(
             (
                 "",
                 "### Verified deployment result",
@@ -591,18 +677,16 @@ def _dashboard_body(
                 "",
             )
         )
-    return (
-        f"{dashboard_marker(issue_number)}\n"
-        f"{_projection_marker(record.record_id)}\n"
-        "## Foundry optimization dashboard\n\n"
-        f"- Generation: `{record.generation}`\n"
-        f"- Sequence: `{record.sequence}`\n"
-        f"- Phase: `{record.payload['phase']}`\n"
-        f"- Status: `{record.payload['status']}`\n"
-        f"- Disposition: `{record.payload['disposition']}`\n"
-        f"{details}"
-        f"{slate}"
-    )
+    return ""
+
+
+def _aggregate_text(metrics: object) -> str:
+    if not isinstance(metrics, dict):
+        raise ProjectionError("aggregate metrics are invalid")
+    return ", ".join(
+        f"`{name}={_number(value)}`"
+        for name, value in sorted(metrics.items())
+    ) or "none"
 
 
 def _number(value: float) -> str:

@@ -44,10 +44,19 @@ _COPILOT_ASSIGNMENT_GUIDANCE = (
     "user-to-server credential for an eligible Copilot user, not an "
     "installation token: preferably a fine-grained personal access token "
     "scoped only to this repository, or a GitHub App user-to-server token "
-    "or OAuth app token. Grant the documented minimum of metadata read plus "
-    "actions, contents, issues, and pull requests read/write, including "
-    "permission to assign Copilot and the selected custom agents. Do not "
-    "commit the token."
+    "or OAuth app token. This credential is for Copilot invocation, "
+    "verified assignment-comment cleanup, and workspace pull-request "
+    "bootstrap only when organization policy blocks Actions from creating "
+    "pull requests. "
+    "Grant the documented minimum permissions needed to invoke Copilot on "
+    "the existing workspace pull request. Workspace pull-request creation "
+    "first uses github.token and retries only the explicit organization-policy "
+    "denial with this credential; that pull request is then attributed to the "
+    "eligible user. Its branch push and all other durable repository operations "
+    "use github.token and appear as github-actions[bot]. The transient "
+    "assignment comment is removed only "
+    "after verified provenance capture; Copilot commit and acknowledgement "
+    "comment links remain durable public evidence. Do not commit the token."
 )
 
 
@@ -189,7 +198,7 @@ def run_onboarding(
                 "Generated onboarding files are already current.",
                 "Keep AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and the "
                 "optimizer AZURE_CLIENT_ID in the generated Actions "
-                "environment for the Foundry capability workflow.",
+                "environment for the Foundry operations workflow.",
                 _COPILOT_ASSIGNMENT_GUIDANCE,
             ),
         )
@@ -395,9 +404,10 @@ def run_onboarding(
                     f"{request.environment_name}.",
                 )
             ),
-            "The generated Foundry capability workflow uses only the "
-            "optimizer identity for asset, draft, and development "
-            "evaluation effects.",
+            "The generated Foundry operations workflow uses only the "
+            "optimizer identity for persisted candidate operations and "
+            "post-deployment evaluation; deployment remains isolated in "
+            "the preserved customer workflow.",
             "Azure OIDC itself uses no stored credential; Copilot "
             "assignment separately requires the Actions secret below.",
             _COPILOT_ASSIGNMENT_GUIDANCE,

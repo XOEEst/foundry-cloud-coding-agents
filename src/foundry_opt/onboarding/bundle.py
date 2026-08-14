@@ -31,7 +31,115 @@ def generate_repository_agent_bundle(
 ) -> dict[Path, str]:
     contents = _copy_skill_template()
     skill_root = Path(".github/skills/foundry-agent-optimizer")
-    contents[skill_root / "REPOSITORY_CONTEXT.md"] = (
+    contents[skill_root / "REPOSITORY_CONTEXT.md"] = _repository_context(
+        request,
+        oidc_subject=oidc_subject,
+    )
+    contents.update(
+        {
+            Path(".foundry-optimizer/.gitignore"): (
+                "campaigns/\nworktrees/\ncapability-worktrees/\n"
+            ),
+            Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml"): (
+                _issue_form(request)
+            ),
+            Path(
+                ".github/agents/foundry-optimization-steward.agent.md"
+            ): _steward_agent(),
+            Path(
+                ".github/workflows/foundry-optimization-workspace.yml"
+            ): _workspace_workflow(request),
+            Path(
+                ".github/workflows/foundry-optimization-operations.yml"
+            ): _operations_workflow(
+                request,
+                deployment_workflow_name=deployment_workflow_name,
+            ),
+            Path(
+                ".github/workflows/foundry-exact-candidate-check.yml"
+            ): _candidate_check_workflow(request),
+        }
+    )
+    return contents
+
+
+def _repository_context(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str,
+) -> str:
+    return (
+        "# Repository optimization context\n\n"
+        f"- Configured target: `{request.target_name}`\n"
+        f"- Configured environment: `{request.environment_name}`\n"
+        f"- Verified immutable OIDC subject: `{oidc_subject}`\n"
+        "- Configuration: `.github/foundry-optimizer.yaml`\n"
+        "- Azure authentication is OIDC-only; never request credentials.\n"
+        "- GitHub Copilot receives non-secret Azure identifiers through "
+        "repository-level Agents variables.\n"
+        "- Deployment uses only the separate "
+        "`AZURE_DEPLOYMENT_CLIENT_ID` Actions-environment variable.\n"
+        "- Preserve the customer deployment workflow; do not overwrite "
+        "`.github/workflows/deploy-foundry-agent.yml`. The optimizer "
+        "operations workflow observes or dispatches it and consumes its "
+        "`foundry-optimization-deployment-result` artifact.\n"
+        "- Foundry operations and post-deployment evaluation run only in "
+        "`foundry-optimization-operations.yml` under the optimizer "
+        "`AZURE_CLIENT_ID`; Copilot performs no Foundry network operations.\n"
+        "- Copilot session assignment uses the repository Actions secret "
+        "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
+        "user-to-server token; an installation token is not supported. "
+        "This credential is for Copilot invocation and verified assignment-"
+        "comment cleanup, plus workspace pull-request bootstrap only when "
+        "organization policy blocks Actions from creating pull requests.\n"
+        "- Durable repository operations use Actions `github.token` and "
+        "therefore appear as `github-actions[bot]`. Workspace pull-request "
+        "creation first uses `github.token`; only the explicit organization-"
+        "policy denial retries that one mutation with the eligible-user "
+        "credential. The branch push and every other repository mutation "
+        "remain on the normal Actions identity.\n"
+        "- Actor ledger: a fallback-created workspace pull request is "
+        "attributed to the eligible user until the Foundry-owned App "
+        "migration; ordinary issue comments, status, evidence, checks, "
+        "closure, and other optimizer writes remain `github-actions[bot]`. "
+        "Only transient assignment-comment cleanup uses the same narrow "
+        "eligible-user adapter.\n"
+        "- The transient assignment comment is removed only after verified "
+        "provenance capture. Copilot source-commit and acknowledgement-comment "
+        "links remain durable public evidence.\n"
+        "- Onboarding generation and preflight reject workflow artifacts that "
+        "use the assignment secret as generic `GH_TOKEN`, without inspecting "
+        "the secret value.\n"
+        "- Long term, Foundry will own, publish, and secure the "
+        "`foundry-optimizer[bot]` GitHub App. Customers will install it only "
+        "on selected repositories; short-lived installation tokens will come "
+        "from a Foundry broker/workload-identity exchange, with no private key "
+        "in the customer repository. That migration must not change candidate "
+        "or lineage interfaces or the human journey.\n"
+        "- foundry-opt init cannot create Actions secrets; configure the "
+        "assignment secret manually and never commit its value.\n"
+        "- Create the generated `[Optimize]` issue to start one persistent "
+        "draft workspace pull request; workflow dispatch is retry-only.\n"
+        "- `.github/foundry-optimizer.yaml` is durable repository policy; "
+        "each issue supplies its own goal and assets within that boundary.\n"
+        "- The steward compares bounded candidates internally, updates the "
+        "same workspace pull request, and creates no secondary optimization "
+        "branches or review surfaces.\n"
+        "- The steward follows the durable workspace `next_action`; candidate "
+        "actions include the exact work contract and submission command. It "
+        "pauses for external operations, the human merge, a blocked state, "
+        "or completion.\n"
+        "- Normal user action: watch the issue and its one workspace pull "
+        "request, then merge that pull request when it becomes eligible.\n"
+    )
+
+
+def _previous_repository_context(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str,
+) -> str:
+    return (
         "# Repository optimization context\n\n"
         f"- Configured target: `{request.target_name}`\n"
         f"- Configured environment: `{request.environment_name}`\n"
@@ -48,7 +156,23 @@ def generate_repository_agent_bundle(
         "operations.\n"
         "- Copilot session assignment uses the repository Actions secret "
         "`COPILOT_ASSIGNMENT_TOKEN`, containing a least-privilege "
-        "user-to-server token; an installation token is not supported.\n"
+        "user-to-server token; an installation token is not supported. "
+        "This credential is for Copilot invocation and verified assignment-"
+        "comment cleanup, plus workspace pull-request bootstrap only when "
+        "organization policy blocks Actions from creating pull requests.\n"
+        "- Durable repository operations use Actions `github.token` and "
+        "therefore appear as `github-actions[bot]`. Workspace pull-request "
+        "creation first uses `github.token`; only the explicit organization-"
+        "policy denial retries that one mutation with the eligible-user "
+        "credential. The branch push and every other repository mutation "
+        "remain on the normal Actions identity.\n"
+        "- Actor ledger: a fallback-created workspace pull request is "
+        "attributed to the eligible user until the Foundry-owned App "
+        "migration; all other optimizer writes remain "
+        "`github-actions[bot]`.\n"
+        "- The transient assignment comment is removed only after verified "
+        "provenance capture. Copilot source-commit and acknowledgement-comment "
+        "links remain durable public evidence.\n"
         "- foundry-opt init cannot create Actions secrets; configure the "
         "assignment secret manually and never commit its value.\n"
         "- Create the generated `[Optimize]` issue to start; workflow "
@@ -64,6 +188,18 @@ def generate_repository_agent_bundle(
         "`refs/heads/foundry-opt/state/issue-<N>`; issue comments and labels "
         "are projections.\n"
     )
+
+
+def _previous_repository_agent_bundle(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str,
+    deployment_workflow_name: str = "Foundry deployment",
+) -> dict[Path, str]:
+    contents = _copy_skill_template()
+    contents[
+        Path(".github/skills/foundry-agent-optimizer/REPOSITORY_CONTEXT.md")
+    ] = _previous_repository_context(request, oidc_subject=oidc_subject)
     contents.update(
         {
             Path(".foundry-optimizer/.gitignore"): (
@@ -83,7 +219,7 @@ def generate_repository_agent_bundle(
             ): _applier_agent(),
             Path(
                 ".github/agents/foundry-optimization-steward.agent.md"
-            ): _steward_agent(),
+            ): _previous_steward_agent(),
             Path(
                 ".github/workflows/foundry-optimization-issue-intake.yml"
             ): _issue_intake_workflow(request),
@@ -102,6 +238,7 @@ def generate_repository_agent_bundle(
             ): _deployment_bridge_workflow(
                 request,
                 deployment_workflow_name=deployment_workflow_name,
+                consolidated=False,
             ),
             Path(
                 ".github/workflows/foundry-exact-candidate-check.yml"
@@ -144,12 +281,10 @@ def _issue_form(request: OnboardingRequest) -> str:
                 "type": "markdown",
                 "attributes": {
                     "value": (
-                        "Creating this one issue starts the campaign. Normally "
-                        "you take no action until eligible candidate PRs are "
-                        "ready, then merge exactly one. An immutable spec PR "
-                        "needs review only when the dashboard identifies new, "
-                        "changed, custom, synthetic, trace-derived, human-gated, "
-                        "or unpinned assets. Track bounded experiments, "
+                        "Creating this one issue starts one persistent draft "
+                        "workspace pull request. Normally you take no action "
+                        "until that pull request is eligible, then merge it. "
+                        "Track bounded internal experiments, "
                         "held-out evidence, deployment, and retained improvement "
                         "in the root issue dashboard. Do not include credentials, "
                         "raw traces, or private dataset rows."
@@ -378,6 +513,85 @@ rejects the candidate.
 def _steward_agent() -> str:
     return """---
 name: foundry-optimization-steward
+description: Own one issue's persistent Foundry optimization workspace.
+target: github-copilot
+tools: ["read", "search", "edit", "execute"]
+disable-model-invocation: false
+---
+
+Read `.github/skills/foundry-agent-optimizer/SKILL.md`,
+`REPOSITORY_CONTEXT.md`, the assigned optimization issue, and the existing
+workspace pull request for that issue.
+
+Own exactly one persistent draft workspace pull request. Advance it only with:
+
+`foundry-opt workspace advance --issue <number> --json`
+
+Read the returned durable workspace state and `next_action`. Perform only the
+listed action and compare bounded candidates internally through the candidate
+work contract; never create another review surface. Update the same pull request
+only when trusted finalization supplies the selected exact patch.
+
+When `next_action.kind` is `run_candidate_experiments`, execute exactly one
+candidate from `next_action.candidate_work`. Treat its target, base commit,
+candidate ID and slot, configured limit, allowed mutation classes, prior
+redacted experiment results, and command as authoritative:
+
+1. Read the issue goal, target configuration, allowed edit paths, relevant
+   source, and prior experiment results.
+2. Create a disposable detached worktree at the supplied base commit. Make one
+   coherent change using one supplied mutation class. Never edit or commit on
+   the persistent workspace branch.
+3. Run the configured validation commands.
+4. Export a non-empty binary Git patch relative to the supplied base commit,
+   including new files, and base64-encode it.
+5. Write a schema-v3 JSON manifest containing only `schema_version`,
+   `issue_number`, `target`, `base_commit`, and `candidate`. The candidate
+   contains only `candidate_id`, `mutation_class`, `summary`, and
+   `patch_base64`. Copy every binding value from `candidate_work`.
+6. Run the exact `candidate_work.command`, currently
+   `foundry-opt workspace experiment --issue <number>
+   --candidate-manifest <manifest.json> --json`.
+7. Remove the disposable worktree and manifest after successful submission.
+   If the result says `proxy_import_required`, add only
+   `.foundry-optimizer/workspace-candidate.json`, commit it on the existing
+   workspace PR branch, push that branch, then comment on that same pull
+   request with exactly
+   `<!-- foundry-opt:workspace-candidate-ack:<assignment-marker-key>:<candidate-id>:<git rev-parse HEAD> -->`,
+   using the assignment marker key from the comment that assigned this
+   session. Ask GitHub to publish that marker, but trusted scheduled import can
+   proceed only from a verified GitHub-signed Copilot source commit made
+   through the linked `web-flow` committer if GitHub does not publish the
+   acknowledgement comment. Then stop. If it says
+   `await_trusted_actions_result`, stop directly. Trusted Actions imports and
+   evaluates the proposal, then a revision-bound continuation requests the
+   next slot.
+
+Do not stop merely because an internal invocation returned successfully. Stop
+only when the result is waiting for an external operation, waiting for the
+human merge, blocked, or complete.
+
+Never create another issue, a handoff artifact, or a second optimization pull
+request. Do not create a second optimization branch or review surface. Do not
+reproduce workspace transitions in prose, shell, comments, labels, or ad hoc
+files. The workspace command owns candidate bounds, evaluation, eligibility,
+selection, deployment intent, and retained-improvement state.
+
+Edit only the paths allowed by the immutable issue and repository policy.
+Never expose credentials, private dataset rows, held-out cases, raw traces,
+evaluator prompts, or unredacted evidence. Copilot never calls Foundry network
+adapters; the optimizer-OIDC operations workflow performs persisted Foundry
+operations and post-deployment evaluation. Deployment remains isolated under
+the separate deployment identity.
+
+Never invent an action absent from `next_action` or continue after an
+external/human wait. Do not attempt a workaround for a blocked result.
+"""
+
+
+def _previous_steward_agent() -> str:
+    return """---
+name: foundry-optimization-steward
 description: Advance one issue-driven optimization campaign from trusted events.
 target: github-copilot
 tools: ["read", "search", "execute"]
@@ -432,6 +646,965 @@ workflows apply only effects already persisted in the outbox.
 After the single command returns, stop immediately. A `blocked`, `delegate`, or `wait`
 disposition, or a `waiting` status, means stop and await transport
 or a new assignment. Do not continue investigating or attempt a workaround.
+"""
+
+
+def _workspace_workflow(request: OnboardingRequest) -> str:
+    install = json.dumps(request.product_install)
+    return f"""name: Foundry optimization workspace
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review, closed]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_run:
+    workflows: ["CodeQL"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Optimization issue number to retry
+        required: true
+        type: number
+      candidate_import_origin:
+        description: Trusted scanner-proxy origin
+        required: false
+        type: choice
+        default: none
+        options: [none, schedule]
+
+# GitHub permissions apply to github.token. Ordinary durable writes appear as
+# github-actions[bot]. The eligible-user token is limited to Copilot assignment
+# cleanup and the explicit organization-policy workspace PR bootstrap fallback.
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: foundry-optimization-workspace
+  cancel-in-progress: false
+
+jobs:
+  scan-candidate-envelopes:
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch trusted imports for current candidate envelopes
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
+          TRUSTED_DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+        shell: python
+        run: |
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+
+          repository = os.environ["TRUSTED_REPOSITORY"]
+          pages = json.loads(
+              subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      "--paginate",
+                      "--slurp",
+                      f"repos/{{repository}}/pulls?state=open&per_page=100",
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout
+          )
+          for pull_request in [
+              item for page in pages for item in page
+          ]:
+              head = pull_request.get("head", {{}})
+              base = pull_request.get("base", {{}})
+              branch = head.get("ref")
+              repository_data = head.get("repo") or {{}}
+              match = (
+                  re.fullmatch(
+                      r"foundry-opt/workspace/issue-([1-9][0-9]*)",
+                      branch or "",
+                  )
+                  if repository_data.get("full_name") == repository
+                  and base.get("ref") == os.environ["TRUSTED_DEFAULT_BRANCH"]
+                  else None
+              )
+              if match is None:
+                  continue
+              issue = int(match.group(1))
+              head_sha = head.get("sha")
+              if not isinstance(head_sha, str):
+                  continue
+              envelope = subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      "--method",
+                      "GET",
+                      (
+                          f"repos/{{repository}}/contents/"
+                          ".foundry-optimizer/workspace-candidate.json"
+                      ),
+                      "-f",
+                      f"ref={{head_sha}}",
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if envelope.returncode != 0:
+                  continue
+              document = json.loads(envelope.stdout)
+              payload = json.loads(
+                  base64.b64decode(document["content"]).decode("utf-8")
+              )
+              expected = payload.get("expected_revision")
+              state = subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      (
+                          f"repos/{{repository}}/git/ref/heads/"
+                          f"foundry-opt/state/issue-{{issue}}"
+                      ),
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if state.returncode != 0:
+                  continue
+              current = json.loads(state.stdout).get("object", {{}}).get("sha")
+              if current != expected:
+                  continue
+              subprocess.run(
+                  [
+                      "gh",
+                      "workflow",
+                      "run",
+                      "foundry-optimization-workspace.yml",
+                      "--repo",
+                      repository,
+                      "--ref",
+                      os.environ["TRUSTED_DEFAULT_BRANCH"],
+                      "-f",
+                      f"issue={{issue}}",
+                      "-f",
+                      "candidate_import_origin=schedule",
+                  ],
+                  check=True,
+              )
+  advance:
+    if: >-
+      github.event_name != 'schedule' &&
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' &&
+      (github.event.action != 'opened' ||
+      startsWith(github.event.issue.title, '[Optimize] '))) ||
+      (github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      github.event.comment.user.login == 'Copilot') ||
+      (github.event_name == 'pull_request_target' &&
+      github.event.pull_request.base.ref ==
+      github.event.repository.default_branch &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(
+      github.event.pull_request.head.ref,
+      'foundry-opt/workspace/issue-'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Resolve trusted workspace issue
+        id: workspace
+        env:
+          DISPATCH_ISSUE: ${{{{ inputs.issue }}}}
+          DISPATCH_IMPORT_ORIGIN: >-
+            ${{{{ inputs.candidate_import_origin }}}}
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+
+          with open(
+              os.environ["TRUSTED_EVENT_PATH"],
+              encoding="utf-8",
+          ) as stream:
+              event = json.load(stream)
+          event_name = os.environ["TRUSTED_EVENT_NAME"]
+          if event_name == "issues":
+              issue = event.get("issue", {{}}).get("number")
+              pull_request = ""
+          elif event_name == "issue_comment":
+              issue_data = event.get("issue", {{}})
+              body = issue_data.get("body") or ""
+              matches = re.findall(
+                  r"foundry-opt:workspace-pr:issue-([1-9][0-9]*):v1",
+                  body,
+              )
+              if len(matches) != 1:
+                  raise SystemExit(
+                      "workspace pull request marker is missing or ambiguous"
+                  )
+              issue = int(matches[0])
+              pull_request = str(issue_data.get("number") or "")
+          elif event_name == "pull_request_target":
+              pull_request_data = event.get("pull_request", {{}})
+              body = pull_request_data.get("body") or ""
+              matches = re.findall(
+                  r"foundry-opt:workspace-pr:issue-([1-9][0-9]*):v1",
+                  body,
+              )
+              if len(matches) != 1:
+                  raise SystemExit(
+                      "workspace pull request marker is missing or ambiguous"
+                  )
+              issue = int(matches[0])
+              pull_request = str(pull_request_data.get("number") or "")
+          elif event_name == "workflow_dispatch":
+              raw_issue = os.environ.get("DISPATCH_ISSUE", "")
+              issue = int(raw_issue) if re.fullmatch(
+                  r"[1-9][0-9]*",
+                  raw_issue,
+              ) else None
+              pull_request = ""
+          else:
+              raise SystemExit("unsupported workspace event")
+          if type(issue) is not int or issue < 1:
+              raise SystemExit("workspace issue number is invalid")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"issue={{issue}}\\n")
+              output.write(f"pull_request={{pull_request}}\\n")
+      - name: Ingest trusted event or retry the workspace
+        id: ingest
+        env:
+          FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN: >-
+            ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          GH_TOKEN: ${{{{ github.token }}}}
+          ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_EVENT_PATH: ${{{{ github.event_path }}}}
+          TRUSTED_HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}
+          TRUSTED_ACK_COMMENT_ID: ${{{{ github.event.comment.id }}}}
+          TRUSTED_DISPATCH_IMPORT_ORIGIN: >-
+            ${{{{ inputs.candidate_import_origin }}}}
+          TRUSTED_PULL_REQUEST_NUMBER: >-
+            ${{{{ steps.workspace.outputs.pull_request }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_RUN_ID: ${{{{ github.run_id }}}}
+        shell: bash
+        run: |
+          command=(
+            uv run --no-project --no-config --no-env-file
+            --with "$OPTIMIZER_PACKAGE"
+            foundry-opt workspace
+          )
+          workspace_pr_bootstrap_token="$FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"
+          unset FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN
+          head_sha="$TRUSTED_HEAD_SHA"
+          pull_request="$TRUSTED_PULL_REQUEST_NUMBER"
+          if (
+            [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] ||
+            [ "$TRUSTED_EVENT_NAME" = "issue_comment" ]
+          ); then
+            owner="${{TRUSTED_REPOSITORY%%/*}}"
+            branch="foundry-opt/workspace/issue-$ISSUE"
+            pull_data="$(
+              gh api --method GET \
+                "repos/$TRUSTED_REPOSITORY/pulls" \
+                -f state=open \
+                -f head="$owner:$branch" \
+                --jq 'if length == 1 then "\\(.[0].number) \\(.[0].head.sha)" else "" end'
+            )"
+            read -r pull_request head_sha <<< "$pull_data"
+          fi
+          import_origin=""
+          if [ "$TRUSTED_EVENT_NAME" = "issue_comment" ]; then
+            import_origin="issue_comment"
+          elif (
+            [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] &&
+            [ "$TRUSTED_DISPATCH_IMPORT_ORIGIN" = "schedule" ]
+          ); then
+            import_origin="schedule"
+          fi
+          envelope_path=".foundry-optimizer/workspace-candidate.json"
+          envelope_file="$RUNNER_TEMP/workspace-candidate-envelope.json"
+          manifest_file="$RUNNER_TEMP/workspace-candidate-manifest.json"
+          if (
+            [ -n "$import_origin" ] &&
+            [[ "$pull_request" =~ ^[1-9][0-9]*$ ]] &&
+            [[ "$head_sha" =~ ^[0-9a-f]{{40}}$ ]] &&
+            git fetch --no-tags origin "$head_sha" &&
+            git cat-file -e "$head_sha:$envelope_path" 2>/dev/null
+          ); then
+              git show "$head_sha:$envelope_path" > "$envelope_file"
+              expected_revision="$(
+                python - "$envelope_file" "$manifest_file" "$ISSUE" <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          envelope = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if (
+              not isinstance(envelope, dict)
+              or set(envelope) != {{
+                  "expected_revision",
+                  "kind",
+                  "manifest",
+                  "schema_version",
+              }}
+              or envelope["schema_version"] != 1
+              or envelope["kind"] != "workspace_candidate_proposal"
+              or re.fullmatch(
+                  r"[0-9a-f]{{40}}",
+                  envelope["expected_revision"],
+              )
+              is None
+              or not isinstance(envelope["manifest"], dict)
+              or envelope["manifest"].get("issue_number") != int(sys.argv[3])
+          ):
+              raise SystemExit("workspace candidate envelope is invalid")
+          Path(sys.argv[2]).write_text(
+              json.dumps(
+                  envelope["manifest"],
+                  ensure_ascii=True,
+                  allow_nan=False,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ),
+              encoding="utf-8",
+          )
+          print(envelope["expected_revision"])
+          PY
+              )"
+              current_revision="$(
+                git ls-remote origin \
+                  "refs/heads/foundry-opt/state/issue-$ISSUE" |
+                  awk '{{print $1}}'
+              )"
+              if [ "$current_revision" != "$expected_revision" ]; then
+                echo "Workspace candidate envelope is stale" >&2
+                exit 1
+              fi
+              export TRUSTED_CANDIDATE_IMPORT_ORIGIN="$import_origin"
+              export TRUSTED_PULL_REQUEST_NUMBER="$pull_request"
+              export TRUSTED_HEAD_SHA="$head_sha"
+              export TRUSTED_EXPECTED_REVISION="$expected_revision"
+              if [ "$import_origin" != "issue_comment" ]; then
+                export TRUSTED_ACK_COMMENT_ID=""
+              fi
+              "${{command[@]}}" experiment \
+                --issue "$ISSUE" \
+                --candidate-manifest "$manifest_file" \
+                --json
+              {{
+                echo "cleanup_pull_request=$pull_request"
+                echo "cleanup_assignment_revision=$expected_revision"
+              }} >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          if (
+            [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] ||
+            [ "$TRUSTED_EVENT_NAME" = "issue_comment" ]
+          ); then
+            "${{command[@]}}" advance --issue "$ISSUE" --json
+          else
+            args=(
+              intake
+              --event-path "$TRUSTED_EVENT_PATH"
+              --event-name "$TRUSTED_EVENT_NAME"
+              --delivery-id "$TRUSTED_RUN_ID"
+              --repository "$TRUSTED_REPOSITORY"
+              --repository-id "$TRUSTED_REPOSITORY_ID"
+              --json
+            )
+            if [ "$TRUSTED_EVENT_NAME" = "issues" ]; then
+              args+=(--base-commit "$(git rev-parse HEAD)")
+            fi
+            FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN="$workspace_pr_bootstrap_token" \
+              "${{command[@]}}" "${{args[@]}}"
+          fi
+      - name: Remove transient Copilot assignment marker after verified provenance capture
+        if: steps.ingest.outputs.cleanup_pull_request != ''
+        env:
+          ASSIGNMENT_REVISION: >-
+            ${{{{ steps.ingest.outputs.cleanup_assignment_revision }}}}
+          COPILOT_ASSIGNMENT_TOKEN: >-
+            ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
+          PULL_REQUEST: >-
+            ${{{{ steps.ingest.outputs.cleanup_pull_request }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+        run: >-
+          uv run --no-project --no-config --no-env-file
+          --with "$OPTIMIZER_PACKAGE"
+          foundry-opt workspace cleanup-assignment
+          --issue "$ISSUE"
+          --pull-request "$PULL_REQUEST"
+          --assignment-revision "$ASSIGNMENT_REVISION"
+          --repository "$TRUSTED_REPOSITORY"
+          --json
+      - name: Dispatch trusted workspace operations
+        env:
+          DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+          ISSUE: ${{{{ steps.workspace.outputs.issue }}}}
+        shell: bash
+        run: >-
+          gh workflow run foundry-optimization-operations.yml
+          --repo "$GITHUB_REPOSITORY"
+          --ref "$DEFAULT_BRANCH"
+          -f "issue=$ISSUE"
+"""
+
+
+def _operations_workflow(
+    request: OnboardingRequest,
+    *,
+    deployment_workflow_name: str,
+) -> str:
+    install = json.dumps(request.product_install)
+    workflow_name = json.dumps(deployment_workflow_name)
+    actions_environment = (
+        request.mirror_actions_environment or request.environment_name
+    )
+    return f"""name: Foundry optimization operations
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_run:
+    workflows: [{workflow_name}]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Optional optimization issue number to retry
+        required: false
+        type: number
+      deployment_run_id:
+        description: Optional successful deployment run to reconcile
+        required: false
+        type: number
+
+# GitHub permissions apply to github.token. Durable writes appear as
+# github-actions[bot]; COPILOT_ASSIGNMENT_TOKEN is never general GH_TOKEN.
+permissions:
+  actions: write
+  checks: write
+  contents: write
+  id-token: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: >-
+    foundry-optimization-operations-${{{{
+      github.event.workflow_run.id ||
+      inputs.deployment_run_id ||
+      inputs.issue ||
+      github.ref_name ||
+      github.run_id
+    }}}}
+  cancel-in-progress: false
+
+jobs:
+  operate:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: {json.dumps(actions_environment)}
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      AZURE_CLIENT_ID: ${{{{ vars.AZURE_CLIENT_ID }}}}
+      AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
+      AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      FOUNDRY_OPT_DEPLOYMENT_GH_TOKEN: ${{{{ github.token }}}}
+      OPTIMIZER_PACKAGE: {install}
+    steps:
+      - uses: {_CHECKOUT_ACTION} # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{{{ github.event.repository.default_branch }}}}
+      - uses: {_AZURE_LOGIN_ACTION} # v3.0.0
+        with:
+          client-id: ${{{{ vars.AZURE_CLIENT_ID }}}}
+          tenant-id: ${{{{ vars.AZURE_TENANT_ID }}}}
+          subscription-id: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
+      - uses: {_SETUP_PYTHON_ACTION} # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: {_SETUP_UV_ACTION} # v9.0.0
+      - name: Execute trusted workspace operations
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
+          REQUESTED_ISSUE: ${{{{ inputs.issue }}}}
+          TRUSTED_EVENT_NAME: ${{{{ github.event_name }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_STATE_REF: ${{{{ github.ref_name }}}}
+          TRUSTED_WORKFLOW_RUN_ID: >-
+            ${{{{ github.event.workflow_run.id || inputs.deployment_run_id }}}}
+          WORKSPACE_RESUME_FILE: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
+        shell: bash
+        run: |
+          mkdir -p "$(dirname "$WORKSPACE_RESUME_FILE")"
+          : > "$WORKSPACE_RESUME_FILE"
+          issues=()
+          if (
+            [ "$TRUSTED_EVENT_NAME" = "workflow_dispatch" ] &&
+            [ -n "$TRUSTED_WORKFLOW_RUN_ID" ]
+          ); then
+            :
+          elif [ -n "$REQUESTED_ISSUE" ]; then
+            if [[ ! "$REQUESTED_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Invalid issue number" >&2
+              exit 1
+            fi
+            issues=("$REQUESTED_ISSUE")
+          elif [ "$TRUSTED_EVENT_NAME" = "push" ] && \
+            [[ "$TRUSTED_STATE_REF" =~ ^foundry-opt/state/issue-([1-9][0-9]*)$ ]]; then
+            issues=("${{BASH_REMATCH[1]}}")
+          elif [ "$TRUSTED_EVENT_NAME" != "workflow_run" ]; then
+            mapfile -t issues < <(
+              git ls-remote --heads origin \
+                'refs/heads/foundry-opt/state/issue-*' |
+              sed -n \
+                's#.*refs/heads/foundry-opt/state/issue-\\([1-9][0-9]*\\)$#\\1#p' |
+              sort -n -u |
+              head -25
+            )
+          fi
+          for issue in "${{issues[@]}}"; do
+            args=(
+              foundry-opt workspace operations execute
+              --issue "$issue"
+              --event-name "$TRUSTED_EVENT_NAME"
+              --repository "$TRUSTED_REPOSITORY"
+              --repository-id "$TRUSTED_REPOSITORY_ID"
+              --json
+            )
+            if [ "$TRUSTED_EVENT_NAME" = "push" ] && \
+              [ -n "$TRUSTED_STATE_REF" ]; then
+              args+=(--state-ref "$TRUSTED_STATE_REF")
+            fi
+            if [[ "$TRUSTED_WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              args+=(--workflow-run-id "$TRUSTED_WORKFLOW_RUN_ID")
+            fi
+            result_json="$(
+              uv run --no-project --no-config --no-env-file \
+                --with "$OPTIMIZER_PACKAGE" \
+                "${{args[@]}}"
+            )"
+            printf '%s\\n' "$result_json"
+            printf '%s\\n' "$result_json" >> "$WORKSPACE_RESUME_FILE"
+          done
+      - name: Reconcile authenticated deployment result
+        if: >-
+          github.event_name == 'workflow_run' ||
+          inputs.deployment_run_id != ''
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          TRUSTED_REPOSITORY_ID: ${{{{ github.repository_id }}}}
+          TRUSTED_WORKFLOW_RUN_ID: >-
+            ${{{{ github.event.workflow_run.id || inputs.deployment_run_id }}}}
+          WORKSPACE_RESUME_FILE: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
+        shell: bash
+        run: |
+          if [[ ! "$TRUSTED_WORKFLOW_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid workflow run ID" >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$WORKSPACE_RESUME_FILE")"
+          result_dir="$GITHUB_WORKSPACE/.foundry-optimizer/deployment-result"
+          mkdir -p "$result_dir"
+          gh run download "$TRUSTED_WORKFLOW_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name foundry-optimization-deployment-result \
+            --dir "$result_dir"
+          mapfile -d '' result_files < <(
+            find "$result_dir" -type f -name deployment-result.json -print0
+          )
+          if [ "${{#result_files[@]}}" -ne 1 ]; then
+            echo "Expected exactly one deployment-result.json" >&2
+            exit 1
+          fi
+          issue="$(
+            RESULT_FILE="${{result_files[0]}}" python -c \
+              "import json, os; value = json.load(open(os.environ['RESULT_FILE'], encoding='utf-8')); issue = value.get('issue_number'); assert type(issue) is int and issue > 0; print(issue)"
+          )"
+          result_json="$(
+            uv run --no-project --no-config --no-env-file \
+              --with "$OPTIMIZER_PACKAGE" \
+              foundry-opt workspace operations reconcile \
+              --issue "$issue" \
+              --result "${{result_files[0]}}" \
+              --repository "$TRUSTED_REPOSITORY" \
+              --repository-id "$TRUSTED_REPOSITORY_ID" \
+              --run-id "$TRUSTED_WORKFLOW_RUN_ID" \
+              --artifact-name foundry-optimization-deployment-result \
+              --json
+          )"
+          printf '%s\\n' "$result_json"
+          printf '%s\\n' "$result_json" >> "$WORKSPACE_RESUME_FILE"
+      - name: Publish trusted exact verification check and ready finalized workspace pull request
+        env:
+          GH_TOKEN: ${{{{ github.token }}}}
+          OPTIMIZER_PACKAGE: {install}
+          TRUSTED_REPOSITORY: ${{{{ github.repository }}}}
+          WORKSPACE_RESUME_FILE: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
+        shell: python
+        run: |
+          from datetime import datetime, timezone
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          results_path = Path(os.environ["WORKSPACE_RESUME_FILE"])
+          if not results_path.is_file():
+              raise SystemExit(0)
+
+          entries: dict[tuple[int, str], dict[str, object]] = {{}}
+          for line in results_path.read_text(encoding="utf-8").splitlines():
+              if not line.strip():
+                  continue
+              document = json.loads(line)
+              verification = document.get("verification")
+              if verification is None:
+                  continue
+              if not isinstance(verification, dict):
+                  raise SystemExit("workspace verification payload is invalid")
+              issue = verification.get("issue_number")
+              pull_request = verification.get(
+                  "workspace_pull_request_number"
+              )
+              candidate = verification.get("candidate_id")
+              check_name = verification.get("check_name")
+              if (
+                  type(issue) is not int
+                  or issue < 1
+                  or type(pull_request) is not int
+                  or pull_request < 1
+                  or not isinstance(candidate, str)
+                  or not re.fullmatch(
+                      r"[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}",
+                      candidate,
+                  )
+                  or not isinstance(check_name, str)
+                  or not check_name
+              ):
+                  raise SystemExit("workspace verification payload is invalid")
+              entries[(pull_request, check_name)] = {{
+                  "candidate_id": candidate,
+                  "issue_number": issue,
+              }}
+
+          repository = os.environ["TRUSTED_REPOSITORY"]
+          package = os.environ["OPTIMIZER_PACKAGE"]
+          failure = False
+          for (pull_request, check_name), entry in sorted(entries.items()):
+              pull_request_view = json.loads(
+                  subprocess.run(
+                      [
+                          "gh",
+                          "pr",
+                          "view",
+                          str(pull_request),
+                          "--repo",
+                          repository,
+                          "--json",
+                          "number,headRefOid,isDraft,state",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+              )
+              head_sha = pull_request_view.get("headRefOid")
+              if (
+                  not isinstance(pull_request_view, dict)
+                  or pull_request_view.get("number") != pull_request
+                  or pull_request_view.get("state") != "OPEN"
+                  or not isinstance(pull_request_view.get("isDraft"), bool)
+                  or not isinstance(head_sha, str)
+                  or re.fullmatch(r"[0-9a-f]{{40}}", head_sha) is None
+              ):
+                  raise SystemExit(
+                      "workspace pull request verification target is invalid"
+                  )
+
+              verify = subprocess.run(
+                  [
+                      "uv",
+                      "run",
+                      "--no-project",
+                      "--no-config",
+                      "--no-env-file",
+                      "--with",
+                      package,
+                      "foundry-opt",
+                      "workspace",
+                      "verify",
+                      "--issue",
+                      str(entry["issue_number"]),
+                      "--candidate",
+                      str(entry["candidate_id"]),
+                      "--pull-request",
+                      str(pull_request),
+                      "--head-sha",
+                      head_sha,
+                      "--json",
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if verify.stdout:
+                  print(verify.stdout, end="")
+              if verify.stderr:
+                  print(verify.stderr, end="", file=sys.stderr)
+
+              summary = (
+                  "## Trusted workspace verification\\n\\n"
+                  "Trusted verification failed before a summary could be "
+                  "produced.\\n"
+              )
+              if verify.stdout.strip():
+                  try:
+                      verify_document = json.loads(verify.stdout)
+                  except json.JSONDecodeError:
+                      verify_document = None
+                  if isinstance(verify_document, dict):
+                      value = verify_document.get("summary_markdown")
+                      if isinstance(value, str) and value.strip():
+                          summary = value
+              if verify.returncode != 0:
+                  details = verify.stderr.strip() or verify.stdout.strip()
+                  if details:
+                      summary = (
+                          f"{{summary}}\\n"
+                          "```text\\n"
+                          f"{{details[:4000]}}\\n"
+                          "```\\n"
+                      )
+
+              external_id = (
+                  "foundry-opt:workspace-verify:"
+                  f"issue-{{entry['issue_number']}}:"
+                  f"pr-{{pull_request}}:"
+                  f"{{check_name}}"
+              )
+              existing_runs = json.loads(
+                  subprocess.run(
+                      [
+                          "gh",
+                          "api",
+                          f"repos/{{repository}}/commits/{{head_sha}}/check-runs",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+              )
+              check_run_id = None
+              if not isinstance(existing_runs, dict) or not isinstance(
+                  existing_runs.get("check_runs"),
+                  list,
+              ):
+                  raise SystemExit(
+                      "workspace verification check-runs response is invalid"
+                  )
+              for check_run in existing_runs["check_runs"]:
+                  if (
+                      isinstance(check_run, dict)
+                      and check_run.get("name") == check_name
+                      and check_run.get("external_id") == external_id
+                      and type(check_run.get("id")) is int
+                      and check_run["id"] > 0
+                  ):
+                      check_run_id = check_run["id"]
+                      break
+
+              timestamp = (
+                  datetime.now(timezone.utc)
+                  .replace(microsecond=0)
+                  .isoformat()
+                  .replace("+00:00", "Z")
+              )
+              payload = {{
+                  "completed_at": timestamp,
+                  "conclusion": (
+                      "success" if verify.returncode == 0 else "failure"
+                  ),
+                  "external_id": external_id,
+                  "name": check_name,
+                  "output": {{
+                      "summary": summary,
+                      "title": "Foundry exact candidate check",
+                  }},
+                  "status": "completed",
+              }}
+              if check_run_id is None:
+                  payload["head_sha"] = head_sha
+                  subprocess.run(
+                      [
+                          "gh",
+                          "api",
+                          f"repos/{{repository}}/check-runs",
+                          "--method",
+                          "POST",
+                          "--input",
+                          "-",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      input=json.dumps(payload),
+                  )
+              else:
+                  subprocess.run(
+                      [
+                          "gh",
+                          "api",
+                          f"repos/{{repository}}/check-runs/{{check_run_id}}",
+                          "--method",
+                          "PATCH",
+                          "--input",
+                          "-",
+                      ],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      input=json.dumps(payload),
+                  )
+
+              if verify.returncode == 0:
+                  if pull_request_view["isDraft"]:
+                      subprocess.run(
+                          [
+                              "gh",
+                              "pr",
+                              "ready",
+                              str(pull_request),
+                              "--repo",
+                              repository,
+                          ],
+                          check=True,
+                          capture_output=True,
+                          text=True,
+                      )
+              else:
+                  failure = True
+
+          if failure:
+              raise SystemExit(1)
+      - name: Resume same workspace pull request when trusted state needs Copilot
+        env:
+          COPILOT_ASSIGNMENT_TOKEN: ${{{{ secrets.COPILOT_ASSIGNMENT_TOKEN }}}}
+          GH_TOKEN: ${{{{ github.token }}}}
+          OPTIMIZER_PACKAGE: {install}
+          WORKSPACE_RESUME_FILE: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-resume.ndjson
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          resume_path = Path(os.environ["WORKSPACE_RESUME_FILE"])
+          if not resume_path.is_file():
+              raise SystemExit(0)
+          if not os.environ.get("COPILOT_ASSIGNMENT_TOKEN"):
+              raise SystemExit(
+                  "Missing required Actions secret: COPILOT_ASSIGNMENT_TOKEN"
+              )
+
+          entries: set[int] = set()
+          for line in resume_path.read_text(encoding="utf-8").splitlines():
+              if not line.strip():
+                  continue
+              document = json.loads(line)
+              issue = document.get("issue_number")
+              if type(issue) is not int or issue < 1:
+                  raise SystemExit("workspace resume payload is invalid")
+              resume = document.get("resume")
+              if resume is None:
+                  continue
+              if not isinstance(resume, dict):
+                  raise SystemExit("workspace resume payload is invalid")
+              pull_request = resume.get("workspace_pull_request_number")
+              if (
+                  type(pull_request) is not int
+                  or pull_request < 1
+              ):
+                  raise SystemExit("workspace resume payload is invalid")
+              entries.add(issue)
+
+          package = os.environ["OPTIMIZER_PACKAGE"]
+          environment = dict(os.environ)
+          for issue in sorted(entries):
+              result = subprocess.run(
+                  [
+                      "uv",
+                      "run",
+                      "--no-project",
+                      "--no-config",
+                      "--no-env-file",
+                      "--with",
+                      package,
+                      "foundry-opt",
+                      "workspace",
+                      "assign",
+                      "--issue",
+                      str(issue),
+                      "--json",
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+                  env=environment,
+              )
+              if result.stdout:
+                  print(result.stdout, end="")
+              if result.stderr:
+                  print(result.stderr, end="", file=sys.stderr)
+              if result.returncode != 0:
+                  raise SystemExit(result.returncode)
 """
 
 
@@ -724,13 +1897,39 @@ def _deployment_bridge_workflow(
     request: OnboardingRequest,
     *,
     deployment_workflow_name: str,
+    consolidated: bool = True,
 ) -> str:
     install = json.dumps(request.product_install)
     workflow_name = json.dumps(deployment_workflow_name)
+    display_name = (
+        "Deploy Foundry agent"
+        if consolidated
+        else "Foundry optimization deployment bridge"
+    )
+    default_branch_env = (
+        ""
+        if consolidated
+        else (
+            "      DEFAULT_BRANCH: "
+            "${{ github.event.repository.default_branch }}\n"
+        )
+    )
+    reconcile = (
+        '            printf \'Recorded deployment publication for issue '
+        '%s\\n\' "$issue"\n'
+        if consolidated
+        else (
+            "            gh workflow run "
+            "foundry-optimization-reconcile.yml               "
+            '--repo "$GITHUB_REPOSITORY"               '
+            '--ref "$DEFAULT_BRANCH"               '
+            '-f "issue=$issue"\n'
+        )
+    )
     actions_environment = (
         request.mirror_actions_environment or request.environment_name
     )
-    return f"""name: Foundry optimization deployment bridge
+    return f"""name: {display_name}
 
 on:
   push:
@@ -775,7 +1974,7 @@ jobs:
       AZURE_CLIENT_ID: ${{{{ vars.AZURE_DEPLOYMENT_CLIENT_ID }}}}
       AZURE_TENANT_ID: ${{{{ vars.AZURE_TENANT_ID }}}}
       AZURE_SUBSCRIPTION_ID: ${{{{ vars.AZURE_SUBSCRIPTION_ID }}}}
-      DEFAULT_BRANCH: ${{{{ github.event.repository.default_branch }}}}
+{default_branch_env}\
       OPTIMIZER_PACKAGE: {install}
     steps:
       - uses: {_CHECKOUT_ACTION} # v7.0.1
@@ -829,10 +2028,7 @@ jobs:
               PUBLICATION_JSON="$publication_json" python -c \
                 'import json, os; value = json.loads(os.environ["PUBLICATION_JSON"]); issue = value.get("issue_number"); assert type(issue) is int and issue > 0; print(issue)'
             )"
-            gh workflow run foundry-optimization-reconcile.yml \
-              --repo "$GITHUB_REPOSITORY" \
-              --ref "$DEFAULT_BRANCH" \
-              -f "issue=$issue"
+{reconcile}\
           elif [ -n "$REQUESTED_ISSUE" ]; then
             if [[ ! "$REQUESTED_ISSUE" =~ ^[1-9][0-9]*$ ]]; then
               echo "Invalid issue number" >&2
@@ -860,6 +2056,8 @@ on:
     paths-ignore:
       - .foundry-optimizer/handoffs/**
 
+# GitHub permissions apply to github.token. This workflow is read-only and
+# COPILOT_ASSIGNMENT_TOKEN is never general GH_TOKEN.
 permissions:
   contents: read
   issues: read
@@ -916,16 +2114,79 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"candidate={{candidate}}\\n")
               output.write(f"issue={{marker.group(1)}}\\n")
-      - name: Verify exact candidate metadata and tree
+      - name: Verify trusted workspace candidate and publish required-check summary
         env:
           CANDIDATE: ${{{{ steps.metadata.outputs.candidate }}}}
           ISSUE: ${{{{ steps.metadata.outputs.issue }}}}
-        shell: bash
-        run: foundry-opt optimize apply --issue "$ISSUE" --candidate "$CANDIDATE" --verify-only
+          PULL_REQUEST_NUMBER: ${{{{ github.event.pull_request.number }}}}
+          PULL_REQUEST_HEAD_SHA: ${{{{ github.event.pull_request.head.sha }}}}
+          VERIFY_JSON_PATH: >-
+            ${{{{ github.workspace }}}}/.foundry-optimizer/workspace-verify.json
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          verify_json_path = Path(os.environ["VERIFY_JSON_PATH"])
+          verify_json_path.parent.mkdir(parents=True, exist_ok=True)
+          command = [
+              "foundry-opt",
+              "workspace",
+              "verify",
+              "--issue",
+              os.environ["ISSUE"],
+              "--candidate",
+              os.environ["CANDIDATE"],
+              "--pull-request",
+              os.environ["PULL_REQUEST_NUMBER"],
+              "--head-sha",
+              os.environ["PULL_REQUEST_HEAD_SHA"],
+              "--json",
+          ]
+          completed = subprocess.run(
+              command,
+              check=False,
+              capture_output=True,
+              text=True,
+          )
+          if completed.stdout:
+              print(completed.stdout, end="")
+              verify_json_path.write_text(
+                  completed.stdout,
+                  encoding="utf-8",
+              )
+              document = json.loads(completed.stdout)
+              summary = document.get("summary_markdown")
+              if not isinstance(summary, str) or not summary.strip():
+                  raise SystemExit("workspace verify summary is invalid")
+              with open(
+                  os.environ["GITHUB_STEP_SUMMARY"],
+                  "a",
+                  encoding="utf-8",
+              ) as output:
+                  output.write(summary)
+                  if not summary.endswith("\\n"):
+                      output.write("\\n")
+          else:
+              with open(
+                  os.environ["GITHUB_STEP_SUMMARY"],
+                  "a",
+                  encoding="utf-8",
+              ) as output:
+                  output.write(
+                      "## Trusted workspace verification\\n\\n"
+                      "No trusted workspace verify JSON was produced.\\n"
+                  )
+          if completed.stderr:
+              print(completed.stderr, end="", file=sys.stderr)
+          raise SystemExit(completed.returncode)
 """
 
 
-def legacy_repository_agent_bundle(
+def _historical_repository_agent_bundle(
     request: OnboardingRequest,
     *,
     oidc_subject: str = "repository_id:legacy-placeholder",
@@ -974,6 +2235,28 @@ def legacy_repository_agent_bundle(
             ".github/workflows/foundry-exact-candidate-check.yml"
         ): _legacy_candidate_check_workflow(request),
     }
+
+
+def legacy_repository_agent_bundle(
+    request: OnboardingRequest,
+    *,
+    oidc_subject: str = "repository_id:legacy-placeholder",
+    deployment_workflow_name: str = "Foundry deployment",
+) -> dict[Path, str]:
+    """Return prior generated files and exact content for safe migration."""
+
+    contents = _historical_repository_agent_bundle(
+        request,
+        oidc_subject=oidc_subject,
+    )
+    contents.update(
+        _previous_repository_agent_bundle(
+            request,
+            oidc_subject=oidc_subject,
+            deployment_workflow_name=deployment_workflow_name,
+        )
+    )
+    return contents
 
 
 def _legacy_planner_agent() -> str:
@@ -1295,10 +2578,12 @@ def legacy_repository_agent_hashes(
     request: OnboardingRequest,
     *,
     oidc_subject: str,
+    deployment_workflow_name: str = "Foundry deployment",
 ) -> dict[Path, str]:
     contents = legacy_repository_agent_bundle(
         request,
         oidc_subject=oidc_subject,
+        deployment_workflow_name=deployment_workflow_name,
     )
     hashes = {
         path: hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -1307,6 +2592,12 @@ def legacy_repository_agent_hashes(
     hashes[
         Path(".github/skills/foundry-agent-optimizer/SKILL.md")
     ] = "ff0c3f9a072d5381bfd5d056efc9a0fbb27d82be319297666502a8142143e9e9"
+    hashes[Path(".github/workflows/campaign-drafts.yml")] = (
+        "5823847aa2c124c5865742b5ae1e041af3bec882b2b6a9cf13269e3468adcd23"
+    )
+    hashes[Path(".github/workflows/campaign-evaluate.yml")] = (
+        "c41bf79ee88c750b686d72c90e5fd892c5dbd69f18a95465e1464dd94d4879c6"
+    )
     return hashes
 
 

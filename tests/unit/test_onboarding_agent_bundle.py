@@ -6,9 +6,16 @@ import json
 from pathlib import Path
 import re
 
+from typer.testing import CliRunner
 import yaml
 
-from foundry_opt.onboarding.bundle import generate_repository_agent_bundle
+from foundry_opt.cli import app
+from foundry_opt.onboarding.bundle import (
+    generate_repository_agent_bundle,
+    legacy_repository_agent_bundle,
+    legacy_repository_agent_hashes,
+)
+from foundry_opt.onboarding.generation import _render_setup_workflow
 from foundry_opt.onboarding.models import OnboardingRequest
 from foundry_opt.optimization.issues import (
     REQUIRED_HEADINGS,
@@ -36,59 +43,176 @@ def _request() -> OnboardingRequest:
     )
 
 
-def test_bundle_generates_issue_form_and_four_custom_agents() -> None:
+def _workflows(files: dict[Path, str]) -> dict[Path, str]:
+    return {
+        path: text
+        for path, text in files.items()
+        if path.parts[:2] == (".github", "workflows")
+    }
+
+
+def test_bundle_generates_single_workspace_customer_surfaces() -> None:
     files = generate_repository_agent_bundle(
         _request(),
         oidc_subject="repository_id:123",
     )
 
-    assert {
-        Path(".foundry-optimizer/.gitignore"),
-        Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml"),
-        Path(".github/agents/foundry-optimization-planner.agent.md"),
-        Path(".github/agents/foundry-candidate-designer.agent.md"),
-        Path(".github/agents/foundry-candidate-applier.agent.md"),
-        Path(".github/agents/foundry-optimization-steward.agent.md"),
-    } <= set(files)
-
-    issue_form = yaml.safe_load(
-        files[Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml")]
-    )
-    assert issue_form["name"] == "Foundry optimization"
-    assert issue_form["labels"] == ["needs-triage"]
-    field_ids = {
-        field["id"]
-        for field in issue_form["body"]
-        if isinstance(field, dict) and "id" in field
+    agents = {
+        path
+        for path in files
+        if path.parts[:2] == (".github", "agents")
     }
-    assert {
-        "target",
-        "goal",
-        "datasets",
-        "evaluators",
-        "metrics",
-        "mutations",
-        "decision",
-        "deployment",
-    } <= field_ids
+    workflows = set(_workflows(files))
 
-    planner = files[
-        Path(".github/agents/foundry-optimization-planner.agent.md")
+    assert agents == {
+        Path(".github/agents/foundry-optimization-steward.agent.md"),
+    }
+    assert workflows == {
+        Path(".github/workflows/foundry-optimization-workspace.yml"),
+        Path(".github/workflows/foundry-optimization-operations.yml"),
+        Path(".github/workflows/foundry-exact-candidate-check.yml"),
+    }
+    assert not any(
+        fragment in path.name
+        for path in files
+        for fragment in (
+            "planner",
+            "designer",
+            "applier",
+            "handoff",
+            "capability",
+            "reconcile",
+            "deployment-bridge",
+        )
+    )
+
+    steward = files[
+        Path(".github/agents/foundry-optimization-steward.agent.md")
     ]
-    designer = files[
-        Path(".github/agents/foundry-candidate-designer.agent.md")
-    ]
-    applier = files[
-        Path(".github/agents/foundry-candidate-applier.agent.md")
-    ]
-    assert "prepare_specification_pr" in planner
-    assert "github/*" not in planner
-    assert "CandidateDesignIntent" in designer
-    assert "CandidateDesignResult" in designer
-    assert "github/*" not in designer
-    assert "foundry-opt optimize apply" in applier
-    assert 'tools: ["read", "execute"]' in applier
-    assert "edit" not in applier.split("---", 2)[1]
+    normalized_steward = " ".join(steward.split())
+    assert "one persistent draft workspace pull request" in normalized_steward
+    assert "compare bounded candidates internally" in normalized_steward
+    assert "Update the same pull request" in normalized_steward
+    assert "Never create another issue" in normalized_steward
+    assert "a handoff artifact" in normalized_steward
+    assert "or a second optimization pull request" in normalized_steward
+    assert (
+        "returned durable workspace state and `next_action`"
+        in normalized_steward
+    )
+    assert "`next_action.candidate_work`" in normalized_steward
+    assert "schema-v3 JSON manifest" in normalized_steward
+    assert "--candidate-manifest <manifest.json> --json" in normalized_steward
+    assert "revision-bound continuation" in normalized_steward
+    assert "proxy_import_required" in normalized_steward
+    assert ".foundry-optimizer/workspace-candidate.json" in steward
+    assert "Do not stop merely because" in normalized_steward
+    assert "waiting for an external operation" in normalized_steward
+    assert "waiting for the human merge" in normalized_steward
+    assert steward.count(
+        "foundry-opt workspace advance --issue <number> --json"
+    ) == 1
+    assert "foundry-opt steward advance" not in steward
+    assert Path(".github/workflows/deploy-foundry-agent.yml") not in files
+
+
+def test_generated_customer_instructions_have_no_legacy_transport() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    instruction_paths = (
+        Path(".github/agents/foundry-optimization-steward.agent.md"),
+        Path(
+            ".github/skills/foundry-agent-optimizer/"
+            "ADAPTER_MAPPING.md"
+        ),
+        Path(".github/skills/foundry-agent-optimizer/SKILL.md"),
+        Path(
+            ".github/skills/foundry-agent-optimizer/"
+            "REPOSITORY_CONTEXT.md"
+        ),
+    )
+    text = "\n".join(files[path] for path in instruction_paths).casefold()
+
+    for forbidden in (
+        "worker issue",
+        "specialist agent",
+        "internal handoff",
+        "candidate pull request",
+        "candidate pr",
+        "foundry-optimization-capability.yml",
+        "foundry-optimization-deployment-bridge.yml",
+        "foundry-optimization-handoff.yml",
+        "foundry-optimization-issue-intake.yml",
+        "foundry-optimization-reconcile.yml",
+        "foundry-opt steward advance",
+    ):
+        assert forbidden not in text
+    assert "foundry-opt workspace advance" in text
+    assert "next_actions" in text
+
+
+def test_every_emitted_foundry_opt_command_resolves_against_cli() -> None:
+    request = _request()
+    files = generate_repository_agent_bundle(
+        request,
+        oidc_subject="repository_id:123",
+        deployment_workflow_name="Deploy support agent",
+    )
+    files[Path(".github/workflows/copilot-setup-steps.yml")] = (
+        _render_setup_workflow(
+            request,
+            warm_token_cache=True,
+            export_proxy_marker=True,
+        )
+    )
+    emitted = " ".join("\n".join(files.values()).split())
+    occurrences = re.findall(
+        r"\bfoundry-opt\s+(--version|[a-z][a-z0-9-]*)"
+        r"(?:\s+([a-z][a-z0-9-]*))?"
+        r"(?:\s+([a-z][a-z0-9-]*))?",
+        emitted,
+    )
+    assert occurrences
+
+    runner = CliRunner()
+    resolved: set[str] = set()
+    for first, second, third in occurrences:
+        if first == "--version":
+            result = runner.invoke(app, ["--version"])
+            command = "--version"
+        else:
+            candidates = (
+                ([first, second, third, "--help"], f"{first} {second} {third}")
+                if second and third
+                else None,
+                ([first, second, "--help"], f"{first} {second}")
+                if second
+                else None,
+                ([first, "--help"], first),
+            )
+            result = None
+            command = ""
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                arguments, name = candidate
+                completed = runner.invoke(app, arguments)
+                if completed.exit_code == 0:
+                    result = completed
+                    command = name
+                    break
+            assert result is not None, (first, second, third)
+        assert result.exit_code == 0, (command, result.stdout)
+        resolved.add(command)
+
+    assert {
+        "init",
+        "workspace advance",
+        "workspace operations execute",
+        "workspace operations reconcile",
+    } <= resolved
 
 
 def test_orchestration_onboarding_bundle_matches_golden_hashes() -> None:
@@ -114,112 +238,15 @@ def test_orchestration_onboarding_bundle_matches_golden_hashes() -> None:
     assert actual == expected
 
 
-def test_bundle_uses_issue_only_entry_and_canonical_specialists() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-
-    assert Path(
-        ".github/agents/foundry-candidate-designer.agent.md"
-    ) in files
-    assert Path(
-        ".github/agents/foundry-optimization-runner.agent.md"
-    ) not in files
-
-    steward = files[
-        Path(".github/agents/foundry-optimization-steward.agent.md")
-    ]
-    planner = files[
-        Path(".github/agents/foundry-optimization-planner.agent.md")
-    ]
-    designer = files[
-        Path(".github/agents/foundry-candidate-designer.agent.md")
-    ]
-    applier = files[
-        Path(".github/agents/foundry-candidate-applier.agent.md")
-    ]
-
-    command = "foundry-opt steward advance --issue <number> --json"
-    assert steward.count(command) == 1
-    assert "exactly once per assignment" in steward
-    assert "stop immediately" in steward
-    assert "blocked`, `delegate`, or `wait" in steward
-    assert "Never inspect or edit agent source, tests, or configuration" in (
-        steward
-    )
-    assert "internal handoff pull request artifact" in steward
-    assert "only the reserved handoff path" in steward
-    assert "never any other edit" in steward
-    assert "Never improvise specialist work" in steward
-    assert "refs/heads/foundry-opt/state/issue-<number>" in steward
-    assert "canonical steward interfaces" in steward
-    assert "raw evidence" in steward
-    assert "specialist_work_request" in steward
-    assert "candidate_design" in steward
-    assert "applier_worker_issue_planned" in steward
-
-    assert "prepare_specification_pr" in planner
-    assert "pull request is opened by the native Copilot session" in planner
-    assert 'tools: ["read", "search", "edit", "execute"]' in planner
-    assert "github/*" not in planner.split("---", 2)[1]
-
-    assert "CandidateDesignIntent" in designer
-    assert "CandidateDesignResult" in designer
-    assert (
-        "foundry-opt steward candidate-design-result "
-        "--issue <number> --effect <effect-id> "
-        "--worker-issue <worker-issue-number>"
-    ) in designer
-    assert "Do not create or update a pull request" in designer
-    assert "internal handoff pull request artifact" in designer
-    assert "only the reserved handoff path" in designer
-    assert "never any other edit" in designer
-    assert "only the reserved worktree" in designer
-    assert "raw evidence" in designer
-    assert 'tools: ["read", "search", "edit", "execute"]' in designer
-    assert "disable-model-invocation: false" in designer
-    assert "github/*" not in designer.split("---", 2)[1]
-
-    assert "applier_worker_issue_planned" in applier
-    assert "native Copilot session" in applier
-    assert 'tools: ["read", "execute"]' in applier
-
-
-def test_skill_keeps_actions_as_verifying_transport_not_decision_owner() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    skill = files[
-        Path(".github/skills/foundry-agent-optimizer/SKILL.md")
-    ]
-
-    assert "Actions may replay canonical interfaces only to verify" in skill
-    assert "cannot choose a different transition" in skill
-    assert "internal handoff pull requests" in skill
-    assert "auto-closed" in skill
-    assert "Discovery binds the exact head SHA to a bounded GitHub" in skill
-    assert "selects transport envelopes" in skill
-    assert "canonical replay still validates the steward's exact" in skill
-    assert "`action_required` run does not block fallback" in skill
-    assert "candidate_assets_registration_planned" in skill
-    assert "candidate_effect_planned" in skill
-    assert "optimizer OIDC identity" in skill
-    assert "cannot choose candidates" in " ".join(
-        skill.casefold().split()
-    )
-
-
 def test_issue_form_matches_strict_parser_and_configured_target() -> None:
     request = replace(_request(), target_name="claims-agent")
-    text = generate_repository_agent_bundle(
+    files = generate_repository_agent_bundle(
         request,
         oidc_subject="repository_id:123",
-    )[Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml")]
-    issue_form = yaml.safe_load(text)
-
-    assert issue_form["title"] == "[Optimize] "
+    )
+    issue_form = yaml.safe_load(
+        files[Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml")]
+    )
     fields = {
         field["attributes"]["label"]: field
         for field in issue_form["body"]
@@ -229,42 +256,37 @@ def test_issue_form_matches_strict_parser_and_configured_target() -> None:
     assert fields["Configured target"]["attributes"]["placeholder"] == (
         "claims-agent"
     )
-
     sections: list[str] = []
     for heading in REQUIRED_HEADINGS:
         field = fields[heading]
         attributes = field["attributes"]
-        if field["type"] == "dropdown":
-            value = attributes["options"][attributes.get("default", 0)]
-        else:
-            value = attributes["placeholder"]
+        value = (
+            attributes["options"][attributes.get("default", 0)]
+            if field["type"] == "dropdown"
+            else attributes["placeholder"]
+        )
         sections.append(f"### {heading}\n\n{value}\n")
-    rendered_body = "\n".join(sections)
-    assert "```" not in rendered_body
+
     parsed = parse_optimization_issue_request(
         issue_number=42,
         repository="octo-org/agents",
-        body=rendered_body,
+        body="\n".join(sections),
     )
 
     assert parsed.target == "claims-agent"
-    assert {asset.role for asset in parsed.datasets} == {
-        "development",
-        "validation",
-    }
+    assert issue_form["labels"] == ["needs-triage"]
 
 
-def test_bundle_copies_tenzing_snapshot_license_and_context() -> None:
+def test_bundle_copies_skill_snapshot_and_workspace_context() -> None:
     files = generate_repository_agent_bundle(
         _request(),
         oidc_subject="repository_id:123",
     )
-
     skill_root = Path(".github/skills/foundry-agent-optimizer")
+
     assert skill_root / "SKILL.md" in files
     assert skill_root / "ADAPTER_MAPPING.md" in files
     assert skill_root / "references/tenzing/LICENSE" in files
-    assert skill_root / "references/tenzing/climb.md" in files
     assert "MIT License" in files[
         skill_root / "references/tenzing/LICENSE"
     ]
@@ -274,366 +296,106 @@ def test_bundle_copies_tenzing_snapshot_license_and_context() -> None:
     assert "repository_id:123" in context
     assert "tenant-id" not in context
     assert "client-id" not in context
-    assert "durable repository policy" in context
-    assert "merge exactly one eligible candidate PR" in context
-    assert "Exceptional action" in context
-    assert "refs/heads/foundry-opt/state/issue-<N>" in context
-    assert "COPILOT_ASSIGNMENT_TOKEN" in context
-    assert "foundry-opt init cannot create Actions secrets" in context
-    assert "installation token" in context
+    assert "one persistent draft workspace pull request" in context
+    assert "same workspace pull request" in context
+    assert "secondary optimization" in context
+    assert "specialist pull requests" not in context
+    assert "workspace pull-request bootstrap only" in context
+    assert "Actor ledger" in context
+    assert "attributed to the eligible user" in context
+    assert "github-actions[bot]" in context
+    assert "verified provenance capture" in context
+    assert "durable public evidence" in context
+    assert "foundry-optimizer[bot]" in context
+    assert "broker/workload-identity exchange" in context
+    assert "no private key" in context
+    assert "must not change candidate or lineage interfaces" in context
 
 
-def test_generated_skill_documents_issue_only_orchestration() -> None:
+def test_workspace_workflow_owns_intake_lifecycle_and_same_pr_resume() -> None:
     files = generate_repository_agent_bundle(
         _request(),
         oidc_subject="repository_id:123",
     )
-    skill = files[
-        Path(".github/skills/foundry-agent-optimizer/SKILL.md")
+    text = files[
+        Path(".github/workflows/foundry-optimization-workspace.yml")
     ]
-    normalized = " ".join(skill.split())
-
-    assert "Create one `[Optimize]` issue" in skill
-    assert "foundry-opt steward advance --issue <number>" in skill
-    assert "native Copilot session" in skill
-    assert "Merge exactly one eligible candidate pull request" in normalized
-    assert "Do not start a campaign with `workflow_dispatch`" in skill
-    assert "foundry-opt optimize run --issue" not in skill
-    assert "The only exceptional human gate" in skill
-    assert "Foundry exact candidate check" in skill
-    assert "deployment identity" in skill
-    assert "`COPILOT_ASSIGNMENT_TOKEN`" in skill
-    assert "fine-grained personal access token" in skill
-    assert "GitHub App user-to-server token" in normalized
-    assert "installation tokens are not supported" in normalized
-    assert "Metadata: read" in skill
-    assert "Actions, Contents, Issues, and Pull requests: read/write" in skill
-    assert "`foundry-opt init` cannot create Actions secrets" in normalized
-    assert "Never commit the token" in skill
-
-
-def test_generated_issue_form_explains_normal_and_exceptional_user_actions() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    issue_form = yaml.safe_load(
-        files[Path(".github/ISSUE_TEMPLATE/foundry-optimization.yml")]
-    )
-    guidance = issue_form["body"][0]["attributes"]["value"]
-
-    assert "Creating this one issue starts the campaign" in guidance
-    assert "merge exactly one" in guidance
-    assert "immutable spec PR" in guidance
-    assert "root issue dashboard" in guidance
-
-
-def test_bundle_generates_transport_and_verification_workflows() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-
-    workflow_paths = {
-        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
-        Path(".github/workflows/foundry-optimization-reconcile.yml"),
-        Path(
-            ".github/workflows/"
-            "foundry-optimization-capability.yml"
-        ),
-        Path(
-            ".github/workflows/"
-            "foundry-optimization-deployment-bridge.yml"
-        ),
-        Path(".github/workflows/foundry-optimization-handoff.yml"),
-        Path(".github/workflows/foundry-exact-candidate-check.yml"),
-    }
-    assert workflow_paths <= set(files)
-    for path in workflow_paths:
-        document = yaml.safe_load(files[path])
-        assert document["jobs"]
-        text = files[path]
-        assert "foundry-opt" in text or "foundry_opt" in text
-        assert "GH_TOKEN: ${{ github.token }}" in text
-        assert "@main" not in text
-        assert "@master" not in text
-    handoff = yaml.safe_load(
-        files[Path(".github/workflows/foundry-optimization-handoff.yml")]
-    )
-    assert handoff[True] == {
-        "pull_request_target": {
-            "types": ["opened", "synchronize", "reopened"],
-            "paths": [".foundry-optimizer/handoffs/**"],
-        },
-        "schedule": [{"cron": "*/5 * * * *"}],
-        "workflow_dispatch": {
-            "inputs": {
-                "pull_request": {
-                    "description": (
-                        "Optional internal handoff pull request number to retry"
-                    ),
-                    "required": False,
-                    "type": "number",
-                }
-            }
-        },
-    }
-
-
-def test_assignment_workflows_require_dedicated_user_token_secret() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    assignment_paths = (
-        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
-        Path(".github/workflows/foundry-optimization-reconcile.yml"),
-        Path(
-            ".github/workflows/foundry-optimization-capability.yml"
-        ),
-    )
-
-    for path in assignment_paths:
-        workflow = yaml.safe_load(files[path])
-        job = next(iter(workflow["jobs"].values()))
-        assert job["env"]["GH_TOKEN"] == "${{ github.token }}"
-        assert job["steps"][0] == {
-            "name": "Require Copilot assignment token",
-            "env": {
-                "COPILOT_ASSIGNMENT_TOKEN": (
-                    "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
-                ),
-            },
-            "shell": "bash",
-            "run": (
-                'if [ -z "$COPILOT_ASSIGNMENT_TOKEN" ]; then\n'
-                "  echo \"Missing required Actions secret: "
-                'COPILOT_ASSIGNMENT_TOKEN" >&2\n'
-                "  exit 1\n"
-                "fi\n"
-            ),
-        }
-        transport_step = job["steps"][-1]
-        assert transport_step["env"]["COPILOT_ASSIGNMENT_TOKEN"] == (
-            "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
-        )
-        assert (
-            "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
-            not in files[path]
-        )
-
-    for path in (
-        Path(
-            ".github/workflows/"
-            "foundry-optimization-deployment-bridge.yml"
-        ),
-        Path(".github/workflows/foundry-exact-candidate-check.yml"),
-    ):
-        assert "COPILOT_ASSIGNMENT_TOKEN" not in files[path]
-
-
-def test_generated_bundle_contains_no_azure_secret_contract() -> None:
-    generated = "\n".join(
-        generate_repository_agent_bundle(
-            _request(),
-            oidc_subject="repository_id:123",
-        ).values()
-    )
-
-    assert "AZURE_CLIENT_SECRET" not in generated
-    assert "client-secret" not in generated.casefold()
-    assert "repository_id:123" in generated
-
-
-def test_bundle_ignores_runtime_state_but_not_approved_specs() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-
-    ignore = files[Path(".foundry-optimizer/.gitignore")]
-    assert ignore == "campaigns/\nworktrees/\ncapability-worktrees/\n"
-    assert "specs/" not in ignore
-
-
-def test_candidate_check_never_sources_pr_controlled_shell_content() -> None:
-    workflow = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )[Path(".github/workflows/foundry-exact-candidate-check.yml")]
-
-    assert "source candidate.env" not in workflow
-    assert "> candidate.env" not in workflow
-    assert "GITHUB_OUTPUT" in workflow
-    assert (
-        r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
-        in workflow
-    )
-    assert "steps.metadata.outputs.candidate" in workflow
-    assert "contains(github.event.pull_request.body" in workflow
-    assert "marker.group(3)" in workflow
-    assert "len(markers) != 1" in workflow
-    assert "campaign_match" not in workflow
-    assert "Candidate issue: #" not in workflow
-    assert (
-        'foundry-opt optimize apply --issue "$ISSUE" '
-        '--candidate "$CANDIDATE" --verify-only'
-    ) in workflow
-    for executable_pr_code in (
-        "uv run pytest",
-        "npm test",
-        "python agent/",
-        "bash ./",
-        "sh ./",
-    ):
-        assert executable_pr_code not in workflow
-
-
-def test_dispatch_inputs_are_validated_through_environment_variables() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    recovery = files[
-        Path(".github/workflows/foundry-optimization-reconcile.yml")
-    ]
-    deployment = files[
-        Path(
-            ".github/workflows/"
-            "foundry-optimization-deployment-bridge.yml"
-        )
-    ]
-
-    assert '--issue "${{ inputs.issue }}"' not in recovery
-    assert "TRUSTED_ISSUE_NUMBER: ${{ inputs.issue }}" in recovery
-    assert '--issue "${{ inputs.issue }}"' not in deployment
-    assert "REQUESTED_ISSUE: ${{ inputs.issue }}" in deployment
-    assert (
-        'foundry-opt steward deployment-bridge --issue "$REQUESTED_ISSUE"'
-        in " ".join(deployment.split())
-    )
-    assert "31;echo" not in deployment
-
-
-def test_state_ref_workflows_fetch_full_history() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-
-    for path in (
-        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
-        Path(".github/workflows/foundry-optimization-reconcile.yml"),
-        Path(".github/workflows/foundry-optimization-capability.yml"),
-        Path(
-            ".github/workflows/"
-            "foundry-optimization-deployment-bridge.yml"
-        ),
-    ):
-        assert "fetch-depth: 0" in files[path]
-        assert "ref: ${{ github.event.repository.default_branch }}" in (
-            files[path]
-        )
-
-
-def test_privileged_workflows_disable_project_uv_and_dotenv_configuration() -> (
-    None
-):
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-
-    for path in (
-        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
-        Path(".github/workflows/foundry-optimization-reconcile.yml"),
-        Path(".github/workflows/foundry-optimization-capability.yml"),
-        Path(
-            ".github/workflows/"
-            "foundry-optimization-deployment-bridge.yml"
-        ),
-    ):
-        normalized = " ".join(files[path].split())
-        assert normalized.count("uv run --no-project") == normalized.count(
-            "uv run --no-project --no-config --no-env-file"
-        ), path
-        assert "uv run --no-project --with" not in normalized, path
-
-
-def test_deployment_workflow_uses_only_deployment_oidc_identity() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    deployment = files[
-        Path(
-            ".github/workflows/"
-            "foundry-optimization-deployment-bridge.yml"
-        )
-    ]
-    transport = files[
-        Path(".github/workflows/foundry-optimization-reconcile.yml")
-    ]
-
-    assert "AZURE_DEPLOYMENT_CLIENT_ID" in deployment
-    assert "AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}" not in deployment
-    assert "azure/login@" not in transport
-    assert "AZURE_" not in transport
-
-
-def test_capability_workflow_uses_optimizer_oidc_without_domain_decisions() -> (
-    None
-):
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    path = Path(
-        ".github/workflows/foundry-optimization-capability.yml"
-    )
-    text = files[path]
     workflow = yaml.safe_load(text)
 
-    assert workflow[True] == {
-        "push": {"branches": ["foundry-opt/state/issue-*"]},
-        "schedule": [{"cron": "*/5 * * * *"}],
-        "workflow_dispatch": {
-            "inputs": {
-                "issue": {
-                    "description": (
-                        "Optional tracked optimization issue number to retry"
-                    ),
-                    "required": False,
-                    "type": "number",
-                }
-            }
-        },
+    assert set(workflow[True]) == {
+        "issues",
+        "issue_comment",
+        "pull_request_target",
+        "schedule",
+        "workflow_run",
+        "workflow_dispatch",
     }
     assert workflow["permissions"] == {
+        "actions": "write",
         "contents": "write",
-        "id-token": "write",
         "issues": "write",
+        "pull-requests": "write",
     }
-    job = workflow["jobs"]["execute-capability"]
-    assert job["environment"] == "acceptance"
-    assert job["env"]["AZURE_CLIENT_ID"] == "${{ vars.AZURE_CLIENT_ID }}"
-    assert "AZURE_DEPLOYMENT_CLIENT_ID" not in text
-    assert "azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43" in (
-        text
+    assert text.count("COPILOT_ASSIGNMENT_TOKEN") == 3
+    assert "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}" not in text
+    assert text.count("GH_TOKEN: ${{ github.token }}") >= 2
+    ingest = next(
+        step
+        for step in workflow["jobs"]["advance"]["steps"]
+        if step.get("name") == "Ingest trusted event or retry the workspace"
     )
-    assert "python -m foundry_opt.orchestration.capability_bridge" in text
-    assert "ref: ${{ github.event.repository.default_branch }}" in text
-    assert "fetch-depth: 0" in text
-    assert "pull_request" not in workflow[True]
-    assert "github.event.pull_request" not in text
-    assert "gh pr checkout" not in text
-    assert "select candidate" not in text.casefold()
-    assert "choose candidate" not in text.casefold()
-    assert "change policy" not in text.casefold()
-    assert "COPILOT_ASSIGNMENT_TOKEN" in text
+    assert ingest["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "COPILOT_ASSIGNMENT_TOKEN" not in ingest["env"]
+    assert ingest["env"]["FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"] == (
+        "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    )
+    assert (
+        'unset FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN'
+        in ingest["run"]
+    )
+    assert (
+        'FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN="$workspace_pr_bootstrap_token"'
+        in ingest["run"]
+    )
+    assert ingest["run"].index(
+        "unset FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"
+    ) < ingest["run"].index("gh api")
+    cleanup = next(
+        step
+        for step in workflow["jobs"]["advance"]["steps"]
+        if step.get("name")
+        == (
+            "Remove transient Copilot assignment marker after verified "
+            "provenance capture"
+        )
+    )
+    assert set(cleanup["env"]) == {
+        "ASSIGNMENT_REVISION",
+        "COPILOT_ASSIGNMENT_TOKEN",
+        "ISSUE",
+        "PULL_REQUEST",
+        "TRUSTED_REPOSITORY",
+    }
+    assert '"${command[@]}" advance --issue "$ISSUE" --json' in text
+    assert "intake" in text
+    assert '--event-path "$TRUSTED_EVENT_PATH"' in text
+    assert '--event-name "$TRUSTED_EVENT_NAME"' in text
+    assert '--delivery-id "$TRUSTED_RUN_ID"' in text
+    assert 'args+=(--base-commit "$(git rev-parse HEAD)")' in text
+    assert "Dispatch trusted workspace operations" in text
+    assert "gh workflow run foundry-optimization-operations.yml" in text
+    assert '--ref "$DEFAULT_BRANCH"' in text
+    assert '-f "issue=$ISSUE"' in text
+    assert "foundry-opt:workspace-pr:issue-" in text
+    assert "pull_request_target" in text
+    assert "github.event.repository.default_branch" in text
+    assert "ref: ${{ github.event.pull_request.head.sha }}" not in text
+    assert "azure/login@" not in text
+    assert "id-token: write" not in text
+    assert "foundry-opt steward advance" not in text
 
 
-def test_deployment_bridge_uses_selected_actions_environment() -> None:
+def test_operations_workflow_uses_optimizer_oidc_and_owns_retention() -> None:
     request = replace(
         _request(),
         set_github_variables=True,
@@ -643,308 +405,286 @@ def test_deployment_bridge_uses_selected_actions_environment() -> None:
         request,
         oidc_subject="repository_id:123",
     )
-    deployment = yaml.safe_load(
-        files[
-            Path(
-                ".github/workflows/"
-                "foundry-optimization-deployment-bridge.yml"
-            )
-        ]
-    )
-
-    assert deployment["jobs"]["deployment-bridge"]["environment"] == (
-        "production"
-    )
-    capability = yaml.safe_load(
-        files[
-            Path(
-                ".github/workflows/"
-                "foundry-optimization-capability.yml"
-            )
-        ]
-    )
-    assert capability["jobs"]["execute-capability"]["environment"] == (
-        "production"
-    )
-
-
-def test_bundle_generates_transport_only_issue_intake_workflow() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    path = Path(
-        ".github/workflows/foundry-optimization-issue-intake.yml"
-    )
-
-    assert path in files
-    workflow = yaml.safe_load(files[path])
-    assert workflow[True]["issues"]["types"] == [
-        "opened",
-        "edited",
-        "reopened",
-        "closed",
+    text = files[
+        Path(".github/workflows/foundry-optimization-operations.yml")
     ]
-    assert workflow[True]["pull_request"]["types"]
-    assert "workflow_run" not in workflow[True]
-    assert workflow["permissions"] == {
-        "contents": "write",
-        "issues": "write",
-        "pull-requests": "write",
-    }
-    assert (
-        workflow["jobs"]["bridge"]["if"]
-        == (
-            "github.event_name != 'issues' || "
-            "github.event.action != 'opened' || "
-            "startsWith(github.event.issue.title, '[Optimize] ')"
-        )
-    )
-    text = files[path]
-    assert "github.event_path" in text
-    assert "github.event_name" in text
-    assert "github.repository_id" in text
-    assert "github.run_id" in text
-    assert "foundry_opt.orchestration.issue_intake" in text
-    assert "fetch-depth: 0" in text
-    assert "id-token: write" not in text
-    assert "pull-requests: write" in text
-    assert "actions: write" not in text
-    assert "AZURE_" not in text
-    assert text.count("github.event.issue.title") == 1
-    assert "github.event.issue.body" not in text
-    assert "optimize spec" not in text
-    assert "optimize run" not in text
-    assert "optimize apply" not in text
-    assert "optimize reconcile" not in text
-
-
-def test_bundle_generates_base_context_handoff_transport_workflow() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    path = Path(
-        ".github/workflows/foundry-optimization-handoff.yml"
-    )
-
-    assert path in files
-    text = files[path]
     workflow = yaml.safe_load(text)
-    assert workflow[True] == {
-        "pull_request_target": {
-            "types": ["opened", "synchronize", "reopened"],
-            "paths": [".foundry-optimizer/handoffs/**"],
-        },
-        "schedule": [{"cron": "*/5 * * * *"}],
-        "workflow_dispatch": {
-            "inputs": {
-                "pull_request": {
-                    "description": (
-                        "Optional internal handoff pull request number to retry"
-                    ),
-                    "required": False,
-                    "type": "number",
-                }
-            }
-        },
-    }
+
     assert workflow["permissions"] == {
+        "actions": "write",
+        "checks": "write",
         "contents": "write",
+        "id-token": "write",
         "issues": "write",
         "pull-requests": "write",
     }
-    job = workflow["jobs"]["apply-handoff"]
-    assert "environment" not in job
-    assert workflow["concurrency"] == {
-        "group": "foundry-internal-handoff",
-        "cancel-in-progress": False,
-    }
-    checkout = next(
-        step
-        for step in job["steps"]
-        if step.get("uses", "").startswith("actions/checkout@")
-    )
-    assert checkout["with"]["ref"] == (
-        "${{ github.event.repository.default_branch }}"
-    )
-    assert checkout["with"]["fetch-depth"] == 0
-    assert "persist-credentials" not in checkout["with"]
-    assert "github.event.pull_request.head.sha" not in str(checkout)
-    assert "python -m foundry_opt.orchestration.handoff" in text
-    assert "TRUSTED_EVENT_PATH: ${{ github.event_path }}" in text
-    assert "TRUSTED_EVENT_NAME: ${{ github.event_name }}" in text
-    assert "TRUSTED_PULL_REQUEST_NUMBER: ${{ inputs.pull_request }}" in text
-    assert "TRUSTED_REPOSITORY: ${{ github.repository }}" in text
-    assert "TRUSTED_REPOSITORY_ID: ${{ github.repository_id }}" in text
-    assert "TRUSTED_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}" in (
-        text
-    )
-    assert "COPILOT_ASSIGNMENT_TOKEN" in text
-    assert "pull_request.head.ref }}" not in text
-    assert "pull_request.head.sha }}" not in text
-    assert "github.event.pull_request.base.ref ==" in text
-    assert "github.event.sender.id == 198982749" in text
-    assert "github.event.pull_request.user.id == 198982749" in text
-    assert "github.event.pull_request.user.login == 'Copilot'" in text
-    assert "TRUSTED_HANDOFF_PRODUCT_COMMITS:" in text
-    assert "gh auth setup-git" not in text
-    assert "uv run --no-project --no-config --no-env-file" in text
-    assert "source " not in text
-    assert "id-token" not in workflow["permissions"]
-    assert "actions" not in workflow["permissions"]
-
-
-def test_pull_request_workflows_skip_internal_handoff_only_changes() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    for path in (
-        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
-        Path(".github/workflows/foundry-exact-candidate-check.yml"),
-    ):
-        workflow = yaml.safe_load(files[path])
-        assert workflow[True]["pull_request"]["paths-ignore"] == [
-            ".foundry-optimizer/handoffs/**"
-        ]
-
-
-def test_bundle_generates_transport_recovery_and_deployment_workflows() -> None:
-    files = generate_repository_agent_bundle(
-        _request(),
-        oidc_subject="repository_id:123",
-    )
-    event_path = Path(
-        ".github/workflows/foundry-optimization-issue-intake.yml"
-    )
-    recovery_path = Path(
-        ".github/workflows/foundry-optimization-reconcile.yml"
-    )
-    deployment_path = Path(
-        ".github/workflows/foundry-optimization-deployment-bridge.yml"
-    )
-
-    assert {event_path, recovery_path, deployment_path} <= set(files)
-    assert Path(
-        ".github/workflows/foundry-optimization-control.yml"
-    ) not in files
-    assert Path(
-        ".github/workflows/foundry-post-deployment-check.yml"
-    ) not in files
-
-    events = yaml.safe_load(files[event_path])
-    assert events[True]["issues"]["types"] == [
-        "opened",
-        "edited",
-        "reopened",
-        "closed",
-    ]
-    assert events[True]["pull_request"]["types"] == [
-        "opened",
-        "synchronize",
-        "reopened",
-        "edited",
-        "closed",
-    ]
-    assert "workflow_run" not in events[True]
-    assert events["permissions"] == {
-        "contents": "write",
-        "issues": "write",
-        "pull-requests": "write",
-    }
-    assert "concurrency" not in events
-
-    recovery = yaml.safe_load(files[recovery_path])
-    assert recovery[True]["push"]["branches"] == [
-        "foundry-opt/state/issue-*"
-    ]
-    assert recovery[True]["schedule"]
-    assert recovery[True]["workflow_dispatch"]["inputs"]["issue"]["type"] == (
-        "number"
-    )
-    assert recovery["permissions"] == {
-        "contents": "write",
-        "issues": "write",
-        "pull-requests": "write",
-    }
-    assert "id-token" not in recovery["permissions"]
-    assert "TRUSTED_STATE_REF: ${{ github.ref_name }}" in files[recovery_path]
-
-    deployment = yaml.safe_load(files[deployment_path])
-    assert deployment[True]["push"]["branches"] == [
-        "foundry-opt/state/issue-*"
-    ]
-    assert deployment[True]["schedule"]
-    assert deployment[True]["workflow_run"] == {
+    assert workflow["jobs"]["operate"]["environment"] == "production"
+    assert workflow[True]["workflow_run"] == {
         "workflows": ["Foundry deployment"],
         "types": ["completed"],
     }
-    assert deployment[True]["workflow_dispatch"]["inputs"]["issue"]["type"] == (
-        "number"
+    assert "AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}" in text
+    assert "AZURE_DEPLOYMENT_CLIENT_ID" not in text
+    assert "foundry-opt workspace operations execute" in (
+        " ".join(text.split())
     )
-    assert deployment["permissions"] == {
-        "actions": "write",
-        "contents": "write",
-        "id-token": "write",
+    assert "foundry-opt workspace operations reconcile" in (
+        " ".join(text.split())
+    )
+    assert "gh run download" in text
+    assert "workspace-resume.ndjson" in text
+    assert "Publish trusted exact verification check and ready finalized workspace pull request" in text
+    assert 'repos/{repository}/commits/{head_sha}/check-runs' in text
+    assert 'repos/{repository}/check-runs/{check_run_id}' in text
+    assert '"foundry-opt",' in text
+    assert '"workspace",' in text
+    assert '"verify",' in text
+    assert '"ready",' in text
+    assert '"assign",' in text
+    assert "gh pr comment" not in text
+    assert "@copilot" not in text
+    assert "head -25" in text
+    assert "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}" not in text
+    operate_steps = {
+        step.get("name"): step
+        for step in workflow["jobs"]["operate"]["steps"]
     }
-    assert recovery["concurrency"] == {
-        "group": "foundry-optimization-effects",
-        "cancel-in-progress": False,
-    }
-    assert "github.event.workflow_run.id" in deployment["concurrency"][
-        "group"
-    ]
-    assert deployment["concurrency"]["cancel-in-progress"] is False
-    bridge = files[deployment_path]
-    assert "AZURE_DEPLOYMENT_CLIENT_ID" in bridge
-    assert "AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}" not in bridge
-    assert (
-        "uv run --no-project --no-config --no-env-file "
-        '--with "$OPTIMIZER_PACKAGE" '
-        "foundry-opt steward deployment-bridge"
-    ) in " ".join(bridge.split())
-    assert "uv tool install" not in bridge
-    assert "foundry-optimization-deployment-result" in bridge
-    assert "publication-result-auto" in bridge
-    assert "gh workflow run foundry-optimization-reconcile.yml" in bridge
-    assert 'environment: "acceptance"' in bridge
-
-    transport_text = files[event_path] + files[recovery_path]
-    assert "azure/login@" not in transport_text
-    assert "AZURE_" not in transport_text
-    assert "id-token: write" not in transport_text
-    for forbidden in (
-        "optimize spec",
-        "optimize run",
-        "optimize candidate",
-        "optimize apply",
-        "select candidate",
-        "evaluate candidate",
-        "gh pr create",
+    for name in (
+        "Execute trusted workspace operations",
+        "Reconcile authenticated deployment result",
+        "Publish trusted exact verification check and ready finalized workspace pull request",
     ):
-        assert forbidden not in transport_text.casefold()
+        assert operate_steps[name]["env"]["GH_TOKEN"] == "${{ github.token }}"
+        assert "COPILOT_ASSIGNMENT_TOKEN" not in operate_steps[name]["env"]
+    assert (
+        'if [ "$TRUSTED_EVENT_NAME" = "push" ] &&'
+        in text
+    )
+    assert "ref: ${{ github.event.repository.default_branch }}" in text
+    assert "push:" not in text
+    for forbidden in (
+        "optimize reconcile",
+        "capability_bridge",
+        "deployment_bridge",
+        "worker issue",
+        "internal handoff",
+        "campaign-drafts",
+        "campaign-evaluate",
+    ):
+        assert forbidden not in text
 
 
-def test_workflow_completion_trigger_is_limited_to_discovered_deployment() -> None:
+def test_operations_workflow_resumes_same_workspace_pull_request_without_creating_new_work() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-optimization-operations.yml")
+    ]
+    workflow = yaml.safe_load(text)
+
+    assert "Resume same workspace pull request when trusted state needs Copilot" in text
+    assert text.index(
+        "Publish trusted exact verification check and ready finalized workspace pull request"
+    ) < text.index(
+        "Resume same workspace pull request when trusted state needs Copilot"
+    )
+    assert "workspace resume payload is invalid" in text
+    assert text.index('if resume is None:') < text.index(
+        "entries.add(issue)"
+    )
+    assert "foundry-opt" in text
+    assert "workspace" in text
+    assert "assign" in text
+    assert "gh pr comment" not in text
+    assert "COPILOT_ASSIGNMENT_TOKEN" in text
+    assert "GH_TOKEN: ${{ github.token }}" in text
+    assert "FOUNDRY_OPT_DEPLOYMENT_GH_TOKEN: ${{ github.token }}" in text
+    assert "deployment_run_id:" in text
+    assert "inputs.deployment_run_id != ''" in text
+    assert (
+        "github.event.workflow_run.id || inputs.deployment_run_id"
+        in text
+    )
+    assert (
+        'environment["GH_TOKEN"] = '
+        'environment["COPILOT_ASSIGNMENT_TOKEN"]'
+    ) not in text
+    resume_step = next(
+        step
+        for step in workflow["jobs"]["operate"]["steps"]
+        if step.get("name")
+        == "Resume same workspace pull request when trusted state needs Copilot"
+    )
+    assert resume_step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert resume_step["env"]["COPILOT_ASSIGNMENT_TOKEN"] == (
+        "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    )
+    assert 'print(result.stderr, end="", file=sys.stderr)' in text
+    assert "raise SystemExit(result.returncode)" in text
+    assert "gh pr create" not in text
+    assert "gh issue edit" not in text
+    assert "--add-assignee" not in text
+    assert "worker issue" not in text
+
+
+def test_workspace_workflow_imports_candidate_envelope_from_exact_pr_head() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-optimization-workspace.yml")
+    ]
+
+    assert "workspace-candidate.json" in text
+    assert 'git fetch --no-tags origin "$head_sha"' in text
+    assert 'git show "$head_sha:$envelope_path"' in text
+    assert 'envelope["kind"] != "workspace_candidate_proposal"' in text
+    assert "Workspace candidate envelope is stale" in text
+    assert '--candidate-manifest "$manifest_file"' in text
+    assert 'branch="foundry-opt/workspace/issue-$ISSUE"' in text
+    assert 'export TRUSTED_HEAD_SHA="$head_sha"' in text
+    assert 'export TRUSTED_EXPECTED_REVISION="$expected_revision"' in text
+    assert (
+        'export TRUSTED_CANDIDATE_IMPORT_ORIGIN="$import_origin"'
+        in text
+    )
+    workflow = yaml.safe_load(text)
+    steps = {
+        step.get("name"): step
+        for step in workflow["jobs"]["advance"]["steps"]
+    }
+    ingest = steps["Ingest trusted event or retry the workspace"]
+    cleanup = steps[
+        "Remove transient Copilot assignment marker after verified "
+        "provenance capture"
+    ]
+    assert ingest["id"] == "ingest"
+    assert "COPILOT_ASSIGNMENT_TOKEN" not in ingest.get("env", {})
+    assert ingest["env"]["FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN"] == (
+        "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    )
+    assert cleanup["if"] == (
+        "steps.ingest.outputs.cleanup_pull_request != ''"
+    )
+    assert cleanup["env"]["COPILOT_ASSIGNMENT_TOKEN"] == (
+        "${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}"
+    )
+    assert "cleanup-assignment" in cleanup["run"]
+    assert "--assignment-revision" in cleanup["run"]
+    assert "cleanup_pull_request=" in text
+    assert "cleanup_assignment_revision=" in text
+    assert "GH_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}" not in text
+
+
+def test_workspace_workflow_scans_candidate_envelopes_from_trusted_schedule() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-optimization-workspace.yml")
+    ]
+
+    assert 'cron: "*/5 * * * *"' in text
+    assert "scan-candidate-envelopes:" in text
+    assert "github.event_name == 'schedule'" in text
+    assert ".foundry-optimizer/workspace-candidate.json" in text
+    assert "foundry-opt/state/issue-" in text
+    assert '"foundry-optimization-workspace.yml"' in text
+    assert 'f"issue={issue}"' in text
+    assert '"candidate_import_origin=schedule"' in text
+    assert 'export TRUSTED_ACK_COMMENT_ID=""' in text
+    assert 'echo "cleanup_pull_request=$pull_request"' in text
+    assert 'echo "cleanup_assignment_revision=$expected_revision"' in text
+    assert 'workflows: ["CodeQL"]' in text
+    assert "github.event.workflow_run.conclusion == 'success'" in text
+
+
+def test_workspace_workflow_imports_after_copilot_completion_comment() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-optimization-workspace.yml")
+    ]
+
+    assert "issue_comment:" in text
+    assert "github.event.comment.user.login == 'Copilot'" in text
+    assert 'event_name == "issue_comment"' in text
+    assert '[ "$TRUSTED_EVENT_NAME" = "issue_comment" ]' in text
+    assert 'import_origin="issue_comment"' in text
+    assert "TRUSTED_ACK_COMMENT_ID" in text
+
+
+def test_workspace_steward_posts_revision_bound_candidate_acknowledgement() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/agents/foundry-optimization-steward.agent.md")
+    ]
+
+    assert "workspace-candidate-ack:" in text
+    assert "<assignment-marker-key>" in text
+    assert "<candidate-id>" in text
+    assert "<git rev-parse HEAD>" in text
+    normalized = " ".join(text.split())
+    assert (
+        "trusted scheduled import can proceed only from a verified "
+        "GitHub-signed Copilot source commit made through the linked "
+        "`web-flow` committer if GitHub does not publish "
+        "the acknowledgement comment"
+        in normalized
+    )
+
+
+def test_bundle_preserves_customer_deployment_workflow() -> None:
     files = generate_repository_agent_bundle(
         _request(),
         oidc_subject="repository_id:123",
         deployment_workflow_name="Deploy support agent",
     )
-    deployment = yaml.safe_load(
+    operations = yaml.safe_load(
         files[
-            Path(
-                ".github/workflows/"
-                "foundry-optimization-deployment-bridge.yml"
-            )
+            Path(".github/workflows/foundry-optimization-operations.yml")
         ]
     )
 
-    assert deployment[True]["workflow_run"] == {
+    assert Path(".github/workflows/deploy-foundry-agent.yml") not in files
+    assert operations[True]["workflow_run"] == {
         "workflows": ["Deploy support agent"],
         "types": ["completed"],
     }
+
+
+def test_exact_check_never_executes_untrusted_pull_request_code() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = files[
+        Path(".github/workflows/foundry-exact-candidate-check.yml")
+    ]
+
+    assert "shell: python" in text
+    assert "PR_BODY: ${{ github.event.pull_request.body }}" in text
+    assert '"foundry-opt",' in text
+    assert '"workspace",' in text
+    assert '"verify",' in text
+    assert 'GITHUB_STEP_SUMMARY' in text
+    assert 'summary_markdown' in text
+    assert "source " not in text
+    assert "eval " not in text
+    assert "bash -c" not in text
+    assert "${{ github.event.pull_request.body }}" not in "\n".join(
+        line for line in text.splitlines() if line.lstrip().startswith("run:")
+    )
+    assert 'optimize apply --issue "$ISSUE"' not in text
 
 
 def test_generated_workflows_are_yaml_safe_and_action_pinned() -> None:
@@ -955,13 +695,8 @@ def test_generated_workflows_are_yaml_safe_and_action_pinned() -> None:
         ),
         oidc_subject="repository_id:123",
     )
-    workflows = {
-        path: text
-        for path, text in files.items()
-        if path.parts[:2] == (".github", "workflows")
-    }
 
-    for path, text in workflows.items():
+    for path, text in _workflows(files).items():
         document = yaml.safe_load(text)
         assert document["jobs"], path
         for line in text.splitlines():
@@ -975,32 +710,85 @@ def test_generated_workflows_are_yaml_safe_and_action_pinned() -> None:
         assert "gh pr create" not in text
         assert "source " not in text
 
-    deployment = yaml.safe_load(
-        workflows[
-            Path(
-                ".github/workflows/"
-                "foundry-optimization-deployment-bridge.yml"
-            )
+    operations = yaml.safe_load(
+        files[
+            Path(".github/workflows/foundry-optimization-operations.yml")
         ]
     )
-    assert deployment["jobs"]["deployment-bridge"]["environment"] == (
+    assert operations["jobs"]["operate"]["environment"] == (
         'prod"\\nrun: echo owned'
     )
+    assert Path(".github/workflows/deploy-foundry-agent.yml") not in files
 
 
-def test_bundle_generates_copilot_steward_domain_instructions() -> None:
+def test_privileged_workflows_use_pinned_isolated_installs() -> None:
     files = generate_repository_agent_bundle(
         _request(),
         oidc_subject="repository_id:123",
     )
-    steward = files[
-        Path(".github/agents/foundry-optimization-steward.agent.md")
-    ]
 
-    assert "Git-state inbox" in steward
-    assert "canonical steward interfaces" in steward
-    assert "foundry-opt steward advance" in steward
-    assert "raw evidence" in steward
-    assert "transport workflows own GitHub" in steward
-    assert "stop immediately" in steward
-    assert "retained-improvement evaluation" in steward
+    for path in (
+        Path(".github/workflows/foundry-optimization-workspace.yml"),
+        Path(".github/workflows/foundry-optimization-operations.yml"),
+    ):
+        text = files[path]
+        assert "fetch-depth: 0" in text
+        assert "ref: ${{ github.event.repository.default_branch }}" in text
+        assert "--no-project --no-config --no-env-file" in (
+            " ".join(text.split())
+        )
+
+
+def test_bundle_contains_no_azure_secret_contract() -> None:
+    files = generate_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+    )
+    text = "\n".join(files.values()).casefold()
+
+    assert "azure_client_secret" not in text
+    assert "client-secret" not in text
+    assert "password:" not in text
+
+
+def test_previous_generated_surfaces_remain_available_for_safe_cleanup() -> None:
+    previous = legacy_repository_agent_bundle(
+        _request(),
+        oidc_subject="repository_id:123",
+        deployment_workflow_name="Deploy support agent",
+    )
+
+    for path in (
+        Path(".github/agents/foundry-optimization-planner.agent.md"),
+        Path(".github/agents/foundry-candidate-designer.agent.md"),
+        Path(".github/agents/foundry-candidate-applier.agent.md"),
+        Path(".github/workflows/foundry-optimization-issue-intake.yml"),
+        Path(".github/workflows/foundry-optimization-reconcile.yml"),
+        Path(".github/workflows/foundry-optimization-handoff.yml"),
+        Path(".github/workflows/foundry-optimization-capability.yml"),
+        Path(
+            ".github/workflows/"
+            "foundry-optimization-deployment-bridge.yml"
+        ),
+        Path(".github/workflows/foundry-optimization-control.yml"),
+        Path(".github/workflows/foundry-post-deployment-check.yml"),
+    ):
+        assert path in previous
+
+    bridge = previous[
+        Path(
+            ".github/workflows/"
+            "foundry-optimization-deployment-bridge.yml"
+        )
+    ]
+    assert "workflows: [\"Deploy support agent\"]" in bridge
+    assert "gh workflow run foundry-optimization-reconcile.yml" in bridge
+    hashes = legacy_repository_agent_hashes(
+        _request(),
+        oidc_subject="repository_id:123",
+        deployment_workflow_name="Deploy support agent",
+    )
+    assert {
+        Path(".github/workflows/campaign-drafts.yml"),
+        Path(".github/workflows/campaign-evaluate.yml"),
+    } <= set(hashes)

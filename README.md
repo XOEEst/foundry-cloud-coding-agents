@@ -48,24 +48,66 @@ unneeded.
 Before merging or running the generated workflows, manually create the
 repository Actions secret `COPILOT_ASSIGNMENT_TOKEN`. `foundry-opt init`
 cannot create Actions secrets. The value must be a user-to-server credential
-for a user who can use Copilot cloud agent and assign the generated custom
-agents; GitHub Actions `github.token` and GitHub App installation tokens are
-not supported for this assignment API.
+for a user who can use Copilot cloud agent and summon it on the existing
+workspace pull request; GitHub Actions `github.token` and GitHub App
+installation tokens are not supported for this invocation. This credential is
+for Copilot invocation, verified assignment-comment cleanup, and the narrow
+workspace pull-request bootstrap fallback described below.
 
 Prefer a fine-grained personal access token scoped only to the target
 repository, or use a GitHub App user-to-server token or OAuth app token.
 GitHub documents these minimum fine-grained repository permissions for
-assigning Copilot:
+posting the invocation, cleaning up its transient marker, and creating the
+workspace pull request when the organization-policy fallback is required:
 
 - Metadata: read
-- Actions, Contents, Issues, and Pull requests: read/write
+- Issues and Pull requests: read/write
 
 Store the credential only as the Actions secret. Never commit it, put it in a
 workflow variable, print it, or persist it in issue content or optimizer
-state. Issue intake and scheduled/manual reconciliation fail before checkout
-with a non-secret error when the secret is absent. Generated workflows retain
-`github.token` for ordinary GitHub transport and use the dedicated credential
-only for the remove/reassign calls that create Copilot sessions.
+state. Generated workflows use `github.token` for durable repository
+operations, which therefore appear as `github-actions[bot]`. The generated
+workspace intake step also exposes the same secret under the distinct
+`FOUNDRY_OPT_WORKSPACE_PR_BOOTSTRAP_TOKEN` name. Intake removes that variable
+before generic subprocesses run and supplies it only to the workspace PR
+creation adapter.
+
+The adapter first creates the workspace pull request with `github.token`. It
+retries with the eligible-user credential only for GitHub's explicit
+organization-policy response that Actions may not create or approve pull
+requests. The workspace branch push keeps the existing Actions-authenticated
+Git transport. Ordinary issue comments, status, evidence, checks, closure, and
+all other repository mutations continue to use `github.token`; only transient
+assignment-comment cleanup remains on the narrow eligible-user adapter.
+
+Actor ledger: when that organization-policy fallback is required, the
+workspace pull request is authored by the eligible user until the
+Foundry-owned App migration. It is therefore incorrect to attribute every
+optimizer write to `github-actions[bot]`; all ordinary writes still use that
+Actions identity.
+
+After the trusted workflow verifies and captures candidate provenance, it
+removes the transient assignment comment with the same narrow credential.
+The Copilot source-commit link always remains in the issue and workspace pull
+request as durable public evidence. The acknowledgement-comment link is also
+retained when GitHub publishes that comment; otherwise scheduled import may
+proceed only from a verified GitHub-signed Copilot source commit made through
+the linked `web-flow` committer, and public evidence reports the acknowledgement
+as unavailable without weakening provenance.
+
+The long-term target is a Foundry-owned, published, and secured
+`foundry-optimizer[bot]` GitHub App. Customers will only install the App on
+selected repositories. Foundry will issue short-lived installation tokens
+through a broker/workload-identity exchange; no App private key will be stored
+in a customer repository. This migration is not active yet and must not change
+candidate or lineage interfaces, the issue and single-workspace pull-request
+journey, or the human merge gate.
+
+`foundry-opt init` validates the generated workflow scope, and
+`foundry-opt preflight` scans repository workflow artifacts without reading
+secret values. Both reject using `COPILOT_ASSIGNMENT_TOKEN` as a generic
+`GH_TOKEN` or exposing it outside the narrow invocation, cleanup, and
+workspace PR bootstrap fallback environments.
 
 ### 2. Create one optimization issue
 
