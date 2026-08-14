@@ -211,6 +211,11 @@ def test_spoofed_copilot_login_is_rejected(login: str) -> None:
         _provenance(copilot_actor_login=login)
 
 
+def test_spoofed_copilot_actor_id_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Copilot actor ID"):
+        _provenance(copilot_actor_id=7)
+
+
 @pytest.mark.parametrize("event_name", ["push", "workflow_dispatch"])
 def test_unsupported_import_event_is_rejected(event_name: str) -> None:
     with pytest.raises(ValueError, match="trusted event"):

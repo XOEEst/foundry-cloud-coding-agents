@@ -654,6 +654,30 @@ def test_trusted_candidate_import_persists_verified_provenance(
                     + "c" * 40
                 ),
                 "author": actor,
+                "committer": {
+                    "id": 19864447,
+                    "login": "web-flow",
+                    "type": "User",
+                },
+                "commit": {
+                    "verification": {
+                        "verified": True,
+                        "reason": "valid",
+                        "signature": (
+                            "-----BEGIN PGP SIGNATURE-----\n"
+                            "genuine\n"
+                        ),
+                        "payload": (
+                            f"tree {'d' * 40}\n"
+                            f"parent {'e' * 40}\n"
+                            "author Copilot "
+                            "<198982749+Copilot@users.noreply.github.com> "
+                            "1776139200 -0700\n"
+                            "committer GitHub <noreply@github.com> "
+                            "1776139200 -0700\n"
+                        ),
+                    }
+                },
             }
         ),
     }

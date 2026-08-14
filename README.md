@@ -91,8 +91,9 @@ removes the transient assignment comment with the same narrow credential.
 The Copilot source-commit link always remains in the issue and workspace pull
 request as durable public evidence. The acknowledgement-comment link is also
 retained when GitHub publishes that comment; otherwise scheduled import may
-proceed from the verified Copilot commit, and public evidence reports the
-acknowledgement as unavailable without weakening provenance.
+proceed only from a verified GitHub-signed Copilot source commit made through
+the linked `web-flow` committer, and public evidence reports the acknowledgement
+as unavailable without weakening provenance.
 
 The long-term target is a Foundry-owned, published, and secured
 `foundry-optimizer[bot]` GitHub App. Customers will only install the App on

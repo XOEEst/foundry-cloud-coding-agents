@@ -23,6 +23,23 @@ _ACTOR = {
     "login": "Copilot",
     "type": "Bot",
 }
+_COMMITTER = {
+    "id": 19864447,
+    "login": "web-flow",
+    "type": "User",
+}
+_VERIFICATION = {
+    "verified": True,
+    "reason": "valid",
+    "signature": "-----BEGIN PGP SIGNATURE-----\ngenuine\n",
+    "payload": (
+        f"tree {'d' * 40}\n"
+        f"parent {'e' * 40}\n"
+        "author Copilot <198982749+Copilot@users.noreply.github.com> "
+        "1776139200 -0700\n"
+        "committer GitHub <noreply@github.com> 1776139200 -0700\n"
+    ),
+}
 
 
 class FakeCommands:
@@ -72,6 +89,8 @@ def _responses(
     comment_body: str | None = None,
     comment_actor: Mapping[str, object] | None = None,
     commit_url: str | None = None,
+    committer: Mapping[str, object] = _COMMITTER,
+    verification: Mapping[str, object] = _VERIFICATION,
 ) -> dict[tuple[str, ...], object]:
     marker_key = workspace_assignment_marker_key(31, _STATE_REVISION)
     acknowledgement = (
@@ -97,6 +116,8 @@ def _responses(
                 or f"https://github.com/{_REPOSITORY}/commit/{_SOURCE_SHA}"
             ),
             "author": dict(actor),
+            "committer": dict(committer),
+            "commit": {"verification": dict(verification)},
         },
         (
             "gh",
@@ -215,6 +236,96 @@ def test_scheduled_capture_accepts_missing_acknowledgement(
     assert provenance.candidate_source_commit_sha == _SOURCE_SHA
 
 
+def test_scheduled_capture_rejects_spoofed_unsigned_author(
+    tmp_path: Path,
+) -> None:
+    responses = _responses(
+        verification={
+            "verified": False,
+            "reason": "unsigned",
+            "signature": None,
+            "payload": None,
+        }
+    )
+    endpoint = (
+        "gh",
+        "api",
+        (
+            f"repos/{_REPOSITORY}/issues/104/comments?"
+            "per_page=100&sort=created&direction=desc"
+        ),
+    )
+    responses[endpoint] = []
+
+    with pytest.raises(ValueError, match="verification is not valid"):
+        _resolve(
+            tmp_path,
+            context=_context(
+                trusted_event_name="schedule",
+                acknowledgement_comment_id=None,
+            ),
+            responses=responses,
+        )
+
+
+def test_capture_rejects_wrong_committer(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="committer.*web-flow"):
+        _resolve(
+            tmp_path,
+            responses=_responses(
+                committer={
+                    "id": 7,
+                    "login": "web-flow",
+                    "type": "User",
+                }
+            ),
+        )
+
+
+def test_capture_rejects_invalid_verification_reason(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="verification is not valid"):
+        _resolve(
+            tmp_path,
+            responses=_responses(
+                verification={
+                    **_VERIFICATION,
+                    "reason": "unknown_key",
+                }
+            ),
+        )
+
+
+@pytest.mark.parametrize("field", ["signature", "payload"])
+def test_capture_rejects_missing_verification_material(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=rf"verification {field} is missing",
+    ):
+        _resolve(
+            tmp_path,
+            responses=_responses(
+                verification={
+                    **_VERIFICATION,
+                    field: "",
+                }
+            ),
+        )
+
+
+def test_capture_accepts_genuine_github_signed_copilot_fixture(
+    tmp_path: Path,
+) -> None:
+    provenance = _resolve(tmp_path, responses=_responses())
+
+    assert provenance.copilot_actor_id == 198982749
+    assert provenance.copilot_actor_login == "Copilot"
+
+
 def test_scheduled_capture_rejects_multiple_acknowledgements(
     tmp_path: Path,
 ) -> None:
@@ -319,6 +430,12 @@ def test_direct_context_requires_acknowledgement_comment_id() -> None:
         (
             _responses(
                 actor={"id": 7, "login": "octocat", "type": "User"}
+            ),
+            "Copilot commit actor",
+        ),
+        (
+            _responses(
+                actor={"id": 7, "login": "Copilot", "type": "Bot"}
             ),
             "Copilot commit actor",
         ),

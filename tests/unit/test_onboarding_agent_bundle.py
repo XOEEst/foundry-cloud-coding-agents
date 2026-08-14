@@ -635,8 +635,9 @@ def test_workspace_steward_posts_revision_bound_candidate_acknowledgement() -> N
     assert "<git rev-parse HEAD>" in text
     normalized = " ".join(text.split())
     assert (
-        "trusted scheduled import can proceed from the verified Copilot "
-        "commit if GitHub does not publish "
+        "trusted scheduled import can proceed only from a verified "
+        "GitHub-signed Copilot source commit made through the linked "
+        "`web-flow` committer if GitHub does not publish "
         "the acknowledgement comment"
         in normalized
     )

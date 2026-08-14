@@ -25,6 +25,8 @@ _ASSIGNMENT_MARKER = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
 )
 _NORMALIZED_COPILOT_LOGIN = "copilot-swe-agent[bot]"
+_COPILOT_ACTOR_ID = 198982749
+_GITHUB_WEB_FLOW_ID = 19864447
 
 
 class WorkspaceCandidateImportEvent(StrEnum):
@@ -109,6 +111,8 @@ class WorkspaceCandidateProvenance:
             (self.importer_workflow_run_id, "importer workflow run ID"),
         ):
             _positive_integer(value, name)
+        if self.copilot_actor_id != _COPILOT_ACTOR_ID:
+            raise ValueError("Copilot actor ID is not trusted")
         acknowledgement_present = (
             self.acknowledgement_comment_id is not None
         )
@@ -277,6 +281,7 @@ class GhWorkspaceCandidateProvenanceResolver:
             or not _trusted_copilot_actor(actor)
         ):
             raise ValueError("trusted Copilot commit actor is invalid")
+        _validate_github_signed_copilot_commit(commit)
         assert isinstance(actor, Mapping)
 
         assignment_marker_key = workspace_assignment_marker_key(
@@ -550,10 +555,44 @@ def _trusted_copilot_actor(value: Any) -> bool:
     return (
         isinstance(value, Mapping)
         and value.get("login") in {"Copilot", _NORMALIZED_COPILOT_LOGIN}
-        and type(value.get("id")) is int
-        and value["id"] > 0
+        and value.get("id") == _COPILOT_ACTOR_ID
         and value.get("type") == "Bot"
     )
+
+
+def _validate_github_signed_copilot_commit(
+    value: Mapping[str, Any],
+) -> None:
+    committer = value.get("committer")
+    if (
+        not isinstance(committer, Mapping)
+        or committer.get("login") != "web-flow"
+        or committer.get("id") != _GITHUB_WEB_FLOW_ID
+        or committer.get("type") != "User"
+    ):
+        raise ValueError(
+            "trusted Copilot commit committer is not GitHub web-flow"
+        )
+    commit = value.get("commit")
+    verification = (
+        commit.get("verification")
+        if isinstance(commit, Mapping)
+        else None
+    )
+    if (
+        not isinstance(verification, Mapping)
+        or verification.get("verified") is not True
+        or verification.get("reason") != "valid"
+    ):
+        raise ValueError(
+            "trusted Copilot commit verification is not valid"
+        )
+    for field in ("signature", "payload"):
+        content = verification.get(field)
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(
+                f"trusted Copilot commit verification {field} is missing"
+            )
 
 
 def _same_actor(value: Any, expected: Mapping[str, Any]) -> bool:
